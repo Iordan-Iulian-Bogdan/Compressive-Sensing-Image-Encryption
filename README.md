@@ -103,6 +103,8 @@ Without `--password` the passphrase is read from `CS_ENCRYPTION_PASSWORD` or pro
 
 Quality notes: tiles are composited with a **cosine-feathered** weight ramp (width = tile overlap) instead of a fixed alpha blend — overlap zones sum to a smooth transition and the composite is order-independent. Tiles are solved in **wavefront (anti-diagonal) order**: every tile is warm-started from the already-solved west/north neighbors' overlap strips, which turned out to be by far the largest quality lever — roundtrip baselines went from ~19.2/16.7 dB (independent solves) to **~26.8/30.4 dB** (synthetic/photo) with no wall-time penalty, since the better warm-starts converge faster than the wave barriers cost. A YCrCb-domain solve was re-tested properly on top of the wavefront (neighbor chroma strips, softened chroma l1) after the first attempt turned out to have a channel-ordering bug — the corrected result is a tie with BGR (26.7/30.3 vs 26.8/30.4 dB) at higher cost, so BGR remains the default; the path is kept behind a flag for future tuning experiments (see `decrypt_image::decrypt`).
 
+Performance : the decrypt solver saturates by ~5 L-BFGS iterations across compression ratios 0.25–1.0 (`tests/bench_iterations.cpp`: PSNR plateau at 5 steps everywhere, time linear beyond it), so auto mode allocates `ceil(5/ratio)` iterations capped at 8 — previously `10/ratio` capped at 30, which overshot 2–6× with identical output quality.
+
 Performance : 
 
 ~1.0 seconds to decompress and decrypt a 4032 X 3024 image on a Ryzen 7900 after adding upscaling using [this library](https://github.com/avaneev/avir).

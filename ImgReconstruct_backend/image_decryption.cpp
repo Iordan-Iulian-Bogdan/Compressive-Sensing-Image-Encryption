@@ -368,10 +368,14 @@ int decrypt_image::decrypt_image_tiled(
     cv::Size org_size = dimgs.get_org_size();
 
     if (CSencryption::params == AUTO_PARAM) {
-        iterations = (1.0f / dimgs.get_compression_ratio()) * 10;
-
-        if (iterations > 30) {
-            iterations = 30;
+        // iterations: the solver saturates by ~5 steps across compression
+        // ratios 0.25..1.0 (tests/bench_iterations.cpp: the PSNR plateau
+        // starts at 5 everywhere, time scales linearly beyond it), so the
+        // old 10*(1/ratio) formula (capped 30) overshot by 2-6x. Keep a
+        // knee-proportional allocation with a cap of 8.
+        iterations = (int)std::ceil(5.0f / dimgs.get_compression_ratio());
+        if (iterations > 8) {
+            iterations = 8;
         }
 
         if (dimgs.get_compression_ratio() < 0.5f) {
