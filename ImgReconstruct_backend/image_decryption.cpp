@@ -334,8 +334,8 @@ int decrypt_image::decrypt_image_tiled(
                 throw std::runtime_error("Overlap is outside the acceptable range of (24, 96)");
             }
 
-            if (num_tiles < 24) {
-                throw std::runtime_error("Number of tiles is less than 24");
+            if (num_tiles < 8) {
+                throw std::runtime_error("Number of tiles is less than 8");
             }
 
             if (coef < 0.01f || coef > 0.05f) {

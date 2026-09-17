@@ -595,9 +595,13 @@ void splitImageIntoTiles(const cv::Mat& inputImage,
     int height = inputImage.rows;
     int width = inputImage.cols;
 
-    // Calculate tile dimensions considering overlap
-    int tileWidth = (width + (tileCountN - 1) * overlap) / tileCountN;
-    int tileHeight = (height + (tileCountN - 1) * overlap) / tileCountN;
+    // Calculate tile dimensions considering overlap. Ceiling (not flooring)
+    // guarantees the natural stride reaches the image edge: with a floored
+    // tile size the accumulated truncation could exceed the stride, leaving
+    // uncovered strips between the last tiles (and the previous edge-anchor
+    // workaround itself opened holes for tiny strides).
+    int tileWidth = (int)std::ceil((width + (tileCountN - 1) * (double)overlap) / tileCountN);
+    int tileHeight = (int)std::ceil((height + (tileCountN - 1) * (double)overlap) / tileCountN);
 
     // Resize vectors to N x N
     tiles.resize(tileCountN, std::vector<cv::Mat>(tileCountN));
@@ -610,16 +614,17 @@ void splitImageIntoTiles(const cv::Mat& inputImage,
             int x = j * (tileWidth - overlap);
             int y = i * (tileHeight - overlap);
 
-            // Integer truncation of tileWidth can leave the last column short
-            // of the right image edge (a uncovered black strip up to ~4% of
-            // the image). Anchor the last tile to the edge so coverage is
-            // complete for any width/height/overlap combination.
-            if (j == tileCountN - 1 && width >= tileWidth) {
+            // Clamp tiles that overrun the right/bottom edge so their outer
+            // edge lands exactly on the image boundary (full coverage, no
+            // gaps); tiny images where the tile exceeds the image are skipped
+            if (x + tileWidth > width && width >= tileWidth) {
                 x = width - tileWidth;
             }
-            if (i == tileCountN - 1 && height >= tileHeight) {
+            if (y + tileHeight > height && height >= tileHeight) {
                 y = height - tileHeight;
             }
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
 
             // Adjust for edges
             int currentWidth = tileWidth;
