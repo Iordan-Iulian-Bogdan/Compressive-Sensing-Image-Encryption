@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <numeric>
 #include <set>
@@ -255,6 +256,74 @@ void test_roundtrip() {
     std::remove(tmp_out.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// 5. photo-based roundtrip (second data point on real image statistics)
+// ---------------------------------------------------------------------------
+// Photos are gitignored (*.png), so this test is opt-in: it runs when a real
+// photo is available, and skips (without failing) otherwise. Photo sources,
+// in order: $CS_TEST_PHOTO, IMG_3690.png next to the test binary, or the
+// project sample at ImgReconstruct_backend/IMG_3690.png.
+void test_photo_roundtrip() {
+    std::string path;
+    if (const char* env = std::getenv("CS_TEST_PHOTO")) {
+        path = env;
+    }
+    if (path.empty()) path = "IMG_3690.png";
+    if (path.empty() || !std::ifstream(path.c_str()).good()) {
+        path = "ImgReconstruct_backend/IMG_3690.png";
+    }
+    if (!std::ifstream(path.c_str(), std::ios::binary).good()) {
+        std::printf("[SKIP] photo roundtrip: no photo found (set CS_TEST_PHOTO=<path>)\n");
+        return;
+    }
+
+    cv::Mat original = cv::imread(path, cv::IMREAD_COLOR);
+    if (original.empty()) {
+        std::printf("[SKIP] photo roundtrip: '%s' did not load\n", path.c_str());
+        return;
+    }
+
+    const std::string password = "roundtrip-test-password";
+    const std::string tmp_out = ".cs_test_photo_output.png";
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(path, "", password, 1.0f, &encrypted) != 0) {
+        check(false, "photo roundtrip: encrypt");
+        return;
+    }
+
+    // cap the solve dimensions: a multi-tens-of-MP input would dominate the
+    // suite's runtime; the auto parameters (24 tiles, overlap 24) still get
+    // exercised at full tile statistics
+    const int max_dim = 2400;
+    if (original.cols > max_dim || original.rows > max_dim) {
+        cv::resize(original, original, cv::Size(max_dim, original.rows * max_dim / original.cols));
+    }
+    const std::string tmp_in = ".cs_test_photo.png";
+    cv::imwrite(tmp_in, original);
+
+    if (decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, 10, 4, 0.01f, false) != 0) {
+        check(false, "photo roundtrip: decrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+
+    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    check(!decrypted.empty(), "photo roundtrip: decrypted file readable");
+    if (!decrypted.empty()) {
+        cv::Mat dec_sized;
+        cv::resize(decrypted, dec_sized, original.size());
+        const double p = psnr(original, dec_sized);
+        std::printf("       photo roundtrip PSNR (%s, %dx%d): %.2f dB\n",
+            path.c_str(), original.cols, original.rows, p);
+        // second data point on natural image statistics; threshold mirrors
+        // the synthetic roundtrip guard (broken pipeline -> single-digit dB)
+        check(p > 15.0, "photo roundtrip: PSNR > 15 dB");
+    }
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
 } // namespace
 
 int main() {
@@ -262,6 +331,7 @@ int main() {
     test_shuffle();
     test_tile_helpers();
     test_roundtrip();
+    test_photo_roundtrip();
 
     if (g_failures == 0) {
         std::printf("ALL TESTS PASSED\n");

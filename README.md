@@ -89,7 +89,7 @@ Alternatively point CMake at any OpenCV with CMake config files via `-DOpenCV_DI
 
 ### Test suite
 
-`cs_tests` covers: PBKDF2/seal/verify unit tests, wrong-password and tamper rejection, seed determinism (same password+salt ⇒ same key/indices), shuffle determinism, tile-grid helpers, and a full encrypt→decrypt roundtrip scored by PSNR. Run with `ctest` or directly (`build\cs_tests.exe`).
+`cs_tests` covers: PBKDF2/seal/verify unit tests, wrong-password and tamper rejection, seed determinism (same password+salt ⇒ same key/indices), shuffle determinism, tile-grid helpers, a synthetic encrypt→decrypt roundtrip scored by PSNR (~19.2 dB baseline), and an **opt-in photo roundtrip** that runs a real photo (auto-found: `$CS_TEST_PHOTO`, `IMG_3690.png`, or the project sample) for a second data point on natural image statistics (~16.7 dB baseline) and skips cleanly when no photo is available. Run with `ctest` or directly (`build\cs_tests.exe`).
 
 ### CLI usage
 
