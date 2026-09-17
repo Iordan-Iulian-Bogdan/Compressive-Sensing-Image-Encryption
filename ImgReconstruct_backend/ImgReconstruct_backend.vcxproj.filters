@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="CS_encryption.cpp" />
+    <ClCompile Include="helper_functions.cpp" />
+    <ClCompile Include="image_decryption.cpp" />
+    <ClCompile Include="image_encryption.cpp" />
+    <ClCompile Include="ImgReconstruct_backend.cpp" />
+    <ClCompile Include="lbfgs.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="arithmetic_ansi.h" />
+    <ClInclude Include="CS_encryption.hpp" />
+    <ClInclude Include="helper_functions.hpp" />
+    <ClInclude Include="image_decryption.hpp" />
+    <ClInclude Include="image_encryption.hpp" />
+    <ClInclude Include="lbfgs.hpp" />
+    <ClInclude Include="avir.h" />
+    <ClInclude Include="avir_dil.h" />
+    <ClInclude Include="avir_float4_sse.h" />
+    <ClInclude Include="avir_float8_avx.h" />
+    <ClInclude Include="lancir.h" />
+  </ItemGroup>
+</Project>

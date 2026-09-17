@@ -1,0 +1,9 @@
+{
+  "name": "cs-image-encryption",
+  "version": "0.2.0",
+  "description": "Image encryption proof of concept using compressive sensing with an L-BFGS solver",
+  "dependencies": [
+    "opencv4",
+    "openssl"
+  ]
+}
