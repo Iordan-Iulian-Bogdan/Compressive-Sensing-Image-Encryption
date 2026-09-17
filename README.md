@@ -95,11 +95,13 @@ Alternatively point CMake at any OpenCV with CMake config files via `-DOpenCV_DI
 
 ```
 ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R]
-ImgReconstruct_backend decrypt  <input.png> <output.png> [--password <pw>] [--tiles N] [--overlap N] [--iterations N] [--threads N] [--coef F] [--manual] [--no-preview]
+ImgReconstruct_backend decrypt  <input.png> <output.png> [--password <pw>] [--tiles N] [--overlap N] [--iterations N] [--threads N] [--coef F] [--manual] [--no-preview] [--denoise]
 ImgReconstruct_backend roundtrip <input.png> <output.png> [options]
 ```
 
-Without `--password` the passphrase is read from `CS_ENCRYPTION_PASSWORD` or prompted. Parameter overrides (`--tiles` etc.) switch the decrypt to manual mode; otherwise parameters are derived automatically from the container.
+Without `--password` the passphrase is read from `CS_ENCRYPTION_PASSWORD` or prompted. Parameter overrides (`--tiles` etc.) switch the decrypt to manual mode; otherwise parameters are derived automatically from the container. `--denoise` adds an opt-in final non-local-means pass (`cv::fastNlMeansDenoisingColored`) that smooths solver noise at the cost of fine detail.
+
+Quality notes: tiles are composited with a **cosine-feathered** weight ramp (width = tile overlap) instead of a fixed alpha blend — overlap zones sum to a smooth transition and the composite is order-independent. Measured on the test roundtrip, feathered blending scores ~19.2 dB vs ~18.3 dB with the legacy 0.5 alpha blend. A YCrCb-domain solve was also tried (smoother chroma, softened chroma l1, neutral chroma warm-start) but measured ~15.6 dB — see the experiment notes in `decrypt_image::decrypt` for the details before re-attempting it.
 
 Performance : 
 

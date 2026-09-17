@@ -104,10 +104,18 @@ void splitImageIntoTiles(const cv::Mat& inputImage,
     std::vector<std::vector<TileCoord>>& coordinates,
     const int& tileCountN,
     const int& overlap);
+/** @brief merges tiles back into an image.
+@param alpha : legacy sequential alpha blend weight (used when feather <= 0)
+@param feather : if > 0, tiles are composited with a cosine-feathered weight
+                 ramp of this many pixels at every tile border instead of the
+                 sequential alpha blend; weights sum to 1 across overlaps, so
+                 the result is order-independent and seam-free
+*/
 cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
     const std::vector<std::vector<TileCoord>>& coordinates,
     const cv::Mat& targetImage,
-    float alpha);
+    float alpha,
+    int feather = 0);
 
 struct display {
     std::thread display_image_thread;

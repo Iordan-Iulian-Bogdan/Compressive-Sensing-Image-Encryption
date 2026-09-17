@@ -51,9 +51,9 @@ public:
     /** @brief decrypts tiles from an already-loaded encrypted image (in-memory, no PNG roundtrip).
     Shared implementation for both overloads. Note: the Mat is const but the impl needs a copy.
     */
-    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 20, int nun_threads = 8, float coef = 0.01f, bool show_preview = true);
+    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 20, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, bool denoise = false);
 
-    static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 20, int nun_threads = 8, float coef = 0.01f, bool show_preview = true);
+    static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 20, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, bool denoise = false);
 
 };
 

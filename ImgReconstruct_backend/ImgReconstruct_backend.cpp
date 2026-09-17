@@ -28,6 +28,8 @@ void print_usage(const char* exe) {
         "  --manual              force manual parameter mode (auto is the default and\n"
         "                        derives tiles/overlap/iterations/coef from the image)\n"
         "  --no-preview          disable the live decryption preview window\n"
+        "  --denoise             apply a final non-local-means denoise pass\n"
+        "                        (smooths solver noise, blurs fine detail)\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
         "\n"
@@ -92,6 +94,7 @@ int main(int argc, char* argv[])
     float coef = 0.01f;
     bool manual = false;
     bool show_preview = true;
+    bool denoise = false;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -143,6 +146,9 @@ int main(int argc, char* argv[])
         else if (a == "--no-preview") {
             show_preview = false;
         }
+        else if (a == "--denoise") {
+            denoise = true;
+        }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
             print_usage(argv[0]);
@@ -170,14 +176,14 @@ int main(int argc, char* argv[])
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                tiles, overlap, iterations, threads, coef, show_preview);
+                tiles, overlap, iterations, threads, coef, show_preview, denoise);
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, &encrypted);
             if (rc == 0) {
                 rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview);
+                    tiles, overlap, iterations, threads, coef, show_preview, denoise);
             }
         }
     }

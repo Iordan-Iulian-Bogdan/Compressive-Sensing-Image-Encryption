@@ -562,7 +562,8 @@ void splitImageIntoTiles(const cv::Mat& inputImage,
 cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
     const std::vector<std::vector<TileCoord>>& coordinates,
     const cv::Mat& targetImage,
-    float alpha) {
+    float alpha,
+    int feather) {
     // Input validation
     if (tiles.empty() || coordinates.empty() ||
         tiles.size() != coordinates.size() ||
@@ -575,6 +576,68 @@ cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
     int tileCountN = tiles.size();
     int maxX = targetImage.cols;
     int maxY = targetImage.rows;
+
+    if (feather > 0) {
+        // cosine-feathered compositing: every tile contributes a weighted sum,
+        // the weight ramping from 1 in the tile interior to 0 at the borders
+        // over `feather` pixels. Accumulate color*weight and weight, then
+        // normalize; overlapped regions get exactly the sum of the tiles'
+        // ramped contributions (order-independent, no visible seams even at
+        // low overlap).
+        cv::Mat acc(maxY, maxX, CV_32FC3, cv::Scalar(0, 0, 0));
+        cv::Mat wsum(maxY, maxX, CV_32FC1, cv::Scalar(0));
+
+        for (int i = 0; i < tileCountN; i++) {
+            for (int j = 0; j < tileCountN; j++) {
+                if (tiles[i][j].empty()) continue;
+                const int th = tiles[i][j].rows, tw = tiles[i][j].cols;
+                const int x = coordinates[i][j].x, y = coordinates[i][j].y;
+                if (x < 0 || y < 0 || x + tw > maxX || y + th > maxY) continue;
+
+                // per-tile weight map: 0.5*(1 - cos(pi * d / feather)) with d =
+                // distance to the nearest tile border, clamped to [0, feather]
+                cv::Mat w(th, tw, CV_32FC1);
+                for (int r = 0; r < th; r++) {
+                    const int dy = (std::min)(r, th - 1 - r);
+                    for (int c = 0; c < tw; c++) {
+                        const int dx = (std::min)(c, tw - 1 - c);
+                        const int d = (std::min)(dx, dy);
+                        const int dc = (std::min)(d, feather);
+                        w.at<float>(r, c) = 0.5f * (1.0f - std::cos(CV_PI * dc / (float)feather));
+                    }
+                }
+
+                cv::Mat tile_f;
+                tiles[i][j].convertTo(tile_f, CV_32FC3);
+
+                cv::Rect roi(x, y, tw, th);
+                cv::Mat acc_roi = acc(roi);
+                cv::Mat wsum_roi = wsum(roi);
+
+                std::vector<cv::Mat> w3 = { w, w, w };
+                cv::Mat w3c;
+                cv::merge(w3, w3c);
+                cv::Mat contrib;
+                cv::multiply(tile_f, w3c, contrib);
+                cv::add(acc_roi, contrib, acc_roi);
+                cv::add(wsum_roi, w, wsum_roi);
+            }
+        }
+
+        // normalize by accumulated weight (guard fully-uncovered pixels)
+        cv::Mat safe_w;
+        (cv::max)(wsum, 1e-6f, safe_w);
+        std::vector<cv::Mat> acc_planes;
+        cv::split(acc, acc_planes);
+        for (auto& plane : acc_planes) {
+            cv::divide(plane, safe_w, plane);
+        }
+        cv::merge(acc_planes, acc);
+
+        cv::Mat out;
+        acc.convertTo(out, CV_8UC3);
+        return out;
+    }
 
     // Create a copy of the target image as base
     cv::Mat output = targetImage.clone();

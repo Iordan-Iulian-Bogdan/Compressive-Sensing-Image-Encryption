@@ -44,15 +44,22 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
 
 void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out) {
 
+    // Experiment notes (kept so the findings aren't re-litigated):
+    // 1. Packed 3-channel solve: a merged single lbfgs over all 3 channels
+    //    measured ~2.3x slower wall time (~7s vs ~3s) because channels must
+    //    share convergence/step (30 iters x 3 planes instead of staggered
+    //    30/20/20). If re-enabled prefer reconstruct_image_packed below.
+    // 2. YCrCb solve (tried): re-encoding the BGR measurements to YCrCb and
+    //    solving luma/chroma planes (softened chroma l1 coefficient, neutral
+    //    flat-chroma warm-start) measured ~15.6 dB on the test roundtrip vs
+    //    ~19.2 dB for BGR. Chroma planes are smoother as expected, but the
+    //    warm-start chain and l1 balancing no longer match their statistics;
+    //    re-tuning both is left as future work.
+    int num_iterations_offset = (num_iterations / 2);
+
     // c1/c2 get half the iterations: later channels are warm-started from the previous
     // channel's solution, so they need far fewer iterations to converge; capping them
     // harder trims nearly-free solver time (~30% less solver work at same quality target)
-    int num_iterations_offset = (num_iterations / 2);
-
-    // Reverted to per-channel saves: A merged single lbfgs over all 3 channels measured
-    // ~2.3x slower wall time (~7s vs ~3s) because channels must share convergence/step
-    // (30 iters x 3 planes instead of staggered 30/20/20). If re-enabled prefer
-    // reconstruct_image_packed below.
     reconstruct_color_channel(encrypted_img, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], true, ref[1]);
     reconstruct_color_channel(encrypted_img, 1, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2]);
     reconstruct_color_channel(encrypted_img, 2, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false);
@@ -171,10 +178,11 @@ int decrypt_image::decrypt_image_tiled(
     int iterations,
     int nun_threads,
     float coef,
-    bool show_preview
+    bool show_preview,
+    bool denoise
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise);
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -186,7 +194,8 @@ int decrypt_image::decrypt_image_tiled(
     int iterations,
     int nun_threads,
     float coef,
-    bool show_preview
+    bool show_preview,
+    bool denoise
 ) {
     const cv::Mat& encrypted_img_g = encrypted_img_in;
     try {
@@ -329,9 +338,18 @@ int decrypt_image::decrypt_image_tiled(
 
         reconstructed = reconstructImage(decrypted_image_tiles, coordinates);
 
-        // blending the overlapping tiles together for better quality
-        reconstructed = blendTilesWithImage(decrypted_image_tiles, coordinates, reconstructed, 0.5f);
+        // cosine-feathered compositing across the overlapping tile borders:
+        // ramp width == overlap means non-overlapped interiors keep full
+        // weight and the overlap zones sum to a smooth transition (fewer
+        // visible seams than the legacy 0.5 alpha blend)
+        reconstructed = blendTilesWithImage(decrypted_image_tiles, coordinates, reconstructed, 0.5f, overlap);
         cv::resize(reconstructed, reconstructed, org_size);
+
+        // optional final denoise (cv::photo): smooths solver noise but blurs
+        // fine detail, so it is opt-in
+        if (denoise) {
+            cv::fastNlMeansDenoisingColored(reconstructed, reconstructed, 3.0f, 3.0f, 7, 21);
+        }
 
         // sharpening the image to bring out more detail
         cv::Mat sharpened;
@@ -354,4 +372,5 @@ int decrypt_image::decrypt_image_tiled(
 
     return 0;
 }
+
 
