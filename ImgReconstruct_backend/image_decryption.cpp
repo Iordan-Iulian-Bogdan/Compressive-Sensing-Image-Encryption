@@ -42,21 +42,60 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     }
 }
 
-void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out) {
+void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb) {
 
     // Experiment notes (kept so the findings aren't re-litigated):
     // 1. Packed 3-channel solve: a merged single lbfgs over all 3 channels
     //    measured ~2.3x slower wall time (~7s vs ~3s) because channels must
     //    share convergence/step (30 iters x 3 planes instead of staggered
     //    30/20/20). If re-enabled prefer reconstruct_image_packed below.
-    // 2. YCrCb solve (tried): re-encoding the BGR measurements to YCrCb and
-    //    solving luma/chroma planes (softened chroma l1 coefficient, neutral
-    //    flat-chroma warm-start) measured ~15.6 dB on the test roundtrip vs
-    //    ~19.2 dB for BGR. Chroma planes are smoother as expected, but the
-    //    warm-start chain and l1 balancing no longer match their statistics;
-    //    re-tuning both is left as future work.
+    // 2. YCrCb solve: the first attempt (15.6 dB, looked hopeless) was later
+    //    traced to a channel-ordering bug -- the manual BGR->YCrCb conversion
+    //    packed (Cb, Cr, Y) while cvtColor/warm-strips use (Y, Cr, Cb), so the
+    //    solver got a permuted measurement space. Re-tested correctly on top
+    //    of wavefront warm-starts (chroma strips from neighbors, half chroma
+    //    l1, no luma->chroma forwarding): 26.71 / 30.29 dB synthetic / photo,
+    //    i.e. a tie with BGR (26.77 / 30.39) at strictly higher cost
+    //    (O(m) re-encoding per tile + extra cvtColor). BGR stays the default;
+    //    ycrcb=true keeps the path alive for future tuning experiments.
     int num_iterations_offset = (num_iterations / 2);
 
+    if (ycrcb) {
+        // YCrCb solve on top of wavefront warm-starts: luma carries most of
+        // the structure while the chroma planes are much smoother, so the
+        // chroma l1 penalty is softened (half coefficient). The stored
+        // measurements are sampled BGR pixels; they are re-encoded to YCrCb
+        // once here (O(m)) and the solved planes are merged back.
+        cv::Mat ycc_measurements = encrypted_img.clone();
+        const int measurement_pixels = std::min<int>((int)ycc_measurements.total(), m - 1 + CS_HEADER_PIXELS);
+        for (int i = CS_HEADER_PIXELS; i < measurement_pixels; i++) {
+            const cv::Vec3b bgr = ycc_measurements.at<cv::Vec3b>(i);
+            // same coefficients as cv::BGR2YCrCb; packed (Y, Cr, Cb) to match
+            // cv::COLOR_BGR2YCrCb / COLOR_YCrCb2BGR channel order
+            const float y  = 0.299f * bgr[2] + 0.587f * bgr[1] + 0.114f * bgr[0];
+            const float cr = (bgr[2] - y) * 0.713f + 128.0f;
+            const float cb = (bgr[0] - y) * 0.564f + 128.0f;
+            ycc_measurements.at<cv::Vec3b>(i) = cv::Vec3b(
+                cv::saturate_cast<uchar>(y + 0.5f),
+                cv::saturate_cast<uchar>(cr + 0.5f),
+                cv::saturate_cast<uchar>(cb + 0.5f));
+        }
+
+        // Y gets full iterations and no in-tile forwarding: the chroma solves
+        // warm-start from the neighbor strips' CHROMA content (x0[1]/x0[2]) and
+        // from each other (Cr -> Cb), not from luma-like planes.
+        const float chroma_coef = coef * 0.5f;
+        reconstruct_color_channel(ycc_measurements, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], false, ref[1]);
+        reconstruct_color_channel(ycc_measurements, 1, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2]);
+        reconstruct_color_channel(ycc_measurements, 2, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false);
+
+        cv::merge(ref, 3, out);
+        out.convertTo(out, CV_8UC3);
+        cv::cvtColor(out, out, cv::COLOR_YCrCb2BGR);
+        return;
+    }
+
+    // BGR per-channel solve (best measured configuration so far):
     // c1/c2 get half the iterations: later channels are warm-started from the previous
     // channel's solution, so they need far fewer iterations to converge; capping them
     // harder trims nearly-free solver time (~30% less solver work at same quality target)
@@ -123,11 +162,13 @@ cv::Size decrypt_image::get_org_size() {
 // the generic reference. Pixel-domain copy first, then the same DCT / 10
 // convention createRefSolutions uses, so reconstruct_color_channel accepts
 // it unchanged.
+// With ycrcb = true the strips (and the fallback refs) are produced in the
+// YCrCb domain instead, to match a YCrCb solve.
 static void build_neighbor_warm_start(cv::Mat refs[3],
     const std::vector<cv::Mat>& generic_refs,
     const std::vector<std::vector<cv::Mat>>& solved,
     const std::vector<std::vector<TileCoord>>& coordinates,
-    int i, int j)
+    int i, int j, bool ycrcb)
 {
     const cv::Rect t_rect(coordinates[i][j].x, coordinates[i][j].y, solved[i][j].cols, solved[i][j].rows);
     cv::Mat pix(t_rect.height, t_rect.width, CV_32FC3, cv::Scalar(0, 0, 0)); // pixel domain, [0,1]
@@ -145,16 +186,33 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 
         const cv::Rect dst_local(inter.x - t_rect.x, inter.y - t_rect.y, inter.width, inter.height);
         const cv::Rect src_local(inter.x - n_rect.x, inter.y - n_rect.y, inter.width, inter.height);
+        cv::Mat strip = solved[ni][nj](src_local).clone();
+        if (ycrcb) {
+            // the solved tiles hold BGR pixels; re-encode to YCrCb so the
+            // warm start lives in the same domain as the solve
+            cv::cvtColor(strip, strip, cv::COLOR_BGR2YCrCb);
+        }
         cv::Mat strip32;
-        solved[ni][nj](src_local).convertTo(strip32, CV_32FC3, 1.0 / 255.0);
+        strip.convertTo(strip32, CV_32FC3, 1.0 / 255.0);
         strip32.copyTo(pix(dst_local));
         any_neighbor = true;
     }
 
     if (!any_neighbor) {
         // first wave (or failed neighbors): generic reference as before
-        for (int ch = 0; ch < 3; ++ch) {
-            refs[ch] = generic_refs[ch].clone();
+        if (ycrcb) {
+            // Y gets the generic image-like ref; chroma planes start from a
+            // neutral flat-chroma solution (their statistics are very different)
+            refs[0] = generic_refs[0].clone();
+            refs[1] = cv::Mat(generic_refs[0].size(), CV_32F, cv::Scalar(0.5f));
+            cv::dct(refs[1], refs[1], 0);
+            refs[1] /= 10.0f;
+            refs[2] = refs[1].clone();
+        }
+        else {
+            for (int ch = 0; ch < 3; ++ch) {
+                refs[ch] = generic_refs[ch].clone();
+            }
         }
         return;
     }
@@ -171,7 +229,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb) {
 
     // we use a reference image as the initial solution for tiles without
     // neighbors (first wave); this helps speed up convergence
@@ -194,10 +252,10 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 const int j = w - i;
 
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j);
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, ycrcb);
 
                 decrypt_image dimgs = decrypt_image(mats_in[i][j]);
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j]);
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb);
             }
             catch (const std::exception& e) {
                 // an exception escaping an OpenMP region terminates the process;
@@ -366,8 +424,12 @@ int decrypt_image::decrypt_image_tiled(
     }
 
     std::thread decrypt_tiles_thread;
+    // ycrcb = true re-tests the YCrCb solve; measured results (wavefront
+    // warm-starts, chroma strips, half chroma l1): 26.71 / 30.29 dB
+    // synthetic / photo vs 26.77 / 30.39 dB for BGR -- a tie at higher cost,
+    // so BGR stays the default. See notes in decrypt().
     decrypt_tiles_thread = std::thread(decrypt_tiles, nun_threads, std::ref(encrypted_image_tiles), std::ref(indices_reconfigured),
-        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef);
+        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false);
     decrypt_tiles_thread.join();
 
     if (show_preview) {

@@ -19,7 +19,7 @@ public:
 
     decrypt_image(cv::Mat input, const std::string& password = "");
 
-    void decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out);
+    void decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb = false);
 
     void get_mat(cv::Mat& dest);
 
@@ -64,5 +64,5 @@ generic reference solution when no neighbor exists, e.g. the first wave).
 */
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef);
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb = false);
 #endif
