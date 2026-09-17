@@ -90,7 +90,7 @@ int main(int argc, char* argv[])
     std::string password;
     bool have_password = false;
     float ratio = 1.0f;
-    int tiles = 24, overlap = 24, iterations = 20, threads = 8;
+    int tiles = 24, overlap = 24, iterations = 5, threads = 8;
     float coef = 0.01f;
     bool manual = false;
     bool show_preview = true;
@@ -203,3 +203,4 @@ int main(int argc, char* argv[])
 
     return 0;
 }
+

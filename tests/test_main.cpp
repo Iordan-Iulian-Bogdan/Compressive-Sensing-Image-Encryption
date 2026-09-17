@@ -225,17 +225,17 @@ void test_roundtrip() {
         "roundtrip: encrypt to memory");
 
     // wrong password must fail authentication before the solve
-    const int wrong_rc = decrypt_image::decrypt_image_tiled(encrypted2, tmp_out, "wrong-password-99", 24, 24, 10, 4, 0.01f, false);
+    const int wrong_rc = decrypt_image::decrypt_image_tiled(encrypted2, tmp_out, "wrong-password-99", 24, 24, 5, 4, 0.01f, false);
     check(wrong_rc == -2, "roundtrip: wrong password rejected with -2");
 
     // tamper: flip one byte in the container body
     cv::Mat tampered = encrypted2.clone();
     tampered.data[tampered.total() * 3 - 1] ^= 0x80;
-    const int tamper_rc = decrypt_image::decrypt_image_tiled(tampered, tmp_out, password, 24, 24, 10, 4, 0.01f, false);
+    const int tamper_rc = decrypt_image::decrypt_image_tiled(tampered, tmp_out, password, 24, 24, 5, 4, 0.01f, false);
     check(tamper_rc == -2, "roundtrip: tampered container rejected with -2");
 
     // correct password: full solve
-    check(decrypt_image::decrypt_image_tiled(encrypted2, tmp_out, password, 24, 24, 20, 4, 0.01f, false) == 0,
+    check(decrypt_image::decrypt_image_tiled(encrypted2, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
         "roundtrip: decrypt succeeds");
 
     cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
@@ -302,7 +302,7 @@ void test_photo_roundtrip() {
     const std::string tmp_in = ".cs_test_photo.png";
     cv::imwrite(tmp_in, original);
 
-    if (decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, 10, 4, 0.01f, false) != 0) {
+    if (decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, 5, 4, 0.01f, false) != 0) {
         check(false, "photo roundtrip: decrypt");
         std::remove(tmp_in.c_str());
         return;
@@ -342,4 +342,6 @@ int main() {
     std::printf("%d TEST(S) FAILED\n", g_failures);
     return 1;
 }
+
+
 
