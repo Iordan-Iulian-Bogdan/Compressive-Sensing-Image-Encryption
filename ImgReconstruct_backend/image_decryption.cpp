@@ -117,53 +117,95 @@ cv::Size decrypt_image::get_org_size() {
     return org_size;
 }
 
-// decrypts tiles in parallel
-void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
-    std::vector<std::vector<cv::Mat>>& mats_out, std::vector<std::string> processing_order, int iterations, cv::Size tile_size, float coef) {
+// Builds the initial solver solution for one tile from its already-solved
+// west/north neighbors: their overlap strips contain actual reconstructed
+// image content for this tile's border region, a much stronger prior than
+// the generic reference. Pixel-domain copy first, then the same DCT / 10
+// convention createRefSolutions uses, so reconstruct_color_channel accepts
+// it unchanged.
+static void build_neighbor_warm_start(cv::Mat refs[3],
+    const std::vector<cv::Mat>& generic_refs,
+    const std::vector<std::vector<cv::Mat>>& solved,
+    const std::vector<std::vector<TileCoord>>& coordinates,
+    int i, int j)
+{
+    const cv::Rect t_rect(coordinates[i][j].x, coordinates[i][j].y, solved[i][j].cols, solved[i][j].rows);
+    cv::Mat pix(t_rect.height, t_rect.width, CV_32FC3, cv::Scalar(0, 0, 0)); // pixel domain, [0,1]
+    bool any_neighbor = false;
 
-    // we use a reference image as the initial solution
-    // this helps speed up convergence
+    const int west[2] = { i, j - 1 };
+    const int north[2] = { i - 1, j };
+    for (int n = 0; n < 2; ++n) {
+        const int ni = west[0] + (north[0] - west[0]) * n; // (i, j-1) then (i-1, j)
+        const int nj = west[1] + (north[1] - west[1]) * n;
+        if (ni < 0 || nj < 0 || solved[ni][nj].empty()) continue;
+        const cv::Rect n_rect(coordinates[ni][nj].x, coordinates[ni][nj].y, solved[ni][nj].cols, solved[ni][nj].rows);
+        const cv::Rect inter = n_rect & t_rect;
+        if (inter.width <= 0 || inter.height <= 0) continue;
+
+        const cv::Rect dst_local(inter.x - t_rect.x, inter.y - t_rect.y, inter.width, inter.height);
+        const cv::Rect src_local(inter.x - n_rect.x, inter.y - n_rect.y, inter.width, inter.height);
+        cv::Mat strip32;
+        solved[ni][nj](src_local).convertTo(strip32, CV_32FC3, 1.0 / 255.0);
+        strip32.copyTo(pix(dst_local));
+        any_neighbor = true;
+    }
+
+    if (!any_neighbor) {
+        // first wave (or failed neighbors): generic reference as before
+        for (int ch = 0; ch < 3; ++ch) {
+            refs[ch] = generic_refs[ch].clone();
+        }
+        return;
+    }
+
+    std::vector<cv::Mat> planes;
+    cv::split(pix, planes);
+    for (int ch = 0; ch < 3; ++ch) {
+        cv::dct(planes[ch], planes[ch], 0);
+        planes[ch] /= 10.0f;
+        refs[ch] = planes[ch];
+    }
+}
+
+// decrypts tiles in wavefront (anti-diagonal) order
+void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
+    std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef) {
+
+    // we use a reference image as the initial solution for tiles without
+    // neighbors (first wave); this helps speed up convergence
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
 
-    // the loop is driven by processing_order instead of a squared grid
-    // dimension: it already holds exactly one entry per tile, so non-square
-    // tile layouts no longer silently break
-    #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-    for (int k = 0; k < (int)processing_order.size(); k++) {
-        try {
-            std::vector<std::string> splitText = splitString(processing_order[k], '_');
-            int tile_i = std::stoi(splitText[0]);
-            int tile_j = std::stoi(splitText[1]);
+    // wavefront over the tile grid: wave w = i + j. Tiles on the same
+    // anti-diagonal share no west or north neighbors, so every tile of a
+    // wave runs in parallel while warm-starting from tiles of earlier
+    // waves only -- no ordering races, and roughly 2N-1 waves instead of
+    // num_tiles^2 independent solves.
+    for (int w = 0; w <= 2 * (num_tiles - 1); ++w) {
+        const int i_lo = (std::max)(0, w - (num_tiles - 1));
+        const int i_hi = (std::min)(num_tiles - 1, w);
+        const int wave_count = i_hi - i_lo + 1;
 
-            if (tile_i < 0 || tile_j < 0 ||
-                tile_i >= (int)mats_in.size() || tile_j >= (int)mats_in[tile_i].size() ||
-                tile_i >= (int)indices.size() || tile_j >= (int)indices[tile_i].size() ||
-                tile_i >= (int)mats_out.size() || tile_j >= (int)mats_out[tile_i].size()) {
+        #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+        for (int t = 0; t < wave_count; ++t) {
+            try {
+                const int i = i_lo + t;
+                const int j = w - i;
+
+                cv::Mat x0[3];
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j);
+
+                decrypt_image dimgs = decrypt_image(mats_in[i][j]);
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j]);
+            }
+            catch (const std::exception& e) {
+                // an exception escaping an OpenMP region terminates the process;
+                // log it and degrade this one tile gracefully instead
                 #pragma omp critical
                 {
-                    std::cerr << "Tile (" << tile_i << ", " << tile_j << ") is outside the tile grid, skipping" << std::endl;
+                    std::cerr << "Tile decryption failed: " << e.what() << std::endl;
                 }
-                continue;
-            }
-
-            // it's faster to make a copy of the original reference rather than create one every time
-            cv::Mat copied[3];
-
-            // renamed to ch: this counter used to shadow the parsed tile
-            // index 'i' above, which made the loop very easy to misread
-            for (size_t ch = 0; ch < ref.size() && ch < 3; ++ch) {
-                copied[ch] = ref[ch].clone();
-            }
-
-            decrypt_image dimgs = decrypt_image(mats_in[tile_i][tile_j]);
-            dimgs.decrypt(copied, indices[tile_i][tile_j].ri_x_g, indices[tile_i][tile_j].ri_y_g, iterations, coef, mats_out[tile_i][tile_j]);
-        }
-        catch (const std::exception& e) {
-            // an exception escaping an OpenMP region terminates the process;
-            // log it and degrade this one tile gracefully instead
-            #pragma omp critical
-            {
-                std::cerr << "Tile decryption failed: " << e.what() << std::endl;
             }
         }
     }
@@ -276,10 +318,6 @@ int decrypt_image::decrypt_image_tiled(
         // this becomes more obvious as the numer of samples goes down, aka more compression 
         splitImageIntoTiles(sampled_mat, encrypted_image_tiles, coordinates, num_tiles, overlap);
 
-        // we will decrypt the tiles in a spiral order from the middle
-        // this is done just beacuse it looks "better" this way
-        const std::vector<std::string> processing_order = spiralOrder(num_tiles);
-
         cv::Size tile_size;
         int estimated_number_of_samples = 0;
 
@@ -329,7 +367,7 @@ int decrypt_image::decrypt_image_tiled(
 
     std::thread decrypt_tiles_thread;
     decrypt_tiles_thread = std::thread(decrypt_tiles, nun_threads, std::ref(encrypted_image_tiles), std::ref(indices_reconfigured),
-        std::ref(decrypted_image_tiles), std::ref(processing_order), iterations, tile_size, coef);
+        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef);
     decrypt_tiles_thread.join();
 
     if (show_preview) {

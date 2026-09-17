@@ -57,6 +57,12 @@ public:
 
 };
 
+/** @brief solves all tiles in wavefront (anti-diagonal) order: wave w = i + j,
+all tiles of a wave run in parallel and every tile is warm-started from the
+already-solved west/north neighbors' overlap strips (falling back to the
+generic reference solution when no neighbor exists, e.g. the first wave).
+*/
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
-    std::vector<std::vector<cv::Mat>>& mats_out, std::vector<std::string> processing_order, int iterations, cv::Size tile_size, float coef);
+    std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef);
 #endif

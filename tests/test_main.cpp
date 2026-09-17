@@ -246,11 +246,12 @@ void test_roundtrip() {
     cv::resize(decrypted, dec_sized, original.size());
     const double p = psnr(original, dec_sized);
     std::printf("       roundtrip PSNR: %.2f dB\n", p);
-    // Regression guard, not a quality benchmark: the tile solve + sharpen +
-    // resample pipeline measures ~18 dB on this synthetic image today. A
-    // broken index pipeline (wrong sampling, misaligned offsets) collapses
-    // to single-digit dB noise, so 15 dB is a safe failure line.
-    check(p > 15.0, "roundtrip: PSNR > 15 dB");
+    // Regression guard, not a quality benchmark: with wavefront neighbor
+    // warm-starts the synthetic roundtrip measures ~26.8 dB today (19.2 dB
+    // with the old independent-solve order). A broken index pipeline
+    // (wrong sampling, misaligned offsets) collapses to single-digit dB,
+    // so 24 dB leaves ~2.7 dB of headroom for noise/rounding variance.
+    check(p > 24.0, "roundtrip: PSNR > 24 dB");
 
     std::remove(tmp_in.c_str());
     std::remove(tmp_out.c_str());
@@ -315,9 +316,10 @@ void test_photo_roundtrip() {
         const double p = psnr(original, dec_sized);
         std::printf("       photo roundtrip PSNR (%s, %dx%d): %.2f dB\n",
             path.c_str(), original.cols, original.rows, p);
-        // second data point on natural image statistics; threshold mirrors
-        // the synthetic roundtrip guard (broken pipeline -> single-digit dB)
-        check(p > 15.0, "photo roundtrip: PSNR > 15 dB");
+        // second data point on natural image statistics; with wavefront
+        // neighbor warm-starts this measures ~30.4 dB (16.7 dB before).
+        // Threshold keeps ~3.5 dB of headroom below the baseline.
+        check(p > 27.0, "photo roundtrip: PSNR > 27 dB");
     }
 
     std::remove(tmp_in.c_str());
