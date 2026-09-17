@@ -93,6 +93,23 @@ float evaluate_stacked(
 );
 
 void reconstruct_color_channel(const cv::Mat& measurement, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat());
+
+/** @brief solves ONE chroma plane at half resolution (4:2:0-style subsampling).
+The unknown is a (rows+1)/2 x (cols+1)/2 DCT plane; the forward operator
+IDCTs it, upsamples it back to the full tile grid and gathers the scattered
+full-res measurements there. The gradient path downsamples the full-res
+residual (2x2 area average) before the DCT. ref holds the coarse warm-start
+(crows x ccols, DCT / 10 domain) and is left holding the solved plane as a
+full-res pixel plane (CV_32F, 0..255) so cv::merge can consume it.
+*/
+void reconstruct_color_channel_subchroma(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat& ref);
+
+/** @brief objective/gradient for the subsampled-chroma solve: forward =
+IDCT(coarse) -> upsample -> gather at full-res positions; gradient =
+downsample(residual) -> DCT -> 2*s. */
+float evaluate_coarse(void* instance, const float* x, eval_data data, float* g, const int n, const float step);
 std::vector<std::string> splitString(const std::string& str, const char& delimiter);
 std::string removeCharacter(const std::string& str, const char& ch);
 void storeStringInColorMat(const std::string& text, cv::Mat& colorMat);

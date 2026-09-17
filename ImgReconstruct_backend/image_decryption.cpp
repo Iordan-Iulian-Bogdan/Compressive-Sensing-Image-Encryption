@@ -42,7 +42,7 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     }
 }
 
-void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb) {
+void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb, bool chroma_sub) {
 
     // Experiment notes (kept so the findings aren't re-litigated):
     // 1. Packed 3-channel solve: a merged single lbfgs over all 3 channels
@@ -58,6 +58,14 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
     //    i.e. a tie with BGR (26.77 / 30.39) at strictly higher cost
     //    (O(m) re-encoding per tile + extra cvtColor). BGR stays the default;
     //    ycrcb=true keeps the path alive for future tuning experiments.
+    // 3. Chroma subsampling (4:2:0-style: chroma solved at half resolution,
+    //    see reconstruct_color_channel_subchroma): 25.18 / 28.73 dB
+    //    synthetic/photo (-1.6/-1.7 dB vs full-res BGR) for only ~7% faster
+    //    wall time on the 20MP photo and slightly slower on small images --
+    //    the per-eval resize overhead eats the 4x unknown reduction. Off by
+    //    default; a viable opt-in when speed matters more than color accuracy
+    //    (e.g. previews). Revisit only after making evaluate_coarse
+    //    allocation-free (the residual buffer is reallocated per lbfgs eval).
     int num_iterations_offset = (num_iterations / 2);
 
     if (ycrcb) {
@@ -85,9 +93,21 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
         // warm-start from the neighbor strips' CHROMA content (x0[1]/x0[2]) and
         // from each other (Cr -> Cb), not from luma-like planes.
         const float chroma_coef = coef * 0.5f;
-        reconstruct_color_channel(ycc_measurements, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], false, ref[1]);
-        reconstruct_color_channel(ycc_measurements, 1, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2]);
-        reconstruct_color_channel(ycc_measurements, 2, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false);
+        if (chroma_sub) {
+            // 4:2:0-style subsampling: chroma solved at half resolution --
+            // 4x fewer unknowns per chroma plane; content is smooth so the
+            // upsampled result is expected to be near-lossless. x0[1]/x0[2]
+            // hold coarse chroma warm-starts from the neighbor strips.
+            const int chroma_iters = num_iterations - num_iterations_offset;
+            reconstruct_color_channel(ycc_measurements, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], false, ref[1]);
+            reconstruct_color_channel_subchroma(ycc_measurements, 1, chroma_coef, rows, cols, ri_x_g, ri_y_g, chroma_iters, ref[1]);
+            reconstruct_color_channel_subchroma(ycc_measurements, 2, chroma_coef, rows, cols, ri_x_g, ri_y_g, chroma_iters, ref[2]);
+        }
+        else {
+            reconstruct_color_channel(ycc_measurements, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], false, ref[1]);
+            reconstruct_color_channel(ycc_measurements, 1, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2]);
+            reconstruct_color_channel(ycc_measurements, 2, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false);
+        }
 
         cv::merge(ref, 3, out);
         out.convertTo(out, CV_8UC3);
@@ -163,12 +183,14 @@ cv::Size decrypt_image::get_org_size() {
 // convention createRefSolutions uses, so reconstruct_color_channel accepts
 // it unchanged.
 // With ycrcb = true the strips (and the fallback refs) are produced in the
-// YCrCb domain instead, to match a YCrCb solve.
+// YCrCb domain instead, to match a YCrCb solve. With chroma_sub the chroma
+// warm-start planes are additionally downsampled to half resolution so they
+// match the subsampled-chroma solver's unknown space.
 static void build_neighbor_warm_start(cv::Mat refs[3],
     const std::vector<cv::Mat>& generic_refs,
     const std::vector<std::vector<cv::Mat>>& solved,
     const std::vector<std::vector<TileCoord>>& coordinates,
-    int i, int j, bool ycrcb)
+    int i, int j, bool ycrcb, bool chroma_sub)
 {
     const cv::Rect t_rect(coordinates[i][j].x, coordinates[i][j].y, solved[i][j].cols, solved[i][j].rows);
     cv::Mat pix(t_rect.height, t_rect.width, CV_32FC3, cv::Scalar(0, 0, 0)); // pixel domain, [0,1]
@@ -204,7 +226,10 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
             // Y gets the generic image-like ref; chroma planes start from a
             // neutral flat-chroma solution (their statistics are very different)
             refs[0] = generic_refs[0].clone();
-            refs[1] = cv::Mat(generic_refs[0].size(), CV_32F, cv::Scalar(0.5f));
+            cv::Size chroma_size = chroma_sub
+                ? cv::Size((generic_refs[0].cols + 1) / 2, (generic_refs[0].rows + 1) / 2)
+                : generic_refs[0].size();
+            refs[1] = cv::Mat(chroma_size, CV_32F, cv::Scalar(0.5f));
             cv::dct(refs[1], refs[1], 0);
             refs[1] /= 10.0f;
             refs[2] = refs[1].clone();
@@ -220,16 +245,21 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
     std::vector<cv::Mat> planes;
     cv::split(pix, planes);
     for (int ch = 0; ch < 3; ++ch) {
-        cv::dct(planes[ch], planes[ch], 0);
-        planes[ch] /= 10.0f;
-        refs[ch] = planes[ch];
+        cv::Mat plane = planes[ch];
+        if (chroma_sub && ch > 0) {
+            // match the subsampled-chroma solver's unknown space
+            cv::resize(plane, plane, cv::Size((plane.cols + 1) / 2, (plane.rows + 1) / 2), 0, 0, cv::INTER_AREA);
+        }
+        cv::dct(plane, plane, 0);
+        plane /= 10.0f;
+        refs[ch] = plane;
     }
 }
 
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub) {
 
     // we use a reference image as the initial solution for tiles without
     // neighbors (first wave); this helps speed up convergence
@@ -252,10 +282,10 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 const int j = w - i;
 
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, ycrcb);
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, ycrcb, chroma_sub);
 
                 decrypt_image dimgs = decrypt_image(mats_in[i][j]);
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb);
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb, chroma_sub);
             }
             catch (const std::exception& e) {
                 // an exception escaping an OpenMP region terminates the process;
@@ -424,12 +454,14 @@ int decrypt_image::decrypt_image_tiled(
     }
 
     std::thread decrypt_tiles_thread;
-    // ycrcb = true re-tests the YCrCb solve; measured results (wavefront
-    // warm-starts, chroma strips, half chroma l1): 26.71 / 30.29 dB
-    // synthetic / photo vs 26.77 / 30.39 dB for BGR -- a tie at higher cost,
-    // so BGR stays the default. See notes in decrypt().
+    // chroma_sub = true runs the subsampled-chroma solve (requires ycrcb);
+    // measured (wavefront, half chroma l1): 25.18 / 28.73 dB synthetic/photo
+    // vs 26.77 / 30.39 dB full-res BGR, for only ~7% faster wall time on the
+    // 20MP photo (3.8s vs 4.1s) and slightly slower on small images -- the
+    // resize-heavy coarse operators eat the 4x unknown reduction. Off by
+    // default; kept as an opt-in speed/quality trade via the flags.
     decrypt_tiles_thread = std::thread(decrypt_tiles, nun_threads, std::ref(encrypted_image_tiles), std::ref(indices_reconfigured),
-        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false);
+        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false);
     decrypt_tiles_thread.join();
 
     if (show_preview) {

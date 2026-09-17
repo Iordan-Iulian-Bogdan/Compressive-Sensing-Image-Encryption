@@ -60,6 +60,8 @@
         int m;
         int rows;
         int cols;
+        int full_rows;   // > 0 only for the subsampled-chroma solver: full-res plane dims
+        int full_cols;
     };
 
     typedef struct {

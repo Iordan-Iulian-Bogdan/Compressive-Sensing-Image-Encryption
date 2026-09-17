@@ -299,9 +299,87 @@ void reconstruct_color_channel(const cv::Mat& pixel_measurements, const int& k, 
     AtAxb2 = AtAxb2 * 255.0f;
 }
 
-float evaluate_stacked(void* instance, const float* x, eval_data data, float* g, const int nTotal, const float step)
+float evaluate_coarse(void* instance, const float* x, eval_data data, float* g, const int n, const float step)
 {
     float fx = 0;
+
+    // x: coarse-plane DCT coefficients -> pixel plane (coarse)
+    copy_x(data.x_copy, (float*)x, data.Axb2, n);
+    cv::Mat C(data.rows, data.cols, CV_32F, data.x_copy);
+    cv::dct(C, C, cv::DCT_INVERSE);
+
+    // forward operator: upsample the coarse chroma plane to the full tile
+    // grid and gather the scattered full-res measurements there
+    cv::Mat full;
+    cv::resize(C, full, cv::Size(data.full_cols, data.full_rows), 0, 0, cv::INTER_LINEAR);
+
+    const int mm = data.m;
+    cv::Mat R(data.full_rows, data.full_cols, CV_32F, cv::Scalar(0));
+    float* rp = (float*)R.data;
+    for (int k = 0; k < mm; ++k) {
+        const int r = data.ri_x[k], c = data.ri_y[k];
+        const float diff = full.at<float>(r, c) - data.b[k];
+        R.at<float>(r, c) = diff;
+        fx += diff * diff;
+    }
+
+    // gradient: 2x2 area-average the full-res residual back to the coarse
+    // grid, then DCT it and scale
+    cv::resize(R, C, cv::Size(data.cols, data.rows), 0, 0, cv::INTER_AREA);
+    cv::dct(C, C, 0);
+    eval_g((float*)C.data, g, n);
+
+    return fx;
+}
+
+void reconstruct_color_channel_subchroma(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat& ref)
+{
+    const int crows = (rows + 1) / 2, ccols = (cols + 1) / 2;
+    const int nC = crows * ccols;
+    float fx;
+
+    lbfgs_parameter_t param;
+    lbfgs_parameter_init(&param);
+    param.orthantwise_c = (float)param_c; // OWL-QN
+    param.linesearch = LBFGS_LINESEARCH_BACKTRACKING;
+    param.max_iterations = iterations;
+
+    // measurements for this channel at the scattered full-res positions
+    std::vector<float> b;
+    b.reserve(ri_x.size());
+    for (int i = CS_HEADER_PIXELS; i < (int)ri_x.size() + CS_HEADER_PIXELS && i < pixel_measurements.total(); i++) {
+        b.push_back(pixel_measurements.at<cv::Vec3b>(i)[channel] / 255.0f);
+    }
+    for (int i = (int)b.size(); i < (int)ri_x.size(); i++) {
+        b.push_back(0.0f);
+    }
+
+    eval_data data;
+    std::vector<float> Axb2(nC), x_copy(nC);
+    data.b = b.data();
+    data.Axb2 = Axb2.data();
+    data.x_copy = x_copy.data();
+    data.m = (int)ri_x.size();
+    data.ri_x = ri_x.data();
+    data.ri_y = ri_y.data();
+    data.rows = crows;      // coarse unknown dims
+    data.cols = ccols;
+    data.full_rows = rows;  // full-res measurement grid
+    data.full_cols = cols;
+
+    lbfgs(nC, (float*)ref.data, data, &fx, evaluate_coarse, NULL, NULL, &param);
+
+    // solved coarse DCT plane -> pixel plane -> upsample to the full tile size
+    cv::Mat C(crows, ccols, CV_32F, ref.data);
+    cv::dct(C, C, cv::DCT_INVERSE);
+    C *= 255.0f;
+    cv::resize(C, ref, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+}
+
+float evaluate_stacked(void* instance, const float* x, eval_data data, float* g, const int nTotal, const float step)
+{    float fx = 0;
     const int planes = 3;
     const int n = nTotal / planes;
 
