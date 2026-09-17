@@ -422,8 +422,11 @@ int decrypt_image::decrypt_image_tiled(
                 ri_x_g.reserve(estimated_number_of_samples);
                 ri_y_g.reserve(estimated_number_of_samples);
 
-                int base_row = i * (encrypted_image_tiles[i][j].rows - overlap);
-                int base_col = j * (encrypted_image_tiles[i][j].cols - overlap);
+                // tile origin as produced by splitImageIntoTiles: the last
+                // row/column tiles are anchored to the image edge there, so
+                // the origin cannot be re-derived arithmetically here
+                const int base_row = coordinates[i][j].y;
+                const int base_col = coordinates[i][j].x;
 
                 for (int q = 0; q < encrypted_image_tiles[i][j].rows; q++) {
                     for (int k = 0; k < encrypted_image_tiles[i][j].cols; k++) {

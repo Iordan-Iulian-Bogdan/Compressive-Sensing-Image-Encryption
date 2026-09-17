@@ -610,6 +610,17 @@ void splitImageIntoTiles(const cv::Mat& inputImage,
             int x = j * (tileWidth - overlap);
             int y = i * (tileHeight - overlap);
 
+            // Integer truncation of tileWidth can leave the last column short
+            // of the right image edge (a uncovered black strip up to ~4% of
+            // the image). Anchor the last tile to the edge so coverage is
+            // complete for any width/height/overlap combination.
+            if (j == tileCountN - 1 && width >= tileWidth) {
+                x = width - tileWidth;
+            }
+            if (i == tileCountN - 1 && height >= tileHeight) {
+                y = height - tileHeight;
+            }
+
             // Adjust for edges
             int currentWidth = tileWidth;
             int currentHeight = tileHeight;
