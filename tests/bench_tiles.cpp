@@ -115,7 +115,9 @@ int main() {
         }
         cv::Mat original = cv::imread(path, cv::IMREAD_COLOR);
         if (original.empty()) return 0;
-        if (original.cols > 2400) {
+        // CS_BENCH_FULL=1 keeps the full resolution (production geometry);
+        // default caps at 2400px to keep the sweep fast
+        if (!(std::getenv("CS_BENCH_FULL") && *std::getenv("CS_BENCH_FULL")) && original.cols > 2400) {
             cv::resize(original, original, cv::Size(2400, original.rows * 2400 / original.cols));
         }
         const std::string tmp_in = ".bench_photo.png";

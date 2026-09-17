@@ -134,11 +134,9 @@ int encrypt_image::encrypt_image_tiled(
     cv::Mat* encrypted_out
 ){
     try {
-
-        if (CSencryption::params == AUTO_PARAM)
-        {
-            compression_ratio = 1.0f;
-        }
+        // the caller-requested ratio is honored in every mode: decryption
+        // derives its own coef/iterations from the container's actual ratio,
+        // so auto mode has no reason to force full sampling
 
         if (compression_ratio < 0.25f || compression_ratio > 1.0f) {
             throw std::runtime_error("Compression ratio is outside the acceptable range of (0.25, 1.0)");
