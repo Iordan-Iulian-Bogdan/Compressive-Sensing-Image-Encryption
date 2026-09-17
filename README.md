@@ -65,6 +65,42 @@ Security caveats (this is still a proof of concept):
 
 Performance note : the PBKDF2 stretch adds ~0.2–0.4s per encrypt/decrypt operation (once per image, not per tile), which is negligible next to the solve time.
 
+## Building
+
+Requirements: C++17 compiler, OpenCV (developed against 4.13.0; any 4.x with core, imgproc, imgcodecs, highgui, photo), OpenMP, and a crypto backend (Windows CNG is built in; Linux/macOS use OpenSSL). x86-64 with AVX2+FMA is assumed for the solver kernels.
+
+### Visual Studio (Windows)
+
+1. Open `ImgReconstruct_backend.sln` (MSVC v143 / VS 2022 or newer).
+2. The project expects OpenCV headers/libs at `C:\opencv\include` and `C:\opencv\lib` (see the `IncludePath`/`LibraryPath` entries in `ImgReconstruct_backend.vcxproj`); adjust if yours differs.
+3. Build `Release | x64`. `bcrypt.lib` (CNG) is linked automatically.
+
+### CMake + vcpkg (Windows/Linux)
+
+A vcpkg manifest is included (`vcpkg.json`: `opencv4`, `openssl`).
+
+```sh
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+ctest --test-dir build            # runs the cs_tests suite
+```
+
+Alternatively point CMake at any OpenCV with CMake config files via `-DOpenCV_DIR=<path>`; on Windows the CNG backend means OpenSSL is not required.
+
+### Test suite
+
+`cs_tests` covers: PBKDF2/seal/verify unit tests, wrong-password and tamper rejection, seed determinism (same password+salt ⇒ same key/indices), shuffle determinism, tile-grid helpers, and a full encrypt→decrypt roundtrip scored by PSNR. Run with `ctest` or directly (`build\cs_tests.exe`).
+
+### CLI usage
+
+```
+ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R]
+ImgReconstruct_backend decrypt  <input.png> <output.png> [--password <pw>] [--tiles N] [--overlap N] [--iterations N] [--threads N] [--coef F] [--manual] [--no-preview]
+ImgReconstruct_backend roundtrip <input.png> <output.png> [options]
+```
+
+Without `--password` the passphrase is read from `CS_ENCRYPTION_PASSWORD` or prompted. Parameter overrides (`--tiles` etc.) switch the decrypt to manual mode; otherwise parameters are derived automatically from the container.
+
 Performance : 
 
 ~1.0 seconds to decompress and decrypt a 4032 X 3024 image on a Ryzen 7900 after adding upscaling using [this library](https://github.com/avaneev/avir).
