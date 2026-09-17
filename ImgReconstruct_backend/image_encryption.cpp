@@ -138,8 +138,8 @@ int encrypt_image::encrypt_image_tiled(
         // derives its own coef/iterations from the container's actual ratio,
         // so auto mode has no reason to force full sampling
 
-        if (compression_ratio < 0.25f || compression_ratio > 1.0f) {
-            throw std::runtime_error("Compression ratio is outside the acceptable range of (0.25, 1.0)");
+        if (compression_ratio < 0.05f || compression_ratio > 1.0f) {
+            throw std::runtime_error("Compression ratio is outside the acceptable range of (0.05, 1.0)");
         }
 
         if (password.size() < 10) {

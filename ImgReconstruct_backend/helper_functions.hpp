@@ -92,7 +92,7 @@ float evaluate_stacked(
     const float step
 );
 
-void reconstruct_color_channel(const cv::Mat& measurement, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat());
+void reconstruct_color_channel(const cv::Mat& measurement, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat(), float tv = 0.0f);
 
 /** @brief solves ONE chroma plane at half resolution (4:2:0-style subsampling).
 The unknown is a (rows+1)/2 x (cols+1)/2 DCT plane; the forward operator

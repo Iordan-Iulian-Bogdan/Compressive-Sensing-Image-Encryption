@@ -62,6 +62,7 @@
         int cols;
         int full_rows;   // > 0 only for the subsampled-chroma solver: full-res plane dims
         int full_cols;
+        float tv_lambda = 0.0f;  // > 0 enables total-variation fusion in evaluate()
     };
 
     typedef struct {

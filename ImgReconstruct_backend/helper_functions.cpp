@@ -182,6 +182,47 @@ float evaluate(
     dct(Axb2, Axb2);
     eval_g(data.Axb2, g, n);
 
+    // Optional total-variation fusion (smoothed isotropic TV on the
+    // pixel-domain plane, which data.x_copy holds at this point):
+    //   fx += tv_lambda * sum(sqrt(dx^2 + dy^2 + eps^2) - eps)
+    //   gradient back-projected through the DCT and added to g.
+    // The gradient is accumulated into the Axb2 buffer, which is free after
+    // eval_g consumed its DCT of the data residual.
+    if (data.tv_lambda > 0.0f) {
+        const int rows = data.rows, cols = data.cols;
+        const float eps = 1e-3f; // normalized-domain smoothing (x in [0,1])
+        float* xpix = data.x_copy;
+        float* tvgrad = data.Axb2;
+        float phi = 0.0f;
+        std::memset(tvgrad, 0, sizeof(float) * n);
+        for (int i = 0; i < rows; ++i) {
+            const bool has_down = i + 1 < rows;
+            for (int j = 0; j < cols; ++j) {
+                const int idx = i * cols + j;
+                const float a = has_down ? xpix[idx + cols] - xpix[idx] : 0.0f;
+                const float b = (j + 1 < cols) ? xpix[idx + 1] - xpix[idx] : 0.0f;
+                const float d = std::sqrt(a * a + b * b + eps * eps);
+                phi += d - eps;
+                const float ua = a / d;
+                const float vb = b / d;
+                // phi = sum(sqrt(a^2+b^2)); dphi/dx[p,q] = -div(u, v)
+                tvgrad[idx] -= ua + vb;
+                if (has_down) {
+                    tvgrad[idx + cols] += ua;
+                }
+                if (j + 1 < cols) {
+                    tvgrad[idx + 1] += vb;
+                }
+            }
+        }
+        cv::Mat tvgrad_m(data.rows, data.cols, CV_32F, tvgrad);
+        dct(tvgrad_m, tvgrad_m);
+        for (int i = 0; i < n; ++i) {
+            g[i] += data.tv_lambda * tvgrad[i];
+        }
+        fx += data.tv_lambda * phi;
+    }
+
     return fx;
 }
 
@@ -237,7 +278,7 @@ std::vector<cv::Mat> createRefSolutions(const int& rows, const int& cols) {
 }
 
 // reconstructs a color channel using LBFGS
-void reconstruct_color_channel(const cv::Mat& pixel_measurements, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref, cv::Mat& next_ref) {
+void reconstruct_color_channel(const cv::Mat& pixel_measurements, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref, cv::Mat& next_ref, float tv) {
 
     int n = rows * cols; // size of solution (size of vectorized image)
     float fx;
@@ -278,6 +319,7 @@ void reconstruct_color_channel(const cv::Mat& pixel_measurements, const int& k, 
     data.ri_y = ri_y.data();
     data.rows = rows;
     data.cols = cols;
+    data.tv_lambda = tv;
 
     // LBFGS optimization
     lbfgs_ret = lbfgs(n, (float*)ref.data, data, &fx, evaluate, update_progress, NULL, &param);

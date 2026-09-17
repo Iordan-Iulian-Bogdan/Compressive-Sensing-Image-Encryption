@@ -30,6 +30,9 @@ void print_usage(const char* exe) {
         "  --no-preview          disable the live decryption preview window\n"
         "  --denoise             apply a final non-local-means denoise pass\n"
         "                        (smooths solver noise, blurs fine detail)\n"
+        "  --tv <f>              total-variation fusion weight for the solver\n"
+        "                        (>0 enables TV, smoother edges, helps at high\n"
+        "                        compression; 0 = off)\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
         "\n"
@@ -92,6 +95,7 @@ int main(int argc, char* argv[])
     float ratio = 1.0f;
     int tiles = 24, overlap = 24, iterations = 5, threads = 8;
     float coef = 0.01f;
+    float tv_lambda = 0.0f;
     bool manual = false;
     bool show_preview = true;
     bool denoise = false;
@@ -149,6 +153,11 @@ int main(int argc, char* argv[])
         else if (a == "--denoise") {
             denoise = true;
         }
+        else if (a == "--tv") {
+            const char* v = next("floating point");
+            if (!v || !parse_float(v, tv_lambda)) return 64;
+            manual = true;
+        }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
             print_usage(argv[0]);
@@ -176,14 +185,14 @@ int main(int argc, char* argv[])
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                tiles, overlap, iterations, threads, coef, show_preview, denoise);
+                tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda);
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, &encrypted);
             if (rc == 0) {
                 rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview, denoise);
+                    tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda);
             }
         }
     }
