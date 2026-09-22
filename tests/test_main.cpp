@@ -213,15 +213,15 @@ void test_roundtrip() {
     const int W = 960, H = 720;
     cv::Mat original = make_test_image(W, H);
 
-    cv::Mat encrypted;
-    const int enc_rc = encrypt_image::encrypt_image_tiled("", "", password, 1.0f, &encrypted);
+cv::Mat encrypted;
+    const int enc_rc = encrypt_image::encrypt_image_tiled("", "", password, 1.0f, 64, &encrypted);
     check(enc_rc != 0, "roundtrip: missing input file rejected");
 
     const std::string tmp_in = ".cs_test_input.png";
     const std::string tmp_out = ".cs_test_output.png";
     cv::Mat encrypted2;
     cv::imwrite(tmp_in, original);
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, &encrypted2) == 0,
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 64, &encrypted2) == 0,
         "roundtrip: encrypt to memory");
 
     // wrong password must fail authentication before the solve
@@ -287,7 +287,7 @@ void test_photo_roundtrip() {
     const std::string password = "roundtrip-test-password";
     const std::string tmp_out = ".cs_test_photo_output.png";
     cv::Mat encrypted;
-    if (encrypt_image::encrypt_image_tiled(path, "", password, 1.0f, &encrypted) != 0) {
+    if (encrypt_image::encrypt_image_tiled(path, "", password, 1.0f, 64, &encrypted) != 0) {
         check(false, "photo roundtrip: encrypt");
         return;
     }

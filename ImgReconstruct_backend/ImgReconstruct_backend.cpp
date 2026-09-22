@@ -17,9 +17,9 @@ void print_usage(const char* exe) {
         "  " << exe << " decrypt <input.png> <output.png> [options]\n"
         "  " << exe << " roundtrip <input.png> <output.png> [options]\n"
         "\n"
-        "Options:\n"
+"Options:\n"
         "  --password <pw>       passphrase (else $CS_PASSWORD, else interactive prompt)\n"
-        "  --ratio <f>           encryption sampling ratio in (0.25, 1.0]; default 1.0\n"
+        "  --ratio <f>           encryption sampling ratio in (0.05, 1.0]; default 1.0\n"
         "  --tiles <n>           decrypt tile count (manual mode only)\n"
         "  --overlap <n>         decrypt tile overlap in (24, 96) (manual mode only)\n"
         "  --iterations <n>      decrypt solver iterations (manual mode only)\n"
@@ -35,13 +35,17 @@ void print_usage(const char* exe) {
         "                        compression; 0 = off)\n"
         "  --dict <file>         solve with a learned K-SVD patch dictionary\n"
         "                        instead of the DCT basis (see the trainer tool)\n"
+        "  --periodic            use periodic tile-based sampling (repeat a random\n"
+        "                        tile pattern across the image)\n"
+        "  --tile-size <n>       tile size for periodic mode (default 64, must divide image dims)\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
         "\n"
         "Examples:\n"
         "  " << exe << " encrypt photo.png photo.enc.png\n"
         "  " << exe << " decrypt photo.enc.png photo.dec.png --password \"my secret\"\n"
-        "  " << exe << " roundtrip photo.png photo.dec.png --password \"my secret\"\n";
+        "  " << exe << " roundtrip photo.png photo.dec.png --password \"my secret\"\n"
+        "  " << exe << " encrypt photo.png photo.enc.png --ratio 0.5 --periodic --tile-size 64\n";
 }
 
 std::string read_password() {
@@ -102,6 +106,8 @@ int main(int argc, char* argv[])
     bool manual = false;
     bool show_preview = true;
     bool denoise = false;
+    bool periodic = false;
+    int tile_size = 64;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -166,6 +172,15 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             dict_path = v;
         }
+        else if (a == "--periodic") {
+            periodic = true;
+            manual = true;
+        }
+        else if (a == "--tile-size") {
+            const char* v = next("integer");
+            if (!v || !parse_int(v, tile_size)) return 64;
+            manual = true;
+        }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
             print_usage(argv[0]);
@@ -187,17 +202,21 @@ int main(int argc, char* argv[])
     auto start = std::chrono::high_resolution_clock::now();
     int rc = 0;
 
-    try {
+try {
         if (mode == "encrypt") {
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio);
+            if (periodic) {
+                rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, tile_size);
+            } else {
+                rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio);
+            }
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
                 tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path);
         }
-        else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
+else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, &encrypted);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, 64, &encrypted);
             if (rc == 0) {
                 rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                     tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path);

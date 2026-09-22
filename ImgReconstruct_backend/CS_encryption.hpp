@@ -5,6 +5,7 @@
 #include "helper_functions.hpp"
 #include "crypto_utils.hpp"
 
+
 class CSencryption {
 protected:
     cv::Mat encrypted_img, input_img;
@@ -20,6 +21,10 @@ protected:
     bool cs_key_valid = false;
 
     void returnRandomIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym, int numOfIndices, const uint8_t key[32]);
+
+    // New: periodic tile-based sampling - generate random pattern within one tile,
+    // then tile it across the entire image.
+    void returnPeriodicIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym, int numOfIndices, const uint8_t key[32], int tile_size);
 
 public:
     static int params;

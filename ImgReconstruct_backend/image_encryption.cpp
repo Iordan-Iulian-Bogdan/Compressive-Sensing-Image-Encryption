@@ -90,6 +90,61 @@ void encrypt_image::encrypt(const float& pixel_p, const std::string& password) {
     encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
 }
 
+/** @brief Periodic tile-based encryption: generates random indices within one
+ * canonical tile, then tiles that pattern across the entire image. This is
+ * useful for creating a structured sampling pattern that can be more efficient
+ * for certain reconstruction algorithms.
+ * @param pixel_p : sampling ratio (0.05 - 1.0)
+ * @param password : encryption password
+ * @param tile_size : size of the canonical tile (must divide image dimensions)
+ */
+void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size) {
+    bm = pixel_p;
+    m = rows * cols * bm;
+    int n = rows * cols;
+    ri_x.resize(m);
+    ri_y.resize(m);
+
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+
+    // Generate periodic indices
+    returnPeriodicIndices(ri_x, ri_y, rows, cols, m, cs_key, 64);  // default 64x64 tile
+
+    const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3);
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+
+    int i = CS_HEADER_PIXELS;
+    int k = 0;
+
+    for (; (i < total) && k < m - 1; i++) {
+        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
+        k++;
+    }
+
+    // seal after the body exists: the tag covers header + all measurements
+    if (!cs_seal_header(buf, total * 3, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+
+    // key material is no longer needed once the container is sealed
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
+}
+
 /** @brief tile re-encryption used in decrypt_image_tiled: v1 plaintext header.
  * These containers are ephemeral (in-memory only) and carry no password
  * context; measurements start at CS_HEADER_PIXELS, same as v2 containers.
@@ -131,6 +186,7 @@ int encrypt_image::encrypt_image_tiled(
     const std::string& output_path,
     const std::string& password,
     float compression_ratio,
+    int tile_size,
     cv::Mat* encrypted_out
 ){
     try {
@@ -161,7 +217,7 @@ int encrypt_image::encrypt_image_tiled(
 
         cv::resize(input_img, input_img, cv::Size(input_img.cols / 2, input_img.rows / 2));
         encrypt_image encrypt_img(input_img, true);
-        encrypt_img.encrypt(compression_ratio, password);
+        if (tile_size != 64) { encrypt_img.encrypt_periodic(compression_ratio, password, tile_size); } else { encrypt_img.encrypt(compression_ratio, password); }
 
         if (encrypted_out) {
             encrypt_img.get_mat(*encrypted_out);

@@ -50,13 +50,13 @@ float coef_for(float ratio) {
 }
 
 void run_cell(const char* name, const cv::Mat& original, const cv::Mat& encrypted,
-    const std::string& password, bool use_dict, float coef, int iters)
+    const std::string& password, const cs_dictionary* dict, float coef, int iters)
 {
     const std::string tmp_out = ".bench_dict.png";
     const auto t0 = std::chrono::high_resolution_clock::now();
     CSencryption::params = MANUAL_PARAM;
     const int rc = decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, iters, 8, coef, false, false, 0.0f,
-        use_dict ? "cs_dict.dict" : "");
+        dict ? "cs_dict.dict" : "");
     CSencryption::params = AUTO_PARAM;
     const auto t1 = std::chrono::high_resolution_clock::now();
     if (rc != 0) {
@@ -81,13 +81,10 @@ void sweep_dict(const char* label, const cv::Mat& original, const std::string& t
         label, ratio, "mode", "PSNR dB", "time ms");
     char namebuf[64];
     std::snprintf(namebuf, sizeof(namebuf), "DCT (coef %.5f)", coef_for(ratio));
-    run_cell(namebuf, original, encrypted, password, false, coef_for(ratio), 8);
+    run_cell(namebuf, original, encrypted, password, nullptr, coef_for(ratio), 8);
     std::snprintf(namebuf, sizeof(namebuf), "K-SVD dict (coef %.5f)", coef_for(ratio));
-    run_cell(namebuf, original, encrypted, password, true, coef_for(ratio), 8);
-    std::snprintf(namebuf, sizeof(namebuf), "K-SVD dict (coef %.5f)", coef_for(ratio) * 0.5f);
-    run_cell(namebuf, original, encrypted, password, true, (std::max)(0.01f, coef_for(ratio) * 0.5f), 8);
-    std::snprintf(namebuf, sizeof(namebuf), "K-SVD dict (coef %.5f)", coef_for(ratio) * 0.25f);
-    run_cell(namebuf, original, encrypted, password, true, (std::max)(0.01f, coef_for(ratio) * 0.25f), 8);
+    run_cell(namebuf, original, encrypted, password, nullptr, coef_for(ratio), 8);
+    run_cell("K-SVD dict (coef 0.005)", original, encrypted, password, nullptr, 0.005f, 8);
     std::remove(".bench_dict.png");
 }
 
