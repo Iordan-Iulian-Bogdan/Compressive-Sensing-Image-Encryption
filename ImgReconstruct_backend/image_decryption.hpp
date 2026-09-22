@@ -19,7 +19,7 @@ public:
 
     decrypt_image(cv::Mat input, const std::string& password = "");
 
-    void decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb = false, bool chroma_sub = false, float tv = 0.0f);
+    void decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb = false, bool chroma_sub = false, float tv = 0.0f, const cs_dictionary* dict = nullptr);
 
     void get_mat(cv::Mat& dest);
 
@@ -51,9 +51,9 @@ public:
     /** @brief decrypts tiles from an already-loaded encrypted image (in-memory, no PNG roundtrip).
     Shared implementation for both overloads. Note: the Mat is const but the impl needs a copy.
     */
-    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, bool denoise = false, float tv = 0.0f);
+    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, bool denoise = false, float tv = 0.0f, const std::string& dict_path = "");
 
-    static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, bool denoise = false, float tv = 0.0f);
+    static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, bool denoise = false, float tv = 0.0f, const std::string& dict_path = "");
 
 };
 
@@ -64,5 +64,5 @@ generic reference solution when no neighbor exists, e.g. the first wave).
 */
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb = false, bool chroma_sub = false, float tv = 0.0f);
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb = false, bool chroma_sub = false, float tv = 0.0f, const cs_dictionary* dict = nullptr);
 #endif

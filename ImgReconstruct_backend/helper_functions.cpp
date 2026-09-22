@@ -1,4 +1,4 @@
-#include "helper_functions.hpp"
+﻿#include "helper_functions.hpp"
 
 int nextClosestDivisible(const int& x, const int& y) {
     // Ensure y is not zero to avoid division by zero error
@@ -418,6 +418,590 @@ void reconstruct_color_channel_subchroma(const cv::Mat& pixel_measurements, cons
     cv::dct(C, C, cv::DCT_INVERSE);
     C *= 255.0f;
     cv::resize(C, ref, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Patch-dictionary (K-SVD) machinery
+// ---------------------------------------------------------------------------
+
+static float cs_dict_lipschitz(const cs_dictionary& d);
+
+void cs_omp_encode(const float* patch_values, const cs_dictionary& dict, int target_sparsity, float* coefficients_out) {
+    const int P = dict.patch * dict.patch;
+    const int A = dict.atoms;
+    std::memset(coefficients_out, 0, sizeof(float) * A);
+
+    float residual[64 * 64];
+    const int Pcap = P <= 64 * 64 ? P : 64 * 64;
+    std::memcpy(residual, patch_values, sizeof(float) * Pcap);
+    bool used[4096] = {};
+    int support[64];
+    int support_len = 0;
+
+    for (int s = 0; s < target_sparsity && support_len < A; ++s) {
+        int best = -1;
+        float best_corr = 0.0f;
+        for (int a = 0; a < A; ++a) {
+            if (used[a]) continue;
+            const float* atom = &dict.D[(size_t)a * P];
+            float corr = 0.0f;
+            for (int p = 0; p < P; ++p) {
+                corr += atom[p] * residual[p];
+            }
+            const float mag = std::fabs(corr);
+            if (best < 0 || mag > best_corr) {
+                best_corr = mag;
+                best = a;
+            }
+        }
+        if (best < 0) break;
+        used[best] = true;
+        support[support_len++] = best;
+
+        // least-squares refit of the coefficients on the selected support:
+        // normal equations G = Ds^T Ds, rhs = Ds^T residual (small system,
+        // solved by Gaussian elimination -- no per-patch LAPACK calls)
+        float G[16][16] = {};
+        float rhs[16] = {};
+        for (int r = 0; r < support_len; ++r) {
+            const float* atom_r = &dict.D[(size_t)support[r] * P];
+            for (int s = 0; s <= r; ++s) {
+                const float* atom_s = &dict.D[(size_t)support[s] * P];
+                float dot = 0.0f;
+                for (int p = 0; p < P; ++p) dot += atom_r[p] * atom_s[p];
+                G[r][s] = dot;
+                G[s][r] = dot;
+            }
+            float dot = 0.0f;
+            for (int p = 0; p < P; ++p) dot += atom_r[p] * residual[p];
+            rhs[r] = dot;
+        }
+        float csol[16] = {};
+        for (int col = 0; col < support_len; ++col) {
+            int piv = col;
+            for (int row = col + 1; row < support_len; ++row) {
+                if (std::fabs(G[row][col]) > std::fabs(G[piv][col])) piv = row;
+            }
+            if (std::fabs(G[piv][col]) < 1e-12f) break;
+            if (piv != col) {
+                // swap rows AND columns (the system is symmetric) and keep the
+                // support permutation in sync, so csol[r] still corresponds to
+                // support[r] after elimination
+                for (int c2 = 0; c2 < support_len; ++c2) std::swap(G[piv][c2], G[col][c2]);
+                std::swap(rhs[piv], rhs[col]);
+                for (int row = 0; row < support_len; ++row) std::swap(G[row][piv], G[row][col]);
+                std::swap(support[piv], support[col]);
+            }
+            for (int row = col + 1; row < support_len; ++row) {
+                const float f = G[row][col] / G[col][col];
+                for (int c2 = col; c2 < support_len; ++c2) G[row][c2] -= f * G[col][c2];
+                rhs[row] -= f * rhs[col];
+            }
+        }
+        for (int row = support_len - 1; row >= 0; --row) {
+            float acc = rhs[row];
+            for (int c2 = row + 1; c2 < support_len; ++c2) acc -= G[row][c2] * csol[c2];
+            csol[row] = G[row][row] != 0.0f ? acc / G[row][row] : 0.0f;
+        }
+        for (int r = 0; r < support_len; ++r) {
+            coefficients_out[support[r]] = csol[r];
+        }
+
+        // residual = patch - D_S * c_S
+        for (int p = 0; p < P; ++p) {
+            float syn = 0.0f;
+            for (int r = 0; r < support_len; ++r) {
+                syn += dict.D[(size_t)support[r] * P + p] * coefficients_out[support[r]];
+            }
+            residual[p] = patch_values[p] - syn;
+        }
+    }
+}
+
+bool cs_train_dictionary(const std::vector<cv::Mat>& images, int atoms, int ksvd_iters,
+    int max_patches, cs_dictionary& out)
+{
+    const int PATCH = 8;
+    const int P = PATCH * PATCH;
+    if (images.empty() || atoms <= 0 || atoms > 4096) return false;
+
+    // gather 8x8 patches (zero-meaned) sampled across the WHOLE image —
+    // sampling only the first rows would make the training data homogeneous
+    // and the dictionary degenerate
+    std::vector<std::vector<std::pair<int, int>>> per_image(images.size());
+    for (size_t idx = 0; idx < images.size(); ++idx) {
+        const auto& img = images[idx];
+        if (img.empty()) continue;
+        for (int y = 0; y + PATCH <= img.rows; y += 4) {
+            for (int x = 0; x + PATCH <= img.cols; x += 4) {
+                per_image[idx].push_back({ y, x });
+            }
+        }
+    }
+    long long total_slots = 0;
+    for (const auto& pv : per_image) total_slots += (long long)pv.size() * 3;
+    const long long cap = max_patches;
+    const long long step_slots = total_slots > cap ? total_slots / cap + 1 : 1;
+
+    std::vector<float> Y;
+    long long gathered = 0, slot = 0;
+    for (size_t idx = 0; idx < images.size(); ++idx) {
+        const auto& img = images[idx];
+        for (const auto& pt : per_image[idx]) {
+            for (int ch = 0; ch < 3; ++ch, ++slot) {
+                if (gathered >= cap) break;
+                if (slot % step_slots != 0) continue;
+                float sum = 0.0f;
+                const size_t base = Y.size();
+                Y.resize(Y.size() + P);
+                for (int r = 0; r < PATCH; ++r) {
+                    for (int c = 0; c < PATCH; ++c) {
+                        Y[base + (size_t)r * PATCH + c] = img.at<cv::Vec3b>(pt.first + r, pt.second + c)[ch] / 255.0f;
+                        sum += Y[base + (size_t)r * PATCH + c];
+                    }
+                }
+                // zero-mean the patch: the shared brightness component would
+                // collapse every SVD update toward the mean patch
+                const float mean = sum / P;
+                for (int q = 0; q < P; ++q) Y[base + (size_t)q] -= mean;
+                ++gathered;
+            }
+            if (gathered >= cap) break;
+        }
+        if (gathered >= cap) break;
+    }
+    const long long P_total = gathered;
+    if (P_total < atoms) return false;
+
+    // initialize atoms from deterministic slices of the training set, unit norm
+    out.patch = PATCH;
+    out.atoms = atoms;
+    out.D.assign((size_t)atoms * P, 0.0f);
+    for (int a = 0; a < atoms; ++a) {
+        float* atom = &out.D[(size_t)a * P];
+        const long long src = ((long long)a * P_total) / atoms;
+        std::memcpy(atom, &Y[(size_t)src * P], sizeof(float) * P);
+        float norm = 0.0f;
+        for (int p = 0; p < P; ++p) norm += atom[p] * atom[p];
+        norm = std::sqrt((std::max)(norm, 1e-12f));
+        for (int p = 0; p < P; ++p) atom[p] /= norm;
+    }
+
+    const int K = 10; // target sparsity per patch
+    cv::RNG rng(12345);
+    std::vector<float> codes((size_t)atoms * P_total, 0.0f);
+
+    for (int iter = 0; iter < ksvd_iters; ++iter) {
+        // ---- sparse coding: OMP per training patch (parallel, thread-safe) ----
+        std::fill(codes.begin(), codes.end(), 0.0f);
+        #pragma omp parallel for schedule(dynamic)
+        for (long long p = 0; p < P_total; ++p) {
+            cs_omp_encode(&Y[(size_t)p * P], out, K, &codes[(size_t)p * atoms]);
+        }
+        {
+            // training diagnostics: how many codes came out non-degenerate?
+            long long nnz = 0;
+            for (size_t i = 0; i < codes.size(); ++i) if (codes[i] != 0.0f) nnz++;
+            std::printf("  ksvd iter %d: nonzero codes = %lld (of %lld)\n", iter, nnz, (long long)codes.size());
+        }
+
+        // ---- atom update: SVD refit per atom over its users ----
+        for (int a = 0; a < atoms; ++a) {
+            std::vector<std::pair<float, long long>> users; // |coef|, patch idx
+            for (long long p = 0; p < P_total; ++p) {
+                const float c = codes[(size_t)p * atoms + a];
+                if (c != 0.0f) users.push_back({ std::fabs(c), p });
+            }
+            if (users.empty()) {
+                // dead atom: reinitialize from a random training patch
+                const int rp = rng.uniform(0, (int)P_total - 1);
+                float* atom = &out.D[(size_t)a * P];
+                std::memcpy(atom, &Y[(size_t)rp * P], sizeof(float) * P);
+                float norm = 0.0f;
+                for (int q = 0; q < P; ++q) norm += atom[q] * atom[q];
+                norm = std::sqrt((std::max)(norm, 1e-12f));
+                for (int q = 0; q < P; ++q) atom[q] /= norm;
+                continue;
+            }
+            // cap the user set so the SVD stays cheap
+            if (users.size() > 256) {
+                std::nth_element(users.begin(), users.begin() + 255, users.end());
+                users.resize(256);
+            }
+            const int nu = (int)users.size();
+
+            // E (nu x P): row u = user's training patch minus every OTHER
+            // atom's contribution; the best rank-1 fit's RIGHT singular
+            // vector (vt row 0) becomes the new atom
+            cv::Mat E(nu, P, CV_32F);
+            for (int u = 0; u < nu; ++u) {
+                std::memcpy(E.ptr<float>(u), &Y[(size_t)users[u].second * P], sizeof(float) * P);
+                for (int a2 = 0; a2 < atoms; ++a2) {
+                    if (a2 == a) continue;
+                    const float c2 = codes[(size_t)users[u].second * atoms + a2];
+                    if (c2 == 0.0f) continue;
+                    const float* atom2 = &out.D[(size_t)a2 * P];
+                    for (int q = 0; q < P; ++q) {
+                        E.at<float>(u, q) -= atom2[q] * c2;
+                    }
+                }
+            }
+            cv::Mat w, uu, vt;
+            cv::SVD::compute(E, w, uu, vt, cv::SVD::MODIFY_A | cv::SVD::FULL_UV);
+            float* atom = &out.D[(size_t)a * P];
+            for (int q = 0; q < P; ++q) {
+                atom[q] = vt.at<float>(0, q);   // right singular vector (P-dim)
+            }
+            float norm = 0.0f;
+            for (int q = 0; q < P; ++q) norm += atom[q] * atom[q];
+            norm = std::sqrt((std::max)(norm, 1e-12f));
+            for (int q = 0; q < P; ++q) atom[q] /= norm;
+            for (int u = 0; u < nu; ++u) {
+                codes[(size_t)users[u].second * atoms + a] = w.at<float>(0) * uu.at<float>(u, 0);
+            }
+        }
+        // diagnostic: atom distinctness after the update pass
+        {
+            double d01 = 0.0, d12 = 0.0;
+            for (int p = 0; p < P; ++p) {
+                const double x = out.D[(size_t)0 * P + p] - out.D[(size_t)1 * P + p];
+                const double y = out.D[(size_t)1 * P + p] - out.D[(size_t)2 * P + p];
+                d01 += x * x;
+                d12 += y * y;
+            }
+            std::printf("  ksvd iter %d: |d0-d1|^2 = %.6f, |d1-d2|^2 = %.6f\n", iter, d01, d12);
+        }
+    }
+    out.lipschitz = cs_dict_lipschitz(out);
+    return true;
+}
+
+// lambda_max(D^T D) via power iteration (used as the FISTA step constant)
+static float cs_dict_lipschitz(const cs_dictionary& d) {
+    const int P = d.patch * d.patch;
+    const int A = d.atoms;
+    std::vector<float> v((size_t)A, 1.0f / std::sqrt((float)A));
+    float lam = 1.0f;
+    for (int it = 0; it < 24; ++it) {
+        // syn = D v
+        std::vector<float> syn((size_t)P, 0.0f);
+        for (int a = 0; a < A; ++a) {
+            const float ca = v[(size_t)a];
+            if (ca == 0.0f) continue;
+            const float* atom = &d.D[(size_t)a * P];
+            for (int p = 0; p < P; ++p) syn[(size_t)p] += atom[p] * ca;
+        }
+        // w = D^T syn
+        std::vector<float> w((size_t)A, 0.0f);
+        for (int a = 0; a < A; ++a) {
+            const float* atom = &d.D[(size_t)a * P];
+            float dot = 0.0f;
+            for (int p = 0; p < P; ++p) dot += atom[p] * syn[(size_t)p];
+            w[(size_t)a] = dot;
+        }
+        float n2 = 0.0f;
+        for (int a = 0; a < A; ++a) n2 += w[(size_t)a] * w[(size_t)a];
+        lam = std::sqrt(n2);
+        if (lam <= 1e-9f) return 1.0f;
+        for (int a = 0; a < A; ++a) v[(size_t)a] = w[(size_t)a] / lam;
+    }
+    return lam;
+}
+
+bool cs_save_dictionary(const std::string& path, const cs_dictionary& d) {    std::ofstream f(path, std::ios::binary);
+    if (!f.good()) return false;
+    const char magic[4] = { 'C', 'S', 'D', '1' };
+    f.write(magic, 4);
+    f.write((const char*)&d.atoms, sizeof(int));
+    f.write((const char*)&d.patch, sizeof(int));
+    f.write((const char*)d.D.data(), (std::streamsize)(d.D.size() * sizeof(float)));
+    return f.good();
+}
+
+bool cs_load_dictionary(const std::string& path, cs_dictionary& d) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return false;
+    char magic[4];
+    f.read(magic, 4);
+    if (std::memcmp(magic, "CSD1", 4) != 0) return false;
+    f.read((char*)&d.atoms, sizeof(int));
+    f.read((char*)&d.patch, sizeof(int));
+    if (d.atoms <= 0 || d.atoms > 4096 || d.patch < 2 || d.patch > 64) return false;
+    d.D.resize((size_t)d.atoms * d.patch * d.patch);
+    f.read((char*)d.D.data(), (std::streamsize)(d.D.size() * sizeof(float)));
+    if (!(f.good() && !d.D.empty())) return false;
+    d.lipschitz = cs_dict_lipschitz(d);
+    return true;
+}
+
+float evaluate_dict(void* instance, const float* x, eval_data data, float* g, const int n, const float step)
+{
+    const int patch = data.patch;
+    const int P = patch * patch;
+    const int atoms = data.dict_atoms;
+    const int patchRows = (data.rows + patch - 1) / patch;
+    const int patchCols = (data.cols + patch - 1) / patch;
+
+    float fx = 0.0f;
+    std::memset(g, 0, sizeof(float) * n);
+
+    // synthesize the tile plane from the concatenated patch coefficients
+    float* plane = data.x_copy;
+    std::memset(plane, 0, sizeof(float) * (size_t)data.rows * data.cols);
+    for (int pr = 0; pr < patchRows; ++pr) {
+        for (int pc = 0; pc < patchCols; ++pc) {
+            const float* c = x + ((size_t)pr * patchCols + pc) * atoms;
+            for (int py = 0; py < patch; ++py) {
+                for (int px = 0; px < patch; ++px) {
+                    const int ty = pr * patch + py;
+                    const int tx = pc * patch + px;
+                    if (ty >= data.rows || tx >= data.cols) continue;
+                    float syn = 0.0f;
+                    const int pidx = py * patch + px;
+                    const float* Dcol = data.dict_D + pidx; // strided access per atom
+                    for (int a = 0; a < atoms; ++a) {
+                        syn += Dcol[(size_t)a * P] * c[a];
+                    }
+                    plane[(size_t)ty * data.cols + tx] = syn;
+                }
+            }
+        }
+    }
+
+    // residual at the measured positions
+    float* resid = data.Axb2;
+    std::memset(resid, 0, sizeof(float) * (size_t)data.rows * data.cols);
+    for (int k = 0; k < data.m; ++k) {
+        const int r = data.ri_x[k], c = data.ri_y[k];
+        const float diff = plane[(size_t)r * data.cols + c] - data.b[k];
+        resid[(size_t)r * data.cols + c] = diff;
+        fx += diff * diff;
+    }
+
+    // gradient: per patch, g_p = 2 * D^T * resid_p
+    for (int pr = 0; pr < patchRows; ++pr) {
+        for (int pc = 0; pc < patchCols; ++pc) {
+            float* gpatch = g + ((size_t)pr * patchCols + pc) * atoms;
+            for (int py = 0; py < patch; ++py) {
+                const int ty = pr * patch + py;
+                for (int px = 0; px < patch; ++px) {
+                    const int tx = pc * patch + px;
+                    if (ty >= data.rows || tx >= data.cols) continue;
+                    const float rv = resid[(size_t)ty * data.cols + tx];
+                    if (rv == 0.0f) continue;
+                    const int pidx = py * patch + px;
+                    for (int a = 0; a < atoms; ++a) {
+                        gpatch[a] += 2.0f * data.dict_D[(size_t)a * P + pidx] * rv;
+                    }
+                }
+            }
+        }
+    }
+
+    return fx;
+}
+
+/** @brief orthogonal matching pursuit against a SUB-SAMPLED observation of one
+patch: only the measured positions (their dictionary rows) are observable.
+Selects up to target_sparsity atoms by correlation magnitude on the measured
+rows, refits coefficients by normal equations on the same rows, and finally
+synthesizes the FULL patch from the sparse code. */
+void cs_omp_encode_measured(const int* pos, const float* vals, int count,
+    const cs_dictionary& dict, int target_sparsity, float* coefficients_out, float* patch_out)
+{
+    const int P = dict.patch * dict.patch;
+    const int A = dict.atoms;
+    std::memset(coefficients_out, 0, sizeof(float) * A);
+
+    const int M = count < P ? count : P;
+    float resid[64 * 64];
+    std::memcpy(resid, vals, sizeof(float) * count);
+    bool used[4096] = {};
+    int support[64];
+    int support_len = 0;
+    if (target_sparsity > 64) target_sparsity = 64;
+    if (target_sparsity > count) target_sparsity = count;
+
+    for (int s = 0; s < target_sparsity; ++s) {
+        int best = -1;
+        float best_corr = 0.0f;
+        for (int a = 0; a < A; ++a) {
+            if (used[a]) continue;
+            float corr = 0.0f;
+            for (int m = 0; m < M; ++m) {
+                corr += dict.D[(size_t)a * P + pos[m]] * resid[m];
+            }
+            const float mag = std::fabs(corr);
+            if (best < 0 || mag > best_corr) {
+                best_corr = mag;
+                best = a;
+            }
+        }
+        if (best < 0) break;
+        used[best] = true;
+        support[support_len++] = best;
+
+        // normal equations on the MEASURED rows only
+        float G[16][16] = {};
+        float rhs[16] = {};
+        for (int r = 0; r < support_len; ++r) {
+            const float* atom_r = &dict.D[(size_t)support[r] * P];
+            for (int s2 = 0; s2 <= r; ++s2) {
+                const float* atom_s = &dict.D[(size_t)support[s2] * P];
+                float dot = 0.0f;
+                for (int m = 0; m < M; ++m) dot += atom_r[pos[m]] * atom_s[pos[m]];
+                G[r][s2] = dot;
+                G[s2][r] = dot;
+            }
+            float dot = 0.0f;
+            for (int m = 0; m < M; ++m) dot += atom_r[pos[m]] * resid[m];
+            rhs[r] = dot;
+        }
+        float csol[16] = {};
+        for (int col = 0; col < support_len; ++col) {
+            int piv = col;
+            for (int row = col + 1; row < support_len; ++row) {
+                if (std::fabs(G[row][col]) > std::fabs(G[piv][col])) piv = row;
+            }
+            if (std::fabs(G[piv][col]) < 1e-10f) break;
+            if (piv != col) {
+                // symmetric elimination: swap rows AND columns, keep support in sync
+                for (int c2 = 0; c2 < support_len; ++c2) std::swap(G[piv][c2], G[col][c2]);
+                std::swap(rhs[piv], rhs[col]);
+                for (int row = 0; row < support_len; ++row) std::swap(G[row][piv], G[row][col]);
+                std::swap(support[piv], support[col]);
+            }
+            for (int row = col + 1; row < support_len; ++row) {
+                const float f = G[row][col] / G[col][col];
+                for (int c2 = col; c2 < support_len; ++c2) G[row][c2] -= f * G[col][c2];
+                rhs[row] -= f * rhs[col];
+            }
+        }
+        for (int row = support_len - 1; row >= 0; --row) {
+            float acc = rhs[row];
+            for (int c2 = row + 1; c2 < support_len; ++c2) acc -= G[row][c2] * csol[c2];
+            csol[row] = G[row][row] != 0.0f ? acc / G[row][row] : 0.0f;
+        }
+        for (int r = 0; r < support_len; ++r) {
+            coefficients_out[support[r]] = csol[r];
+        }
+
+        // residual update over measured positions
+        for (int m = 0; m < M; ++m) {
+            float syn = 0.0f;
+            for (int r = 0; r < support_len; ++r) {
+                syn += dict.D[(size_t)support[r] * P + pos[m]] * csol[r];
+            }
+            resid[m] = vals[m] - syn;
+        }
+    }
+
+    // full patch synthesis from the sparse code
+    for (int p = 0; p < P; ++p) {
+        float syn = 0.0f;
+        const float* Dcol = dict.D.data() + p;
+        for (int a = 0; a < A; ++a) {
+            syn += Dcol[(size_t)a * P] * coefficients_out[a];
+        }
+        patch_out[p] = syn;
+    }
+}
+
+void reconstruct_color_channel_dict(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, const cs_dictionary& dict, cv::Mat& ref_out)
+{
+    // Classic K-SVD compressed-sensing decoder: every 8x8 patch of the tile is
+    // coded independently with OMP against its OWN measured subset of
+    // positions (sparse codes are recoverable from far fewer measurements
+    // than a dense DCT plane needs), then synthesized back onto the full
+    // patch. Fully data-parallel per patch; no global iterative solve.
+    (void)param_c;    // OMP is parameter-free (sparsity is fixed at training time)
+    (void)iterations; // OMP runs a fixed number of selections
+
+    const int patch = dict.patch;
+    const int P = patch * patch;
+    const int patchRows = (rows + patch - 1) / patch;
+    const int patchCols = (cols + patch - 1) / patch;
+    const int nPatches = patchRows * patchCols;
+    const int m = (int)ri_x.size();
+
+    std::vector<float> b((size_t)m, 0.0f);
+    for (int i = CS_HEADER_PIXELS; i < m + CS_HEADER_PIXELS && i < pixel_measurements.total(); i++) {
+        b[i - CS_HEADER_PIXELS] = pixel_measurements.at<cv::Vec3b>(i)[channel] / 255.0f;
+    }
+
+    // bucket measurement indices per patch
+    std::vector<std::vector<int>> per_patch((size_t)nPatches);
+    for (int k = 0; k < m; ++k) {
+        const int pr = ri_x[k] / patch;
+        const int pc = ri_y[k] / patch;
+        per_patch[(size_t)pr * patchCols + pc].push_back(k);
+    }
+
+    if (std::getenv("CS_DICT_DEBUG")) {
+        std::printf("[dict] tile %dx%d m=%d patches=%dx%d; b[0..3] = %.4f %.4f %.4f %.4f\n",
+            rows, cols, m, patchRows, patchCols, b[0], b[1], b[2], b[3]);
+        std::printf("[dict] ri[0..3] = (%d,%d) (%d,%d) (%d,%d) (%d,%d)\n",
+            ri_x[0], ri_y[0], ri_x[1], ri_y[1], ri_x[2], ri_y[2], ri_x[3], ri_y[3]);
+    }
+
+    ref_out.create(rows, cols, CV_32F);
+    float* plane = (float*)ref_out.data;
+    std::memset(plane, 0, sizeof(float) * (size_t)rows * cols);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int pi = 0; pi < nPatches; ++pi) {
+        const auto& ks = per_patch[(size_t)pi];
+        const int M = (int)ks.size();
+        if (M < 4) continue; // not enough evidence for this patch
+
+        int pos[64 * 64];
+        float vals[64 * 64];
+        const int Mcap = M < 64 * 64 ? M : 64 * 64;
+        float mean = 0.0f;
+        for (int i = 0; i < Mcap; ++i) {
+            const int k = ks[i];
+            pos[i] = (ri_x[k] % patch) * patch + (ri_y[k] % patch);
+            vals[i] = b[k];
+            mean += b[k];
+        }
+        mean /= (float)Mcap;
+        for (int i = 0; i < Mcap; ++i) {
+            vals[i] -= mean; // the dictionary models zero-mean patches
+        }
+
+        float coeffs[4096] = {};
+        float patch_rec[64 * 64] = {};
+        cs_omp_encode_measured(pos, vals, Mcap, dict, 10, coeffs, patch_rec);
+        for (int p = 0; p < P; ++p) {
+            patch_rec[p] += mean; // restore the brightness level
+        }
+        if (std::getenv("CS_DICT_DEBUG") && pi == 0) {
+            double e = 0.0;
+            for (int i = 0; i < Mcap; ++i) {
+                const float syn = patch_rec[pos[i]];
+                e += (syn - (vals[i] + mean)) * (syn - (vals[i] + mean));
+            }
+            std::printf("[dict] patch0: M=%d mean=%.4f vals[0..3]=%.4f %.4f %.4f %.4f rec[0]=%.4f residEnergy=%.4f\n",
+                Mcap, mean, vals[0] + mean, vals[1] + mean, vals[2] + mean, patch_rec[0], e);
+        }
+
+        const int pr = pi / patchCols;
+        const int pc = pi % patchCols;
+        for (int py = 0; py < patch; ++py) {
+            const int ty = pr * patch + py;
+            if (ty >= rows) continue;
+            for (int px = 0; px < patch; ++px) {
+                const int tx = pc * patch + px;
+                if (tx >= cols) continue;
+                // scale to the 0..255 pixel domain the merge/convert stage
+                // expects (the DCT path multiplies by 255 the same way)
+                plane[(size_t)ty * cols + tx] = patch_rec[py * patch + px] * 255.0f;
+            }
+        }
+    }
 }
 
 float evaluate_stacked(void* instance, const float* x, eval_data data, float* g, const int nTotal, const float step)
@@ -862,3 +1446,5 @@ void sharpenImage(const cv::Mat& input, cv::Mat& output, float sharpness) {
     cv::GaussianBlur(input, blurred, cv::Size(0, 0), 3);
     cv::addWeighted(input, 1.0 + sharpness, blurred, -sharpness, 0, output);
 }
+
+

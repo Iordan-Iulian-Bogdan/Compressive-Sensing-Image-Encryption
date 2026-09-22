@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "lbfgs.hpp"
 #include "crypto_utils.hpp"
+#include <fstream>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -38,6 +39,59 @@ struct TileCoord {
 struct indices {
     std::vector<int> ri_x_g, ri_y_g;
 };
+
+/** @brief an overcomplete patch dictionary learned with K-SVD.
+D holds `atoms` columns of patch*patch float values (atom-major layout,
+column == one atom, unit L2 norm). Patches are patch x patch grayscale
+planes in [0,1]; color channels are coded independently.
+*/
+struct cs_dictionary {
+    int atoms = 0;
+    int patch = 8;
+    std::vector<float> D; // atoms * patch * patch
+    float lipschitz = 1.0f; // lambda_max(D^T D), estimated at load/train time
+};
+
+/** @brief K-SVD training: OMP sparse coding (K atoms per patch) + atom SVD
+updates, iterated. images are CV_8UC3; patches are sampled at stride 4 from
+each channel (capped at max_patches). Returns false when there is not enough
+training data.
+*/
+bool cs_train_dictionary(const std::vector<cv::Mat>& images, int atoms, int ksvd_iters,
+    int max_patches, cs_dictionary& out);
+
+bool cs_save_dictionary(const std::string& path, const cs_dictionary& d);
+bool cs_load_dictionary(const std::string& path, cs_dictionary& out);
+
+/** @brief orthogonal matching pursuit for ONE patch: returns the sparse
+coefficient vector over the dictionary atoms (length atoms, mostly zeros).
+*/
+void cs_omp_encode(const float* patch_values /*patch*patch*/, const cs_dictionary& dict,
+    int target_sparsity, float* coefficients_out);
+
+/** @brief OMP against a SUB-SAMPLED observation: only the `count` positions
+pos[] are observable with values vals[]; the sparse code is fit on those rows
+and the full patch is synthesized from the code into patch_out. */
+void cs_omp_encode_measured(const int* pos, const float* vals, int count,
+    const cs_dictionary& dict, int target_sparsity, float* coefficients_out, float* patch_out);
+
+/** @brief solves ONE color channel of a tile against a learned patch
+dictionary instead of the DCT basis. The unknown is the concatenated sparse
+coefficient vector of every 8x8 patch of the tile (zero-padded to a multiple
+of the patch size); the forward operator synthesizes patches at their tile
+positions and gathers the scattered measurements there. ref_out receives the
+reconstructed pixel plane (CV_32F, rows x cols, 0..255) so cv::merge can
+consume it. coefficients_out must be pre-sized to the unknown count and may
+hold a warm start (e.g. OMP codes of neighbor strips).
+*/
+void reconstruct_color_channel_dict(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, const cs_dictionary& dict, cv::Mat& ref_out);
+
+/** @brief objective/gradient for the patch-dictionary solve: forward =
+per-patch D * c synthesis -> gather at full-res positions; gradient =
+scatter residual -> per-patch D^T. */
+float evaluate_dict(void* instance, const float* x, eval_data data, float* g, const int n, const float step);
 
 int nextClosestDivisible(const int& x, const int& y);
 

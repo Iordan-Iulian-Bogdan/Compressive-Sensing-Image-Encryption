@@ -42,7 +42,20 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     }
 }
 
-void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb, bool chroma_sub, float tv) {
+void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict) {
+
+    // Patch-dictionary mode: solve each channel against the learned K-SVD
+    // dictionary (no DCT, no in-tile channel chain; starts from zero
+    // coefficients and lets OWL-QN find the sparse atom codes).
+    if (dict != nullptr && dict->atoms > 0) {
+        cv::Mat planes[3];
+        for (int ch = 0; ch < 3; ++ch) {
+            reconstruct_color_channel_dict(encrypted_img, ch, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, *dict, planes[ch]);
+        }
+        cv::merge(planes, 3, out);
+        out.convertTo(out, CV_8UC3);
+        return;
+    }
 
     // Experiment notes (kept so the findings aren't re-litigated):
     // 1. Packed 3-channel solve: a merged single lbfgs over all 3 channels
@@ -258,7 +271,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict) {
 
     // we use a reference image as the initial solution for tiles without
     // neighbors (first wave); this helps speed up convergence
@@ -284,7 +297,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, ycrcb, chroma_sub);
 
                 decrypt_image dimgs = decrypt_image(mats_in[i][j]);
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb, chroma_sub, tv);
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb, chroma_sub, tv, dict);
             }
             catch (const std::exception& e) {
                 // an exception escaping an OpenMP region terminates the process;
@@ -309,10 +322,11 @@ int decrypt_image::decrypt_image_tiled(
     float coef,
     bool show_preview,
     bool denoise,
-    float tv
+    float tv,
+    const std::string& dict_path
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path);
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -326,7 +340,8 @@ int decrypt_image::decrypt_image_tiled(
     float coef,
     bool show_preview,
     bool denoise,
-    float tv
+    float tv,
+    const std::string& dict_path
 ) {
     const cv::Mat& encrypted_img_g = encrypted_img_in;
     try {
@@ -393,6 +408,19 @@ int decrypt_image::decrypt_image_tiled(
 
     //int N_reconfigured = tiles;
     std::string windowName = output_path.empty() ? "decrypted tiles" : output_path;
+
+    // optional learned patch dictionary (K-SVD); loaded once, read-only for
+    // all worker threads
+    cs_dictionary dict_storage;
+    const cs_dictionary* dict = nullptr;
+    if (!dict_path.empty()) {
+        if (!cs_load_dictionary(dict_path, dict_storage)) {
+            std::cerr << "Error: failed to load dictionary: " << dict_path << std::endl;
+            return -2;
+        }
+        dict = &dict_storage;
+    }
+
     try {
         std::vector<std::vector<cv::Mat>> encrypted_image_tiles;
         std::vector<std::vector<cv::Mat>> decrypted_image_tiles;
@@ -469,7 +497,7 @@ int decrypt_image::decrypt_image_tiled(
     // resize-heavy coarse operators eat the 4x unknown reduction. Off by
     // default; kept as an opt-in speed/quality trade via the flags.
     decrypt_tiles_thread = std::thread(decrypt_tiles, nun_threads, std::ref(encrypted_image_tiles), std::ref(indices_reconfigured),
-        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false, tv);
+        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false, tv, dict);
     decrypt_tiles_thread.join();
 
     if (show_preview) {
