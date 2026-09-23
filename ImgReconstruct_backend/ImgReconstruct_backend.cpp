@@ -1,6 +1,11 @@
 ﻿#include "image_decryption.hpp"
 #include "image_encryption.hpp"
+#include "quality_utils.hpp"
+#include <opencv2/core/ocl.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -16,11 +21,12 @@ void print_usage(const char* exe) {
         "  " << exe << " encrypt <input.png> <output.png> [options]\n"
         "  " << exe << " decrypt <input.png> <output.png> [options]\n"
         "  " << exe << " roundtrip <input.png> <output.png> [options]\n"
+        "  " << exe << " compare <original.png> <decrypted.png> <out_prefix> [options]\n"
         "\n"
 "Options:\n"
         "  --password <pw>       passphrase (else $CS_PASSWORD, else interactive prompt)\n"
-        "  --ratio <f>           encryption sampling ratio in (0.05, 1.0]; default 1.0\n"
-        "  --tiles <n>           decrypt tile count (manual mode only)\n"
+        "  --ratio <f>           encryption sampling ratio in (0.001, 1.0]; default 1.0\n"
+        "  --tiles <n>           decrypt tile count >= 1 (manual mode only)\n"
         "  --overlap <n>         decrypt tile overlap in (24, 96) (manual mode only)\n"
         "  --iterations <n>      decrypt solver iterations (manual mode only)\n"
         "  --threads <n>         decrypt worker threads (manual mode only)\n"
@@ -35,17 +41,95 @@ void print_usage(const char* exe) {
         "                        compression; 0 = off)\n"
         "  --dict <file>         solve with a learned K-SVD patch dictionary\n"
         "                        instead of the DCT basis (see the trainer tool)\n"
-        "  --periodic            use periodic tile-based sampling (repeat a random\n"
-        "                        tile pattern across the image)\n"
-        "  --tile-size <n>       tile size for periodic mode (default 64, must divide image dims)\n"
+        "  --periodic            encrypt with periodic tile sampling: one random\n"
+        "                        per-tile pattern repeated across the image\n"
+        "                        (encrypt/roundtrip only; decrypt auto-detects\n"
+        "                        the mode from the container)\n"
+        "  --tile-size <n>       periodic tile size (default 64)\n"
+        "  --adaptive            encrypt with LOD-based adaptive sampling: each\n"
+        "                        tile gets an 8-bit detail score shipped in the\n"
+        "                        container; sample budget splits by score so\n"
+        "                        detailed tiles are over-sampled and flat tiles\n"
+        "                        under-sampled (encrypt/roundtrip only; decrypt\n"
+        "                        auto-detects from the container)\n"
+        "  --adaptive-floor <n>  minimum LOD byte in adaptive mode (default 32;\n"
+        "                        keeps a floor share for flat tiles)\n"
+        "  --adaptive-strength <s>  how aggressively detail tiles are over-sampled\n"
+        "                        and flat tiles under-sampled, s in [0, 1]\n"
+        "                        (default 0.5; 0 = uniform like random sampling,\n"
+        "                        1 = maximum LOD bias)\n"
+        "  --show-mask           after encrypt/roundtrip sampling, write\n"
+        "                        <output>.mask.png and open a preview window\n"
+        "                        (source | binary mask | cyan overlay)\n"
+        "  --full-res            keep native resolution end-to-end (skip the\n"
+        "                        default encrypt 2x downscale and decrypt\n"
+        "                        2x upscale); use on encrypt AND decrypt/roundtrip\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
+        "  compare scores decryption quality (PSNR/SSIM/MAE/max) and writes\n"
+        "    <out_prefix>_sidebyside.png  original | decrypted | JET error map\n"
+        "    <out_prefix>_error.png       amplified absolute-error map\n"
         "\n"
         "Examples:\n"
         "  " << exe << " encrypt photo.png photo.enc.png\n"
         "  " << exe << " decrypt photo.enc.png photo.dec.png --password \"my secret\"\n"
         "  " << exe << " roundtrip photo.png photo.dec.png --password \"my secret\"\n"
-        "  " << exe << " encrypt photo.png photo.enc.png --ratio 0.5 --periodic --tile-size 64\n";
+        "  " << exe << " encrypt photo.png photo.enc.png --ratio 0.5 --periodic --tile-size 64\n"
+        "  " << exe << " roundtrip photo.png photo.dec.png --password \"my secret\" --ratio 0.5 --adaptive\n"
+        "  " << exe << " encrypt photo.png photo.enc.png --ratio 0.5 --adaptive --show-mask\n"
+        "  " << exe << " roundtrip photo.png photo.dec.png --password \"my secret\" --ratio 0.5 --adaptive --full-res\n"
+        "  " << exe << " compare photo.png photo.dec.png report --amp 4\n";
+}
+
+int run_compare(const std::string& original_path, const std::string& decoded_path,
+                const std::string& out_prefix, double amplification)
+{
+    // full-size photos can exhaust GPU buffers in OpenCL UMat paths
+    cv::ocl::setUseOpenCL(false);
+    cv::Mat original = cv::imread(original_path, cv::IMREAD_COLOR);
+    if (original.empty()) {
+        std::cerr << "Error: cannot load original '" << original_path << "'" << std::endl;
+        return 1;
+    }
+    cv::Mat decoded = cv::imread(decoded_path, cv::IMREAD_COLOR);
+    if (decoded.empty()) {
+        std::cerr << "Error: cannot load decrypted '" << decoded_path << "'" << std::endl;
+        return 1;
+    }
+    if (decoded.size() != original.size()) {
+        cv::resize(decoded, decoded, original.size());
+    }
+
+    const double p = cs_quality::psnr(original, decoded);
+    const double s = cs_quality::ssim(original, decoded);
+    const double mae = cs_quality::mean_abs_error(original, decoded);
+    const double mx = cs_quality::max_abs_error(original, decoded);
+
+    std::printf("PSNR: %.2f dB\n", p);
+    if (s >= 0.0) std::printf("SSIM: %.4f\n", s);
+    else          std::printf("SSIM: n/a (OpenCV quality module not available)\n");
+    std::printf("MAE:  %.3f\n", mae);
+    std::printf("MAX:  %.1f\n", mx);
+
+    const cv::Mat err = cs_quality::error_map(original, decoded, amplification);
+    const cv::Mat strip = cs_quality::side_by_side(original, decoded, amplification);
+    if (err.empty() || strip.empty()) {
+        std::cerr << "Error: failed to build error visualization" << std::endl;
+        return 1;
+    }
+    const std::string err_path = out_prefix + "_error.png";
+    const std::string strip_path = out_prefix + "_sidebyside.png";
+    if (!cv::imwrite(err_path, err)) {
+        std::cerr << "Error: cannot write '" << err_path << "'" << std::endl;
+        return 1;
+    }
+    if (!cv::imwrite(strip_path, strip)) {
+        std::cerr << "Error: cannot write '" << strip_path << "'" << std::endl;
+        return 1;
+    }
+    std::printf("Wrote %s\n", err_path.c_str());
+    std::printf("Wrote %s\n", strip_path.c_str());
+    return 0;
 }
 
 std::string read_password() {
@@ -81,10 +165,31 @@ int main(int argc, char* argv[])
     }
 
     const std::string mode = argv[1];
-    if (mode != "encrypt" && mode != "decrypt" && mode != "roundtrip") {
+    if (mode != "encrypt" && mode != "decrypt" && mode != "roundtrip" && mode != "compare") {
         std::cerr << "Error: unknown mode '" << mode << "'" << std::endl;
         print_usage(argv[0]);
         return 64;
+    }
+
+    if (mode == "compare") {
+        if (argc < 5) {
+            std::cerr << "Error: compare needs <original.png> <decrypted.png> <out_prefix>" << std::endl;
+            print_usage(argv[0]);
+            return 64;
+        }
+        double amp = 0.0;
+        for (int i = 5; i < argc; i++) {
+            const std::string a = argv[i];
+            if (a == "--amp" && i + 1 < argc) {
+                amp = std::atof(argv[++i]);
+            }
+            else {
+                std::cerr << "Error: unknown compare option '" << a << "'" << std::endl;
+                print_usage(argv[0]);
+                return 64;
+            }
+        }
+        return run_compare(argv[2], argv[3], argv[4], amp);
     }
 
     if (argc < 4) {
@@ -108,6 +213,11 @@ int main(int argc, char* argv[])
     bool denoise = false;
     bool periodic = false;
     int tile_size = 64;
+    bool adaptive = false;
+    int adaptive_floor = 32;
+    float adaptive_strength = 0.5f;
+    bool show_mask = false;
+    bool full_res = false;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -163,9 +273,10 @@ int main(int argc, char* argv[])
             denoise = true;
         }
         else if (a == "--tv") {
+            // does NOT force manual mode: AUTO still derives coef/iterations
+            // from the container ratio; only the TV weight is overridden
             const char* v = next("floating point");
             if (!v || !parse_float(v, tv_lambda)) return 64;
-            manual = true;
         }
         else if (a == "--dict") {
             const char* v = next("dictionary file");
@@ -173,13 +284,44 @@ int main(int argc, char* argv[])
             dict_path = v;
         }
         else if (a == "--periodic") {
+            // encrypt-side only: decrypt auto-detects the mode from the
+            // container header, so this must not flip decrypt into manual
+            // parameter mode (CLI default coef/iterations are wrong for
+            // ratios other than 1.0 and collapse quality to ~11 dB)
             periodic = true;
-            manual = true;
         }
         else if (a == "--tile-size") {
             const char* v = next("integer");
             if (!v || !parse_int(v, tile_size)) return 64;
-            manual = true;
+        }
+        else if (a == "--adaptive") {
+            // encrypt-side only (same as --periodic): never forces manual
+            // decrypt parameters — mode travels in the authenticated header
+            adaptive = true;
+        }
+        else if (a == "--adaptive-floor") {
+            const char* v = next("integer");
+            if (!v || !parse_int(v, adaptive_floor)) return 64;
+            if (adaptive_floor < 0 || adaptive_floor > 255) {
+                std::cerr << "Error: --adaptive-floor must be in [0, 255]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--adaptive-strength") {
+            const char* v = next("floating point in [0,1]");
+            if (!v || !parse_float(v, adaptive_strength)) return 64;
+            if (adaptive_strength < 0.0f || adaptive_strength > 1.0f) {
+                std::cerr << "Error: --adaptive-strength must be in [0, 1]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--show-mask") {
+            // encrypt/roundtrip only: after sampling, save + open the mask
+            show_mask = true;
+        }
+        else if (a == "--full-res") {
+            // both sides: skip encrypt 2x downscale AND decrypt 2x upscale
+            full_res = true;
         }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
@@ -202,24 +344,24 @@ int main(int argc, char* argv[])
     auto start = std::chrono::high_resolution_clock::now();
     int rc = 0;
 
-try {
+    try {
+        // tile_size > 0 selects periodic sampling on the encrypt side; the
+        // mode travels inside the authenticated container, so decrypt needs
+        // no sampling flags. --adaptive wins over --periodic when both given.
+        const int periodic_tile_arg = (adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
-            if (periodic) {
-                rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, tile_size);
-            } else {
-                rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio);
-            }
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, adaptive, adaptive_floor, adaptive_strength, show_mask, full_res);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path);
+                tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
         }
-else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
+        else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, 64, &encrypted);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, adaptive, adaptive_floor, adaptive_strength, show_mask, full_res);
             if (rc == 0) {
                 rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path);
+                    tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
             }
         }
     }

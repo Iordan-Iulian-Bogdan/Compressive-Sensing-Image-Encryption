@@ -78,7 +78,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;opencv_quality4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>C:\opencv\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <DelayLoadDLLs>
       </DelayLoadDLLs>
@@ -112,7 +112,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;opencv_quality4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>C:\opencv\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <DelayLoadDLLs>
       </DelayLoadDLLs>
@@ -141,6 +141,7 @@
     <ClInclude Include="image_encryption.hpp" />
     <ClInclude Include="lancir.h" />
     <ClInclude Include="lbfgs.hpp" />
+    <ClInclude Include="quality_utils.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

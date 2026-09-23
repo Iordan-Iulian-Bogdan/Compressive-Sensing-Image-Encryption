@@ -22,19 +22,25 @@ cv::Mat reconstructImage(const std::vector<std::vector<cv::Mat>>& tiles,
 
     int tileCountN = tiles.size();
 
-    // Calculate output image size
+    // Calculate output image size from the covered extents of every tile;
+    // empty/skipped slots (default {0,0} + 0-size) must not drag maxX/maxY
+    // down or invent a zero-size canvas
     int maxX = 0, maxY = 0;
     for (int i = 0; i < tileCountN; i++) {
         for (int j = 0; j < tileCountN; j++) {
+            if (tiles[i][j].empty()) continue;
             int rightEdge = coordinates[i][j].x + tiles[i][j].cols;
             int bottomEdge = coordinates[i][j].y + tiles[i][j].rows;
             maxX = max(maxX, rightEdge);
             maxY = max(maxY, bottomEdge);
         }
     }
+    if (maxX <= 0 || maxY <= 0) {
+        return cv::Mat();
+    }
 
     // Create output image
-    cv::Mat output(maxY, maxX, tiles[0][0].type(), cv::Scalar(0));
+    cv::Mat output(maxY, maxX, tiles[0][0].empty() ? CV_8UC3 : tiles[0][0].type(), cv::Scalar(0));
 
     // Copy tiles to their original positions
     for (int i = 0; i < tileCountN; i++) {
@@ -1312,14 +1318,23 @@ cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
                 if (tiles[i][j].empty()) continue;
                 const int th = tiles[i][j].rows, tw = tiles[i][j].cols;
                 const int x = coordinates[i][j].x, y = coordinates[i][j].y;
-                if (x < 0 || y < 0 || x + tw > maxX || y + th > maxY) continue;
+                // clamp into the target instead of dropping the tile: an
+                // OOB discard leaves a black gap when tile geometry is off
+                int cx = x, cy = y, cw = tw, ch = th;
+                if (cx < 0) { cw += cx; cx = 0; }
+                if (cy < 0) { ch += cy; cy = 0; }
+                if (cx + cw > maxX) cw = maxX - cx;
+                if (cy + ch > maxY) ch = maxY - cy;
+                if (cw <= 0 || ch <= 0) continue;
+                const cv::Mat tile_roi = tiles[i][j](cv::Rect(0, 0, cw, ch));
+                const int x0 = cx, y0 = cy;
 
                 // per-tile weight map: 0.5*(1 - cos(pi * d / feather)) with d =
                 // distance to the nearest tile border, clamped to [0, feather]
-                cv::Mat w(th, tw, CV_32FC1);
-                for (int r = 0; r < th; r++) {
+                cv::Mat w(ch, cw, CV_32FC1);
+                for (int r = 0; r < ch; r++) {
                     const int dy = (std::min)(r, th - 1 - r);
-                    for (int c = 0; c < tw; c++) {
+                    for (int c = 0; c < cw; c++) {
                         const int dx = (std::min)(c, tw - 1 - c);
                         const int d = (std::min)(dx, dy);
                         const int dc = (std::min)(d, feather);
@@ -1328,9 +1343,9 @@ cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
                 }
 
                 cv::Mat tile_f;
-                tiles[i][j].convertTo(tile_f, CV_32FC3);
+                tile_roi.convertTo(tile_f, CV_32FC3);
 
-                cv::Rect roi(x, y, tw, th);
+                cv::Rect roi(x0, y0, cw, ch);
                 cv::Mat acc_roi = acc(roi);
                 cv::Mat wsum_roi = wsum(roi);
 
@@ -1375,23 +1390,27 @@ cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
                 int x = coordinates[i][j].x;
                 int y = coordinates[i][j].y;
 
-                // Ensure tile fits within output image
-                if (x < 0 || y < 0 || x + tileWidth > maxX || y + tileHeight > maxY) {
-                    continue;
-                }
+                // clamp into the target instead of discarding the tile
+                int cx = x, cy = y, cw = tileWidth, ch = tileHeight;
+                if (cx < 0) { cw += cx; cx = 0; }
+                if (cy < 0) { ch += cy; cy = 0; }
+                if (cx + cw > maxX) cw = maxX - cx;
+                if (cy + ch > maxY) ch = maxY - cy;
+                if (cw <= 0 || ch <= 0) continue;
+                const cv::Mat src = tiles[i][j](cv::Rect(0, 0, cw, ch));
 
                 // Define ROI in output image
-                cv::Rect roi(x, y, tileWidth, tileHeight);
+                cv::Rect roi(cx, cy, cw, ch);
                 cv::Mat outputROI = output(roi);
 
                 // Ensure compatible types
-                if (tiles[i][j].type() != outputROI.type()) {
+                if (src.type() != outputROI.type()) {
                     continue;
                 }
 
                 // Perform alpha blending
                 // outputROI = alpha * tile + (1 - alpha) * outputROI
-                addWeighted(tiles[i][j], alpha, outputROI, 1.0f - alpha, 0.0f, outputROI);
+                addWeighted(src, alpha, outputROI, 1.0f - alpha, 0.0f, outputROI);
             }
         }
     }

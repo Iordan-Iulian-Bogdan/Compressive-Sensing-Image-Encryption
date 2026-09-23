@@ -1,4 +1,4 @@
-// Benchmark: total-variation fusion weight vs compression ratio.
+﻿// Benchmark: total-variation fusion weight vs compression ratio.
 // For each ratio the container is encrypted once (fixed samples); each cell
 // decrypts with a different TV weight (manual parameter mode, iterations
 // fixed at 8 so low ratios stay converged). PSNR vs the original + time.
@@ -7,6 +7,7 @@
 // sample; skipped if none is available.
 #include "image_encryption.hpp"
 #include "image_decryption.hpp"
+#include "quality_utils.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -18,18 +19,6 @@
 #include <vector>
 
 namespace {
-
-double psnr(const cv::Mat& a, const cv::Mat& b) {
-    if (a.size() != b.size() || a.type() != b.type()) return -1.0;
-    cv::Mat diff;
-    cv::absdiff(a, b, diff);
-    diff.convertTo(diff, CV_32F);
-    diff = diff.mul(diff);
-    const cv::Scalar s = cv::sum(diff);
-    const double mse = (s[0] + s[1] + s[2]) / (double)(a.total() * 3);
-    if (mse < 1e-9) return 99.0;
-    return 10.0 * std::log10((255.0 * 255.0) / mse);
-}
 
 cv::Mat make_test_image(int w, int h) {
     cv::Mat img(h, w, CV_8UC3);
@@ -53,14 +42,14 @@ float coef_for(float ratio) {
 void sweep_tv(const char* label, const cv::Mat& original, const std::string& tmp_in, const std::string& password, float ratio) {
     const std::string tmp_out = ".bench_tv.png";
     cv::Mat encrypted;
-    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, ratio, &encrypted) != 0) {
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, ratio, 0, &encrypted) != 0) {
         std::printf("\n%s ratio %.2f: encrypt failed\n", label, ratio);
         return;
     }
     const float coef = coef_for(ratio);
     const int iters = ratio >= 0.25f ? 5 : 8;
-    std::printf("\n%s ratio %.2f (coef %.5f, %d iterations):\n%-10s %10s %10s\n",
-        label, ratio, coef, iters, "tv", "PSNR dB", "time ms");
+    std::printf("\n%s ratio %.2f (coef %.5f, %d iterations):\n%-10s %10s %10s %10s\n",
+        label, ratio, coef, iters, "tv", "PSNR dB", "SSIM", "time ms");
     const float tvs[] = { 0.0f, 0.05f, 0.2f, 0.5f, 1.0f };
     for (float t : tvs) {
         const auto t0 = std::chrono::high_resolution_clock::now();
@@ -75,9 +64,10 @@ void sweep_tv(const char* label, const cv::Mat& original, const std::string& tmp
         cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
         cv::Mat sized;
         cv::resize(dec, sized, original.size());
-        const double p = psnr(original, sized);
+        const double p = cs_quality::psnr(original, sized);
+        const double s = cs_quality::ssim(original, sized);
         const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        std::printf("%-10.2f %10.2f %10ld\n", t, p, ms);
+        std::printf("%-10.2f %10.2f %10.4f %10ld\n", t, p, s, ms);
     }
     std::remove(tmp_out.c_str());
 }
@@ -131,3 +121,4 @@ int main() {
 
     return 0;
 }
+

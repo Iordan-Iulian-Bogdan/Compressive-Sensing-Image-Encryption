@@ -404,6 +404,31 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
     out.version = 2;
     out.m = vals[0]; out.rows = vals[1]; out.cols = vals[2];
     out.org_h = vals[3]; out.org_w = vals[4];
+
+    // sampling-mode flags live in the authenticated pad region:
+    // [CS_OFF_PAD] = mode (0 random, 1 periodic, 2 adaptive), followed by
+    // tile_size and (mode 1) samples_per_tile as 16-bit little-endian values.
+    // Mode 2 stores lod byte count in the second slot as a sanity check.
+    const uint8_t mode = buf[CS_OFF_PAD];
+    if (mode == CS_MODE_PERIODIC || mode == CS_MODE_ADAPTIVE) {
+        out.sampling_mode = mode;
+        out.periodic_tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
+        out.periodic_samples = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8);
+        if (mode == CS_MODE_ADAPTIVE) {
+            int base = buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] |
+                (buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
+            out.adaptive_base = (base > 0) ? base : 256; // 0 = pre-strength default
+        }
+        if (out.periodic_tile <= 0 ||
+            (mode == CS_MODE_PERIODIC && out.periodic_samples <= 0) ||
+            (mode == CS_MODE_ADAPTIVE &&
+                out.periodic_samples != cs_lod_bytes(out.rows, out.cols, out.periodic_tile))) {
+            out.sampling_mode = CS_MODE_RANDOM;
+            out.periodic_tile = 0;
+            out.periodic_samples = 0;
+            out.adaptive_base = 256;
+        }
+    }
     return true;
 }
 

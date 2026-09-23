@@ -1,6 +1,7 @@
 #ifndef CS_CRYPTO_UTILS_HPP
 #define CS_CRYPTO_UTILS_HPP
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -87,6 +88,49 @@ bool cs_seal_header(uint8_t* buf, size_t buf_bytes, const uint8_t key[32]);
 // mismatch (tampered header or body, or wrong key).
 bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32]);
 
+// Sampling modes recorded in the authenticated pad region (CS_OFF_PAD)
+#define CS_MODE_RANDOM    0            // uniform random global indices (pad = 0)
+#define CS_MODE_PERIODIC  1            // one pattern repeated per tile (pad = 1)
+#define CS_MODE_ADAPTIVE  2            // LOD-based per-tile counts (pad = 2)
+
+// Adaptive pad layout (mode = 2), all little-endian:
+//   [0]      mode (= 2)
+//   [1..2]   tile_size
+//   [3..4]   lod byte count (sanity vs geometry)
+//   [5..6]   weight_base (uint16): w = tile_pixels * (weight_base + lod)
+//            0 is treated as the default 256 on parse (pre-strength containers)
+#define CS_OFF_ADAPTIVE_BASE 5         // offset from CS_OFF_PAD
+
+// Maps --adaptive-strength in [0, 1] to the integer weight_base.
+//   0.0 -> 65535 (essentially uniform: density ratio ~1.004)
+//   0.5 -> 256   (tuned default: density ratio ~1.8x)
+//   1.0 -> 1     (max LOD bias: density ratio ~7.8x)
+inline int cs_adaptive_base_from_strength(double strength) {
+    if (!(strength > 0.0)) return 65535;
+    if (strength >= 1.0) return 1;
+    const double b = std::exp(std::log(65535.0) * (1.0 - strength));
+    int v = (int)std::lround(b);
+    if (v < 1) v = 1;
+    if (v > 65535) v = 65535;
+    return v;
+}
+
+// lod region: tiles_x * tiles_y bytes after the 32-pixel header, padded to a
+// whole number of container pixels so measurements stay pixel-aligned
+inline int cs_lod_tile_count(int rows, int cols, int tile_size) {
+    if (tile_size <= 0) return 0;
+    const int tx = (cols + tile_size - 1) / tile_size;
+    const int ty = (rows + tile_size - 1) / tile_size;
+    return tx * ty;
+}
+inline int cs_lod_bytes(int rows, int cols, int tile_size) {
+    return cs_lod_tile_count(rows, cols, tile_size);
+}
+inline int cs_lod_pixels(int rows, int cols, int tile_size) {
+    const int b = cs_lod_bytes(rows, cols, tile_size);
+    return (b + 2) / 3;               // ceil(b / 3)
+}
+
 struct CsHeaderInfo {
     int m = 0, rows = 0, cols = 0, org_h = 0, org_w = 0;
     int version = 0;                 // 1 = plain v1, 2 = authenticated v2
@@ -94,6 +138,10 @@ struct CsHeaderInfo {
     bool key_valid = false;
     bool auth_failed = false;        // v2 tag mismatch / CNG failure
     bool legacy = false;             // pre-v2 container (no version byte)
+    int sampling_mode = CS_MODE_RANDOM; // CS_MODE_* from the pad byte
+    int periodic_tile = 0;           // > 0: tile size (periodic or adaptive)
+    int periodic_samples = 0;        // mode 1: samples per tile; mode 2: lod byte count (sanity)
+    int adaptive_base = 256;         // mode 2: weight_base (w = cap * (base + lod))
 };
 
 // Parses (+ authenticates and decrypts for v2) the header from the raw bytes

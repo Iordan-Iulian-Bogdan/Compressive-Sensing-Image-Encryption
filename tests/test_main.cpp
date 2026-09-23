@@ -1,11 +1,13 @@
 ﻿// Test suite for the CS image encryption backend.
 // Covers: crypto primitives (KDF determinism, seal/verify, tamper detection),
 // index shuffle determinism, tiling helpers, and a full encrypt->decrypt
-// roundtrip scored by PSNR.
+// roundtrip scored by PSNR + SSIM.
 #include "crypto_utils.hpp"
 #include "image_encryption.hpp"
 #include "image_decryption.hpp"
+#include "quality_utils.hpp"
 
+#include <opencv2/core/ocl.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgproc/types_c.h>
@@ -14,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <functional>
 #include <numeric>
@@ -33,20 +36,6 @@ void check(bool ok, const char* name) {
         std::printf("[FAIL] %s\n", name);
         g_failures++;
     }
-}
-// ---------------------------------------------------------------------------
-// PSNR helper
-// ---------------------------------------------------------------------------
-double psnr(const cv::Mat& a, const cv::Mat& b) {
-    if (a.size() != b.size() || a.type() != b.type()) return -1.0;
-    cv::Mat diff;
-    cv::absdiff(a, b, diff);
-    diff.convertTo(diff, CV_32F);
-    diff = diff.mul(diff);
-    const cv::Scalar s = cv::sum(diff);
-    const double mse = (s[0] + s[1] + s[2]) / (double)(a.total() * 3);
-    if (mse < 1e-9) return 99.0;
-    return 10.0 * std::log10((255.0 * 255.0) / mse);
 }
 
 // procedural test image: smooth gradient + shapes (structure, no noise)
@@ -214,14 +203,14 @@ void test_roundtrip() {
     cv::Mat original = make_test_image(W, H);
 
 cv::Mat encrypted;
-    const int enc_rc = encrypt_image::encrypt_image_tiled("", "", password, 1.0f, 64, &encrypted);
+    const int enc_rc = encrypt_image::encrypt_image_tiled("", "", password, 1.0f, 0, &encrypted);
     check(enc_rc != 0, "roundtrip: missing input file rejected");
 
     const std::string tmp_in = ".cs_test_input.png";
     const std::string tmp_out = ".cs_test_output.png";
     cv::Mat encrypted2;
     cv::imwrite(tmp_in, original);
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 64, &encrypted2) == 0,
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &encrypted2) == 0,
         "roundtrip: encrypt to memory");
 
     // wrong password must fail authentication before the solve
@@ -244,21 +233,172 @@ cv::Mat encrypted;
     // output is 2x the original size (solve -> org_size -> 2x upscale)
     cv::Mat dec_sized;
     cv::resize(decrypted, dec_sized, original.size());
-    const double p = psnr(original, dec_sized);
+    const double p = cs_quality::psnr(original, dec_sized);
+    const double s = cs_quality::ssim(original, dec_sized);
     std::printf("       roundtrip PSNR: %.2f dB\n", p);
+    std::printf("       roundtrip SSIM: %.4f\n", s);
     // Regression guard, not a quality benchmark: with wavefront neighbor
     // warm-starts the synthetic roundtrip measures ~26.8 dB today (19.2 dB
     // with the old independent-solve order). A broken index pipeline
     // (wrong sampling, misaligned offsets) collapses to single-digit dB,
     // so 24 dB leaves ~2.7 dB of headroom for noise/rounding variance.
     check(p > 24.0, "roundtrip: PSNR > 24 dB");
+    // SSIM is the perceptual companion to PSNR: structural breaks (tile seams,
+    // channel swaps) show up here even when MSE stays moderate. Baseline on
+    // the synthetic image with wavefront warm-starts is well above 0.9;
+    // 0.85 keeps headroom while still failing hard on structural damage.
+    if (s >= 0.0) check(s > 0.85, "roundtrip: SSIM > 0.85");
+    else check(false, "roundtrip: SSIM unavailable");
 
     std::remove(tmp_in.c_str());
     std::remove(tmp_out.c_str());
 }
 
 // ---------------------------------------------------------------------------
-// 5. photo-based roundtrip (second data point on real image statistics)
+// 5. adaptive sample-count budget (pure function) + full adaptive roundtrip
+// ---------------------------------------------------------------------------
+void test_adaptive_counts() {
+    // deterministic: same inputs -> same counts, sum respects capacity
+    const int rows = 64, cols = 64, ts = 32;
+    const int tiles_cols = cols / ts, tiles_rows = rows / ts;
+    std::vector<uint8_t> lod((size_t)tiles_rows * tiles_cols);
+    for (size_t i = 0; i < lod.size(); i++) lod[i] = (uint8_t)(i * 50); // spread
+
+    const int m = 64 * 64 / 2; // 50% budget
+    const auto a = cs_compute_tile_sample_counts(lod, m, rows, cols, ts);
+    const auto b = cs_compute_tile_sample_counts(lod, m, rows, cols, ts);
+    check(a == b, "adaptive counts: pure function is deterministic");
+    check((int)a.size() == tiles_rows * tiles_cols, "adaptive counts: one entry per tile");
+
+    long long sum = 0, cap_sum = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        sum += a[i];
+        const int tr = (int)i / tiles_cols, tc = (int)i % tiles_cols;
+        const int tw = (ts < cols - tc * ts) ? ts : cols - tc * ts;
+        const int th = (ts < rows - tr * ts) ? ts : rows - tr * ts;
+        cap_sum += tw * th;
+        if (a[i] < 0 || a[i] > tw * th) {
+            check(false, "adaptive counts: each count in [0, tile capacity]");
+            break;
+        }
+    }
+    check(sum == m, "adaptive counts: total equals requested m");
+
+    // higher LOD must not receive fewer samples than a lower-LOD twin tile
+    // when capacities match (weights are weight_base + lod, default base 256)
+    std::vector<uint8_t> lod2 = { 10, 250, 10, 250 };
+    const auto c = cs_compute_tile_sample_counts(lod2, 1000, 64, 64, 32);
+    check(c[1] > c[0] && c[3] > c[2], "adaptive counts: high LOD gets more samples");
+
+    // strength mapping: 0 -> uniform, 0.5 -> default 256, 1 -> max bias
+    check(cs_adaptive_base_from_strength(0.0) == 65535, "strength 0 -> base 65535 (uniform)");
+    check(cs_adaptive_base_from_strength(0.5) == 256, "strength 0.5 -> base 256 (default)");
+    check(cs_adaptive_base_from_strength(1.0) == 1, "strength 1 -> base 1 (max bias)");
+
+    // low strength must not widen the LOD gap as much as high strength
+    const auto mild = cs_compute_tile_sample_counts(lod2, 1000, 64, 64, 32, 65535);
+    const auto strong = cs_compute_tile_sample_counts(lod2, 1000, 64, 64, 32, 1);
+    const long long gap_mild = (long long)mild[1] - mild[0];
+    const long long gap_strong = (long long)strong[1] - strong[0];
+    check(gap_strong > gap_mild, "adaptive counts: strength 1 widens LOD gap vs strength 0");
+
+    // zero m -> all zeros
+    const auto z = cs_compute_tile_sample_counts(lod2, 0, 64, 64, 32);
+    check(!z.empty() && std::all_of(z.begin(), z.end(), [](int v) { return v == 0; }),
+        "adaptive counts: m=0 yields all zeros");
+
+    // lod length mismatch throws
+    bool threw = false;
+    try { cs_compute_tile_sample_counts(std::vector<uint8_t>{1, 2}, m, rows, cols, ts); }
+    catch (const std::runtime_error&) { threw = true; }
+    check(threw, "adaptive counts: wrong lod length throws");
+
+    // regression: skewed LOD at full budget must still sum to m (the old
+    // clamp loop dropped ~12k samples when detail tiles hit capacity first)
+    const int rows2 = 480, cols2 = 360, ts2 = 64;
+    const int tc2 = (cols2 + ts2 - 1) / ts2, tr2 = (rows2 + ts2 - 1) / ts2;
+    std::vector<uint8_t> lod_skew((size_t)tr2 * tc2);
+    for (size_t i = 0; i < lod_skew.size(); i++)
+        lod_skew[i] = (uint8_t)(32 + ((int)i * 7 + (int)i * 13) % 224);
+    const int m_full = rows2 * cols2;
+    const auto sk = cs_compute_tile_sample_counts(lod_skew, m_full, rows2, cols2, ts2);
+    long long sk_sum = 0;
+    for (int v : sk) sk_sum += v;
+    check(sk_sum == m_full, "adaptive counts: skewed lod at full budget sums to m");
+}
+
+void test_adaptive_roundtrip() {
+    const std::string password = "adaptive-test-password";
+    const int W = 960, H = 720;
+    cv::Mat original = make_test_image(W, H);
+
+    const std::string tmp_in = ".cs_test_adaptive_in.png";
+    const std::string tmp_out = ".cs_test_adaptive_out.png";
+    cv::imwrite(tmp_in, original);
+
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &encrypted, /*adaptive*/ true, 32) != 0) {
+        check(false, "adaptive roundtrip: encrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+    check(!encrypted.empty(), "adaptive roundtrip: encrypt to memory");
+
+    // mode byte must be CS_MODE_ADAPTIVE; default strength lands base=256
+    const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+    check(flat.data[CS_OFF_PAD] == CS_MODE_ADAPTIVE, "adaptive roundtrip: header mode=2");
+    const int base_written =
+        flat.data[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] |
+        (flat.data[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
+    check(base_written == 256, "adaptive roundtrip: default strength writes base=256");
+
+    // wrong password rejected before solve
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, "wrong-password-99", 24, 24, 5, 4, 0.01f, false) == -2,
+        "adaptive roundtrip: wrong password rejected with -2");
+
+    // correct password: full solve
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
+        "adaptive roundtrip: decrypt succeeds");
+
+    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    check(!decrypted.empty(), "adaptive roundtrip: decrypted file readable");
+
+    cv::Mat dec_sized;
+    cv::resize(decrypted, dec_sized, original.size());
+    const double p = cs_quality::psnr(original, dec_sized);
+    const double s = cs_quality::ssim(original, dec_sized);
+    std::printf("       adaptive roundtrip PSNR (ratio 0.5): %.2f dB\n", p);
+    std::printf("       adaptive roundtrip SSIM: %.4f\n", s);
+    // At 50% with the weak suite solve params (5 iters, coef 0.01) even
+    // uniform random lands ~16 dB / ~0.52 SSIM on this synthetic; adaptive
+    // tracks that band. Floors sit well above a broken index pipeline
+    // (single-digit dB, near-zero SSIM) to catch misaligned lod offsets or
+    // wrong measurement origins without over-fitting to solver noise.
+    check(p > 14.0, "adaptive roundtrip: PSNR > 14 dB at ratio 0.5");
+    if (s >= 0.0) check(s > 0.45, "adaptive roundtrip: SSIM > 0.45");
+    else check(false, "adaptive roundtrip: SSIM unavailable");
+
+    // second encrypt with same inputs must produce a working decrypt too
+    // (salt is random, so ciphertexts differ — only quality path is checked)
+    cv::Mat enc2;
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 64, &enc2, true, 32) == 0,
+        "adaptive roundtrip: encrypt at ratio 1.0");
+    check(decrypt_image::decrypt_image_tiled(enc2, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
+        "adaptive roundtrip: decrypt at ratio 1.0");
+    cv::Mat dec2 = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    if (!dec2.empty()) {
+        cv::resize(dec2, dec_sized, original.size());
+        const double p1 = cs_quality::psnr(original, dec_sized);
+        std::printf("       adaptive roundtrip PSNR (ratio 1.0): %.2f dB\n", p1);
+        check(p1 > 24.0, "adaptive roundtrip: PSNR > 24 dB at ratio 1.0");
+    }
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 6. photo-based roundtrip (second data point on real image statistics)
 // ---------------------------------------------------------------------------
 // Photos are gitignored (*.png), so this test is opt-in: it runs when a real
 // photo is available, and skips (without failing) otherwise. Photo sources,
@@ -287,7 +427,7 @@ void test_photo_roundtrip() {
     const std::string password = "roundtrip-test-password";
     const std::string tmp_out = ".cs_test_photo_output.png";
     cv::Mat encrypted;
-    if (encrypt_image::encrypt_image_tiled(path, "", password, 1.0f, 64, &encrypted) != 0) {
+    if (encrypt_image::encrypt_image_tiled(path, "", password, 1.0f, 0, &encrypted) != 0) {
         check(false, "photo roundtrip: encrypt");
         return;
     }
@@ -313,13 +453,19 @@ void test_photo_roundtrip() {
     if (!decrypted.empty()) {
         cv::Mat dec_sized;
         cv::resize(decrypted, dec_sized, original.size());
-        const double p = psnr(original, dec_sized);
+        const double p = cs_quality::psnr(original, dec_sized);
+        const double s = cs_quality::ssim(original, dec_sized);
         std::printf("       photo roundtrip PSNR (%s, %dx%d): %.2f dB\n",
             path.c_str(), original.cols, original.rows, p);
+        std::printf("       photo roundtrip SSIM: %.4f\n", s);
         // second data point on natural image statistics; with wavefront
         // neighbor warm-starts this measures ~30.4 dB (16.7 dB before).
         // Threshold keeps ~3.5 dB of headroom below the baseline.
         check(p > 27.0, "photo roundtrip: PSNR > 27 dB");
+        // natural images score a bit lower on SSIM than the synthetic
+        // gradient; baseline is ~0.95+, leave room for photo variance.
+        if (s >= 0.0) check(s > 0.88, "photo roundtrip: SSIM > 0.88");
+        else check(false, "photo roundtrip: SSIM unavailable");
     }
 
     std::remove(tmp_in.c_str());
@@ -329,10 +475,16 @@ void test_photo_roundtrip() {
 } // namespace
 
 int main() {
+    // Large photos trip CL_MEM_OBJECT_ALLOCATION_FAILURE on this host's
+    // OpenCL runtime during heavy GEMM; CPU path is deterministic for tests.
+    cv::ocl::setUseOpenCL(false);
+
     test_crypto();
     test_shuffle();
     test_tile_helpers();
     test_roundtrip();
+    test_adaptive_counts();
+    test_adaptive_roundtrip();
     test_photo_roundtrip();
 
     if (g_failures == 0) {
@@ -342,6 +494,7 @@ int main() {
     std::printf("%d TEST(S) FAILED\n", g_failures);
     return 1;
 }
+
 
 
 

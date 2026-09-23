@@ -54,8 +54,37 @@ Header layout (v2, 32 pixels = 96 bytes at the start of the container):
 [17..32] AES-CTR IV (random, per image)
 [33..64] metadata (32 bytes) XOR AES-256-CTR keystream
 [65..80] HMAC-SHA256 tag, truncated to 16 bytes, over [0..64] + measurement body
-[81..95] reserved (zeroed)
+[81..95] sampling mode + geometry (authenticated):
+         [81]     mode: 0 = random, 1 = periodic, 2 = adaptive
+         [82..83] tile_size (LE, modes 1 and 2)
+         [84..85] mode 1: samples_per_tile; mode 2: lod byte count (sanity)
+         [86..87] mode 2: weight_base (LE uint16; strength → base mapping below)
 ```
+
+### Adaptive sampling (`--adaptive`)
+
+Mode 2 splits the measurement budget across a tile grid by an 8-bit
+**level-of-detail** score per tile (mean |Laplacian|, min-max normalized,
+floored with `--adaptive-floor`, default 32). Each tile's share is weighted
+by `tile_pixels * (weight_base + lod)` — capacity keeps total allocation
+proportional to tile size, while `weight_base` controls how hard detail tiles
+are pushed over flat ones. `--adaptive-strength <s>` (default 0.5) sets that
+base: `s=0` → 65535 (essentially uniform, like random), `s=0.5` → 256
+(tuned default, density ratio near 1.8× so flat tiles retain enough coverage
+for the wavefront warm-start while detail tiles still get a clear bonus),
+`s=1` → 1 (maximum LOD bias, density ratio near 7.8×). The base is stored in
+the authenticated pad so decryption regenerates the exact counts. The lod
+byte array is stored immediately after the
+header (one byte per tile, row-major, zero-padded to a whole container
+pixel); measurements follow. Decryption regenerates identical indices from
+`(key, lod, m, geometry, weight_base)` via `cs_compute_tile_sample_counts`
+(deterministic largest-remainder split with capacity clamp/redistribute) plus
+a per-tile Fisher–Yates draw — no decrypt-side flag needed (mode travels in
+the header). `--show-mask` (encrypt/roundtrip) writes `<output>.mask.png`
+(source | binary mask | cyan overlay) and opens the same view in a window
+after sampling. **Resolution:** by default encrypt downsamples the input 2×
+and decrypt 2×-upscales the solve (half-res pipeline). Pass `--full-res` on
+**both** encrypt and decrypt/roundtrip to keep native geometry end-to-end.
 
 Security caveats (this is still a proof of concept):
 
@@ -89,17 +118,20 @@ Alternatively point CMake at any OpenCV with CMake config files via `-DOpenCV_DI
 
 ### Test suite
 
-`cs_tests` covers: PBKDF2/seal/verify unit tests, wrong-password and tamper rejection, seed determinism (same password+salt ⇒ same key/indices), shuffle determinism, tile-grid helpers, a synthetic encrypt→decrypt roundtrip scored by PSNR (~19.2 dB baseline), and an **opt-in photo roundtrip** that runs a real photo (auto-found: `$CS_TEST_PHOTO`, `IMG_3690.png`, or the project sample) for a second data point on natural image statistics (~16.7 dB baseline) and skips cleanly when no photo is available. Run with `ctest` or directly (`build\cs_tests.exe`).
+`cs_tests` covers: PBKDF2/seal/verify unit tests, wrong-password and tamper rejection, seed determinism (same password+salt ⇒ same key/indices), shuffle determinism, tile-grid helpers, a synthetic encrypt→decrypt roundtrip scored by PSNR + SSIM (~26.8 dB / ~0.96 baseline), **adaptive sample-count determinism** (`cs_compute_tile_sample_counts` pure-function checks: sum = m, LOD ordering, capacity clamp), an **adaptive roundtrip** at ratios 0.5 and 1.0, and an **opt-in photo roundtrip** that runs a real photo (auto-found: `$CS_TEST_PHOTO`, `IMG_3690.png`, or the project sample) for a second data point on natural image statistics (~30.4 dB / ~0.95 baseline) and skips cleanly when no photo is available. Run with `ctest` or directly (`build\cs_tests.exe`). Quality helpers (PSNR/SSIM/error maps) live in `ImgReconstruct_backend/quality_utils.hpp`; the benches print an SSIM column next to PSNR.
 
 ### CLI usage
 
 ```
-ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R]
+ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R] [--periodic] [--adaptive] [--tile-size N] [--adaptive-floor N] [--adaptive-strength S] [--show-mask] [--full-res]
 ImgReconstruct_backend decrypt  <input.png> <output.png> [--password <pw>] [--tiles N] [--overlap N] [--iterations N] [--threads N] [--coef F] [--manual] [--no-preview] [--denoise]
 ImgReconstruct_backend roundtrip <input.png> <output.png> [options]
+ImgReconstruct_backend compare   <original.png> <decrypted.png> <out_prefix> [--amp F]
 ```
 
-Without `--password` the passphrase is read from `CS_ENCRYPTION_PASSWORD` or prompted. Parameter overrides (`--tiles` etc.) switch the decrypt to manual mode; otherwise parameters are derived automatically from the container. `--denoise` adds an opt-in final non-local-means pass (`cv::fastNlMeansDenoisingColored`) that smooths solver noise at the cost of fine detail.
+`compare` scores a decryption against the original (PSNR, SSIM, MAE, max abs error) and writes `<out_prefix>_sidebyside.png` (original | decrypted | JET error map) plus `<out_prefix>_error.png` (amplified absolute-error map) for inspecting tile seams, blur, and solver noise. `--amp` sets a fixed error-map gain (default: auto-scale to peak).
+
+Without `--password` the passphrase is read from `CS_ENCRYPTION_PASSWORD` or prompted. Parameter overrides (`--tiles` etc.) switch the decrypt to manual mode; `--tiles` accepts any count >= 1 (auto mode derives 24); otherwise parameters are derived automatically from the container. `--denoise` adds an opt-in final non-local-means pass (`cv::fastNlMeansDenoisingColored`) that smooths solver noise at the cost of fine detail.
 
 Quality notes: tiles are composited with a **cosine-feathered** weight ramp (width = tile overlap) instead of a fixed alpha blend — overlap zones sum to a smooth transition and the composite is order-independent. Tiles are solved in **wavefront (anti-diagonal) order**: every tile is warm-started from the already-solved west/north neighbors' overlap strips, which turned out to be by far the largest quality lever — roundtrip baselines went from ~19.2/16.7 dB (independent solves) to **~26.8/30.4 dB** (synthetic/photo) with no wall-time penalty, since the better warm-starts converge faster than the wave barriers cost. A YCrCb-domain solve was re-tested properly on top of the wavefront (neighbor chroma strips, softened chroma l1) after the first attempt turned out to have a channel-ordering bug — the corrected result is a tie with BGR (26.7/30.3 vs 26.8/30.4 dB) at higher cost, so BGR remains the default; the path is kept behind a flag for future tuning experiments (see `decrypt_image::decrypt`).
 

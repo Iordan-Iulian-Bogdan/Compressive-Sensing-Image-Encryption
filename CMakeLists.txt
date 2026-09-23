@@ -11,6 +11,21 @@ if(NOT WIN32)
     find_package(OpenSSL REQUIRED)
 endif()
 
+# contrib quality module (SSIM) -- optional; quality_utils falls back to
+# reporting SSIM as unavailable when the header is missing
+set(CS_HAVE_QUALITY OFF)
+foreach(_inc ${OpenCV_INCLUDE_DIRS})
+    if(EXISTS "${_inc}/opencv2/quality.hpp")
+        set(CS_HAVE_QUALITY ON)
+    endif()
+endforeach()
+if(CS_HAVE_QUALITY)
+    list(APPEND OpenCV_LIBS opencv_quality)
+    message(STATUS "OpenCV quality module found: SSIM enabled")
+else()
+    message(STATUS "OpenCV quality module not found: SSIM will report n/a")
+endif()
+
 # core library shared by the CLI and the test suite
 add_library(cs_core STATIC
     ImgReconstruct_backend/CS_encryption.cpp
@@ -21,6 +36,7 @@ add_library(cs_core STATIC
     ImgReconstruct_backend/lbfgs.cpp
 )
 target_include_directories(cs_core PUBLIC ImgReconstruct_backend)
+# quality_utils.hpp lives next to the core sources; tests include it from there
 target_link_libraries(cs_core PUBLIC ${OpenCV_LIBS} OpenMP::OpenMP_CXX)
 if(NOT WIN32)
     target_link_libraries(cs_core PUBLIC OpenSSL::Crypto)

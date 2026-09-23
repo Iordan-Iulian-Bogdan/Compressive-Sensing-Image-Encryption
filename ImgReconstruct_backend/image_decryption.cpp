@@ -1,6 +1,7 @@
 ﻿#include "image_decryption.hpp"
 #include "image_encryption.hpp"
 #include <cstring>
+#include <algorithm>
 
 decrypt_image::decrypt_image(const std::string input_path, const std::string& password) {
     parse_container_header(cv::imread(input_path, cv::IMREAD_COLOR), password);
@@ -34,6 +35,13 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     cols = info.cols;
     org_size.height = info.org_h;
     org_size.width = info.org_w;
+
+    // sampling mode travels in the authenticated header: periodic and
+    // adaptive modes restore automatically, no decrypt-side flags needed
+    sampling_mode = info.sampling_mode;
+    periodic_tile = info.periodic_tile;
+    periodic_samples = info.periodic_samples;
+    adaptive_base = info.adaptive_base;
 
     if (info.key_valid) {
         std::memcpy(cs_key, info.key, sizeof(cs_key));
@@ -88,7 +96,7 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
         // measurements are sampled BGR pixels; they are re-encoded to YCrCb
         // once here (O(m)) and the solved planes are merged back.
         cv::Mat ycc_measurements = encrypted_img.clone();
-        const int measurement_pixels = std::min<int>((int)ycc_measurements.total(), m - 1 + CS_HEADER_PIXELS);
+        const int measurement_pixels = std::min<int>((int)ycc_measurements.total(), m + CS_HEADER_PIXELS);
         for (int i = CS_HEADER_PIXELS; i < measurement_pixels; i++) {
             const cv::Vec3b bgr = ycc_measurements.at<cv::Vec3b>(i);
             // same coefficients as cv::BGR2YCrCb; packed (Y, Cr, Cb) to match
@@ -164,18 +172,56 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
         throw std::runtime_error("derived key not available: header must be parsed with the password first");
     }
 
-    sampled_mat = cv::Mat(rows, cols, CV_8UC3);
-    masked_mat = cv::Mat(rows, cols, CV_8UC3);
+    sampled_mat = cv::Mat(rows, cols, CV_8UC3, cv::Scalar(0, 0, 0));
+    masked_mat = cv::Mat(rows, cols, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    ri_x.resize(m);
-    ri_y.resize(m);
-    returnRandomIndices(ri_x, ri_y, rows, cols, m, cs_key);
+    // measurement pixel origin inside the container: adaptive mode inserts a
+    // lod byte region (padded to whole pixels) between header and body
+    int meas0 = CS_HEADER_PIXELS;
+    std::vector<uint8_t> lod;
 
-    for (int i = CS_HEADER_PIXELS; i < ri_x.size() + CS_HEADER_PIXELS - 32; i += 32) {
-        // I think this helps with cache hits
-        for (int j = 0; j < 32; ++j) {
-            sampled_mat.at<cv::Vec3b>(ri_x[i - CS_HEADER_PIXELS + j], ri_y[i - CS_HEADER_PIXELS + j]) = encrypted_img.at<cv::Vec3b>(i + j);
-            masked_mat.at<cv::Vec3b>(ri_x[i - CS_HEADER_PIXELS + j], ri_y[i - CS_HEADER_PIXELS + j]) = cv::Vec3b(1, 1, 1);
+    if (sampling_mode == CS_MODE_ADAPTIVE) {
+        if (periodic_tile <= 0) {
+            throw std::runtime_error("adaptive container: missing tile size in header");
+        }
+        const int lod_bytes = cs_lod_bytes(rows, cols, periodic_tile);
+        const int lod_pixels = cs_lod_pixels(rows, cols, periodic_tile);
+        meas0 = CS_HEADER_PIXELS + lod_pixels;
+        const size_t need = (size_t)CS_HEADER_BYTES + (size_t)lod_bytes;
+        if (encrypted_img.total() * 3 < need) {
+            throw std::runtime_error("adaptive container: body too short for lod region");
+        }
+        lod.assign(encrypted_img.data + CS_HEADER_BYTES, encrypted_img.data + CS_HEADER_BYTES + lod_bytes);
+        if ((int)lod.size() != periodic_samples) {
+            // header pad sanity field disagrees with geometry — reject
+            throw std::runtime_error("adaptive container: lod length mismatch");
+        }
+        returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, periodic_tile, adaptive_base);
+    }
+    else if (sampling_mode == CS_MODE_PERIODIC && periodic_tile > 0 && periodic_samples > 0) {
+        // the container was encrypted with periodic tile sampling: regenerate
+        // the identical per-tile pattern from the key + header geometry
+        returnPeriodicIndices(ri_x, ri_y, rows, cols, periodic_samples, cs_key, periodic_tile);
+    }
+    else {
+        // returnRandomIndices writes into [0, m) without resizing
+        ri_x.resize(m);
+        ri_y.resize(m);
+        returnRandomIndices(ri_x, ri_y, rows, cols, m, cs_key);
+    }
+
+    // scatter measurements back to their sampled pixel positions; chunked by
+    // 32 for cache locality, last chunk may be partial when m % 32 != 0
+    const int m_count = (int)ri_x.size();
+    const int enc_limit = (int)encrypted_img.total();
+    for (int base = 0; base < m_count; base += 32) {
+        const int chunk = (std::min)(32, m_count - base);
+        const int enc = meas0 + base;
+        if (enc + chunk > enc_limit) break;
+        for (int j = 0; j < chunk; ++j) {
+            const int k = base + j;
+            sampled_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = encrypted_img.at<cv::Vec3b>(enc + j);
+            masked_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = cv::Vec3b(1, 1, 1);
         }
     }
 }
@@ -233,14 +279,33 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
     }
 
     if (!any_neighbor) {
-        // first wave (or failed neighbors): generic reference as before
+        // first wave (or failed neighbors): generic reference, resized to
+        // this tile's grid so merge/lbfgs always see the split tile's shape
+        // (tile_size is only the last processed tile and can disagree with
+        // edge/clamped tiles — that size mismatch left the top tile row
+        // short and produced black gaps in the composite)
+        cv::Size want(t_rect.width, t_rect.height);
+        auto fit = [&](cv::Mat m) {
+            if (m.empty() || m.size() != want) {
+                cv::Mat r;
+                if (m.empty()) {
+                    r = cv::Mat(want, CV_32F, cv::Scalar(0));
+                    cv::dct(r, r, 0);
+                    r /= 10.0f;
+                } else {
+                    cv::resize(m, r, want, 0, 0, cv::INTER_AREA);
+                }
+                return r;
+            }
+            return m.clone();
+        };
         if (ycrcb) {
             // Y gets the generic image-like ref; chroma planes start from a
             // neutral flat-chroma solution (their statistics are very different)
-            refs[0] = generic_refs[0].clone();
+            refs[0] = fit(generic_refs[0]);
             cv::Size chroma_size = chroma_sub
-                ? cv::Size((generic_refs[0].cols + 1) / 2, (generic_refs[0].rows + 1) / 2)
-                : generic_refs[0].size();
+                ? cv::Size((want.width + 1) / 2, (want.height + 1) / 2)
+                : want;
             refs[1] = cv::Mat(chroma_size, CV_32F, cv::Scalar(0.5f));
             cv::dct(refs[1], refs[1], 0);
             refs[1] /= 10.0f;
@@ -248,7 +313,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
         }
         else {
             for (int ch = 0; ch < 3; ++ch) {
-                refs[ch] = generic_refs[ch].clone();
+                refs[ch] = fit(generic_refs[ch]);
             }
         }
         return;
@@ -323,10 +388,11 @@ int decrypt_image::decrypt_image_tiled(
     bool show_preview,
     bool denoise,
     float tv,
-    const std::string& dict_path
+    const std::string& dict_path,
+    bool full_res
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path, full_res);
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -341,7 +407,8 @@ int decrypt_image::decrypt_image_tiled(
     bool show_preview,
     bool denoise,
     float tv,
-    const std::string& dict_path
+    const std::string& dict_path,
+    bool full_res
 ) {
     const cv::Mat& encrypted_img_g = encrypted_img_in;
     try {
@@ -350,8 +417,8 @@ int decrypt_image::decrypt_image_tiled(
                 throw std::runtime_error("Overlap is outside the acceptable range of (24, 96)");
             }
 
-            if (num_tiles < 8) {
-                throw std::runtime_error("Number of tiles is less than 8");
+            if (num_tiles < 1) {
+                throw std::runtime_error("Number of tiles must be at least 1");
             }
 
             if (coef < 0.01f || coef > 0.05f) {
@@ -524,14 +591,18 @@ int decrypt_image::decrypt_image_tiled(
         float sharpness = 0.3f;
         sharpenImage(reconstructed, sharpened, sharpness);
 
-        // upscaling the image
-        cv::Mat encrypted_img_upscaled = cv::Mat::zeros(sharpened.rows * 2, sharpened.cols * 2, CV_8UC3);
-        typedef avir::fpclass_def< float, float,
-            avir::CImageResizerDithererErrdINL< float > > fpclass_dith;
-        avir::CImageResizer< fpclass_dith > ImageResizer(8);
-        ImageResizer.resizeImage(sharpened.data, sharpened.cols, sharpened.rows, 0, encrypted_img_upscaled.data, sharpened.cols * 2, sharpened.rows * 2, 3, 0);
-        
-        cv::imwrite(output_path, encrypted_img_upscaled);
+        // Default pipeline: encrypt downsamples 2x, so decrypt 2x-upscales the
+        // solve back to native size. --full-res skips both (native geometry).
+        if (full_res) {
+            cv::imwrite(output_path, sharpened);
+        } else {
+            cv::Mat encrypted_img_upscaled = cv::Mat::zeros(sharpened.rows * 2, sharpened.cols * 2, CV_8UC3);
+            typedef avir::fpclass_def< float, float,
+                avir::CImageResizerDithererErrdINL< float > > fpclass_dith;
+            avir::CImageResizer< fpclass_dith > ImageResizer(8);
+            ImageResizer.resizeImage(sharpened.data, sharpened.cols, sharpened.rows, 0, encrypted_img_upscaled.data, sharpened.cols * 2, sharpened.rows * 2, 3, 0);
+            cv::imwrite(output_path, encrypted_img_upscaled);
+        }
     }
     catch (const std::exception& e) {
         std::cerr << "Error: decryption pipeline failed: " << e.what() << std::endl;

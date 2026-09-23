@@ -1,4 +1,4 @@
-// Benchmark: learned K-SVD patch dictionary vs the fixed DCT basis across
+﻿// Benchmark: learned K-SVD patch dictionary vs the fixed DCT basis across
 // compression ratios. Same encrypted container, three decodes:
 //   DCT  (baseline solver)
 //   DICT with the auto-equivalent l1 coefficient
@@ -6,6 +6,7 @@
 // The dictionary file must be trained beforehand (train_dictionary tool).
 #include "image_encryption.hpp"
 #include "image_decryption.hpp"
+#include "quality_utils.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -17,18 +18,6 @@
 #include <vector>
 
 namespace {
-
-double psnr(const cv::Mat& a, const cv::Mat& b) {
-    if (a.size() != b.size() || a.type() != b.type()) return -1.0;
-    cv::Mat diff;
-    cv::absdiff(a, b, diff);
-    diff.convertTo(diff, CV_32F);
-    diff = diff.mul(diff);
-    const cv::Scalar s = cv::sum(diff);
-    const double mse = (s[0] + s[1] + s[2]) / (double)(a.total() * 3);
-    if (mse < 1e-9) return 99.0;
-    return 10.0 * std::log10((255.0 * 255.0) / mse);
-}
 
 cv::Mat make_test_image(int w, int h) {
     cv::Mat img(h, w, CV_8UC3);
@@ -66,19 +55,20 @@ void run_cell(const char* name, const cv::Mat& original, const cv::Mat& encrypte
     cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
     cv::Mat sized;
     cv::resize(dec, sized, original.size());
-    const double p = psnr(original, sized);
+    const double p = cs_quality::psnr(original, sized);
+    const double s = cs_quality::ssim(original, sized);
     const long ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    std::printf("%-24s %10.2f %10ld\n", name, p, ms);
+    std::printf("%-24s %10.2f %10.4f %10ld\n", name, p, s, ms);
 }
 
 void sweep_dict(const char* label, const cv::Mat& original, const std::string& tmp_in, const std::string& password, float ratio) {
     cv::Mat encrypted;
-    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, ratio, &encrypted) != 0) {
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, ratio, 0, &encrypted) != 0) {
         std::printf("\n%s ratio %.2f: encrypt failed\n", label, ratio);
         return;
     }
-    std::printf("\n%s ratio %.2f (5 iterations, overlap 24):\n%-24s %10s %10s\n",
-        label, ratio, "mode", "PSNR dB", "time ms");
+    std::printf("\n%s ratio %.2f (5 iterations, overlap 24):\n%-24s %10s %10s %10s\n",
+        label, ratio, "mode", "PSNR dB", "SSIM", "time ms");
     char namebuf[64];
     std::snprintf(namebuf, sizeof(namebuf), "DCT (coef %.5f)", coef_for(ratio));
     run_cell(namebuf, original, encrypted, password, nullptr, coef_for(ratio), 8);
@@ -145,3 +135,4 @@ int main() {
 
     return 0;
 }
+
