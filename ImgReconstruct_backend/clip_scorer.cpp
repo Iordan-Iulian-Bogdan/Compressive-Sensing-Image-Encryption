@@ -452,6 +452,20 @@ std::string ClipScorer::debug_ids(const std::string& text) const {
     return o;
 }
 
+std::vector<int> ClipScorer::tokenize_public(const std::string& text) const {
+    return tokenize(text);
+}
+
+float ClipScorer::score_embed(const std::vector<int>& ids, const cv::Mat& bgr) {
+    if (!ready_) return -2.f;
+    float te[512], ve[512];
+    if (text_embed(ids, te) < 0) return -1.f;
+    if (vision_embed(bgr, ve) < 0) return -1.f;
+    double dot = 0;
+    for (int i = 0; i < 512; ++i) dot += double(te[i]) * ve[i];
+    return float(dot);
+}
+
 float ClipScorer::score(const cv::Mat& bgr, const std::string& description) {
     if (!ready_) return -2.f;
     std::vector<int> ids = tokenize(description);

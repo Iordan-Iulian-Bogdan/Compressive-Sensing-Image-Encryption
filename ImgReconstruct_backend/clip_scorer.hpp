@@ -26,6 +26,11 @@ public:
     // debug: space-separated token ids for a description (tokenizer check)
     std::string debug_ids(const std::string& text) const;
 
+    // tuner API: tokenize once, then score images against the cached ids
+    // (avoids re-running the text tower per trial). Returns -2/-1 as score().
+    std::vector<int> tokenize_public(const std::string& text) const;
+    float score_embed(const std::vector<int>& ids, const cv::Mat& bgr);
+
 private:
     bool load_tokenizer(const std::string& dir);
     bool load_nets(const std::string& dir);

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <map>
 #include <string>
 #include <vector>
@@ -73,6 +74,14 @@ void print_usage(const char* exe) {
         "                        candidate 0 is the unperturbed decrypt)\n"
         "  --clip-dir <dir>      CLIP model directory (default models/clip\n"
         "                        or $CS_CLIP_DIR)\n"
+        "  --tune                CLIP-guided coordinate descent: search\n"
+        "                        (coef, tv, iterations) to maximize\n"
+        "                        alpha*CLIP - beta*measurement-residual,\n"
+        "                        starting from the AUTO decrypt (requires\n"
+        "                        --desc; cannot combine with --restarts)\n"
+        "  --tune-rounds <n>     coordinate-descent rounds (default 1)\n"
+        "  --tune-alpha <f>      CLIP weight (default 1.0)\n"
+        "  --tune-beta <f>       residual weight (default 0.005)\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
         "  compare scores decryption quality (PSNR/SSIM/MAE/max) and writes\n"
@@ -218,6 +227,184 @@ int run_clip_selection(const std::string& input_path, const cv::Mat& encrypted,
     return 0;
 }
 
+// Measurement consistency: mean |candidate - measurement| over the sampled
+// pixels (in [0,1] units). Guards CLIP against rewarding confabulation that
+// contradicts the container. Candidate is the final full-res output; it is
+// downscaled to the solve geometry before comparison (unless --full-res).
+double measurement_mae(const cv::Mat& encrypted, const std::string& password,
+                       const cv::Mat& candidate) {
+    decrypt_image dimgs(encrypted, password);
+    cv::Mat sampled, masked;
+    dimgs.get_sampled_mat(sampled, masked);
+    if (sampled.empty() || candidate.empty()) return 1e9;
+    cv::Mat cand;
+    if (candidate.size() != sampled.size())
+        cv::resize(candidate, cand, sampled.size(), 0, 0, cv::INTER_AREA);
+    else
+        cand = candidate;
+    cv::Mat a, b;
+    cand.convertTo(a, CV_32FC3, 1.0 / 255.0);
+    sampled.convertTo(b, CV_32FC3, 1.0 / 255.0);
+    double sum = 0;
+    long n = 0;
+    for (int y = 0; y < a.rows; ++y) {
+        const cv::Vec3b* m = masked.ptr<cv::Vec3b>(y);
+        const cv::Vec3f* pa = a.ptr<cv::Vec3f>(y);
+        const cv::Vec3f* pb = b.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < a.cols; ++x) {
+            if (m[x] == cv::Vec3b(1, 1, 1)) {
+                sum += std::fabs(pa[x][0] - pb[x][0])
+                     + std::fabs(pa[x][1] - pb[x][1])
+                     + std::fabs(pa[x][2] - pb[x][2]);
+                ++n;
+            }
+        }
+    }
+    if (n == 0) return 1e9;
+    return sum / (3.0 * n);
+}
+
+// CLIP-guided coordinate descent over (coef, tv, iterations): the gradient-
+// free stand-in for a clip_lambda term in evaluate(). Trial 0 is the AUTO
+// decrypt (incumbent, never-worse guarantee); phases then sweep one axis at
+// a time in MANUAL mode (tiles/overlap mirror AUTO: 24/24). Objective:
+// alpha*CLIP - beta*residual. Evaluated points are cached across rounds.
+int run_tune(const std::string& input_path, const cv::Mat& encrypted,
+    const std::string& output, const std::string& password,
+    int tiles, int overlap, int iterations, int threads, float coef,
+    bool show_preview, bool denoise, float tv_lambda, const std::string& dict_path,
+    bool full_res, const std::string& desc, const std::string& clip_dir,
+    int rounds, double alpha, double beta)
+{
+    ClipScorer clip;
+    if (!clip.load(clip_dir)) {
+        std::cerr << "Error: CLIP load failed: " << clip.error() << std::endl;
+        std::cerr << "Run scripts\\download_clip.ps1 first (models/clip/)" << std::endl;
+        return 2;
+    }
+    cv::Mat enc = input_path.empty() ? encrypted
+                                     : cv::imread(input_path, cv::IMREAD_COLOR);
+    if (enc.empty()) {
+        std::cerr << "Error: cannot load encrypted input" << std::endl;
+        return 1;
+    }
+    // text embedding is description-only: compute once, reuse for all trials
+    const std::vector<int> text_ids = clip.tokenize_public(desc);
+
+    const int saved_params = CSencryption::params;
+    std::map<std::string, double> cache;
+    std::string best_path;
+    double best_score = -1e100;
+    float best_coef = coef;
+    float best_tv = tv_lambda;
+    int best_iters = iterations;
+    int trial_no = 0;
+
+    const char* best_label = "auto";
+    auto eval_point = [&](float c, float tv, int it, const char* label) -> int {
+        // key includes the label: the AUTO trial's derived params are
+        // unknown to the CLI, so its score must not collide with a manual
+        // trial that happens to share the CLI-default numbers
+        char key[80];
+        std::snprintf(key, sizeof(key), "%s|%.4f|%.4f|%d", label, c, tv, it);
+        double s;
+        auto hit = cache.find(key);
+        if (hit != cache.end()) {
+            s = hit->second;
+            if (std::strcmp(label, "auto") == 0)
+                std::printf("trial %d [auto]: cached score %.4f\n", trial_no, s);
+            else
+                std::printf("trial %d [%s] coef=%.3f tv=%.3f iters=%d: cached score %.4f%s\n",
+                    trial_no, label, c, tv, it, s, s > best_score ? " *" : "");
+        } else {
+            const std::string cand = output + ".tune" + std::to_string(trial_no) + ".png";
+            int rc;
+            if (std::strcmp(label, "auto") == 0) {
+                CSencryption::params = AUTO_PARAM;
+                rc = decrypt_image::decrypt_image_tiled(enc, cand, password,
+                    tiles, overlap, iterations, threads, coef, show_preview,
+                    denoise, tv_lambda, dict_path, full_res);
+            } else {
+                CSencryption::params = MANUAL_PARAM;
+                rc = decrypt_image::decrypt_image_tiled(enc, cand, password,
+                    24, 24, it, threads, c, show_preview,
+                    denoise, tv, dict_path, full_res);
+            }
+            if (rc != 0) {
+                std::cerr << "trial " << trial_no << " decrypt failed (code " << rc << ")" << std::endl;
+                std::remove(cand.c_str());
+                CSencryption::params = saved_params;
+                return 1;
+            }
+            cv::Mat img = cv::imread(cand, cv::IMREAD_COLOR);
+            const float cs = clip.score_embed(text_ids, img);
+            const double rs = measurement_mae(enc, password, img);
+            s = alpha * cs - beta * rs;
+            cache[key] = s;
+            const bool is_auto = std::strcmp(label, "auto") == 0;
+            if (is_auto)
+                std::printf("trial %d [auto, derived params]: CLIP %.4f resid %.4f score %.4f%s\n",
+                    trial_no, cs, rs, s, s > best_score ? " *" : "");
+            else
+                std::printf("trial %d [%s] coef=%.3f tv=%.3f iters=%d: CLIP %.4f resid %.4f score %.4f%s\n",
+                    trial_no, label, c, tv, it, cs, rs, s, s > best_score ? " *" : "");
+            if (s > best_score) {
+                if (!best_path.empty()) std::remove(best_path.c_str());
+                best_score = s;
+                best_path = cand;
+                best_coef = c; best_tv = tv; best_iters = it;
+                best_label = label;
+            } else {
+                std::remove(cand.c_str());
+            }
+        }
+        // note: a cache hit can never beat best_score (same value was
+        // already considered), so best_path always names a live file
+        ++trial_no;
+        return 0;
+    };
+
+    int rc = 0;
+    // coef grid spans the MANUAL legal range (0.01, 0.05); note AUTO derives
+    // its own coef inside decrypt (e.g. 0.075 at ratio 0.25), which may lie
+    // outside this range — the manual trials explore the legal neighborhood
+    const float coef_grid[] = { 0.01f, 0.02f, 0.03f, 0.045f };
+    const float tv_grid[] = { 0.0f, 0.05f, 0.2f };
+    const int iter_grid[] = { 4, 6, 8 };
+    for (int r = 0; r < rounds && rc == 0; ++r) {
+        std::printf("--- tune round %d ---\n", r + 1);
+        rc = eval_point(coef, tv_lambda, iterations, r == 0 ? "auto" : "auto");
+        for (float c : coef_grid) {
+            if (rc != 0) break;
+            rc = eval_point(c, best_tv, best_iters, "coef");
+        }
+        for (float tv : tv_grid) {
+            if (rc != 0) break;
+            rc = eval_point(best_coef, tv, best_iters, "tv");
+        }
+        for (int it : iter_grid) {
+            if (rc != 0) break;
+            rc = eval_point(best_coef, best_tv, it, "iters");
+        }
+    }
+    CSencryption::params = saved_params;
+    if (rc != 0) {
+        if (!best_path.empty()) std::remove(best_path.c_str());
+        return rc;
+    }
+    if (std::strcmp(best_label, "auto") == 0)
+        std::printf("tuned: AUTO params kept (score %.4f)\n", best_score);
+    else
+        std::printf("tuned coef=%.3f tv=%.3f iters=%d (score %.4f)\n",
+            best_coef, best_tv, best_iters, best_score);
+    std::remove(output.c_str());
+    if (std::rename(best_path.c_str(), output.c_str()) != 0) {
+        std::cerr << "Error: cannot rename best trial to output" << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -284,6 +471,10 @@ int main(int argc, char* argv[])
     std::string desc;
     int restarts = 4;
     std::string clip_dir;
+    bool tune = false;
+    int tune_rounds = 1;
+    double tune_alpha = 1.0;
+    double tune_beta = 0.005;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -407,6 +598,27 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             clip_dir = v;
         }
+        else if (a == "--tune") {
+            tune = true;
+        }
+        else if (a == "--tune-rounds") {
+            const char* v = next("integer");
+            if (!v || !parse_int(v, tune_rounds)) return 64;
+            if (tune_rounds < 1) {
+                std::cerr << "Error: --tune-rounds must be >= 1" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--tune-alpha") {
+            const char* v = next("floating point");
+            if (!v) return 64;
+            tune_alpha = std::atof(v);
+        }
+        else if (a == "--tune-beta") {
+            const char* v = next("floating point");
+            if (!v) return 64;
+            tune_beta = std::atof(v);
+        }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
             print_usage(argv[0]);
@@ -427,6 +639,18 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --desc is decrypt-side only; ignoring for encrypt" << std::endl;
         desc.clear();
     }
+    if (tune && mode == "encrypt") {
+        std::cerr << "Warning: --tune is decrypt-side only; ignoring for encrypt" << std::endl;
+        tune = false;
+    }
+    if (tune && desc.empty()) {
+        std::cerr << "Error: --tune requires --desc" << std::endl;
+        return 64;
+    }
+    if (tune && restarts != 4) {
+        std::cerr << "Error: --tune cannot be combined with --restarts" << std::endl;
+        return 64;
+    }
 
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;
 
@@ -442,7 +666,12 @@ int main(int argc, char* argv[])
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, adaptive, adaptive_floor, adaptive_strength, show_mask, full_res);
         }
         else if (mode == "decrypt") {
-            if (desc.empty()) {
+            if (tune) {
+                rc = run_tune(input, cv::Mat(), output, password,
+                    tiles, overlap, iterations, threads, coef, show_preview, denoise,
+                    tv_lambda, dict_path, full_res, desc, clip_dir,
+                    tune_rounds, tune_alpha, tune_beta);
+            } else if (desc.empty()) {
                 rc = decrypt_image::decrypt_image_tiled(input, output, password,
                     tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
             } else {
@@ -455,7 +684,12 @@ int main(int argc, char* argv[])
             cv::Mat encrypted;
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, adaptive, adaptive_floor, adaptive_strength, show_mask, full_res);
             if (rc == 0) {
-                if (desc.empty()) {
+                if (tune) {
+                    rc = run_tune(std::string(), encrypted, output, password,
+                        tiles, overlap, iterations, threads, coef, show_preview, denoise,
+                        tv_lambda, dict_path, full_res, desc, clip_dir,
+                        tune_rounds, tune_alpha, tune_beta);
+                } else if (desc.empty()) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
                 } else {
