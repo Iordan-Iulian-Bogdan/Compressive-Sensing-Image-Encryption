@@ -492,7 +492,7 @@ int decrypt_image::decrypt_image_tiled(
         {
             coef = (1.0f / dimgs.get_compression_ratio()) * 0.01875f;
         }
-        num_tiles = 24;
+        num_tiles = 1;
         overlap = 24;
         nun_threads = omp_get_max_threads();
     }

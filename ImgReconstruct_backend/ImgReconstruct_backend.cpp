@@ -28,7 +28,8 @@ void print_usage(const char* exe) {
 "Options:\n"
         "  --password <pw>       passphrase (else $CS_PASSWORD, else interactive prompt)\n"
         "  --ratio <f>           encryption sampling ratio in (0.001, 1.0]; default 1.0\n"
-        "  --tiles <n>           decrypt tile count >= 1 (manual mode only)\n"
+        "  --tiles <n>           decrypt tile count >= 1 (manual mode only,\n"
+        "                        default 1: whole image is one tile)\n"
         "  --overlap <n>         decrypt tile overlap in (24, 96) (manual mode only)\n"
         "  --iterations <n>      decrypt solver iterations (manual mode only)\n"
         "  --threads <n>         decrypt worker threads (manual mode only)\n"
@@ -327,7 +328,7 @@ int run_tune(const std::string& input_path, const cv::Mat& encrypted,
             } else {
                 CSencryption::params = MANUAL_PARAM;
                 rc = decrypt_image::decrypt_image_tiled(enc, cand, password,
-                    24, 24, it, threads, c, show_preview,
+                    tiles, overlap, it, threads, c, show_preview,
                     denoise, tv, dict_path, full_res);
             }
             if (rc != 0) {
@@ -454,7 +455,7 @@ int main(int argc, char* argv[])
     std::string password;
     bool have_password = false;
     float ratio = 1.0f;
-    int tiles = 24, overlap = 24, iterations = 5, threads = 8;
+    int tiles = 1, overlap = 24, iterations = 5, threads = 8;
     float coef = 0.01f;
     float tv_lambda = 0.0f;
     std::string dict_path;
