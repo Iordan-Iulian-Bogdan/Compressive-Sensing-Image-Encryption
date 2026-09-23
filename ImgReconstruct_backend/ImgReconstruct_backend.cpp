@@ -1,6 +1,7 @@
 ﻿#include "image_decryption.hpp"
 #include "image_encryption.hpp"
 #include "quality_utils.hpp"
+#include "clip_scorer.hpp"
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <cstring>
@@ -64,6 +65,14 @@ void print_usage(const char* exe) {
         "  --full-res            keep native resolution end-to-end (skip the\n"
         "                        default encrypt 2x downscale and decrypt\n"
         "                        2x upscale); use on encrypt AND decrypt/roundtrip\n"
+        "  --desc <text>         CLIP restart selection: decrypt N candidates\n"
+        "                        with perturbed warm-starts and keep the one\n"
+        "                        scoring highest against this description\n"
+        "                        (decrypt/roundtrip only; needs models/clip/)\n"
+        "  --restarts <n>        candidate count for --desc (default 4, >= 1;\n"
+        "                        candidate 0 is the unperturbed decrypt)\n"
+        "  --clip-dir <dir>      CLIP model directory (default models/clip\n"
+        "                        or $CS_CLIP_DIR)\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
         "  compare scores decryption quality (PSNR/SSIM/MAE/max) and writes\n"
@@ -155,6 +164,60 @@ bool parse_float(const char* s, float& out) {
     catch (...) { return false; }
 }
 
+// CLIP restart selection: decrypt N candidates (candidate 0 unperturbed,
+// rest with seeded warm-start noise) and keep the highest-scoring one.
+// input_path is used for decrypt mode; encrypted (non-empty) for roundtrip.
+int run_clip_selection(const std::string& input_path, const cv::Mat& encrypted,
+    const std::string& output, const std::string& password,
+    int tiles, int overlap, int iterations, int threads, float coef,
+    bool show_preview, bool denoise, float tv_lambda, const std::string& dict_path,
+    bool full_res, const std::string& desc, int restarts, const std::string& clip_dir)
+{
+    ClipScorer clip;
+    if (!clip.load(clip_dir)) {
+        std::cerr << "Error: CLIP load failed: " << clip.error() << std::endl;
+        std::cerr << "Run scripts\\download_clip.ps1 first (models/clip/)" << std::endl;
+        return 2;
+    }
+    std::string best_path;
+    float best_score = -2.0f;
+    for (int k = 0; k < restarts; ++k) {
+        const int seed = (k == 0) ? -1 : (k - 1);
+        const std::string cand = output + ".cand" + std::to_string(k) + ".png";
+        int rc;
+        if (!input_path.empty())
+            rc = decrypt_image::decrypt_image_tiled(input_path, cand, password,
+                tiles, overlap, iterations, threads, coef, show_preview,
+                denoise, tv_lambda, dict_path, full_res, seed);
+        else
+            rc = decrypt_image::decrypt_image_tiled(encrypted, cand, password,
+                tiles, overlap, iterations, threads, coef, show_preview,
+                denoise, tv_lambda, dict_path, full_res, seed);
+        if (rc != 0) {
+            std::cerr << "candidate " << k << " decrypt failed (code " << rc << ")" << std::endl;
+            std::remove(cand.c_str());
+            return 1;
+        }
+        cv::Mat img = cv::imread(cand, cv::IMREAD_COLOR);
+        const float s = clip.score(img, desc);
+        std::printf("candidate %d (seed %d): CLIP %.4f\n", k, seed, s);
+        if (s > best_score) {
+            if (!best_path.empty()) std::remove(best_path.c_str());
+            best_score = s;
+            best_path = cand;
+        } else {
+            std::remove(cand.c_str());
+        }
+    }
+    std::printf("selected %s (CLIP %.4f)\n", best_path.c_str(), best_score);
+    std::remove(output.c_str());
+    if (std::rename(best_path.c_str(), output.c_str()) != 0) {
+        std::cerr << "Error: cannot rename best candidate to output" << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -218,6 +281,9 @@ int main(int argc, char* argv[])
     float adaptive_strength = 0.5f;
     bool show_mask = false;
     bool full_res = false;
+    std::string desc;
+    int restarts = 4;
+    std::string clip_dir;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -323,6 +389,24 @@ int main(int argc, char* argv[])
             // both sides: skip encrypt 2x downscale AND decrypt 2x upscale
             full_res = true;
         }
+        else if (a == "--desc") {
+            const char* v = next("description text");
+            if (!v) return 64;
+            desc = v;
+        }
+        else if (a == "--restarts") {
+            const char* v = next("integer");
+            if (!v || !parse_int(v, restarts)) return 64;
+            if (restarts < 1) {
+                std::cerr << "Error: --restarts must be >= 1" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--clip-dir") {
+            const char* v = next("directory");
+            if (!v) return 64;
+            clip_dir = v;
+        }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
             print_usage(argv[0]);
@@ -339,6 +423,11 @@ int main(int argc, char* argv[])
         return 64;
     }
 
+    if (!desc.empty() && mode == "encrypt") {
+        std::cerr << "Warning: --desc is decrypt-side only; ignoring for encrypt" << std::endl;
+        desc.clear();
+    }
+
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -353,15 +442,27 @@ int main(int argc, char* argv[])
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, adaptive, adaptive_floor, adaptive_strength, show_mask, full_res);
         }
         else if (mode == "decrypt") {
-            rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
+            if (desc.empty()) {
+                rc = decrypt_image::decrypt_image_tiled(input, output, password,
+                    tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
+            } else {
+                rc = run_clip_selection(input, cv::Mat(), output, password,
+                    tiles, overlap, iterations, threads, coef, show_preview, denoise,
+                    tv_lambda, dict_path, full_res, desc, restarts, clip_dir);
+            }
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, adaptive, adaptive_floor, adaptive_strength, show_mask, full_res);
             if (rc == 0) {
-                rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
+                if (desc.empty()) {
+                    rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
+                        tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res);
+                } else {
+                    rc = run_clip_selection(std::string(), encrypted, output, password,
+                        tiles, overlap, iterations, threads, coef, show_preview, denoise,
+                        tv_lambda, dict_path, full_res, desc, restarts, clip_dir);
+                }
             }
         }
     }

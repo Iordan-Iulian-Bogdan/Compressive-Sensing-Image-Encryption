@@ -366,3 +366,9 @@ FodyWeavers.xsd
 *.exe
 # cmake build dir
 build/
+
+# CLIP models (downloaded via scripts/download_clip.ps1)
+models/
+
+# vendored ONNX Runtime binaries (see scripts/download_clip.ps1)
+third_party/

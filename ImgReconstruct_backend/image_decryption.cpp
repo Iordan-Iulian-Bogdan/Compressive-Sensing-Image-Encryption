@@ -333,10 +333,30 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
     }
 }
 
+// restart perturbation: seeded pixel-domain noise on the warm-start refs so
+// early-stopped L-BFGS trajectories diverge across restarts. refs live in the
+// DCT/10 domain; round-trip through IDCT, add noise in [0,1] pixel units,
+// forward DCT/10 again — the same convention createRefSolutions uses.
+static void perturb_restart_refs(cv::Mat refs[3], int seed_base, int ti, int tj) {
+    const float sigma = 0.02f * float(seed_base + 1);
+    for (int ch = 0; ch < 3; ++ch) {
+        if (refs[ch].empty()) continue;
+        cv::Mat pix = refs[ch].clone();
+        cv::dct(pix, pix, cv::DCT_INVERSE);
+        cv::RNG rng((uint64)(seed_base * 1000003LL + ti * 73856093LL + tj * 19349663LL + ch * 83492791LL + 17));
+        cv::Mat noise(pix.size(), pix.type());
+        rng.fill(noise, cv::RNG::NORMAL, 0.0, sigma);
+        pix += noise;
+        cv::dct(pix, pix, 0);
+        pix /= 10.0f;
+        refs[ch] = pix;
+    }
+}
+
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict, int restart_seed) {
 
     // we use a reference image as the initial solution for tiles without
     // neighbors (first wave); this helps speed up convergence
@@ -360,6 +380,8 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
 
                 cv::Mat x0[3];
                 build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, ycrcb, chroma_sub);
+                if (restart_seed >= 0)
+                    perturb_restart_refs(x0, restart_seed, i, j);
 
                 decrypt_image dimgs = decrypt_image(mats_in[i][j]);
                 dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb, chroma_sub, tv, dict);
@@ -389,10 +411,11 @@ int decrypt_image::decrypt_image_tiled(
     bool denoise,
     float tv,
     const std::string& dict_path,
-    bool full_res
+    bool full_res,
+    int restart_seed
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path, full_res);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path, full_res, restart_seed);
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -408,7 +431,8 @@ int decrypt_image::decrypt_image_tiled(
     bool denoise,
     float tv,
     const std::string& dict_path,
-    bool full_res
+    bool full_res,
+    int restart_seed
 ) {
     const cv::Mat& encrypted_img_g = encrypted_img_in;
     try {
@@ -564,7 +588,7 @@ int decrypt_image::decrypt_image_tiled(
     // resize-heavy coarse operators eat the 4x unknown reduction. Off by
     // default; kept as an opt-in speed/quality trade via the flags.
     decrypt_tiles_thread = std::thread(decrypt_tiles, nun_threads, std::ref(encrypted_image_tiles), std::ref(indices_reconfigured),
-        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false, tv, dict);
+        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false, tv, dict, restart_seed);
     decrypt_tiles_thread.join();
 
     if (show_preview) {

@@ -4,7 +4,7 @@ project(ImgReconstruct_backend LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs highgui photo)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs highgui photo dnn)
 find_package(OpenMP REQUIRED)
 if(NOT WIN32)
     # non-Windows crypto backend (Windows uses CNG / bcrypt)
@@ -29,6 +29,7 @@ endif()
 # core library shared by the CLI and the test suite
 add_library(cs_core STATIC
     ImgReconstruct_backend/CS_encryption.cpp
+    ImgReconstruct_backend/clip_scorer.cpp
     ImgReconstruct_backend/crypto_utils.cpp
     ImgReconstruct_backend/helper_functions.cpp
     ImgReconstruct_backend/image_decryption.cpp
@@ -36,6 +37,17 @@ add_library(cs_core STATIC
     ImgReconstruct_backend/lbfgs.cpp
 )
 target_include_directories(cs_core PUBLIC ImgReconstruct_backend)
+if(WIN32)
+    # ONNX Runtime (CLIP scorer); headers + import lib vendored under third_party.
+    # Delay-loaded so the CLI still starts when onnxruntime.dll is absent;
+    # the scorer then reports a clean error instead of a loader failure.
+    target_include_directories(cs_core PRIVATE ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include)
+    target_link_libraries(cs_core PUBLIC ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib/onnxruntime.lib)
+    if(MSVC)
+        target_link_options(cs_core PUBLIC /DELAYLOAD:onnxruntime.dll)
+        target_link_libraries(cs_core PUBLIC delayimp.lib)
+    endif()
+endif()
 # quality_utils.hpp lives next to the core sources; tests include it from there
 target_link_libraries(cs_core PUBLIC ${OpenCV_LIBS} OpenMP::OpenMP_CXX)
 if(NOT WIN32)
