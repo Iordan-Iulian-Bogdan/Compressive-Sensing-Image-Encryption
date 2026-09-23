@@ -370,7 +370,7 @@ int run_tune(const std::string& input_path, const cv::Mat& encrypted,
     // outside this range — the manual trials explore the legal neighborhood
     const float coef_grid[] = { 0.01f, 0.02f, 0.03f, 0.045f };
     const float tv_grid[] = { 0.0f, 0.05f, 0.2f };
-    const int iter_grid[] = { 4, 6, 8 };
+    const int iter_grid[] = { 5, 8, 12, 16 };
     for (int r = 0; r < rounds && rc == 0; ++r) {
         std::printf("--- tune round %d ---\n", r + 1);
         rc = eval_point(coef, tv_lambda, iterations, r == 0 ? "auto" : "auto");
