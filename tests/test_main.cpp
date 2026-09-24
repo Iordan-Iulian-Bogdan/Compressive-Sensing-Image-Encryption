@@ -255,6 +255,79 @@ cv::Mat encrypted;
 }
 
 // ---------------------------------------------------------------------------
+// 4b. FISTA solvers (reweighted-L1 single + SOMP-structured joint)
+// ---------------------------------------------------------------------------
+void test_fista_solvers() {
+    int s = -1;
+    check(cs_solver_from_name("owlqn", s) == 0 && s == CS_SOLVER_OWLQN, "fista: owlqn parses to 0");
+    check(cs_solver_from_name("fista", s) == 0 && s == CS_SOLVER_FISTA, "fista: fista parses to 1");
+    check(cs_solver_from_name("joint", s) == 0 && s == CS_SOLVER_FISTA_JOINT, "fista: joint parses to 2");
+    check(cs_solver_from_name("somp", s) == 0 && s == CS_SOLVER_FISTA_JOINT, "fista: somp aliases joint");
+    check(cs_solver_from_name("bogus", s) != 0, "fista: unknown solver name rejected");
+
+    const std::string password = "fista-test-password";
+    cv::Mat original = make_test_image(320, 240);
+    const std::string tmp_in = ".cs_test_fista_in.png";
+    const std::string tmp_out = ".cs_test_fista_out.png";
+    cv::imwrite(tmp_in, original);
+
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &encrypted) != 0) {
+        check(false, "fista: encrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+
+    const int solvers[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
+    const char* names[2] = { "fista", "joint" };
+    for (int k = 0; k < 2; ++k) {
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "fista: %s decrypt succeeds", names[k]);
+        const int rc = decrypt_image::decrypt_image_tiled(
+            encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, false, 0.0f, "", false, -1, solvers[k]);
+        check(rc == 0, tag);
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        std::snprintf(tag, sizeof(tag), "fista: %s output readable", names[k]);
+        check(!dec.empty(), tag);
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, original.size());
+            const double p = cs_quality::psnr(original, sized);
+            std::printf("       fista %s PSNR: %.2f dB\n", names[k], p);
+            std::snprintf(tag, sizeof(tag), "fista: %s PSNR finite and sane", names[k]);
+            check(std::isfinite(p) && p > 12.0, tag);
+        }
+    }
+
+    // native FISTA controls: few steps + single pass must still solve sanely
+    {
+        const int rc = decrypt_image::decrypt_image_tiled(
+            encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, false, 0.0f, "", false, -1,
+            CS_SOLVER_FISTA, 8, 1);
+        check(rc == 0, "fista: fista-iters/reweights override decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "fista: override output readable");
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, original.size());
+            const double p = cs_quality::psnr(original, sized);
+            std::printf("       fista override (8 iters, 1 pass) PSNR: %.2f dB\n", p);
+            check(std::isfinite(p) && p > 10.0, "fista: override PSNR finite and sane");
+        }
+    }
+    // invalid values rejected before the solve
+    check(decrypt_image::decrypt_image_tiled(
+        encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, false, 0.0f, "", false, -1,
+        CS_SOLVER_FISTA, 501, 2) == -1, "fista: fista-iters > 500 rejected");
+    check(decrypt_image::decrypt_image_tiled(
+        encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, false, 0.0f, "", false, -1,
+        99, 0, 2) == -1, "fista: unknown solver id rejected");
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // 5. adaptive sample-count budget (pure function) + full adaptive roundtrip
 // ---------------------------------------------------------------------------
 void test_adaptive_counts() {
@@ -398,6 +471,145 @@ void test_adaptive_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. two-pass coarse-to-fine sampling roundtrip
+// ---------------------------------------------------------------------------
+// Same container contract as Laplacian adaptive (mode=2 + lod bytes), so
+// decrypt needs no new flags; only the scoring path differs (pilot uniform
+// sample + cheap recon, residual-driven LOD).
+void test_twopass_roundtrip() {
+    const std::string password = "twopass-test-password";
+    cv::Mat original = make_test_image(480, 360);
+    const std::string tmp_in = ".cs_test_twopass_in.png";
+    const std::string tmp_out = ".cs_test_twopass_out.png";
+    cv::imwrite(tmp_in, original);
+
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &encrypted,
+        /*adaptive*/ true, 32, 0.5f, /*show_mask*/ false, /*full_res*/ false,
+        /*two_pass*/ true, 0.05f) != 0) {
+        check(false, "twopass roundtrip: encrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+    check(!encrypted.empty(), "twopass roundtrip: encrypt to memory");
+
+    const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+    check(flat.data[CS_OFF_PAD] == CS_MODE_ADAPTIVE, "twopass roundtrip: header mode=2");
+
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
+        "twopass roundtrip: decrypt succeeds");
+    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    check(!decrypted.empty(), "twopass roundtrip: decrypted file readable");
+    if (!decrypted.empty()) {
+        cv::Mat dec_sized;
+        cv::resize(decrypted, dec_sized, original.size());
+        const double p = cs_quality::psnr(original, dec_sized);
+        const double s = cs_quality::ssim(original, dec_sized);
+        std::printf("       twopass roundtrip PSNR (ratio 0.5): %.2f dB\n", p);
+        std::printf("       twopass roundtrip SSIM: %.4f\n", s);
+        // Regression guard (same weak-params band as the adaptive sibling
+        // test): broken scoring collapses to single-digit dB, so these
+        // floors catch miswired pilot/residual paths without over-fitting
+        // to solver noise. Head-to-head quality is covered by benches.
+        check(p > 14.0, "twopass roundtrip: PSNR > 14 dB at ratio 0.5");
+        if (s >= 0.0) check(s > 0.2, "twopass roundtrip: SSIM > 0.2");
+        else check(false, "twopass roundtrip: SSIM unavailable");
+    }
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 5c. LLM region-guided sampling roundtrip (canned parrot-style JSON)
+// ---------------------------------------------------------------------------
+// Inline --regions JSON blends box-weighted tile scores over the signal
+// base; container stays mode=2 so decrypt is unchanged. Malformed JSON must
+// fail the encrypt (return -1), never crash.
+void test_regions_roundtrip() {
+    const std::string password = "regions-test-password";
+    cv::Mat original = make_test_image(480, 360);
+    const std::string tmp_in = ".cs_test_regions_in.png";
+    const std::string tmp_out = ".cs_test_regions_out.png";
+    cv::imwrite(tmp_in, original);
+
+    // parrot-style spec: head box (highest) + wing box, 0-1000 coords
+    const std::string regions =
+        "{\"regions\": ["
+        "{\"box\": [325,165,605,445], \"detail\": 1.0, \"label\": \"head\"}, "
+        "{\"box\": [367,512,825,996], \"detail\": 0.75, \"label\": \"wing\"}, "
+        "{\"box\": [290,330,405,985], \"detail\": 0.5}"
+        "]}";
+
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &encrypted,
+        /*adaptive*/ true, 32, 0.5f, /*show_mask*/ false, /*full_res*/ false,
+        /*two_pass*/ false, 0.05f, regions, 0.5f) != 0) {
+        check(false, "regions roundtrip: encrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+    check(!encrypted.empty(), "regions roundtrip: encrypt to memory");
+
+    const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+    check(flat.data[CS_OFF_PAD] == CS_MODE_ADAPTIVE, "regions roundtrip: header mode=2");
+
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
+        "regions roundtrip: decrypt succeeds");
+    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    check(!decrypted.empty(), "regions roundtrip: decrypted file readable");
+    if (!decrypted.empty()) {
+        cv::Mat dec_sized;
+        cv::resize(decrypted, dec_sized, original.size());
+        const double p = cs_quality::psnr(original, dec_sized);
+        const double s = cs_quality::ssim(original, dec_sized);
+        std::printf("       regions roundtrip PSNR (ratio 0.5): %.2f dB\n", p);
+        std::printf("       regions roundtrip SSIM: %.4f\n", s);
+        check(p > 14.0, "regions roundtrip: PSNR > 14 dB at ratio 0.5");
+        if (s >= 0.0) check(s > 0.2, "regions roundtrip: SSIM > 0.2");
+        else check(false, "regions roundtrip: SSIM unavailable");
+    }
+
+    // malformed JSON rejected (no crash, no container)
+    cv::Mat bad;
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &bad,
+        true, 32, 0.5f, false, false, false, 0.05f, "{not json", 0.5f) != 0,
+        "regions roundtrip: malformed JSON rejected");
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &bad,
+        true, 32, 0.5f, false, false, false, 0.05f, "{\"regions\": [{\"label\": \"nobox\"}]}", 0.5f) != 0,
+        "regions roundtrip: region without box rejected");
+
+    // empty array degrades to the signal base gracefully
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &bad,
+        true, 32, 0.5f, false, false, false, 0.05f, "{\"regions\": []}", 0.5f) == 0,
+        "regions roundtrip: empty array falls back to base");
+
+    // single-quoted variant (PowerShell-safe spelling) parses identically
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &bad,
+        true, 32, 0.5f, false, false, false, 0.05f, "{'regions': [{'box': [0,0,1000,1000], 'detail': 1}]}", 0.5f) == 0,
+        "regions roundtrip: single quotes accepted");
+
+    // smoothed density field decrypts through the same mode-2 container
+    cv::Mat smoothed;
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &smoothed,
+        true, 32, 0.5f, false, false, false, 0.05f, regions, 0.5f, 1.5f) == 0,
+        "regions roundtrip: smoothed encrypt succeeds");
+    if (!smoothed.empty()) {
+        check(decrypt_image::decrypt_image_tiled(smoothed, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
+            "regions roundtrip: smoothed decrypt succeeds");
+        cv::Mat sdec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        if (!sdec.empty()) {
+            cv::Mat sized;
+            cv::resize(sdec, sized, original.size());
+            check(cs_quality::psnr(original, sized) > 14.0, "regions roundtrip: smoothed PSNR sane");
+        }
+    }
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // 6. photo-based roundtrip (second data point on real image statistics)
 // ---------------------------------------------------------------------------
 // Photos are gitignored (*.png), so this test is opt-in: it runs when a real
@@ -483,8 +695,11 @@ int main() {
     test_shuffle();
     test_tile_helpers();
     test_roundtrip();
+    test_fista_solvers();
     test_adaptive_counts();
     test_adaptive_roundtrip();
+    test_twopass_roundtrip();
+    test_regions_roundtrip();
     test_photo_roundtrip();
 
     if (g_failures == 0) {

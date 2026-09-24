@@ -31,7 +31,8 @@ public:
     // flat tiles are never starved. adaptive_strength in [0,1] scales LOD bias
     // (0=uniform, 0.5=default, 1=max). Writes mode=2 + lod + weight_base.
     void encrypt_adaptive(const float& pixel_p, const std::string& password, int tile_size,
-        int lod_min, int weight_base = 256);
+        int lod_min, int weight_base = 256, bool two_pass = false, float pilot_ratio = 0.05f,
+        const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f);
 
     void writeEncryptedImageToDisk(const std::string& output_path);
 
@@ -59,9 +60,17 @@ public:
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
     */
-    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false);
+    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f);
 
 private:
+    // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at
+    // pilot_ratio of each tile's pixels, cheap per-tile FISTA recon, then
+    // per-tile MSE vs the source becomes the LOD byte (same grid layout and
+    // min-max + floor normalization as the Laplacian path). Requires the
+    // derived cs_key (pilot draw is keyed deterministically). Pilot positions
+    // are scoring-only and discarded; the final budget draw reuses the
+    // standard adaptive path, so container format and decrypt are unchanged.
+    std::vector<uint8_t> compute_twopass_lod(int tile_size, int lod_min, float pilot_ratio);
 };
 
 /** @brief encrypts a given image and writes the result to disk

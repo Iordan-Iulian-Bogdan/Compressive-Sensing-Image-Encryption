@@ -148,6 +148,40 @@ float evaluate_stacked(
 
 void reconstruct_color_channel(const cv::Mat& measurement, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat(), float tv = 0.0f);
 
+/** @brief solver selector for the tile reconstruction (see --solver).
+OWLQN (0) is the legacy liblbfgs path; FISTA (1) solves each channel
+independently with reweighted-L1 FISTA; FISTA_JOINT (2) solves all three
+channels together with SOMP-structured joint (group-L2,1) sparsity, i.e.
+one common DCT support shared across R/G/B plus reweighting.
+*/
+enum CsSolver {
+    CS_SOLVER_OWLQN = 0,
+    CS_SOLVER_FISTA = 1,
+    CS_SOLVER_FISTA_JOINT = 2
+};
+
+int cs_solver_from_name(const std::string& name, int& out);
+
+/** @brief single-channel reweighted-L1 FISTA (exact proximal soft-threshold
+instead of the OWL-QN pseudo-gradient). `iterations` is in L-BFGS units and
+is scaled internally (each outer reweight gets clamp(iterations*4,16,40)
+FISTA steps); `reweights` counts outer passes (first unweighted).
+Same ref convention as reconstruct_color_channel (DCT/10 warm start in,
+pixel plane 0..255 out after the tail scale).
+*/
+void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat(),
+    float tv = 0.0f, int reweights = 2, int fista_iters = 0);
+
+/** @brief SOMP-structured joint RGB solve: stacked group-L2,1 FISTA with
+reweighting. refs[3] hold per-channel DCT/10 warm starts in, solved pixel
+planes (CV_32F, 0..255, full tile size) out, ready for cv::merge.
+*/
+void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat refs[3], float tv = 0.0f, int reweights = 2, int fista_iters = 0);
+
 /** @brief solves ONE chroma plane at half resolution (4:2:0-style subsampling).
 The unknown is a (rows+1)/2 x (cols+1)/2 DCT plane; the forward operator
 IDCTs it, upsamples it back to the full tile grid and gathers the scattered

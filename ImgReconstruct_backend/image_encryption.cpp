@@ -2,10 +2,194 @@
 #include <opencv2/highgui.hpp>
 #include <cstring>
 #include <cmath>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <random>
 #include <algorithm>
 #include <iostream>
 
 namespace {
+// LLM region spec: box in 0-1000 normalized coords (origin top-left),
+// detail in [0,1]. Passed inline via --regions as
+// {"regions": [{"box": [x0,y0,x1,y1], "detail": 1.0, "label": "..."}]}.
+struct LlmRegion {
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    double detail = 1.0;
+};
+
+void regions_skip_ws(const std::string& s, size_t& p) {
+    while (p < s.size() && std::isspace((unsigned char)s[p])) ++p;
+}
+
+void regions_expect(const std::string& s, size_t& p, char c, const char* ctx) {
+    regions_skip_ws(s, p);
+    if (p >= s.size() || s[p] != c) {
+        throw std::runtime_error(std::string("regions: expected '") + c + "' " + ctx);
+    }
+    ++p;
+}
+
+double regions_number(const std::string& s, size_t& p, const char* ctx) {
+    regions_skip_ws(s, p);
+    const char* b = s.c_str() + p;
+    char* e = nullptr;
+    const double v = std::strtod(b, &e);
+    if (e == b) {
+        throw std::runtime_error(std::string("regions: bad number ") + ctx);
+    }
+    p = (size_t)(e - s.c_str());
+    return v;
+}
+
+std::string regions_string(const std::string& s, size_t& p) {
+    regions_skip_ws(s, p);
+    // double or single quotes (single-quoted JSON survives Windows
+    // PowerShell 5.1 native-arg passing, which strips embedded "...")
+    if (p >= s.size() || (s[p] != '"' && s[p] != '\'')) {
+        throw std::runtime_error("regions: expected string key");
+    }
+    const char q = s[p];
+    ++p;
+    std::string out;
+    while (p < s.size() && s[p] != q) {
+        if (s[p] == '\\' && p + 1 < s.size()) {
+            ++p;
+            out.push_back(s[p++]);
+        } else {
+            out.push_back(s[p++]);
+        }
+    }
+    if (p >= s.size()) {
+        throw std::runtime_error("regions: unterminated string");
+    }
+    ++p;
+    return out;
+}
+
+// skip one JSON value (string/number/array/object/literal) for unknown keys
+void regions_skip_value(const std::string& s, size_t& p) {
+    regions_skip_ws(s, p);
+    if (p >= s.size()) {
+        throw std::runtime_error("regions: unexpected end");
+    }
+    if (s[p] == '"') {
+        regions_string(s, p);
+    } else if (s[p] == '[') {
+        ++p;
+        regions_skip_ws(s, p);
+        if (p < s.size() && s[p] == ']') { ++p; return; }
+        while (true) {
+            regions_skip_value(s, p);
+            regions_skip_ws(s, p);
+            if (p < s.size() && s[p] == ',') { ++p; continue; }
+            break;
+        }
+        regions_expect(s, p, ']', "closing array");
+    } else if (s[p] == '{') {
+        ++p;
+        regions_skip_ws(s, p);
+        if (p < s.size() && s[p] == '}') { ++p; return; }
+        while (true) {
+            regions_string(s, p);
+            regions_expect(s, p, ':', "after key");
+            regions_skip_value(s, p);
+            regions_skip_ws(s, p);
+            if (p < s.size() && s[p] == ',') { ++p; continue; }
+            break;
+        }
+        regions_expect(s, p, '}', "closing object");
+    } else {
+        while (p < s.size() && s[p] != ',' && s[p] != ']' && s[p] != '}') ++p;
+    }
+}
+
+std::vector<LlmRegion> parse_regions_json(const std::string& s) {
+    size_t p = 0;
+    regions_expect(s, p, '{', "at top level");
+    bool have_regions = false;
+    std::vector<LlmRegion> out;
+    regions_skip_ws(s, p);
+    if (p < s.size() && s[p] == '}') return out; // {} -> no regions key
+    while (true) {
+        const std::string key = regions_string(s, p);
+        regions_expect(s, p, ':', "after key");
+        if (key == "regions") {
+            have_regions = true;
+            regions_expect(s, p, '[', "after \"regions\"");
+            regions_skip_ws(s, p);
+            if (p < s.size() && s[p] == ']') { ++p; }
+            else {
+                while (true) {
+                    regions_expect(s, p, '{', "opening region");
+                    LlmRegion r;
+                    bool have_box = false;
+                    regions_skip_ws(s, p);
+                    if (p >= s.size() || s[p] == '}') {
+                        throw std::runtime_error("regions: empty region object");
+                    }
+                    while (true) {
+                        const std::string k = regions_string(s, p);
+                        regions_expect(s, p, ':', "after region key");
+                        if (k == "box") {
+                            regions_expect(s, p, '[', "after \"box\"");
+                            r.x0 = regions_number(s, p, "in box");
+                            regions_expect(s, p, ',', "in box");
+                            r.y0 = regions_number(s, p, "in box");
+                            regions_expect(s, p, ',', "in box");
+                            r.x1 = regions_number(s, p, "in box");
+                            regions_expect(s, p, ',', "in box");
+                            r.y1 = regions_number(s, p, "in box");
+                            regions_expect(s, p, ']', "closing box");
+                            have_box = true;
+                        } else if (k == "detail") {
+                            r.detail = regions_number(s, p, "for detail");
+                        } else {
+                            regions_skip_value(s, p); // label and friends
+                        }
+                        regions_skip_ws(s, p);
+                        if (p < s.size() && s[p] == ',') { ++p; continue; }
+                        break;
+                    }
+                    regions_expect(s, p, '}', "closing region");
+                    if (!have_box) {
+                        throw std::runtime_error("regions: region without \"box\"");
+                    }
+                    // sanitize: clamp to [0,1000], fix inverted, drop empty
+                    r.x0 = (std::max)(0.0, (std::min)(1000.0, r.x0));
+                    r.x1 = (std::max)(0.0, (std::min)(1000.0, r.x1));
+                    r.y0 = (std::max)(0.0, (std::min)(1000.0, r.y0));
+                    r.y1 = (std::max)(0.0, (std::min)(1000.0, r.y1));
+                    if (r.x0 > r.x1) std::swap(r.x0, r.x1);
+                    if (r.y0 > r.y1) std::swap(r.y0, r.y1);
+                    r.detail = (std::max)(0.0, (std::min)(1.0, r.detail));
+                    if (r.x1 > r.x0 && r.y1 > r.y0) {
+                        out.push_back(r);
+                    }
+                    regions_skip_ws(s, p);
+                    if (p < s.size() && s[p] == ',') { ++p; continue; }
+                    break;
+                }
+                regions_expect(s, p, ']', "closing regions");
+            }
+        } else {
+            regions_skip_value(s, p);
+        }
+        regions_skip_ws(s, p);
+        if (p < s.size() && s[p] == ',') { ++p; continue; }
+        break;
+    }
+    regions_expect(s, p, '}', "at top level");
+    regions_skip_ws(s, p);
+    if (p != s.size()) {
+        throw std::runtime_error("regions: trailing characters after object");
+    }
+    if (!have_regions) {
+        throw std::runtime_error("regions: missing \"regions\" array");
+    }
+    return out;
+}
+
 // smallest perfect square >= x (the encrypted container is square)
 int next_perfect_square(int x) {
     int side = (int)std::ceil(std::sqrt((double)x));
@@ -317,18 +501,283 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
 }
 
+std::vector<uint8_t> encrypt_image::compute_twopass_lod(int tile_size, int lod_min, float pilot_ratio) {
+    if (tile_size <= 0) {
+        throw std::runtime_error("two-pass sampling: tile size must be positive");
+    }
+    lod_min = (std::max)(0, (std::min)(255, lod_min));
+    if (!cs_key_valid) {
+        throw std::runtime_error("two-pass sampling: key not derived");
+    }
+    if (pilot_ratio < 0.01f) pilot_ratio = 0.01f;
+    if (pilot_ratio > 0.25f) pilot_ratio = 0.25f;
+
+    const int rows_l = input_img.rows;
+    const int cols_l = input_img.cols;
+    const int tiles_cols = (cols_l + tile_size - 1) / tile_size;
+    const int tiles_rows = (rows_l + tile_size - 1) / tile_size;
+    const int nt = tiles_rows * tiles_cols;
+
+    // pilot RNG keyed deterministically (decrypt never sees these positions,
+    // but both encrypt runs with the same password+salt must agree)
+    uint32_t key_seed = 0;
+    std::memcpy(&key_seed, cs_key, sizeof(key_seed));
+
+    std::vector<float> energy((size_t)nt, 0.0f);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int t = 0; t < nt; ++t) {
+        const int tr = t / tiles_cols;
+        const int tc = t % tiles_cols;
+        const int row0 = tr * tile_size;
+        const int col0 = tc * tile_size;
+        const int tile_w = (tile_size < cols_l - col0) ? tile_size : cols_l - col0;
+        const int tile_h = (tile_size < rows_l - row0) ? tile_size : rows_l - row0;
+        const int tp = tile_w * tile_h;
+
+        // uniform pilot: fixed fraction of tile pixels, min 16 for scoring
+        // stability on small/edge tiles
+        int pilot_c = (int)std::lround((double)tp * pilot_ratio);
+        if (pilot_c < 16) pilot_c = 16;
+        if (pilot_c > tp) pilot_c = tp;
+
+        // partial Fisher-Yates over the tile (same draw style as the
+        // keyed index routines, seeded per tile)
+        std::vector<int> pool((size_t)tp);
+        for (int i = 0; i < tp; ++i) pool[(size_t)i] = i;
+        std::mt19937 rng(key_seed ^ (uint32_t)(t * 0x9E3779B1u + 0x85EBCA6Bu));
+        std::vector<int> lx;
+        std::vector<int> ly;
+        lx.reserve((size_t)pilot_c);
+        ly.reserve((size_t)pilot_c);
+        for (int k = 0; k < pilot_c; ++k) {
+            std::uniform_int_distribution<int> pick(k, tp - 1);
+            const int j = pick(rng);
+            std::swap(pool[(size_t)k], pool[(size_t)j]);
+            lx.push_back(pool[(size_t)k] / tile_w);
+            ly.push_back(pool[(size_t)k] % tile_w);
+        }
+
+        // cheap pilot recon: v1 ephemeral tile container + short per-channel
+        // FISTA solves (16 steps, single unweighted pass, B->G->R chained)
+        // from a DC warm start at the pilot mean — measures actual solver
+        // difficulty, not a proxy, with the stronger solver
+        cv::Mat tile = input_img(cv::Rect(col0, row0, tile_w, tile_h)).clone();
+        encrypt_image tile_enc(tile, false);
+        tile_enc.encrypt(lx, ly);
+        const cv::Mat cont = tile_enc.get_mat();
+
+        cv::Mat refs[3];
+        for (int ch = 0; ch < 3; ++ch) {
+            double mean = 0.0;
+            for (int k = 0; k < pilot_c; ++k) {
+                mean += tile.at<cv::Vec3b>(lx[k], ly[k])[ch] / 255.0;
+            }
+            mean /= pilot_c > 0 ? pilot_c : 1;
+            refs[ch] = cv::Mat(tile_h, tile_w, CV_32F, cv::Scalar(0));
+            // DCT/10 convention: DCT(const c) has DC = c*sqrt(n)
+            refs[ch].at<float>(0, 0) = (float)(mean * std::sqrt((double)tp) / 10.0);
+        }
+        constexpr float pilot_coef = 0.045f; // low-ratio regime, matches auto rule
+        constexpr int pilot_steps = 16;    // FISTA steps per channel (native
+        constexpr int pilot_passes = 1;    // units; single pass keeps it cheap)
+        reconstruct_color_channel_fista(cont, 0, pilot_coef, tile_h, tile_w, lx, ly, 0, refs[0], true, refs[1], 0.0f, pilot_passes, pilot_steps);
+        reconstruct_color_channel_fista(cont, 1, pilot_coef, tile_h, tile_w, lx, ly, 0, refs[1], true, refs[2], 0.0f, pilot_passes, pilot_steps);
+        reconstruct_color_channel_fista(cont, 2, pilot_coef, tile_h, tile_w, lx, ly, 0, refs[2], false, refs[2], 0.0f, pilot_passes, pilot_steps);
+
+        // per-tile MSE vs source in [0,1] units (refs hold 0..255 planes)
+        double se = 0.0;
+        for (int ch = 0; ch < 3; ++ch) {
+            const float* rp = (const float*)refs[ch].data;
+            for (int y = 0; y < tile_h; ++y) {
+                const cv::Vec3b* sp = tile.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < tile_w; ++x) {
+                    const double d = (rp[(size_t)y * tile_w + x] - sp[x][ch]) / 255.0;
+                    se += d * d;
+                }
+            }
+        }
+        float e = (float)(se / ((double)tp * 3.0));
+        if (!std::isfinite(e)) e = 1e6f; // solver blowup => needs samples
+        energy[(size_t)t] = e;
+    }
+
+    // same min-max + floor normalization as the Laplacian path
+    float e_min = energy[0], e_max = energy[0];
+    for (size_t i = 1; i < energy.size(); ++i) {
+        e_min = (std::min)(e_min, energy[i]);
+        e_max = (std::max)(e_max, energy[i]);
+    }
+    std::vector<uint8_t> lod((size_t)nt, (uint8_t)lod_min);
+    const float range = e_max - e_min;
+    for (size_t i = 0; i < energy.size(); ++i) {
+        float n = 0.0f;
+        if (range > 1e-9f) {
+            n = (energy[i] - e_min) / range;
+        }
+        int v = lod_min + (int)std::lround((double)n * (255 - lod_min));
+        lod[i] = (uint8_t)(std::max)(0, (std::min)(255, v));
+    }
+    return lod;
+}
+
+// Blend LLM region scores with a signal-metric base (Laplacian or
+// two-pass bytes): per-tile score = detail * box/tile overlap fraction,
+// unit-normalized, mixed with the unit-normalized base, then min-max mapped
+// to [lod_min, 255]. A zero-range LLM map (no regions / all identical)
+// falls back to the base untouched.
+std::vector<uint8_t> blend_llm_lod(const std::vector<uint8_t>& base,
+    const std::vector<LlmRegion>& regs, int rows_l, int cols_l, int tile_size,
+    int lod_min, float blend) {
+    const int tiles_cols = (cols_l + tile_size - 1) / tile_size;
+    const int tiles_rows = (rows_l + tile_size - 1) / tile_size;
+    const size_t nt = (size_t)tiles_rows * tiles_cols;
+    if (base.size() != nt) {
+        throw std::runtime_error("regions: base LOD grid mismatch");
+    }
+
+    std::vector<double> raw(nt, 0.0);
+    for (const auto& r : regs) {
+        const double rx0 = r.x0 / 1000.0 * cols_l;
+        const double rx1 = r.x1 / 1000.0 * cols_l;
+        const double ry0 = r.y0 / 1000.0 * rows_l;
+        const double ry1 = r.y1 / 1000.0 * rows_l;
+        int tc0 = (std::max)(0, (int)(rx0 / tile_size));
+        int tc1 = (std::min)(tiles_cols - 1, (int)((rx1 - 1e-9) / tile_size));
+        int tr0 = (std::max)(0, (int)(ry0 / tile_size));
+        int tr1 = (std::min)(tiles_rows - 1, (int)((ry1 - 1e-9) / tile_size));
+        for (int tr = tr0; tr <= tr1; ++tr) {
+            for (int tc = tc0; tc <= tc1; ++tc) {
+                const double col0 = (double)tc * tile_size;
+                const double row0 = (double)tr * tile_size;
+                const double tw = (std::min)((double)tile_size, (double)cols_l - col0);
+                const double th = (std::min)((double)tile_size, (double)rows_l - row0);
+                const double ix = (std::max)(0.0, (std::min)(rx1, col0 + tw) - (std::max)(rx0, col0));
+                const double iy = (std::max)(0.0, (std::min)(ry1, row0 + th) - (std::max)(ry0, row0));
+                if (ix > 0.0 && iy > 0.0) {
+                    raw[(size_t)tr * tiles_cols + tc] += r.detail * (ix * iy) / (tw * th);
+                }
+            }
+        }
+    }
+
+    double rmin = raw[0], rmax = raw[0];
+    for (size_t i = 1; i < raw.size(); ++i) {
+        rmin = (std::min)(rmin, raw[i]);
+        rmax = (std::max)(rmax, raw[i]);
+    }
+    if (rmax - rmin <= 1e-12) {
+        return base; // nothing to blend in
+    }
+
+    const double bden = (double)(255 - lod_min);
+    std::vector<double> mixed(nt);
+    for (size_t i = 0; i < nt; ++i) {
+        const double lunit = (raw[i] - rmin) / (rmax - rmin);
+        const double bunit = bden > 0.0 ? ((double)base[i] - lod_min) / bden : 0.0;
+        mixed[i] = (double)blend * lunit + (1.0 - (double)blend) * bunit;
+    }
+    double mmin = mixed[0], mmax = mixed[0];
+    for (size_t i = 1; i < mixed.size(); ++i) {
+        mmin = (std::min)(mmin, mixed[i]);
+        mmax = (std::max)(mmax, mixed[i]);
+    }
+    std::vector<uint8_t> lod(nt, (uint8_t)lod_min);
+    const double mrange = mmax - mmin;
+    for (size_t i = 0; i < mixed.size(); ++i) {
+        double n = 0.0;
+        if (mrange > 1e-12) {
+            n = (mixed[i] - mmin) / mrange;
+        }
+        const int v = lod_min + (int)std::lround(n * (255 - lod_min));
+        lod[i] = (uint8_t)(std::max)(0, (std::min)(255, v));
+    }
+    return lod;
+}
+
+// Gaussian smoothing of the LOD tile grid (sigma in tile units): removes
+// the abrupt per-tile density rectangles by spreading budget across tile
+// borders. The BLURRED bytes are shipped, so decrypt recomputes identical
+// counts with no format change; the largest-remainder split keeps the total
+// exactly m and the capacity clamp still holds. sigma <= 0 returns input.
+std::vector<uint8_t> smooth_lod_grid(const std::vector<uint8_t>& lod,
+    int rows_l, int cols_l, int tile_size, int lod_min, float sigma) {
+    if (sigma <= 0.0f) return lod;
+    if (sigma > 8.0f) sigma = 8.0f;
+    const int tiles_cols = (cols_l + tile_size - 1) / tile_size;
+    const int tiles_rows = (rows_l + tile_size - 1) / tile_size;
+    const size_t nt = (size_t)tiles_rows * tiles_cols;
+    if (lod.size() != nt || nt == 0) return lod;
+
+    const int radius = (std::min)((std::max)(tiles_cols, tiles_rows) - 1,
+        (int)std::ceil(3.0 * sigma));
+    std::vector<double> kernel((size_t)2 * radius + 1);
+    double ksum = 0.0;
+    for (int i = -radius; i <= radius; ++i) {
+        const double v = std::exp(-0.5 * (i / sigma) * (i / sigma));
+        kernel[(size_t)(i + radius)] = v;
+        ksum += v;
+    }
+    for (double& v : kernel) v /= ksum;
+
+    std::vector<double> f(nt);
+    for (size_t i = 0; i < nt; ++i) f[i] = lod[i];
+    std::vector<double> tmp(nt);
+    // separable passes with clamped edges
+    for (int tr = 0; tr < tiles_rows; ++tr) {
+        for (int tc = 0; tc < tiles_cols; ++tc) {
+            double acc = 0.0;
+            for (int i = -radius; i <= radius; ++i) {
+                const int cc = (std::max)(0, (std::min)(tiles_cols - 1, tc + i));
+                acc += kernel[(size_t)(i + radius)] * f[(size_t)tr * tiles_cols + cc];
+            }
+            tmp[(size_t)tr * tiles_cols + tc] = acc;
+        }
+    }
+    for (int tr = 0; tr < tiles_rows; ++tr) {
+        for (int tc = 0; tc < tiles_cols; ++tc) {
+            double acc = 0.0;
+            for (int i = -radius; i <= radius; ++i) {
+                const int rr = (std::max)(0, (std::min)(tiles_rows - 1, tr + i));
+                acc += kernel[(size_t)(i + radius)] * tmp[(size_t)rr * tiles_cols + tc];
+            }
+            f[(size_t)tr * tiles_cols + tc] = acc;
+        }
+    }
+
+    // restore full contrast (blur compresses range), then quantize
+    double fmin = f[0], fmax = f[0];
+    for (size_t i = 1; i < f.size(); ++i) {
+        fmin = (std::min)(fmin, f[i]);
+        fmax = (std::max)(fmax, f[i]);
+    }
+    std::vector<uint8_t> out(nt, (uint8_t)lod_min);
+    const double frange = fmax - fmin;
+    for (size_t i = 0; i < f.size(); ++i) {
+        double n = 0.0;
+        if (frange > 1e-9) n = (f[i] - fmin) / frange;
+        const int v = lod_min + (int)std::lround(n * (255 - lod_min));
+        out[i] = (uint8_t)(std::max)(0, (std::min)(255, v));
+    }
+    return out;
+}
+
 /** @brief Adaptive periodic encryption: score every tile with an 8-bit LOD
  * byte (mean |Laplacian|, min-max + floor), split the measurement budget m
  * across tiles proportional to those bytes, draw a distinct in-tile pattern
  * per tile, and ship the lod byte array in the body (mode=2). Decrypt
  * regenerates identical indices from (key, lod, m, geometry).
+ * With two_pass=true the LOD bytes come from a pilot uniform sample +
+ * cheap per-tile recon (residual scoring) instead of the Laplacian; the
+ * container format is identical so decrypt is unchanged.
  * @param pixel_p : sampling ratio (0.001 - 1.0)
  * @param password : encryption password
  * @param tile_size : adaptive grid tile size (must be > 0)
  * @param lod_min : floor byte so flat tiles keep a minimum sample share
  */
 void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& password, int tile_size,
-    int lod_min, int weight_base) {
+    int lod_min, int weight_base, bool two_pass, float pilot_ratio,
+    const std::string& regions_json, float region_blend, float lod_smooth) {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
     }
@@ -346,7 +795,22 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     }
     cs_key_valid = true;
 
-    const std::vector<uint8_t> lod = compute_adaptive_lod(input_img, tile_size, lod_min);
+    // LOD source priority: inline LLM regions (blended over the base) >
+    // two-pass residual > Laplacian. All three reuse the identical lod
+    // container layout, so decrypt is unchanged either way.
+    if (!regions_json.empty() && (region_blend < 0.0f || region_blend > 1.0f)) {
+        throw std::runtime_error("regions: blend must be in [0, 1]");
+    }
+    const std::vector<uint8_t> base_lod = two_pass
+        ? compute_twopass_lod(tile_size, lod_min, pilot_ratio)
+        : compute_adaptive_lod(input_img, tile_size, lod_min);
+    std::vector<uint8_t> lod = regions_json.empty()
+        ? base_lod
+        : blend_llm_lod(base_lod, parse_regions_json(regions_json),
+            rows, cols, tile_size, lod_min, region_blend);
+    // optional density smoothing: blurred bytes are shipped, so decrypt
+    // agrees exactly with no format change
+    lod = smooth_lod_grid(lod, rows, cols, tile_size, lod_min, lod_smooth);
     const int lod_bytes = (int)lod.size();
     const int lod_pixels = (lod_bytes + 2) / 3;
 
@@ -439,7 +903,12 @@ int encrypt_image::encrypt_image_tiled(
     int lod_min,
     float adaptive_strength,
     bool show_mask,
-    bool full_res
+    bool full_res,
+    bool two_pass,
+    float pilot_ratio,
+    const std::string& regions_json,
+    float region_blend,
+    float lod_smooth
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -475,10 +944,13 @@ int encrypt_image::encrypt_image_tiled(
         encrypt_image encrypt_img(input_img, true);
 
         if (adaptive) {
-            // LOD-based per-tile sampling; default grid when tile_size unset
+            // LOD-based per-tile sampling; default grid when tile_size unset.
+            // two_pass swaps the Laplacian scores for pilot-residual scores;
+            // container format is identical so decrypt needs no new flags.
             const int ts = tile_size > 0 ? tile_size : 64;
             const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
-            encrypt_img.encrypt_adaptive(compression_ratio, password, ts, lod_min, wbase);
+            encrypt_img.encrypt_adaptive(compression_ratio, password, ts, lod_min, wbase, two_pass, pilot_ratio,
+                regions_json, region_blend, lod_smooth);
         }
         else if (tile_size > 0) {
             // periodic tile-based sampling: one random per-tile pattern,

@@ -330,21 +330,303 @@ void reconstruct_color_channel(const cv::Mat& pixel_measurements, const int& k, 
     // LBFGS optimization
     lbfgs_ret = lbfgs(n, (float*)ref.data, data, &fx, evaluate, update_progress, NULL, &param);
 
-    // we are copying the current solution to the next solution for faster convergence
-    if (copy_next_ref) {
-        int i;
-        for (i = 0; i <= next_ref.total() - 8; i += 8) {
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(&next_ref.data[i]), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&ref.data[i])));
-        }
-
-        for (; i < next_ref.total(); i++) {
-            next_ref.data[i] = ref.data[i];
-        }
+    // we are copying the current solution to the next solution for faster convergence.
+    // NOTE: this used to stride i in bytes against total() (an element count),
+    // copying only the first quarter of the float plane; a full memcpy carries
+    // the whole solved plane (including correlated high frequencies) forward.
+    if (copy_next_ref && !next_ref.empty()) {
+        if (!next_ref.isContinuous()) next_ref = next_ref.clone();
+        std::memcpy(next_ref.data, ref.data, sizeof(float) * (size_t)n);
     }
 
     cv::Mat AtAxb2(rows, cols, CV_32F, (float*)ref.data);
     dct(AtAxb2, AtAxb2, cv::DCT_INVERSE);
     AtAxb2 = AtAxb2 * 255.0f;
+}
+
+// ---------------------------------------------------------------------------
+// FISTA + reweighted L1 + SOMP-structured joint sparsity
+// ---------------------------------------------------------------------------
+// Alternative to the OWL-QN (liblbfgs) path in reconstruct_color_channel.
+// The forward operator A = P * IDCT is a row-selected orthonormal DCT, so
+// ||A|| = 1 and the data term f(x) = ||Ax - b||^2 has Lipschitz constant
+// L = 2 exactly (plus ~8*tv when the smoothed-TV fusion is enabled). That
+// makes FISTA's proximal step exact and cheap: one IDCT + one DCT per
+// iteration, no line search, versus several evaluate() calls per OWL-QN
+// step. Reweighting (Candes et al.) runs 2 outer passes with normalized
+// weights w = eps/(|x|+eps) so large coefficients are protected while small
+// ones are pushed harder toward zero. The joint mode replaces the
+// per-channel independent solves with one group-L2,1 FISTA over the stacked
+// [R|G|B] planes: a single DCT support shared across channels, which is the
+// convex (and tractable) form of SOMP-style simultaneous greedy selection.
+// A literal greedy SOMP over ~170k DCT atoms per tile would need a full DCT
+// per candidate atom and is infeasible on CPU; group thresholding converges
+// to the same joint-support structure at the cost of one extra DCT per
+// channel per iteration.
+
+int cs_solver_from_name(const std::string& name, int& out) {
+    std::string s;
+    s.reserve(name.size());
+    for (char c : name) {
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        s.push_back(c);
+    }
+    if (s == "owlqn" || s == "lbfgs" || s == "owl-qn" || s == "0") { out = CS_SOLVER_OWLQN; return 0; }
+    if (s == "fista" || s == "1") { out = CS_SOLVER_FISTA; return 0; }
+    if (s == "joint" || s == "fista-joint" || s == "fistajoint" || s == "somp" || s == "2") { out = CS_SOLVER_FISTA_JOINT; return 0; }
+    return -1;
+}
+
+// Gradient of the smooth part in the DCT domain:
+//   g = 2*DCT(scatter(IDCT(y) - b)) [+ tv*DCT(tvgrad(IDCT(y)))].
+// pix/sc are scratch buffers of size n = rows*cols. pix holds the pixel
+// plane on exit (needed by the TV branch only).
+static void cs_fista_grad(const float* y, float* pix, float* sc, float* g,
+    const float* b, const int* rix, const int* riy, int m,
+    int rows, int cols, float tv_lambda)
+{
+    const int n = rows * cols;
+    std::memcpy(pix, y, sizeof(float) * (size_t)n);
+    cv::Mat P(rows, cols, CV_32F, pix);
+    cv::dct(P, P, cv::DCT_INVERSE);
+    std::memset(sc, 0, sizeof(float) * (size_t)n);
+    for (int k = 0; k < m; ++k) {
+        const int idx = rix[k] * cols + riy[k];
+        sc[idx] = pix[idx] - b[k];
+    }
+    cv::Mat S(rows, cols, CV_32F, sc);
+    cv::dct(S, S, 0);
+    for (int i = 0; i < n; ++i) g[i] = 2.0f * sc[i];
+
+    // Smoothed isotropic TV fusion, same convention as evaluate(): the
+    // gradient is accumulated pixel-side, DCT'd, and scaled by tv_lambda.
+    if (tv_lambda > 0.0f) {
+        const float eps = 1e-3f;
+        float* tvgrad = sc; // scatter buffer is free now (g holds the data grad)
+        std::memset(tvgrad, 0, sizeof(float) * (size_t)n);
+        for (int i = 0; i < rows; ++i) {
+            const bool has_down = i + 1 < rows;
+            for (int j = 0; j < cols; ++j) {
+                const int idx = i * cols + j;
+                const float a = has_down ? pix[idx + cols] - pix[idx] : 0.0f;
+                const float bb = (j + 1 < cols) ? pix[idx + 1] - pix[idx] : 0.0f;
+                const float d = std::sqrt(a * a + bb * bb + eps * eps);
+                const float ua = a / d;
+                const float vb = bb / d;
+                tvgrad[idx] -= ua + vb;
+                if (has_down) tvgrad[idx + cols] += ua;
+                if (j + 1 < cols) tvgrad[idx + 1] += vb;
+            }
+        }
+        cv::Mat T(rows, cols, CV_32F, tvgrad);
+        cv::dct(T, T, 0);
+        for (int i = 0; i < n; ++i) g[i] += tv_lambda * tvgrad[i];
+    }
+}
+
+// One weighted-L1 FISTA run: min ||Ax-b||^2 (+ tv*TV) + lambda*sum(w|x|).
+// x is the warm start in, solution out. y/x_prev/grad/pix/sc are scratch.
+static void cs_fista_core_single(float* x, const float* b, const int* rix, const int* riy, int m,
+    int rows, int cols, const float* w, float lambda, float tv_lambda, int iters,
+    std::vector<float>& y, std::vector<float>& x_prev,
+    std::vector<float>& grad, std::vector<float>& pix, std::vector<float>& sc)
+{
+    const int n = rows * cols;
+    const float step = 1.0f / (2.0f + 8.0f * tv_lambda);
+    const float base = lambda * step;
+    std::memcpy(y.data(), x, sizeof(float) * (size_t)n);
+    std::memcpy(x_prev.data(), x, sizeof(float) * (size_t)n);
+    std::vector<float> z((size_t)n);
+    float t = 1.0f;
+    for (int k = 0; k < iters; ++k) {
+        cs_fista_grad(y.data(), pix.data(), sc.data(), grad.data(), b, rix, riy, m, rows, cols, tv_lambda);
+        for (int i = 0; i < n; ++i) {
+            const float v = y[i] - step * grad[i];
+            const float thr = base * w[i];
+            const float av = std::fabs(v);
+            x[i] = (av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f;
+            z[i] = x[i];
+        }
+        const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
+        const float mom = (t - 1.0f) / t_new;
+        for (int i = 0; i < n; ++i) y[i] = z[i] + mom * (z[i] - x_prev[i]);
+        std::memcpy(x_prev.data(), z.data(), sizeof(float) * (size_t)n);
+        t = t_new;
+    }
+}
+
+// One weighted group-L2,1 FISTA run over stacked [x0|x1|x2]:
+//   min sum_c ||A xc - bc||^2 (+ tv*TV each) + lambda*sum_i w_i*||row_i||_2.
+// Row norms couple the channels, so surviving DCT atoms are shared (joint
+// support, SOMP-structured). Buffers y/xp/grad/z hold 3n floats.
+static void cs_fista_core_joint(float* x0, float* x1, float* x2,
+    const float* b0, const float* b1, const float* b2,
+    const int* rix, const int* riy, int m, int rows, int cols,
+    const float* w, float lambda, float tv_lambda, int iters,
+    std::vector<float>& y, std::vector<float>& xp,
+    std::vector<float>& grad, std::vector<float>& z,
+    std::vector<float>& pix, std::vector<float>& sc)
+{
+    const int n = rows * cols;
+    const float step = 1.0f / (2.0f + 8.0f * tv_lambda);
+    const float base = lambda * step;
+    float* y0 = y.data(), * y1 = y.data() + n, * y2 = y.data() + 2 * n;
+    float* p0 = xp.data(), * p1 = xp.data() + n, * p2 = xp.data() + 2 * n;
+    float* g0 = grad.data(), * g1 = grad.data() + n, * g2 = grad.data() + 2 * n;
+    float* z0 = z.data(), * z1 = z.data() + n, * z2 = z.data() + 2 * n;
+    std::memcpy(y0, x0, sizeof(float) * (size_t)n);
+    std::memcpy(y1, x1, sizeof(float) * (size_t)n);
+    std::memcpy(y2, x2, sizeof(float) * (size_t)n);
+    std::memcpy(p0, x0, sizeof(float) * (size_t)n);
+    std::memcpy(p1, x1, sizeof(float) * (size_t)n);
+    std::memcpy(p2, x2, sizeof(float) * (size_t)n);
+    float t = 1.0f;
+    for (int k = 0; k < iters; ++k) {
+        cs_fista_grad(y0, pix.data(), sc.data(), g0, b0, rix, riy, m, rows, cols, tv_lambda);
+        cs_fista_grad(y1, pix.data(), sc.data(), g1, b1, rix, riy, m, rows, cols, tv_lambda);
+        cs_fista_grad(y2, pix.data(), sc.data(), g2, b2, rix, riy, m, rows, cols, tv_lambda);
+        for (int i = 0; i < n; ++i) {
+            const float v0 = y0[i] - step * g0[i];
+            const float v1 = y1[i] - step * g1[i];
+            const float v2 = y2[i] - step * g2[i];
+            const float rn = std::sqrt(v0 * v0 + v1 * v1 + v2 * v2);
+            const float thr = base * w[i];
+            const float s = (rn > thr && rn > 0.0f) ? (1.0f - thr / rn) : 0.0f;
+            z0[i] = v0 * s; z1[i] = v1 * s; z2[i] = v2 * s;
+        }
+        const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
+        const float mom = (t - 1.0f) / t_new;
+        for (int i = 0; i < n; ++i) {
+            y0[i] = z0[i] + mom * (z0[i] - p0[i]);
+            y1[i] = z1[i] + mom * (z1[i] - p1[i]);
+            y2[i] = z2[i] + mom * (z2[i] - p2[i]);
+            p0[i] = z0[i]; p1[i] = z1[i]; p2[i] = z2[i];
+        }
+        t = t_new;
+    }
+    std::memcpy(x0, z0, sizeof(float) * (size_t)n);
+    std::memcpy(x1, z1, sizeof(float) * (size_t)n);
+    std::memcpy(x2, z2, sizeof(float) * (size_t)n);
+}
+
+// FISTA needs more steps than OWL-QN (no Hessian); map the L-BFGS-scale
+// iteration budget to a per-reweight FISTA count. Total DCT pairs stay
+// within ~3-5x of an OWL-QN solve at the same setting. A positive
+// fista_iters override (CLI --fista-iters) bypasses the map and sets the
+// per-pass step count directly.
+static int cs_fista_inner_iters(int iterations, int fista_iters) {
+    if (fista_iters > 0) {
+        if (fista_iters > 500) fista_iters = 500;
+        return fista_iters;
+    }
+    int inner = iterations * 4;
+    if (inner < 16) inner = 16;
+    if (inner > 40) inner = 40;
+    return inner;
+}
+
+static void cs_extract_channel_measurements(const cv::Mat& pixel_measurements, int channel,
+    int m, std::vector<float>& b)
+{
+    b.assign((size_t)m, 0.0f);
+    const int avail = (int)pixel_measurements.total() - CS_HEADER_PIXELS;
+    const int cnt = avail < m ? (avail < 0 ? 0 : avail) : m;
+    for (int i = 0; i < cnt; ++i) {
+        b[(size_t)i] = pixel_measurements.at<cv::Vec3b>(i + CS_HEADER_PIXELS)[channel] / 255.0f;
+    }
+}
+
+void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat& ref, bool copy_next_ref, cv::Mat& next_ref,
+    float tv, int reweights, int fista_iters)
+{
+    if (!ref.isContinuous()) ref = ref.clone();
+    const int n = rows * cols;
+    const int m = (int)ri_x.size();
+    if (reweights < 1) reweights = 1;
+    if (reweights > 5) reweights = 5;
+
+    std::vector<float> b;
+    cs_extract_channel_measurements(pixel_measurements, channel, m, b);
+
+    std::vector<float> w((size_t)n, 1.0f);
+    std::vector<float> y((size_t)n), x_prev((size_t)n), grad((size_t)n), pix((size_t)n), sc((size_t)n);
+    const int inner = cs_fista_inner_iters(iterations, fista_iters);
+    float* x = (float*)ref.data;
+    for (int r = 0; r < reweights; ++r) {
+        cs_fista_core_single(x, b.data(), ri_x.data(), ri_y.data(), m, rows, cols,
+            w.data(), param_c, tv, inner, y, x_prev, grad, pix, sc);
+        if (r + 1 < reweights) {
+            float mx = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                const float av = std::fabs(x[i]);
+                if (av > mx) mx = av;
+            }
+            float eps = 0.02f * mx;
+            if (eps < 1e-3f) eps = 1e-3f;
+            for (int i = 0; i < n; ++i) w[(size_t)i] = eps / (std::fabs(x[i]) + eps);
+        }
+    }
+
+    if (copy_next_ref && !next_ref.empty()) {
+        if (!next_ref.isContinuous()) next_ref = next_ref.clone();
+        std::memcpy(next_ref.data, ref.data, sizeof(float) * (size_t)n);
+    }
+
+    cv::Mat AtAxb2(rows, cols, CV_32F, (float*)ref.data);
+    dct(AtAxb2, AtAxb2, cv::DCT_INVERSE);
+    AtAxb2 = AtAxb2 * 255.0f;
+}
+
+void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat refs[3], float tv, int reweights, int fista_iters)
+{
+    for (int ch = 0; ch < 3; ++ch) {
+        if (!refs[ch].isContinuous()) refs[ch] = refs[ch].clone();
+    }
+    const int n = rows * cols;
+    const int m = (int)ri_x.size();
+    if (reweights < 1) reweights = 1;
+    if (reweights > 5) reweights = 5;
+
+    std::vector<float> b0, b1, b2;
+    cs_extract_channel_measurements(pixel_measurements, 0, m, b0);
+    cs_extract_channel_measurements(pixel_measurements, 1, m, b1);
+    cs_extract_channel_measurements(pixel_measurements, 2, m, b2);
+
+    std::vector<float> w((size_t)n, 1.0f);
+    std::vector<float> y((size_t)3 * n), xp((size_t)3 * n), grad((size_t)3 * n), z((size_t)3 * n);
+    std::vector<float> pix((size_t)n), sc((size_t)n);
+    const int inner = cs_fista_inner_iters(iterations, fista_iters);
+    float* x0 = (float*)refs[0].data;
+    float* x1 = (float*)refs[1].data;
+    float* x2 = (float*)refs[2].data;
+    for (int r = 0; r < reweights; ++r) {
+        cs_fista_core_joint(x0, x1, x2, b0.data(), b1.data(), b2.data(),
+            ri_x.data(), ri_y.data(), m, rows, cols, w.data(), param_c, tv, inner,
+            y, xp, grad, z, pix, sc);
+        if (r + 1 < reweights) {
+            float mx = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                const float rn = std::sqrt(x0[i] * x0[i] + x1[i] * x1[i] + x2[i] * x2[i]);
+                if (rn > mx) mx = rn;
+            }
+            float eps = 0.02f * mx;
+            if (eps < 1e-3f) eps = 1e-3f;
+            for (int i = 0; i < n; ++i) {
+                const float rn = std::sqrt(x0[i] * x0[i] + x1[i] * x1[i] + x2[i] * x2[i]);
+                w[(size_t)i] = eps / (rn + eps);
+            }
+        }
+    }
+
+    for (int ch = 0; ch < 3; ++ch) {
+        cv::Mat plane(rows, cols, CV_32F, refs[ch].data);
+        dct(plane, plane, cv::DCT_INVERSE);
+        plane = plane * 255.0f;
+    }
 }
 
 float evaluate_coarse(void* instance, const float* x, eval_data data, float* g, const int n, const float step)

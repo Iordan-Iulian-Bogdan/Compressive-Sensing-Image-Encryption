@@ -50,7 +50,7 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     }
 }
 
-void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict) {
+void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict, int solver, int fista_iters, int reweights) {
 
     // Patch-dictionary mode: solve each channel against the learned K-SVD
     // dictionary (no DCT, no in-tile channel chain; starts from zero
@@ -133,6 +133,26 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
         cv::merge(ref, 3, out);
         out.convertTo(out, CV_8UC3);
         cv::cvtColor(out, out, cv::COLOR_YCrCb2BGR);
+        return;
+    }
+
+    // FISTA solvers (BGR only; the ycrcb/chroma_sub experiments above stay on
+    // the OWL-QN path): reweighted-L1 per channel, or SOMP-structured joint
+    // group-L2,1 over all three channels. Same warm-start refs and the same
+    // IDCT+255 tail convention as reconstruct_color_channel, so the
+    // merge/convert below applies unchanged.
+    if (solver == CS_SOLVER_FISTA) {
+        reconstruct_color_channel_fista(encrypted_img, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], true, ref[1], tv, reweights, fista_iters);
+        reconstruct_color_channel_fista(encrypted_img, 1, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2], tv, reweights, fista_iters);
+        reconstruct_color_channel_fista(encrypted_img, 2, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false, ref[2], tv, reweights, fista_iters);
+        cv::merge(ref, 3, out);
+        out.convertTo(out, CV_8UC3);
+        return;
+    }
+    if (solver == CS_SOLVER_FISTA_JOINT) {
+        reconstruct_image_fista_joint(encrypted_img, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref, tv, reweights, fista_iters);
+        cv::merge(ref, 3, out);
+        out.convertTo(out, CV_8UC3);
         return;
     }
 
@@ -356,7 +376,7 @@ static void perturb_restart_refs(cv::Mat refs[3], int seed_base, int ti, int tj)
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict, int restart_seed) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv, const cs_dictionary* dict, int restart_seed, int solver, int fista_iters, int reweights) {
 
     // we use a reference image as the initial solution for tiles without
     // neighbors (first wave); this helps speed up convergence
@@ -384,7 +404,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                     perturb_restart_refs(x0, restart_seed, i, j);
 
                 decrypt_image dimgs = decrypt_image(mats_in[i][j]);
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb, chroma_sub, tv, dict);
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, coef, mats_out[i][j], ycrcb, chroma_sub, tv, dict, solver, fista_iters, reweights);
             }
             catch (const std::exception& e) {
                 // an exception escaping an OpenMP region terminates the process;
@@ -412,10 +432,13 @@ int decrypt_image::decrypt_image_tiled(
     float tv,
     const std::string& dict_path,
     bool full_res,
-    int restart_seed
+    int restart_seed,
+    int solver,
+    int fista_iters,
+    int reweights
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path, full_res, restart_seed);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, denoise, tv, dict_path, full_res, restart_seed, solver, fista_iters, reweights);
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -432,8 +455,23 @@ int decrypt_image::decrypt_image_tiled(
     float tv,
     const std::string& dict_path,
     bool full_res,
-    int restart_seed
+    int restart_seed,
+    int solver,
+    int fista_iters,
+    int reweights
 ) {
+    if (solver < CS_SOLVER_OWLQN || solver > CS_SOLVER_FISTA_JOINT) {
+        std::cerr << "Error: unknown solver id " << solver << " (0=owlqn, 1=fista, 2=joint)" << std::endl;
+        return -1;
+    }
+    if (fista_iters < 0 || fista_iters > 500) {
+        std::cerr << "Error: --fista-iters must be in [0, 500] (0 = auto-map from --iterations)" << std::endl;
+        return -1;
+    }
+    if (reweights < 1 || reweights > 5) {
+        std::cerr << "Error: --reweights must be in [1, 5]" << std::endl;
+        return -1;
+    }
     const cv::Mat& encrypted_img_g = encrypted_img_in;
     try {
         if (CSencryption::params == MANUAL_PARAM) {
@@ -588,7 +626,7 @@ int decrypt_image::decrypt_image_tiled(
     // resize-heavy coarse operators eat the 4x unknown reduction. Off by
     // default; kept as an opt-in speed/quality trade via the flags.
     decrypt_tiles_thread = std::thread(decrypt_tiles, nun_threads, std::ref(encrypted_image_tiles), std::ref(indices_reconfigured),
-        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false, tv, dict, restart_seed);
+        std::ref(decrypted_image_tiles), std::cref(coordinates), num_tiles, overlap, iterations, tile_size, coef, /*ycrcb*/ false, /*chroma_sub*/ false, tv, dict, restart_seed, solver, fista_iters, reweights);
     decrypt_tiles_thread.join();
 
     if (show_preview) {
