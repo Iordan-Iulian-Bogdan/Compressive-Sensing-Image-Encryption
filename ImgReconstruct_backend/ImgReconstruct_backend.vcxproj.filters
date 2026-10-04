@@ -2,19 +2,27 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="CS_encryption.cpp" />
+    <ClCompile Include="cs_wavelet.cpp" />
     <ClCompile Include="helper_functions.cpp" />
     <ClCompile Include="image_decryption.cpp" />
     <ClCompile Include="image_encryption.cpp" />
+    <ClCompile Include="image_preview.cpp" />
+    <ClCompile Include="image_tiles.cpp" />
+    <ClCompile Include="photo_upscaler.cpp" />
     <ClCompile Include="ImgReconstruct_backend.cpp" />
     <ClCompile Include="lbfgs.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="arithmetic_ansi.h" />
     <ClInclude Include="CS_encryption.hpp" />
+    <ClInclude Include="cs_wavelet.hpp" />
     <ClInclude Include="helper_functions.hpp" />
     <ClInclude Include="image_decryption.hpp" />
     <ClInclude Include="image_encryption.hpp" />
+    <ClInclude Include="image_preview.hpp" />
+    <ClInclude Include="image_tiles.hpp" />
     <ClInclude Include="lbfgs.hpp" />
+    <ClInclude Include="photo_upscaler.hpp" />
     <ClInclude Include="avir.h" />
     <ClInclude Include="avir_dil.h" />
     <ClInclude Include="avir_float4_sse.h" />

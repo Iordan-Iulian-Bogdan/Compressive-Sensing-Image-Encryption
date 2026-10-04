@@ -258,6 +258,31 @@ std::vector<uint8_t> compute_adaptive_lod(const cv::Mat& img, int tile_size, int
     }
     return lod;
 }
+
+void build_hf_thumb_png(const cv::Mat& input, std::vector<uint8_t>& encoded) {
+    if (input.empty()) throw std::runtime_error("hf thumbnail: empty input image");
+    const int max_dimension = (std::max)(input.cols, input.rows);
+    const double scale = max_dimension > 128 ? 128.0 / max_dimension : 1.0;
+    cv::Mat thumbnail;
+    cv::resize(input, thumbnail, cv::Size(), scale, scale, cv::INTER_AREA);
+    const std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 6};
+    if (!cv::imencode(".png", thumbnail, encoded, params) || encoded.empty() ||
+        encoded.size() > (static_cast<size_t>(1) << 22)) {
+        throw std::runtime_error("hf thumbnail PNG encode failed");
+    }
+}
+
+void seal_hf_thumb(uint8_t* data, size_t length, const uint8_t* iv,
+                   const uint8_t key[32]) {
+    uint8_t counter[CS_IV_BYTES];
+    std::memcpy(counter, iv, CS_IV_BYTES);
+    counter[0] ^= 0x54;
+    if (!cs_aes256_ctr_xor(data, length, key, counter)) {
+        cs_wipe(counter, sizeof(counter));
+        throw std::runtime_error("hf thumbnail encryption failed");
+    }
+    cs_wipe(counter, sizeof(counter));
+}
 }
 
 encrypt_image::encrypt_image(std::string input_path) {
@@ -396,7 +421,7 @@ void encrypt_image::present_sampling_mask(const std::string& output_path) const 
  * and encrypts/authenticates the metadata header (AES-256-CTR + HMAC-SHA256
  * over header and measurement body). Key material is wiped after sealing.
  */
-void encrypt_image::encrypt(const float& pixel_p, const std::string& password) {
+void encrypt_image::encrypt(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits) {
     bm = pixel_p;
     m = rows * cols * bm;
     int n = rows * cols;
@@ -427,16 +452,30 @@ void encrypt_image::encrypt(const float& pixel_p, const std::string& password) {
     for (int k = 0; k < m; k++) {
         encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
     }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    // --sample-bits: bit-pack the flat measurement section (3 values per
+    // sample at byte offset CS_HEADER_BYTES); skipped at 8 bits.
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img,
+            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
 
     // seal after the body exists: the tag covers header + all measurements
-    if (!cs_seal_header(buf, total * 3, cs_key)) {
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
         throw std::runtime_error("failed to seal header (HMAC)");
     }
 
     // key material is no longer needed once the container is sealed
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
 /** @brief Periodic tile-based encryption: generates random indices within one
@@ -447,7 +486,7 @@ void encrypt_image::encrypt(const float& pixel_p, const std::string& password) {
  * @param password : encryption password
  * @param tile_size : size of the canonical tile (must divide image dimensions)
  */
-void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size) {
+void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size, int sample_bits, int chroma_bits) {
     bm = pixel_p;
 
     uint8_t salt[CS_SALT_BYTES];
@@ -489,20 +528,245 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     for (int k = 0; k < m; k++) {
         encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
     }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    // --sample-bits: bit-pack the flat measurement section (3 values per
+    // sample at byte offset CS_HEADER_BYTES); skipped at 8 bits.
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img,
+            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
 
     // seal after the body exists: the tag covers header + all measurements
-    if (!cs_seal_header(buf, total * 3, cs_key)) {
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
         throw std::runtime_error("failed to seal header (HMAC)");
     }
 
     // key material is no longer needed once the container is sealed
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
-std::vector<uint8_t> encrypt_image::compute_twopass_lod(int tile_size, int lod_min, float pilot_ratio) {
+/** @brief YCC 4:2:0 split encryption (mode 3): BGR -> YCrCb, chroma planes
+ * downsampled 2x (INTER_AREA), then luma sampled at full resolution and each
+ * chroma plane sampled on its own coarse grid with a domain-separated key.
+ * The body is byte-packed [Y x m][Cr x m_chroma][Cb x m_chroma] so the
+ * container holds ~1.5 bytes per luma sample instead of 3 (BGR modes).
+ * Metadata carries the luma budget m; chroma counts re-derive from it.
+ */
+void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits) {
+    bm = pixel_p;
+    m = rows * cols * bm;
+
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+
+    returnYcc420Indices(rows, cols, m, cs_key);
+    const int mC = m_chroma;
+
+    cv::Mat ycc;
+    cv::cvtColor(input_img, ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> planes;
+    cv::split(ycc, planes); // 0:Y 1:Cr 2:Cb to match COLOR_YCrCb2BGR order
+    int crows, ccols;
+    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    cv::Mat cr_small, cb_small;
+    cv::resize(planes[1], cr_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
+    cv::resize(planes[2], cb_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
+
+    const size_t body_bytes = (size_t)m + (size_t)2 * mC;
+    const int body_pixels = (int)((body_bytes + 2) / 3);
+    const int total = next_perfect_square(body_pixels + CS_HEADER_PIXELS + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+
+    // mode=3 in the authenticated pad region; decrypt restores it from here
+    buf[CS_OFF_PAD] = CS_MODE_YCC420;
+
+    uint8_t* body = buf + CS_HEADER_BYTES;
+    for (int k = 0; k < m; k++) {
+        body[k] = planes[0].at<uint8_t>(ri_x[k], ri_y[k]);
+    }
+    for (int k = 0; k < mC; k++) {
+        body[m + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
+        body[m + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
+    }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    // --sample-bits: bit-pack the three planes independently (luma, Cr,
+    // Cb); skipped at 8 bits.
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        const size_t y0 = (size_t)CS_HEADER_BYTES;
+        encrypted_img = cs_pack_container_body(encrypted_img, {
+            { y0, (size_t)m, sample_bits, 0, false },
+            { y0 + (size_t)m, (size_t)mC, chroma_bits, 0, false },
+            { y0 + (size_t)m + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+
+    // seal after the body exists: the tag covers header + all measurements
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    sampling_mode = CS_MODE_YCC420;
+}
+
+// Forward declarations (defined alongside encrypt_adaptive below): LOD
+// region blending + density smoothing shared with encrypt_adaptive.
+std::vector<uint8_t> blend_llm_lod(const std::vector<uint8_t>& base,
+    const std::vector<LlmRegion>& regs, int rows_l, int cols_l, int tile_size,
+    int lod_min, float blend);
+std::vector<uint8_t> smooth_lod_grid(const std::vector<uint8_t>& lod,
+    int rows_l, int cols_l, int tile_size, int lod_min, float sigma);
+
+/** @brief YCC 4:2:0 encryption with LOD-driven luma (mode 3 + lod region):
+ * the luma budget splits across tiles by the same 8-bit LOD bytes as mode 2
+ * (Laplacian, two-pass residual, or LLM-region blend + smoothing — identical
+ * helpers, identical shipped layout), while each chroma plane keeps its
+ * uniform coarse-grid draw. Body: [lod bytes][Y x mY_written][Cr][Cb].
+ * Metadata carries the luma budget m; decrypt regenerates both the per-tile
+ * luma counts and the chroma draws from (key, lod, m, geometry).
+ */
+void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::string& password,
+    int tile_size, int lod_min, int weight_base, bool two_pass, float pilot_ratio,
+    const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full) {
     if (tile_size <= 0) {
+        throw std::runtime_error("adaptive sampling: tile size must be positive");
+    }
+    if (weight_base < 1) weight_base = 1;
+    if (weight_base > 65535) weight_base = 65535;
+    bm = pixel_p;
+    m = rows * cols * bm;
+
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+
+    // LOD source priority mirrors encrypt_adaptive: inline LLM regions >
+    // two-pass residual > Laplacian; smoothing applies to all three.
+    if (!regions_json.empty() && (region_blend < 0.0f || region_blend > 1.0f)) {
+        throw std::runtime_error("regions: blend must be in [0, 1]");
+    }
+    const std::vector<uint8_t> base_lod = two_pass
+        ? compute_twopass_lod(tile_size, lod_min, pilot_ratio)
+        : compute_adaptive_lod(input_img, tile_size, lod_min);
+    std::vector<uint8_t> lod = regions_json.empty()
+        ? base_lod
+        : blend_llm_lod(base_lod, parse_regions_json(regions_json),
+            rows, cols, tile_size, lod_min, region_blend);
+    lod = smooth_lod_grid(lod, rows, cols, tile_size, lod_min, lod_smooth);
+    const int lod_bytes = (int)lod.size();
+    const int lod_pixels = (lod_bytes + 2) / 3;
+
+    // luma follows the LOD budget (capacity clamp may drop a few samples);
+    // chroma stays uniform on the coarse grids
+    returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, tile_size, weight_base, lod_full);
+    const int mY_written = (int)ri_x.size();
+    returnYcc420ChromaIndices(rows, cols, m, cs_key);
+    const int mC = m_chroma;
+
+    cv::Mat ycc;
+    cv::cvtColor(input_img, ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> planes;
+    cv::split(ycc, planes); // 0:Y 1:Cr 2:Cb to match COLOR_YCrCb2BGR order
+    int crows, ccols;
+    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    cv::Mat cr_small, cb_small;
+    cv::resize(planes[1], cr_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
+    cv::resize(planes[2], cb_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
+
+    const size_t meas_bytes = (size_t)mY_written + (size_t)2 * mC;
+    const int meas_pixels = (int)((meas_bytes + 2) / 3);
+    const int total = next_perfect_square(meas_pixels + CS_HEADER_PIXELS + lod_pixels + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+
+    // mode=3 with the adaptive pad layout (tile_size, lod count, base) so
+    // decrypt restores the exact budgeting
+    buf[CS_OFF_PAD] = CS_MODE_YCC420;
+    buf[CS_OFF_PAD + 1] = (uint8_t)(tile_size & 0xFF);
+    buf[CS_OFF_PAD + 2] = (uint8_t)((tile_size >> 8) & 0xFF);
+    buf[CS_OFF_PAD + 3] = (uint8_t)(lod_bytes & 0xFF);
+    buf[CS_OFF_PAD + 4] = (uint8_t)((lod_bytes >> 8) & 0xFF);
+    buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] = (uint8_t)(weight_base & 0xFF);
+    buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] = (uint8_t)((weight_base >> 8) & 0xFF);
+    buf[CS_OFF_PAD + CS_OFF_LOD_FULL] = (uint8_t)lod_full;
+
+    std::memcpy(buf + CS_HEADER_BYTES, lod.data(), (size_t)lod_bytes);
+
+    uint8_t* body = buf + CS_HEADER_BYTES + (size_t)lod_pixels * 3;
+    for (int k = 0; k < mY_written; k++) {
+        body[k] = planes[0].at<uint8_t>(ri_x[k], ri_y[k]);
+    }
+    for (int k = 0; k < mC; k++) {
+        body[mY_written + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
+        body[mY_written + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
+    }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    // --sample-bits: lod stays raw; the three planes pack independently.
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        const size_t y0 = (size_t)CS_HEADER_BYTES + (size_t)lod_pixels * 3;
+        encrypted_img = cs_pack_container_body(encrypted_img, {
+            { y0, (size_t)mY_written, sample_bits, 0, false },
+            { y0 + (size_t)mY_written, (size_t)mC, chroma_bits, 0, false },
+            { y0 + (size_t)mY_written + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    sampling_mode = CS_MODE_YCC420;
+}
+
+std::vector<uint8_t> encrypt_image::compute_twopass_lod(int tile_size, int lod_min, float pilot_ratio) {    if (tile_size <= 0) {
         throw std::runtime_error("two-pass sampling: tile size must be positive");
     }
     lod_min = (std::max)(0, (std::min)(255, lod_min));
@@ -775,9 +1039,172 @@ std::vector<uint8_t> smooth_lod_grid(const std::vector<uint8_t>& lod,
  * @param tile_size : adaptive grid tile size (must be > 0)
  * @param lod_min : floor byte so flat tiles keep a minimum sample share
  */
+void encrypt_image::encrypt_hf_focus(const float& pixel_p,
+    const std::string& password, int tile_size, int lod_min, int sample_bits, int chroma_bits) {
+    if (tile_size <= 0) throw std::runtime_error("hf-focus tile size must be positive");
+    bm = pixel_p;
+    m = rows * cols * bm;
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES) || !cs_derive_key(password, salt, cs_key))
+        throw std::runtime_error("hf-focus key setup failed");
+    cs_key_valid = true;
+    constexpr int kWeightBase = 65535;
+    const std::vector<uint8_t> lod = compute_adaptive_lod(input_img, tile_size, lod_min);
+    const int lod_bytes = static_cast<int>(lod.size());
+    const int lod_pixels = (lod_bytes + 2) / 3;
+    std::vector<uint8_t> thumbnail_png;
+    build_hf_thumb_png(input_img, thumbnail_png);
+    const cv::Mat thumbnail = cv::imdecode(thumbnail_png, cv::IMREAD_COLOR);
+    if (thumbnail.empty()) throw std::runtime_error("hf-focus thumbnail decode failed");
+    std::vector<float> weights;
+    int weight_cols = 0, weight_rows = 0;
+    cs_hf_thumb_weights(thumbnail, weights, weight_cols, weight_rows);
+    returnHfWeightedIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, tile_size,
+        kWeightBase, weights, weight_cols, weight_rows);
+
+    const uint32_t thumb_len = static_cast<uint32_t>(thumbnail_png.size());
+    const size_t thumb_padded = (static_cast<size_t>(thumb_len) + 2) / 3 * 3;
+    const int thumb_pixels = static_cast<int>(thumb_padded / 3);
+    const int written = static_cast<int>(ri_x.size());
+    const int total = next_perfect_square(m + CS_HEADER_PIXELS + lod_pixels + thumb_pixels + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+    const std::string metadata = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buffer = encrypted_img.data;
+    if (!cs_write_header(buffer, static_cast<size_t>(total) * 3, metadata, cs_key, salt))
+        throw std::runtime_error("failed to write hf-focus header");
+    buffer[CS_OFF_PAD] = CS_MODE_HF_FOCUS;
+    buffer[CS_OFF_PAD + 1] = static_cast<uint8_t>(tile_size & 0xff);
+    buffer[CS_OFF_PAD + 2] = static_cast<uint8_t>((tile_size >> 8) & 0xff);
+    buffer[CS_OFF_PAD + 3] = static_cast<uint8_t>(lod_bytes & 0xff);
+    buffer[CS_OFF_PAD + 4] = static_cast<uint8_t>((lod_bytes >> 8) & 0xff);
+    buffer[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] = 0xff;
+    buffer[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] = 0xff;
+    for (int i = 0; i < 4; ++i)
+        buffer[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + i] = static_cast<uint8_t>((thumb_len >> (i * 8)) & 0xff);
+    std::memcpy(buffer + CS_HEADER_BYTES, lod.data(), lod.size());
+    uint8_t* thumbnail_data = buffer + CS_HEADER_BYTES + static_cast<size_t>(lod_pixels) * 3;
+    std::memcpy(thumbnail_data, thumbnail_png.data(), thumb_len);
+    if (thumb_padded > thumb_len) std::memset(thumbnail_data + thumb_len, 0, thumb_padded - thumb_len);
+    seal_hf_thumb(thumbnail_data, thumb_len, buffer + CS_OFF_IV, cs_key);
+    const int measurement_offset = CS_HEADER_PIXELS + lod_pixels + thumb_pixels;
+    for (int i = 0; i < written; ++i)
+        encrypted_img.at<cv::Vec3b>(i + measurement_offset) = input_img.at<cv::Vec3b>(ri_x[i], ri_y[i]);
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    // --sample-bits: lod + encrypted thumbnail stay raw; flat measurements pack.
+    size_t sealed_bytes = static_cast<size_t>(total) * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img,
+            { { (size_t)measurement_offset * 3, (size_t)3 * (size_t)written, sample_bits, chroma_bits, true } });
+        buffer = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+    if (!cs_seal_header(buffer, sealed_bytes, cs_key))
+        throw std::runtime_error("failed to authenticate hf-focus header");
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    sampling_mode = CS_MODE_HF_FOCUS;
+    periodic_tile = tile_size;
+    periodic_samples = lod_bytes;
+    adaptive_base = kWeightBase;
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
+void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
+    const std::string& password, int tile_size, int sample_bits, int chroma_bits) {
+    if (tile_size <= 0) throw std::runtime_error("hf-focus tile size must be positive");
+    bm = pixel_p;
+    m = rows * cols * bm;
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES) || !cs_derive_key(password, salt, cs_key))
+        throw std::runtime_error("hf-focus key setup failed");
+    cs_key_valid = true;
+    std::vector<uint8_t> thumbnail_png;
+    build_hf_thumb_png(input_img, thumbnail_png);
+    const cv::Mat thumbnail = cv::imdecode(thumbnail_png, cv::IMREAD_COLOR);
+    if (thumbnail.empty()) throw std::runtime_error("hf-focus thumbnail decode failed");
+    std::vector<float> weights;
+    int weight_cols = 0, weight_rows = 0;
+    cs_hf_thumb_weights(thumbnail, weights, weight_cols, weight_rows);
+    constexpr int kWeightBase = 65535;
+    const int tile_cols = (cols + tile_size - 1) / tile_size;
+    const int tile_rows = (rows + tile_size - 1) / tile_size;
+    const std::vector<uint8_t> flat_lod(static_cast<size_t>(tile_cols) * tile_rows, 0);
+    returnHfWeightedIndices(ri_x, ri_y, rows, cols, flat_lod, m, cs_key,
+        tile_size, kWeightBase, weights, weight_cols, weight_rows);
+    const int luma_count = static_cast<int>(ri_x.size());
+    returnYcc420ChromaIndices(rows, cols, m, cs_key);
+
+    cv::Mat ycc;
+    cv::cvtColor(input_img, ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> planes;
+    cv::split(ycc, planes);
+    int chroma_rows = 0, chroma_cols = 0;
+    cs_ycc420_chroma_dims(rows, cols, chroma_rows, chroma_cols);
+    cv::Mat cr, cb;
+    cv::resize(planes[1], cr, cv::Size(chroma_cols, chroma_rows), 0, 0, cv::INTER_AREA);
+    cv::resize(planes[2], cb, cv::Size(chroma_cols, chroma_rows), 0, 0, cv::INTER_AREA);
+    const uint32_t thumb_len = static_cast<uint32_t>(thumbnail_png.size());
+    const size_t thumb_padded = (static_cast<size_t>(thumb_len) + 2) / 3 * 3;
+    const int thumb_pixels = static_cast<int>(thumb_padded / 3);
+    const size_t measure_bytes = static_cast<size_t>(luma_count) + static_cast<size_t>(2) * m_chroma;
+    const int measure_pixels = static_cast<int>((measure_bytes + 2) / 3);
+    const int total = next_perfect_square(CS_HEADER_PIXELS + thumb_pixels + measure_pixels + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+    const std::string metadata = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buffer = encrypted_img.data;
+    if (!cs_write_header(buffer, static_cast<size_t>(total) * 3, metadata, cs_key, salt))
+        throw std::runtime_error("failed to write hf-focus header");
+    buffer[CS_OFF_PAD] = CS_MODE_YCC420_HF;
+    buffer[CS_OFF_PAD + 1] = static_cast<uint8_t>(tile_size & 0xff);
+    buffer[CS_OFF_PAD + 2] = static_cast<uint8_t>((tile_size >> 8) & 0xff);
+    buffer[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] = 0xff;
+    buffer[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] = 0xff;
+    for (int i = 0; i < 4; ++i)
+        buffer[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + i] = static_cast<uint8_t>((thumb_len >> (i * 8)) & 0xff);
+    uint8_t* thumbnail_data = buffer + CS_HEADER_BYTES;
+    std::memcpy(thumbnail_data, thumbnail_png.data(), thumb_len);
+    if (thumb_padded > thumb_len) std::memset(thumbnail_data + thumb_len, 0, thumb_padded - thumb_len);
+    seal_hf_thumb(thumbnail_data, thumb_len, buffer + CS_OFF_IV, cs_key);
+    uint8_t* body = thumbnail_data + thumb_padded;
+    for (int i = 0; i < luma_count; ++i) body[i] = planes[0].at<uint8_t>(ri_x[i], ri_y[i]);
+    for (int i = 0; i < m_chroma; ++i) {
+        body[luma_count + i] = cr.at<uint8_t>(ri_cx1[i], ri_cy1[i]);
+        body[luma_count + m_chroma + i] = cb.at<uint8_t>(ri_cx2[i], ri_cy2[i]);
+    }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    // --sample-bits: encrypted thumbnail stays raw; Y/Cr/Cb pack independently.
+    size_t sealed_bytes = static_cast<size_t>(total) * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        const size_t y0 = (size_t)CS_HEADER_BYTES + thumb_padded;
+        encrypted_img = cs_pack_container_body(encrypted_img, {
+            { y0, (size_t)luma_count, sample_bits, 0, false },
+            { y0 + (size_t)luma_count, (size_t)m_chroma, chroma_bits, 0, false },
+            { y0 + (size_t)luma_count + (size_t)m_chroma, (size_t)m_chroma, chroma_bits, 0, false } });
+        buffer = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+    if (!cs_seal_header(buffer, sealed_bytes, cs_key))
+        throw std::runtime_error("failed to authenticate hf-focus header");
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    sampling_mode = CS_MODE_YCC420_HF;
+    periodic_tile = tile_size;
+    periodic_samples = 0;
+    adaptive_base = kWeightBase;
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
 void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& password, int tile_size,
     int lod_min, int weight_base, bool two_pass, float pilot_ratio,
-    const std::string& regions_json, float region_blend, float lod_smooth) {
+    const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full) {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
     }
@@ -816,8 +1243,31 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
 
     // m and weight_base are fixed BEFORE index generation so decrypt
     // recomputes the same per-tile counts from the header — not from ri_x.size()
-    returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, tile_size, weight_base);
+    returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, tile_size, weight_base, lod_full);
     const int m_written = (int)ri_x.size();
+    if (lod_full > 0) {
+        // --lod-full guarantee audit: qualifying tiles that cannot all fit
+        // keep top-detail priority inside the shared counts function; say so
+        long long want = 0;
+        int nqual = 0;
+        const int tx = (cols + tile_size - 1) / tile_size;
+        const int ty = (rows + tile_size - 1) / tile_size;
+        for (int tr = 0; tr < ty; ++tr) {
+            for (int tc = 0; tc < tx; ++tc) {
+                const int i = tr * tx + tc;
+                if (lod[i] >= lod_full) {
+                    ++nqual;
+                    const int tw = (tile_size < cols - tc * tile_size) ? tile_size : cols - tc * tile_size;
+                    const int th = (tile_size < rows - tr * tile_size) ? tile_size : rows - tr * tile_size;
+                    want += (long long)tw * th;
+                }
+            }
+        }
+        if (nqual > 0 && want > m) {
+            std::cerr << "Warning: --lod-full: " << nqual
+                << " tiles qualify but the budget fits fewer; top-detail tiles win" << std::endl;
+        }
+    }
 
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + lod_pixels + 8);
     encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -839,6 +1289,7 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     buf[CS_OFF_PAD + 4] = (uint8_t)((lod_bytes >> 8) & 0xFF);
     buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] = (uint8_t)(weight_base & 0xFF);
     buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] = (uint8_t)((weight_base >> 8) & 0xFF);
+    buf[CS_OFF_PAD + CS_OFF_LOD_FULL] = (uint8_t)lod_full;
 
     // lod region immediately after the header (raw bytes, zero-padded to a
     // whole pixel so measurements stay pixel-aligned at CS_HEADER_PIXELS+lod_pixels)
@@ -849,14 +1300,27 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     for (int k = 0; k < m_written; k++) {
         encrypted_img.at<cv::Vec3b>(k + meas0) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
     }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
 
-    if (!cs_seal_header(buf, total * 3, cs_key)) {
+    // --sample-bits: lod stays raw; the flat measurement section packs.
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img,
+            { { (size_t)meas0 * 3, (size_t)3 * (size_t)m_written, sample_bits, chroma_bits, true } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
         throw std::runtime_error("failed to seal header (HMAC)");
     }
 
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
 /** @brief tile re-encryption used in decrypt_image_tiled: v1 plaintext header.
@@ -877,7 +1341,7 @@ void encrypt_image::encrypt(const std::vector<int>& ri_x_g, const std::vector<in
         encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x_g[k], ri_y_g[k]);
     }
 
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)total));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
 cv::Size encrypt_image::get_size() {
@@ -908,7 +1372,12 @@ int encrypt_image::encrypt_image_tiled(
     float pilot_ratio,
     const std::string& regions_json,
     float region_blend,
-    float lod_smooth
+    float lod_smooth,
+    bool ycc420,
+    bool hf_focus,
+    int sample_bits,
+    int chroma_bits,
+    int lod_full
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -921,6 +1390,17 @@ int encrypt_image::encrypt_image_tiled(
 
         if (password.size() < 10) {
             throw std::runtime_error("Password should be at least 10 characters");
+        }
+        if (!cs_sample_bits_valid(sample_bits) ||
+            (chroma_bits != 0 && !cs_sample_bits_valid(chroma_bits))) {
+            throw std::runtime_error("--sample-bits luma and chroma values must each be in [1, 8]");
+        }
+        if (lod_full < 0 || lod_full > 255) {
+            throw std::runtime_error("--lod-full must be in [0, 255] (0 = off)");
+        }
+        if (hf_focus && (adaptive || two_pass || !regions_json.empty() ||
+            lod_smooth > 0.0f || adaptive_strength != 0.5f || lod_full > 0)) {
+            throw std::runtime_error("--hf-focus cannot be combined with adaptive sampling controls");
         }
     }
     catch (const std::runtime_error& e) {
@@ -943,22 +1423,46 @@ int encrypt_image::encrypt_image_tiled(
         }
         encrypt_image encrypt_img(input_img, true);
 
-        if (adaptive) {
+        if (hf_focus) {
+            const int hf_tile_size = tile_size > 0 ? tile_size : 32;
+            if (ycc420) {
+                encrypt_img.encrypt_ycc420_hf(compression_ratio, password, hf_tile_size, sample_bits, chroma_bits);
+            } else {
+                encrypt_img.encrypt_hf_focus(compression_ratio, password, hf_tile_size, lod_min, sample_bits, chroma_bits);
+            }
+        }
+        else if (ycc420) {
+            // luma/chroma-split 4:2:0 sampling; the mode travels in the
+            // header so decrypt needs no new flags. Adaptive LOD flags
+            // (--adaptive/--two-pass/--regions/--lod-smooth/--lod-full) are
+            // absorbed: they drive the luma budget while chroma stays uniform.
+            const bool ycc_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
+            if (ycc_adaptive) {
+                const int ts = tile_size > 0 ? tile_size : 64;
+                const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
+                encrypt_img.encrypt_ycc420_adaptive(compression_ratio, password, ts, lod_min, wbase,
+                    two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full);
+            } else {
+                encrypt_img.encrypt_ycc420(compression_ratio, password, sample_bits, chroma_bits);
+            }
+        }
+        else if (adaptive || lod_full > 0) {
             // LOD-based per-tile sampling; default grid when tile_size unset.
             // two_pass swaps the Laplacian scores for pilot-residual scores;
             // container format is identical so decrypt needs no new flags.
+            // lod_full>0 alone selects this path (detail guarantee needs LOD).
             const int ts = tile_size > 0 ? tile_size : 64;
             const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
             encrypt_img.encrypt_adaptive(compression_ratio, password, ts, lod_min, wbase, two_pass, pilot_ratio,
-                regions_json, region_blend, lod_smooth);
+                regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full);
         }
         else if (tile_size > 0) {
             // periodic tile-based sampling: one random per-tile pattern,
             // replicated across the image; the mode travels in the header
-            encrypt_img.encrypt_periodic(compression_ratio, password, tile_size);
+            encrypt_img.encrypt_periodic(compression_ratio, password, tile_size, sample_bits, chroma_bits);
         } else {
             // standard random global sampling
-            encrypt_img.encrypt(compression_ratio, password);
+            encrypt_img.encrypt(compression_ratio, password, sample_bits, chroma_bits);
         }
 
         if (encrypted_out) {
@@ -966,7 +1470,12 @@ int encrypt_image::encrypt_image_tiled(
         }
 
         if (!output_path.empty()) {
-            cv::imwrite(output_path, encrypt_img.get_mat());
+            try {
+                if (!cv::imwrite(output_path, encrypt_img.get_mat()))
+                    throw std::runtime_error("failed to write container image: " + output_path);
+            } catch (const cv::Exception& e) {
+                throw std::runtime_error(std::string("failed to write container image: ") + e.what());
+            }
         }
 
         // compression stage just finished: render the mask that was used

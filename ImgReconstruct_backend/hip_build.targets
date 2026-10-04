@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  HIP build rules for cs_gpu.hip. Import AFTER Microsoft.Cpp.targets and set
+  $(CsHipDir) to the directory holding cs_gpu.hip/cs_gpu.h before importing.
+
+  Builds cs_gpu.hip with hipcc (host code = MSVC-compatible clang, device code
+  bundled for gfx1100) into $(IntDir)cs_gpu.obj, feeds that obj to the linker
+  through the standard <Link> item type, links amdhip64.lib, and copies the
+  HIP runtime DLL next to the output so the exe/tests resolve it without PATH.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <HipRoot Condition="'$(HipRoot)' == ''">C:\Program Files\AMD\ROCm\7.2</HipRoot>
+    <HipArch Condition="'$(HipArch)' == ''">gfx1100</HipArch>
+    <CsHipDir Condition="'$(CsHipDir)' == ''">$(ProjectDir)</CsHipDir>
+    <CsHipSrc>$(CsHipDir)cs_gpu.hip;$(CsHipDir)cs_gpu.h</CsHipSrc>
+    <CsHipObj>$(IntDir)cs_gpu.obj</CsHipObj>
+    <CsVcVars>$(VCInstallDir)Auxiliary\Build\vcvars64.bat</CsVcVars>
+    <CsVcVars Condition="'$(VCInstallDir)' == ''">$(VSINSTALLDIR)VC\Auxiliary\Build\vcvars64.bat</CsVcVars>
+    <!-- hipcc's clang driver defaults to the static CRT; the projects link
+         the dynamic one (-MD would be a dependency flag, not a CRT flag) -->
+    <CsHipCrt>-fms-runtime-lib=dll</CsHipCrt>
+    <CsHipCrt Condition="'$(Configuration)' == 'Debug'">-fms-runtime-lib=dll_dbg</CsHipCrt>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <Link>
+      <AdditionalDependencies>amdhip64.lib;hipfft.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(HipRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <Target Name="CsBuildHip" BeforeTargets="Link"
+          Inputs="$(CsHipSrc);$(MSBuildThisFileFullPath)"
+          Outputs="$(CsHipObj)"
+          Condition="'$(Platform)' == 'x64' and Exists('$(HipRoot)\bin\hipcc.bat')">
+    <MakeDir Directories="$(IntDir)" />
+    <Exec Command="call &quot;$(CsVcVars)&quot; >nul &amp;&amp; &quot;$(HipRoot)\bin\hipcc.bat&quot; --offload-arch=$(HipArch) -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS $(CsHipCrt) -c &quot;$(CsHipDir)cs_gpu.hip&quot; -o &quot;$(CsHipObj)&quot;" />
+    <ItemGroup>
+      <Link Include="$(CsHipObj)" />
+    </ItemGroup>
+    <Copy SourceFiles="$(HipRoot)\bin\amdhip64_7.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(HipRoot)\bin\amdhip64_7.dll')" />
+    <Copy SourceFiles="$(HipRoot)\bin\hipfft.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(HipRoot)\bin\hipfft.dll')" />
+    <Copy SourceFiles="$(HipRoot)\bin\rocfft.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(HipRoot)\bin\rocfft.dll')" />
+  </Target>
+</Project>

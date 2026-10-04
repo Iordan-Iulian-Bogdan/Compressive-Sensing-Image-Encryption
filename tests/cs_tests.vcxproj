@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <RootNamespace>cs_tests</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>false</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\ImgReconstruct_backend;$(ProjectDir)..\third_party\onnxruntime\include;C:\Users\iorda\OneDrive\Documents\opencv\Release\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4996</DisableSpecificWarnings>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_dnn4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;opencv_quality4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;onnxruntime.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\ImgReconstruct_backend;$(ProjectDir)..\third_party\onnxruntime\lib;C:\Users\iorda\OneDrive\Documents\opencv\Release\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <DelayLoadDLLs>onnxruntime.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="test_main.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\CS_encryption.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\crypto_utils.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\cs_wavelet.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\helper_functions.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\image_decryption.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\image_encryption.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\image_preview.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\photo_upscaler.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\image_tiles.cpp" />
+    <ClCompile Include="..\ImgReconstruct_backend\lbfgs.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <CsHipDir>$(ProjectDir)..\ImgReconstruct_backend\</CsHipDir>
+  </PropertyGroup>
+  <Import Project="$(ProjectDir)..\ImgReconstruct_backend\hip_build.targets" />
+</Project>

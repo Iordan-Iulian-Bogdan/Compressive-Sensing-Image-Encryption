@@ -308,11 +308,109 @@ void cs_write_header_plain(uint8_t* buf, size_t buf_bytes, const std::string& me
     std::memset(buf + CS_OFF_PAD, 0, CS_HEADER_BYTES - CS_OFF_PAD);
 }
 
+void cs_pack_samples(const uint8_t* in, size_t count, int bits, uint8_t* out) {
+    if (count == 0) return;
+    if (bits >= 8) {
+        std::memcpy(out, in, count);
+        return;
+    }
+    const int maxv = (1 << bits) - 1;
+    uint32_t acc = 0;
+    int acc_bits = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t q = (uint32_t)((in[i] * maxv + 127) / 255);
+        acc = (acc << (uint32_t)bits) | q;
+        acc_bits += bits;
+        while (acc_bits >= 8) {
+            acc_bits -= 8;
+            out[o++] = (uint8_t)((acc >> acc_bits) & 0xFF);
+        }
+    }
+    if (acc_bits > 0) {
+        out[o++] = (uint8_t)((acc << (8 - acc_bits)) & 0xFF);
+    }
+    (void)o;
+}
+
+void cs_unpack_samples(const uint8_t* in, size_t count, int bits, uint8_t* out) {
+    if (count == 0) return;
+    if (bits >= 8) {
+        std::memcpy(out, in, count);
+        return;
+    }
+    const int maxv = (1 << bits) - 1;
+    uint32_t acc = 0;
+    int acc_bits = 0;
+    size_t i = 0;
+    for (size_t k = 0; k < count; ++k) {
+        while (acc_bits < bits) {
+            acc = (acc << 8) | in[i++];
+            acc_bits += 8;
+        }
+        acc_bits -= bits;
+        const uint32_t q = (acc >> acc_bits) & (uint32_t)maxv;
+        acc &= (acc_bits > 0) ? ((1u << acc_bits) - 1u) : 0u;
+        out[k] = (uint8_t)((q * 255 + (uint32_t)(maxv / 2)) / (uint32_t)maxv);
+    }
+}
+
+void cs_pack_samples_bgr(const uint8_t* in, size_t samples, int luma_bits,
+    int chroma_bits, uint8_t* out) {
+    if (luma_bits == chroma_bits) {
+        cs_pack_samples(in, samples * 3, luma_bits, out);
+        return;
+    }
+    uint32_t acc = 0;
+    int acc_bits = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < samples * 3; ++i) {
+        const int bits = (i % 3 == 1) ? luma_bits : chroma_bits; // G is luma-weighted
+        const int maxv = (1 << bits) - 1;
+        const uint32_t q = (uint32_t)((in[i] * maxv + 127) / 255);
+        acc = (acc << (uint32_t)bits) | q;
+        acc_bits += bits;
+        while (acc_bits >= 8) {
+            acc_bits -= 8;
+            out[o++] = (uint8_t)((acc >> acc_bits) & 0xFF);
+        }
+    }
+    if (acc_bits > 0) out[o] = (uint8_t)((acc << (8 - acc_bits)) & 0xFF);
+}
+
+void cs_unpack_samples_bgr(const uint8_t* in, size_t samples, int luma_bits,
+    int chroma_bits, uint8_t* out) {
+    if (luma_bits == chroma_bits) {
+        cs_unpack_samples(in, samples * 3, luma_bits, out);
+        return;
+    }
+    uint32_t acc = 0;
+    int acc_bits = 0;
+    size_t i = 0;
+    for (size_t k = 0; k < samples * 3; ++k) {
+        const int bits = (k % 3 == 1) ? luma_bits : chroma_bits;
+        const int maxv = (1 << bits) - 1;
+        while (acc_bits < bits) {
+            acc = (acc << 8) | in[i++];
+            acc_bits += 8;
+        }
+        acc_bits -= bits;
+        const uint32_t q = (acc >> acc_bits) & (uint32_t)maxv;
+        acc &= (acc_bits > 0) ? ((1u << acc_bits) - 1u) : 0u;
+        out[k] = (uint8_t)((q * 255 + (uint32_t)(maxv / 2)) / (uint32_t)maxv);
+    }
+}
+
 bool cs_seal_header(uint8_t* buf, size_t buf_bytes, const uint8_t key[32]) {
     if (buf_bytes < CS_HEADER_BYTES) return false;
     try {
         HmacSha256 mac(key);
         mac.update(buf, CS_MAC_PREFIX_BYTES);
+        // packed writers (marker 0xA7) also cover the pad (mode/geometry +
+        // depths); legacy writers leave the pad outside the tag.
+        if (buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] == CS_SAMPLE_BITS_MARKER) {
+            mac.update(buf + CS_OFF_PAD, CS_HEADER_BYTES - CS_OFF_PAD);
+        }
         mac.update(buf + CS_HEADER_BYTES, buf_bytes - CS_HEADER_BYTES);
         uint8_t full[32];
         mac.finish(full);
@@ -330,6 +428,9 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
     try {
         HmacSha256 mac(key);
         mac.update(buf, CS_MAC_PREFIX_BYTES);
+        if (buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] == CS_SAMPLE_BITS_MARKER) {
+            mac.update(buf + CS_OFF_PAD, CS_HEADER_BYTES - CS_OFF_PAD);
+        }
         mac.update(buf + CS_HEADER_BYTES, buf_bytes - CS_HEADER_BYTES);
         uint8_t full[32];
         mac.finish(full);
@@ -410,25 +511,89 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
     // tile_size and (mode 1) samples_per_tile as 16-bit little-endian values.
     // Mode 2 stores lod byte count in the second slot as a sanity check.
     const uint8_t mode = buf[CS_OFF_PAD];
-    if (mode == CS_MODE_PERIODIC || mode == CS_MODE_ADAPTIVE) {
+    if (mode == CS_MODE_YCC420) {
+        // luma/chroma-split container. Pure-uniform mode 3 leaves the tile
+        // fields zero; the LOD-luma variant reuses the adaptive pad layout
+        // (tile_size, lod byte count, weight_base). Accept the LOD variant
+        // only when the lod count matches the geometry, otherwise fall back
+        // to uniform (tolerant read of pre-LOD containers).
+        out.sampling_mode = mode;
+        const int tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
+        const int lodc = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8);
+        if (tile > 0 && lodc == cs_lod_bytes(out.rows, out.cols, tile)) {
+            out.periodic_tile = tile;
+            out.periodic_samples = lodc;
+            const int base = buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] |
+                (buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
+            out.adaptive_base = (base > 0) ? base : 256;
+        }
+    }
+    else if (mode == CS_MODE_YCC420_HF) {
+        out.sampling_mode = mode;
+        out.periodic_tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
+        const int lodc = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8);
+        const int base = buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] |
+            (buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
+        out.adaptive_base = base > 0 ? base : 65535;
+        out.thumb_len = (uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN] |
+            ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + 1] << 8) |
+            ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + 2] << 16) |
+            ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + 3] << 24);
+        if (out.periodic_tile <= 0 || lodc != 0) {
+            out.legacy = true;
+            return false;
+        }
+    }
+    else if (mode == CS_MODE_PERIODIC || mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) {
         out.sampling_mode = mode;
         out.periodic_tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
         out.periodic_samples = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8);
-        if (mode == CS_MODE_ADAPTIVE) {
+        if (mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) {
             int base = buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] |
                 (buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
             out.adaptive_base = (base > 0) ? base : 256; // 0 = pre-strength default
         }
         if (out.periodic_tile <= 0 ||
             (mode == CS_MODE_PERIODIC && out.periodic_samples <= 0) ||
-            (mode == CS_MODE_ADAPTIVE &&
+            ((mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) &&
                 out.periodic_samples != cs_lod_bytes(out.rows, out.cols, out.periodic_tile))) {
             out.sampling_mode = CS_MODE_RANDOM;
             out.periodic_tile = 0;
             out.periodic_samples = 0;
             out.adaptive_base = 256;
+            out.thumb_len = 0;
+        }
+        if (mode == CS_MODE_HF_FOCUS && out.sampling_mode == mode) {
+            out.thumb_len = (uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN] |
+                ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + 1] << 8) |
+                ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + 2] << 16) |
+                ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + 3] << 24);
         }
     }
+    // sample bit-depth travels in the pad for every mode: 0 = legacy writer
+    // (zeroed pad) decodes as 8; anything outside 1..8 is a corrupt header.
+    {
+        if (buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] != 0 &&
+            buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] != CS_SAMPLE_BITS_MARKER) {
+            return false;
+        }
+        const int sb = buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS];
+        if (sb == 0) out.sample_bits = 8;
+        else if (sb >= 1 && sb <= 8) out.sample_bits = sb;
+        else return false;
+        const int cb = buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA];
+        if (cb == 0) out.sample_bits_chroma = out.sample_bits;
+        else if (cb >= 1 && cb <= 8) out.sample_bits_chroma = cb;
+        else return false;
+        // Marker + 8/8 is the default writer output (depths always stamped,
+        // body left unpacked): plain 8-bit. The marker keeps the pad
+        // (mode/geometry) under MAC in every mode.
+    }
+    // --lod-full detail guarantee travels in the pad for adaptive-family
+    // modes; 0 = off. Only honored from stamped (MAC-covered) headers so a
+    // legacy zeroed pad always decodes as off.
+    out.full_threshold = (buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] == CS_SAMPLE_BITS_MARKER)
+        ? buf[CS_OFF_PAD + CS_OFF_LOD_FULL] : 0;
     return true;
 }
 

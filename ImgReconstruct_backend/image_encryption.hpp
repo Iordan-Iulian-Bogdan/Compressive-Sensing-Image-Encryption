@@ -19,12 +19,30 @@ public:
 
     cv::Mat get_mat();
 
-    void encrypt(const float& pixel_p, const std::string& password);
+    void encrypt(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
     void encrypt(const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g);
 
-    // Periodic tile-based encryption: generate random pattern within one tile,
+    // YCC 4:2:0 split encryption (mode 3): BGR -> YCrCb, chroma downsampled
+    // 2x, luma sampled at full resolution and each chroma plane sampled on
+    // its coarse grid. Body layout: [Y x m][Cr x m_chroma][Cb x m_chroma].
+    // pixel_p is the LUMA sampling ratio; total stored ~= 1.5x luma budget.
+    void encrypt_ycc420(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
+
+    void encrypt_hf_focus(const float& pixel_p, const std::string& password,
+        int tile_size, int lod_min, int sample_bits = 8, int chroma_bits = 0);
+    void encrypt_ycc420_hf(const float& pixel_p, const std::string& password,
+        int tile_size, int sample_bits = 8, int chroma_bits = 0);
+
+    // YCC 4:2:0 with LOD-driven luma (mode 3 + shipped lod bytes): same LOD
+    // sources as encrypt_adaptive (Laplacian / two-pass / LLM regions +
+    // smoothing) drive the luma budget; chroma stays uniform coarse-grid.
+    // Body layout: [lod x lod_bytes][Y x mY_written][Cr][Cb].
+    void encrypt_ycc420_adaptive(const float& pixel_p, const std::string& password,
+        int tile_size, int lod_min, int weight_base = 256, bool two_pass = false,
+        float pilot_ratio = 0.05f, const std::string& regions_json = "",
+        float region_blend = 0.5f, float lod_smooth = 0.0f, int sample_bits = 8, int chroma_bits = 0, int lod_full = 0);    // Periodic tile-based encryption: generate random pattern within one tile,
     // then repeat across the image. tile_size should divide the image dimensions.
-    void encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size);
+    void encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size, int sample_bits = 8, int chroma_bits = 0);
 
     // Adaptive periodic encryption: per-tile LOD bytes drive sample counts
     // (high detail -> more measurements). lod_min floors the 8-bit score so
@@ -32,7 +50,8 @@ public:
     // (0=uniform, 0.5=default, 1=max). Writes mode=2 + lod + weight_base.
     void encrypt_adaptive(const float& pixel_p, const std::string& password, int tile_size,
         int lod_min, int weight_base = 256, bool two_pass = false, float pilot_ratio = 0.05f,
-        const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f);
+        const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f,
+        int sample_bits = 8, int chroma_bits = 0, int lod_full = 0);
 
     void writeEncryptedImageToDisk(const std::string& output_path);
 
@@ -60,7 +79,7 @@ public:
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
     */
-    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f);
+    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false, int sample_bits = 8, int chroma_bits = 0, int lod_full = 0);
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at

@@ -1,103 +1,60 @@
-#include <stdio.h>
+#ifndef IMGRECONSTRUCT_BACKEND_HELPER_FUNCTIONS_HPP_
+#define IMGRECONSTRUCT_BACKEND_HELPER_FUNCTIONS_HPP_
+
 #include "lbfgs.hpp"
+#include "image_tiles.hpp"
+#include "cs_wavelet.hpp"
 #include "crypto_utils.hpp"
-#include <fstream>
-#include <opencv2/highgui.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-#include <mutex>
-#include <thread>
-#include <vector>
-#include <string>
+
+#include <opencv2/core.hpp>
+
+#include <atomic>
 #include <chrono>
-#include <stdlib.h>
-#include <random>
-#include <iostream>
-#include <omp.h>
-#include <iomanip>
-#include <list>
-#include <numeric>
-#include "avir.h"
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>   // AVX2/FMA gather/scatter kernels
-#endif
-
-#if defined(_WIN32)
-#include <windows.h>     // desktop metrics for the live preview window
-#endif
-
+#include <string>
+#include <vector>
 
 #define MANUAL_PARAM  1
 #define AUTO_PARAM  2
-
-struct TileCoord {
-    int x;
-    int y;
-};
 
 struct indices {
     std::vector<int> ri_x_g, ri_y_g;
 };
 
-/** @brief an overcomplete patch dictionary learned with K-SVD.
-D holds `atoms` columns of patch*patch float values (atom-major layout,
-column == one atom, unit L2 norm). Patches are patch x patch grayscale
-planes in [0,1]; color channels are coded independently.
-*/
-struct cs_dictionary {
-    int atoms = 0;
-    int patch = 8;
-    std::vector<float> D; // atoms * patch * patch
-    float lipschitz = 1.0f; // lambda_max(D^T D), estimated at load/train time
-};
+int nextClosestDivisible(int x, int y);
 
-/** @brief K-SVD training: OMP sparse coding (K atoms per patch) + atom SVD
-updates, iterated. images are CV_8UC3; patches are sampled at stride 4 from
-each channel (capped at max_patches). Returns false when there is not enough
-training data.
-*/
-bool cs_train_dictionary(const std::vector<cv::Mat>& images, int atoms, int ksvd_iters,
-    int max_patches, cs_dictionary& out);
+// Per-tile regularization scaling (--per-tile-coef, --per-tile-tv): tiles
+// with fewer measurements than average get a stronger prior and vice versa,
+// scale = sqrt(m_mean / m_tile) clamped to [0.25x, 4x]. Degenerate inputs
+// (empty tile, non-positive mean) return the base value unchanged. tv shares
+// the law via its own flag; per-tile TV can draw the tile grid on smooth
+// gradients, so the two are independently opt-in.
+inline float cs_per_tile_coef(float coef, int m_tile, double m_mean) {
+    if (m_tile <= 0 || m_mean <= 0.0 || coef <= 0.0f) return coef;
+    double f = std::sqrt(m_mean / (double)m_tile);
+    if (f < 0.25) f = 0.25;
+    if (f > 4.0) f = 4.0;
+    return (float)(coef * f);
+}
 
-bool cs_save_dictionary(const std::string& path, const cs_dictionary& d);
-bool cs_load_dictionary(const std::string& path, cs_dictionary& out);
+// Container section packing for --sample-bits (bit format in
+// crypto_utils.hpp): sections record raw offset/count and their plane depth
+// (or interleaved BGR luma/chroma depths) in ascending order; everything
+// before the first section copies verbatim (header + lod/thumbnail raw
+// prefixes); each measurement section packs independently, whole-byte
+// padded; trailing slack stays zero. The packed Mat is square (same
+// next-perfect-square convention as the raw paths). Unpack mirrors it;
+// both throw std::runtime_error on truncation.
+cv::Mat cs_pack_container_body(const cv::Mat& raw,
+    const std::vector<cs_body_section>& sections);
+cv::Mat cs_pack_container_body(const cv::Mat& raw,
+    const std::vector<std::pair<size_t, size_t>>& sections, int bits);
+size_t cs_unpacked_body_bytes(const std::vector<cs_body_section>& sections);
+size_t cs_unpacked_body_bytes(const std::vector<std::pair<size_t, size_t>>& sections);
+void cs_unpack_container_body(const uint8_t* packed, size_t packed_bytes,
+    const std::vector<cs_body_section>& sections, uint8_t* raw);
+void cs_unpack_container_body(const uint8_t* packed, size_t packed_bytes,
+    const std::vector<std::pair<size_t, size_t>>& sections, int bits, uint8_t* raw);
 
-/** @brief orthogonal matching pursuit for ONE patch: returns the sparse
-coefficient vector over the dictionary atoms (length atoms, mostly zeros).
-*/
-void cs_omp_encode(const float* patch_values /*patch*patch*/, const cs_dictionary& dict,
-    int target_sparsity, float* coefficients_out);
-
-/** @brief OMP against a SUB-SAMPLED observation: only the `count` positions
-pos[] are observable with values vals[]; the sparse code is fit on those rows
-and the full patch is synthesized from the code into patch_out. */
-void cs_omp_encode_measured(const int* pos, const float* vals, int count,
-    const cs_dictionary& dict, int target_sparsity, float* coefficients_out, float* patch_out);
-
-/** @brief solves ONE color channel of a tile against a learned patch
-dictionary instead of the DCT basis. The unknown is the concatenated sparse
-coefficient vector of every 8x8 patch of the tile (zero-padded to a multiple
-of the patch size); the forward operator synthesizes patches at their tile
-positions and gathers the scattered measurements there. ref_out receives the
-reconstructed pixel plane (CV_32F, rows x cols, 0..255) so cv::merge can
-consume it. coefficients_out must be pre-sized to the unknown count and may
-hold a warm start (e.g. OMP codes of neighbor strips).
-*/
-void reconstruct_color_channel_dict(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
-    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
-    const int& iterations, const cs_dictionary& dict, cv::Mat& ref_out);
-
-/** @brief objective/gradient for the patch-dictionary solve: forward =
-per-patch D * c synthesis -> gather at full-res positions; gradient =
-scatter residual -> per-patch D^T. */
-float evaluate_dict(void* instance, const float* x, eval_data data, float* g, const int n, const float step);
-
-int nextClosestDivisible(const int& x, const int& y);
-
-cv::Mat reconstructImage(const std::vector<std::vector<cv::Mat>>& tiles,
-    const std::vector<std::vector<TileCoord>>& coordinates);
-std::vector<cv::Mat> splitMat(cv::Mat& image, int M, int N);
 inline void updateAxb2AndComputeFx(float* x_copy, const int* ri_x, const int* ri_y,
     float* Axb2_vec, const float* b, int cols, float& fx, int n);
 inline void eval_g(float* Axb2, float* g, int n);
@@ -124,43 +81,62 @@ int progress(
 );
 std::vector<cv::Mat> createRefSolutions(const int& rows, const int& cols);
 
-/** @brief reconstructs all 3 color channels inside ONE lbfgs run (dimension 3n).
-Fuses the measurement extraction, the residual gathers and the gradient pass across channels,
-so per solver iteration the vec machinery runs once instead of three times.
-DCT kernels remain 6 real cv::dct calls (cv::dct rejects multi-channel input), but the
-fits/vector overhead and 3 channel launches collapse into one.
-*/
-void reconstruct_image_packed(const cv::Mat& pixel_measurements, const float& param_c, const int& rows, const int& cols,
-    const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat refs[3], cv::Mat& out);
-
-/** @brief fused objective/gradient for the stacked 3-channel solve.
-x has dimension 3n laid out as [plane c0 | plane c1 | plane c2] (row-major n = rows*cols each).
-b, Axb2, x_copy, g follow the same stacked layout.
-*/
-float evaluate_stacked(
-    void* instance,
-    const float* x,
-    eval_data data,
-    float* g,
-    const int n,
-    const float step
-);
-
 void reconstruct_color_channel(const cv::Mat& measurement, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat(), float tv = 0.0f);
 
 /** @brief solver selector for the tile reconstruction (see --solver).
 OWLQN (0) is the legacy liblbfgs path; FISTA (1) solves each channel
 independently with reweighted-L1 FISTA; FISTA_JOINT (2) solves all three
 channels together with SOMP-structured joint (group-L2,1) sparsity, i.e.
-one common DCT support shared across R/G/B plus reweighting.
+one common DCT support shared across R/G/B plus reweighting; ADMM (3) is
+the consensus-ADMM per-channel solve of the same reweighted-L1 objective
+(exact quadratic x-update + exact soft-threshold z-update instead of the
+FISTA proximal gradient).
 */
 enum CsSolver {
     CS_SOLVER_OWLQN = 0,
     CS_SOLVER_FISTA = 1,
-    CS_SOLVER_FISTA_JOINT = 2
+    CS_SOLVER_FISTA_JOINT = 2,
+    CS_SOLVER_ADMM = 3
 };
 
 int cs_solver_from_name(const std::string& name, int& out);
+
+/** @brief solve-stage profiler (opt-in, env CS_PROFILE=1).
+Atomic nanosecond accumulators shared by decrypt_tiles and the solver
+cores. cs_solveprof_reset()/cs_solveprof_dump() bracket a decrypt_tiles
+call; dump prints one "profile[solve ...]" stderr line. Inactive until
+reset sees the env var, so normal runs pay only a predictable branch. */
+struct cs_solve_profile {
+    bool on = false;
+    // decrypt_tiles structure
+    std::atomic<long long> warm_ns{ 0 };      // build_neighbor_warm_start
+    std::atomic<long long> ctor_ns{ 0 };      // decrypt_image(tile) construction
+    std::atomic<long long> call_ns{ 0 };      // decrypt(): channel solves + merge/convert
+    std::atomic<long long> wave_wall_ns{ 0 }; // sum of per-wave wall times
+    std::atomic<long long> wave_cap_ns{ 0 };  // wall x usable threads (capacity; work/cap = efficiency)
+    std::atomic<long long> tiles{ 0 };
+    std::atomic<long long> samples{ 0 };      // sum of m across channel-wrapper calls
+    // channel wrapper (fista/joint/admm share these buckets)
+    std::atomic<long long> wrap_setup_ns{ 0 }, wrap_core_ns{ 0 }, wrap_rw_ns{ 0 }, wrap_tail_ns{ 0 };
+    std::atomic<long long> wrap_calls{ 0 }, rw_passes{ 0 };
+    // ADMM core
+    std::atomic<long long> admm_setup_ns{ 0 }, admm_rhs_ns{ 0 }, admm_x_ns{ 0 }, admm_cg_ns{ 0 }, admm_z_ns{ 0 }, admm_dual_ns{ 0 };
+    std::atomic<long long> admm_iters{ 0 };
+    // FISTA core
+    std::atomic<long long> fs_grad_ns{ 0 }, fs_shrink_ns{ 0 }, fs_mom_ns{ 0 };
+    std::atomic<long long> fs_iters{ 0 };
+    // OWL-QN path (reconstruct_color_channel + evaluate)
+    std::atomic<long long> owl_setup_ns{ 0 }, owl_lbfgs_ns{ 0 }, owl_tail_ns{ 0 };
+    std::atomic<long long> owl_eval_idct_ns{ 0 }, owl_eval_data_ns{ 0 }, owl_eval_dct_ns{ 0 };
+    std::atomic<long long> owl_evals{ 0 };
+};
+extern cs_solve_profile g_solveprof;
+void cs_solveprof_reset();
+void cs_solveprof_dump(int num_tiles, int num_threads, long long wall_ns);
+inline long long cs_solveprof_ns_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
 
 /** @brief single-channel reweighted-L1 FISTA (exact proximal soft-threshold
 instead of the OWL-QN pseudo-gradient). `iterations` is in L-BFGS units and
@@ -172,7 +148,7 @@ pixel plane 0..255 out after the tail scale).
 void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat(),
-    float tv = 0.0f, int reweights = 2, int fista_iters = 0);
+    float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
 
 /** @brief SOMP-structured joint RGB solve: stacked group-L2,1 FISTA with
 reweighting. refs[3] hold per-channel DCT/10 warm starts in, solved pixel
@@ -180,7 +156,21 @@ planes (CV_32F, 0..255, full tile size) out, ready for cv::merge.
 */
 void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
-    const int& iterations, cv::Mat refs[3], float tv = 0.0f, int reweights = 2, int fista_iters = 0);
+    const int& iterations, cv::Mat refs[3], float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
+
+/** @brief single-channel consensus ADMM: same reweighted-L1 objective, same
+budget mapping and same ref convention as reconstruct_color_channel_fista
+(DCT/10 warm start in, pixel plane 0..255 out after the tail scale), but a
+different optimizer -- consensus ADMM (exact quadratic x-update, exact
+soft-threshold z-update, residual-balanced rho) instead of proximal FISTA.
+`iterations` is in L-BFGS units and maps through the same helper
+(clamp(iterations*4,16,40) ADMM steps per reweight pass; a positive
+admm_iters sets the per-pass count directly).
+*/
+void reconstruct_color_channel_admm(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
+    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cv::Mat(),
+    float tv = 0.0f, int reweights = 2, int admm_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
 
 /** @brief solves ONE chroma plane at half resolution (4:2:0-style subsampling).
 The unknown is a (rows+1)/2 x (cols+1)/2 DCT plane; the forward operator
@@ -198,68 +188,5 @@ void reconstruct_color_channel_subchroma(const cv::Mat& pixel_measurements, cons
 IDCT(coarse) -> upsample -> gather at full-res positions; gradient =
 downsample(residual) -> DCT -> 2*s. */
 float evaluate_coarse(void* instance, const float* x, eval_data data, float* g, const int n, const float step);
-std::vector<std::string> splitString(const std::string& str, const char& delimiter);
-std::string removeCharacter(const std::string& str, const char& ch);
-void storeStringInColorMat(const std::string& text, cv::Mat& colorMat);
-std::string retrieveStringFromColorMat(const cv::Mat& colorMat);
-std::vector<cv::Mat> splitImageIntoTiles(const cv::Mat& image, const int& tile_width, const int& tile_height, const int& rows, const int& cols);
-std::vector<std::string> spiralOrder(const int& tiles);
-void splitImageIntoTiles(const cv::Mat& inputImage,
-    std::vector<std::vector<cv::Mat>>& tiles,
-    std::vector<std::vector<TileCoord>>& coordinates,
-    const int& tileCountN,
-    const int& overlap);
-/** @brief merges tiles back into an image.
-@param alpha : legacy sequential alpha blend weight (used when feather <= 0)
-@param feather : if > 0, tiles are composited with a cosine-feathered weight
-                 ramp of this many pixels at every tile border instead of the
-                 sequential alpha blend; weights sum to 1 across overlaps, so
-                 the result is order-independent and seam-free
-*/
-cv::Mat blendTilesWithImage(const std::vector<std::vector<cv::Mat>>& tiles,
-    const std::vector<std::vector<TileCoord>>& coordinates,
-    const cv::Mat& targetImage,
-    float alpha,
-    int feather = 0);
 
-struct display {
-    std::thread display_image_thread;
-    bool continue_displaying = true;
-
-    void display_output(std::string windowName, cv::Mat& image, const std::vector<std::vector<TileCoord>>& coordinates, const std::vector<std::vector<cv::Mat>>& image_tiles) const{
-#if defined(_WIN32)
-        RECT desktop;
-        const HWND hDesktop = GetDesktopWindow();
-        GetWindowRect(hDesktop, &desktop);
-        int horizontal = desktop.right;
-        int vertical = desktop.bottom;
-#else
-        // no Win32 desktop metrics; OpenCV will fit the window itself
-        int horizontal = 1280;
-        int vertical = 720;
-#endif
-        double ratio = double(image.cols) / double(image.rows);
-        double scale = 0.5;
-
-        while (continue_displaying) {
-            cv::waitKey(33);
-            image = reconstructImage(image_tiles, coordinates);
-            cv::Mat aux = image.clone();
-            cv::resize(aux, aux, cv::Size(scale * horizontal, scale * vertical * ratio));
-            cv::imshow(windowName, aux);
-        }
-    }
-
-    void display_image(const std::string& windowName, cv::Mat& reconstructed, const std::vector<std::vector<TileCoord>>& coordinates, const std::vector<std::vector<cv::Mat>>& image_tiles) {
-        display_image_thread = std::thread(&display::display_output, this, windowName, std::ref(reconstructed), std::ref(coordinates), std::ref(image_tiles));
-    }
-
-    void stop_display() {
-        continue_displaying = false;
-        display_image_thread.join();
-    }
-};
-
-void shuffle(std::vector<int>& data, unsigned seed);
-void reverseShuffle(std::vector<int>& data, unsigned seed);
-void sharpenImage(const cv::Mat& input, cv::Mat& output, float sharpness);
+#endif  // IMGRECONSTRUCT_BACKEND_HELPER_FUNCTIONS_HPP_

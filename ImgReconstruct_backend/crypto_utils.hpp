@@ -92,6 +92,9 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_RANDOM    0            // uniform random global indices (pad = 0)
 #define CS_MODE_PERIODIC  1            // one pattern repeated per tile (pad = 1)
 #define CS_MODE_ADAPTIVE  2            // LOD-based per-tile counts (pad = 2)
+#define CS_MODE_YCC420    3            // luma/chroma-split 4:2:0 sampling (pad = 3)
+#define CS_MODE_HF_FOCUS  5            // encrypted thumbnail + HF-weighted BGR sampling
+#define CS_MODE_YCC420_HF 6            // HF-weighted luma + uniform coarse chroma
 
 // Adaptive pad layout (mode = 2), all little-endian:
 //   [0]      mode (= 2)
@@ -100,6 +103,14 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 //   [5..6]   weight_base (uint16): w = tile_pixels * (weight_base + lod)
 //            0 is treated as the default 256 on parse (pre-strength containers)
 #define CS_OFF_ADAPTIVE_BASE 5         // offset from CS_OFF_PAD
+#define CS_OFF_HF_THUMBLEN 7          // modes 5/6: encrypted thumbnail length (u32 LE)
+#define CS_OFF_SAMPLE_BITS 11         // offset from CS_OFF_PAD: bits per stored
+                                      // sample value, 1..8 (0 = legacy 8-bit)
+#define CS_OFF_SAMPLE_BITS_CHROMA 12  // chroma bits; 0 = legacy/same as luma
+#define CS_OFF_SAMPLE_BITS_MARKER 13  // authenticated bit-packing extension marker
+#define CS_SAMPLE_BITS_MARKER 0xA7
+#define CS_OFF_LOD_FULL 14          // offset from CS_OFF_PAD: --lod-full
+                                    // detail threshold 0..255 (0 = off)
 
 // Maps --adaptive-strength in [0, 1] to the integer weight_base.
 //   0.0 -> 65535 (essentially uniform: density ratio ~1.004)
@@ -131,6 +142,39 @@ inline int cs_lod_pixels(int rows, int cols, int tile_size) {
     return (b + 2) / 3;               // ceil(b / 3)
 }
 
+// YCC 4:2:0 split sampling (mode = 3): luma is sampled at full resolution
+// (m_luma positions) while each chroma plane is first downsampled 2x and
+// then sampled on its own coarse grid. The per-plane chroma count derives
+// deterministically from the stored luma budget so no extra header fields
+// are needed — both sides must use cs_ycc420_chroma_count. Container body
+// layout after the 32-pixel header is raw bytes:
+//   [Y x m_luma][Cr x m_chroma][Cb x m_chroma], zero-padded to whole pixels.
+// At the same --ratio this stores ~1.5 bytes/px instead of 3 (BGR modes).
+inline void cs_ycc420_chroma_dims(int rows, int cols, int& crows, int& ccols) {
+    crows = (rows + 1) / 2;
+    ccols = (cols + 1) / 2;
+}
+inline int cs_ycc420_chroma_count(int m_luma, int rows, int cols) {
+    int crows, ccols;
+    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    if (rows <= 0 || cols <= 0) return 0;
+    int mc = (int)(((long long)m_luma * crows * ccols) / ((long long)rows * cols));
+    if (mc < 1) mc = 1;
+    const int cap = crows * ccols;
+    if (mc > cap) mc = cap;
+    return mc;
+}
+// Domain separation for the three per-plane RNG streams: luma uses the key
+// as-is (tag 0), chroma planes use tagged copies. Deterministic on both
+// sides; the tags are fixed constants, not secrets.
+inline void cs_ycc420_channel_key(const uint8_t in[32], uint8_t tag, uint8_t out[32]) {
+    for (int i = 0; i < 32; ++i) out[i] = in[i];
+    out[0] ^= tag;
+    out[16] ^= tag;
+}
+#define CS_YCC420_TAG_CR 0xA5
+#define CS_YCC420_TAG_CB 0x5A
+
 struct CsHeaderInfo {
     int m = 0, rows = 0, cols = 0, org_h = 0, org_w = 0;
     int version = 0;                 // 1 = plain v1, 2 = authenticated v2
@@ -142,6 +186,58 @@ struct CsHeaderInfo {
     int periodic_tile = 0;           // > 0: tile size (periodic or adaptive)
     int periodic_samples = 0;        // mode 1: samples per tile; mode 2: lod byte count (sanity)
     int adaptive_base = 256;         // mode 2: weight_base (w = cap * (base + lod))
+    uint32_t thumb_len = 0;          // modes 5/6: encrypted thumbnail bytes in body
+    int sample_bits = 8;             // bits per stored sample value (pad+11, 0 = legacy 8)
+    int sample_bits_chroma = 8;      // Cr/Cb (pad+12, 0 = same as luma)
+    int full_threshold = 0;          // --lod-full detail guarantee (pad+14, 0 = off)
+};
+
+// Sample bit-depth reduction (--sample-bits): measurement values are
+// plaintext in secret order, so the sequence is incompressible as stored —
+// fewer bits per value is the structural size lever (besides ratio/planes).
+// Quantize maps 8-bit values onto N bits (rounded), dequantize scales back;
+// N = 8 is the identity in both directions. Pack/unpack lay values out
+// MSB-first, each section independently whole-byte padded (pad bits zero).
+inline int cs_sample_bits_valid(int bits) { return bits >= 1 && bits <= 8; }
+inline size_t cs_packed_bytes(size_t count, int bits) {
+    if (count == 0 || bits >= 8) return count;
+    return (count * (size_t)bits + 7) / 8;
+}
+inline size_t cs_packed_bgr_bytes(size_t samples, int luma_bits, int chroma_bits) {
+    return (samples * (size_t)(luma_bits + 2 * chroma_bits) + 7) / 8;
+}
+inline uint8_t cs_quantize_sample(uint8_t v, int bits) {
+    if (bits >= 8) return v;
+    const int maxv = (1 << bits) - 1;
+    return (uint8_t)((v * maxv + 127) / 255);
+}
+inline uint8_t cs_dequantize_sample(uint8_t q, int bits) {
+    if (bits >= 8) return q;
+    const int maxv = (1 << bits) - 1;
+    return (uint8_t)((q * 255 + maxv / 2) / maxv);
+}
+
+// Bit-level sample codec (MSB-first; out must hold cs_packed_bytes /
+// cs_packed_bgr_bytes). The _bgr variants interleave per-value depths: G
+// uses luma_bits, B/R use chroma_bits (equal depths collapse to the plain
+// path, keeping the legacy stream bit-identical).
+void cs_pack_samples(const uint8_t* in, size_t count, int bits, uint8_t* out);
+void cs_unpack_samples(const uint8_t* in, size_t count, int bits, uint8_t* out);
+void cs_pack_samples_bgr(const uint8_t* in, size_t samples, int luma_bits,
+    int chroma_bits, uint8_t* out);
+void cs_unpack_samples_bgr(const uint8_t* in, size_t samples, int luma_bits,
+    int chroma_bits, uint8_t* out);
+
+// One packed body section: raw byte offset + value count + plane depth(s).
+// interleaved_bgr = flat BGR triplets (G = luma depth, B/R = chroma depth);
+// otherwise a single plane at bits. Sections must be ascending; everything
+// before the first section copies verbatim (header + lod/thumbnail prefixes).
+struct cs_body_section {
+    size_t offset;
+    size_t count;
+    int bits;
+    int chroma_bits;
+    bool interleaved_bgr;
 };
 
 // Parses (+ authenticates and decrypts for v2) the header from the raw bytes

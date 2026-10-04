@@ -48,12 +48,12 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>$(ProjectDir)..\third_party\onnxruntime\include;C:\opencv\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)..\third_party\onnxruntime\lib;C:\opencv\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)..\third_party\onnxruntime\include;C:\opencv\build\include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\third_party\onnxruntime\lib;C:\opencv\build\x64\vc16\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>$(ProjectDir)..\third_party\onnxruntime\include;C:\opencv\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)..\third_party\onnxruntime\lib;C:\opencv\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)..\third_party\onnxruntime\include;C:\opencv\build\include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\third_party\onnxruntime\lib;C:\opencv\build\x64\vc16\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -62,7 +62,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <OpenMPSupport>true</OpenMPSupport>
-      <AdditionalIncludeDirectories>C:\opencv\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\opencv\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <DisableSpecificWarnings>4996</DisableSpecificWarnings>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -78,8 +78,8 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_dnn4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;opencv_quality4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;onnxruntime.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\opencv\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world490.lib;bcrypt.lib;onnxruntime.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <DelayLoadDLLs>onnxruntime.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
@@ -92,7 +92,8 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <OpenMPSupport>true</OpenMPSupport>
-      <AdditionalIncludeDirectories>C:\opencv\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\opencv\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
       <DisableSpecificWarnings>4996</DisableSpecificWarnings>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
@@ -111,19 +112,22 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>opencv_core4130.lib;opencv_imgproc4130.lib;opencv_highgui4130.lib;opencv_imgcodecs4130.lib;opencv_dnn4130.lib;opencv_photo4130.lib;opencv_videoio4130.lib;opencv_quality4130.lib;ippicvmt.lib;ippiw.lib;ipphal.lib;ittnotify.lib;bcrypt.lib;libprotobuf.lib;libjpeg-turbo.lib;libpng.lib;libtiff.lib;libopenjp2.lib;IlmImf.lib;zlib.lib;ade.lib;onnxruntime.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\opencv\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world490.lib;bcrypt.lib;onnxruntime.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <DelayLoadDLLs>onnxruntime.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
       <LinkTimeCodeGeneration>UseFastLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CS_encryption.cpp" />
-    <ClCompile Include="clip_scorer.cpp" />
     <ClCompile Include="crypto_utils.cpp" />
+    <ClCompile Include="cs_wavelet.cpp" />
     <ClCompile Include="helper_functions.cpp" />
     <ClCompile Include="image_decryption.cpp" />
     <ClCompile Include="image_encryption.cpp" />
+    <ClCompile Include="image_tiles.cpp" />
+    <ClCompile Include="image_preview.cpp" />
+    <ClCompile Include="photo_upscaler.cpp" />
     <ClCompile Include="ImgReconstruct_backend.cpp" />
     <ClCompile Include="lbfgs.cpp" />
   </ItemGroup>
@@ -133,17 +137,24 @@
     <ClInclude Include="avir_dil.h" />
     <ClInclude Include="avir_float4_sse.h" />
     <ClInclude Include="avir_float8_avx.h" />
-    <ClInclude Include="clip_scorer.hpp" />
     <ClInclude Include="crypto_utils.hpp" />
     <ClInclude Include="CS_encryption.hpp" />
     <ClInclude Include="helper_functions.hpp" />
     <ClInclude Include="image_decryption.hpp" />
     <ClInclude Include="image_encryption.hpp" />
+    <ClInclude Include="image_preview.hpp" />
+    <ClInclude Include="photo_upscaler.hpp" />
+    <ClInclude Include="image_tiles.hpp" />
+    <ClInclude Include="cs_wavelet.hpp" />
     <ClInclude Include="lancir.h" />
     <ClInclude Include="lbfgs.hpp" />
     <ClInclude Include="quality_utils.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <CsHipDir>$(ProjectDir)</CsHipDir>
+  </PropertyGroup>
+  <Import Project="hip_build.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

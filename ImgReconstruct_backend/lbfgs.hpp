@@ -64,10 +64,6 @@
         int full_cols;
         float tv_lambda = 0.0f;  // > 0 enables total-variation fusion in evaluate()
 
-        // patch-dictionary solve (evaluate_dict)
-        const float* dict_D = nullptr;  // atoms * patch * patch, atom-major
-        int dict_atoms = 0;
-        int patch = 8;                  // patch edge length
     };
 
     typedef struct {
@@ -132,4 +128,3 @@
 
 
 #endif/*__cplusplus*/
-

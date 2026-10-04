@@ -1,9 +1,11 @@
 ﻿#include "image_decryption.hpp"
 #include "image_encryption.hpp"
+#include "photo_upscaler.hpp"
 #include "quality_utils.hpp"
-#include "clip_scorer.hpp"
+#include "cs_gpu.h"
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -30,42 +32,96 @@ void print_usage(const char* exe) {
         "  --ratio <f>           encryption sampling ratio in (0.001, 1.0]; default 1.0\n"
         "  --tiles <n>           decrypt tile count >= 1 (manual mode only,\n"
         "                        default 1: whole image is one tile)\n"
-        "  --overlap <n>         decrypt tile overlap in (24, 96) (manual mode only)\n"
+        "  --overlap <n>         decrypt tile overlap in [0, 96] (manual mode only;\n"
+  "                        0 disables overlap: tiles solve independently and\n"
+  "                        composite without feathering)\n"
         "  --iterations <n>      decrypt solver iterations (manual mode only)\n"
         "  --threads <n>         decrypt worker threads (manual mode only)\n"
-        "  --coef <f>            decrypt solver coefficient in (0.01, 0.05) (manual mode only)\n"
+        "  --coef <f>            decrypt solver coefficient (>0; higher = sparser,\n"
+        "                        no upper bound; manual mode only)\n"
+        "  --per-tile-coef       scale the L1 coefficient per tile from its\n"
+        "                        sample count (starved tiles regularized more,\n"
+        "                        rich tiles relaxed; tv stays global unless\n"
+        "                        --per-tile-tv is also given)\n"
+        "  --per-tile-tv         scale the TV weight per tile the same way\n"
+        "                        (smooth/starved tiles smoothed more; watch\n"
+        "                        for seams on flat gradients)\n"
         "  --manual              force manual parameter mode (auto is the default and\n"
         "                        derives tiles/overlap/iterations/coef from the image)\n"
         "  --no-preview          disable the live decryption preview window\n"
-        "  --denoise             apply a final non-local-means denoise pass\n"
-        "                        (smooths solver noise, blurs fine detail)\n"
+        "  --photo-upscaler <b>  per-tile 2x upscaler backend: avir (default,\n"
+        "                        vendored resampler) or waifu2x (one batched\n"
+        "                        nunif subprocess; needs python + nunif, warns\n"
+        "                        and falls back to AVIR when unavailable)\n"
+        "  --waifu2x-cmd <s>     waifu2x command prefix (default\n"
+        "                        \"python -m waifu2x.cli\" or $CS_WAIFU2X_CMD;\n"
+        "                        e.g. \"py -m waifu2x.cli\" on Windows)\n"
+        "  --waifu2x-args <s>    full-arg override appended after -i/-o\n"
+        "                        (default composes --style photo --method\n"
+        "                        <method> -n <noise> -g -1)\n"
+        "  --waifu2x-method <m>  waifu2x denoising: scale (pure 2x upscale,\n"
+        "                        default) or noise_scale (denoise + 2x)\n"
+        "  --waifu2x-noise <n>   waifu2x denoise strength in [0, 3]\n"
+        "                        (default 0; used with noise_scale)\n"
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off)\n"
   "  --solver <name>      tile solver: owlqn (default, liblbfgs),\n"
   "                        fista (reweighted-L1 FISTA per channel),\n"
   "                        joint (SOMP-structured group-sparsity FISTA\n"
-  "                        over R/G/B together + reweighting)\n"
-  "  --fista-iters <n>    FISTA steps per reweight pass (fista/joint only,\n"
+  "                        over R/G/B together + reweighting),\n"
+  "                        admm (consensus ADMM per channel: exact\n"
+  "                        quadratic x-update + soft-threshold z-update)\n"
+  "  --fista-iters <n>    steps per reweight pass (fista/joint/admm only,\n"
   "                        0 = auto-map from --iterations as N*4 clamped\n"
   "                        to [16,40]; max 500)\n"
-  "  --reweights <n>      outer reweight passes for fista/joint (1-5,\n"
-  "                        default 2; 1 = plain unweighted FISTA)\n"
-        "  --dict <file>         solve with a learned K-SVD patch dictionary\n"
-        "                        instead of the DCT basis (see the trainer tool)\n"
+  "  --reweights <n>      outer reweight passes for fista/joint/admm (1-5,\n"
+  "                        default 2; 1 = plain unweighted solve)\n"
+  "  --basis <name>       sparsifying basis for fista/joint/admm: dct\n"
+  "                        (default, block-DCT) or wavelet (multilevel\n"
+  "                        CDF 9/7, sparser on natural images; OWL-QN\n"
+  "                        stays DCT)\n"
+  "  --wscale <f>         wavelet per-scale threshold ramp for fista/joint/admm\n"
+  "                        (in (0,16], default 2: coarsest band x1, finest\n"
+  "                        band x wscale, LL protected; 1 = uniform;\n"
+  "                        DCT ignores it)\n"
+        "  --device <name>      solve device for --solver admm|fista|joint: cpu\n"
+        "                        (default) or gpu (HIP offload; dct basis,\n"
+        "                        any tv; other combinations fall back to cpu per call)\n"
         "  --periodic            encrypt with periodic tile sampling: one random\n"
         "                        per-tile pattern repeated across the image\n"
         "                        (encrypt/roundtrip only; decrypt auto-detects\n"
         "                        the mode from the container)\n"
         "  --tile-size <n>       periodic tile size (default 64)\n"
+        "  --ycc420              encrypt with luma/chroma-split 4:2:0 sampling: Y\n"
+  "                        at full resolution, each chroma plane sampled on\n"
+  "                        its half-resolution grid (~1.5 bytes/px stored\n"
+  "                        instead of 3; decrypt auto-detects from the\n"
+  "                        container). Adaptive flags (--adaptive, --two-pass,\n"
+  "                        --regions, --lod-smooth, --adaptive-strength/floor,\n"
+  "                        --lod-full) are absorbed: they drive the luma budget\n"
+  "                        while chroma stays uniform. --periodic is ignored\n"
+  "                        under --ycc420.\n"
+  "  --hf-focus            encrypt a stored LF thumbnail plus HF-weighted\n"
+  "                        samples (BGR mode 5; with --ycc420, mode 6)\n"
+  "  --sample-bits <L[,C]> bits for luma and optional chroma, each [1, 8]\n"
+  "                        (one value applies to both; default 8; lower values shrink\n"
+  "                        the container near-linearly at the cost of\n"
+  "                        quantization noise; encrypt/roundtrip only;\n"
+  "                        decrypt auto-detects from the header)\n"
         "  --adaptive            encrypt with LOD-based adaptive sampling: each\n"
         "                        tile gets an 8-bit detail score shipped in the\n"
         "                        container; sample budget splits by score so\n"
         "                        detailed tiles are over-sampled and flat tiles\n"
         "                        under-sampled (encrypt/roundtrip only; decrypt\n"
         "                        auto-detects from the container)\n"
-        "  --adaptive-floor <n>  minimum LOD byte in adaptive mode (default 32;\n"
-        "                        keeps a floor share for flat tiles)\n"
+  "  --adaptive-floor <n>  minimum LOD byte in adaptive mode (default 32;\n"
+  "                        keeps a floor share for flat tiles)\n"
+  "  --lod-full <n>       tiles scoring >= n detail are fully sampled\n"
+  "                        regardless of --ratio (0 = off, default; 1-255\n"
+  "                        LOD byte; implies adaptive scoring, top-detail\n"
+  "                        tiles win when the budget cannot fit them all;\n"
+  "                        encrypt/roundtrip only, decrypt auto-detects)\n"
   "  --adaptive-strength <s>  how aggressively detail tiles are over-sampled\n"
   "                        and flat tiles under-sampled, s in [0, 1]\n"
   "                        (default 0.5; 0 = uniform like random sampling,\n"
@@ -97,22 +153,6 @@ void print_usage(const char* exe) {
         "  --full-res            keep native resolution end-to-end (skip the\n"
         "                        default encrypt 2x downscale and decrypt\n"
         "                        2x upscale); use on encrypt AND decrypt/roundtrip\n"
-        "  --desc <text>         CLIP restart selection: decrypt N candidates\n"
-        "                        with perturbed warm-starts and keep the one\n"
-        "                        scoring highest against this description\n"
-        "                        (decrypt/roundtrip only; needs models/clip/)\n"
-        "  --restarts <n>        candidate count for --desc (default 4, >= 1;\n"
-        "                        candidate 0 is the unperturbed decrypt)\n"
-        "  --clip-dir <dir>      CLIP model directory (default models/clip\n"
-        "                        or $CS_CLIP_DIR)\n"
-        "  --tune                CLIP-guided coordinate descent: search\n"
-        "                        (coef, tv, iterations) to maximize\n"
-        "                        alpha*CLIP - beta*measurement-residual,\n"
-        "                        starting from the AUTO decrypt (requires\n"
-        "                        --desc; cannot combine with --restarts)\n"
-        "  --tune-rounds <n>     coordinate-descent rounds (default 1)\n"
-        "  --tune-alpha <f>      CLIP weight (default 1.0)\n"
-        "  --tune-beta <f>       residual weight (default 0.005)\n"
         "\n"
         "  roundtrip encrypts the input and then decrypts the in-memory result\n"
         "  compare scores decryption quality (PSNR/SSIM/MAE/max) and writes\n"
@@ -204,240 +244,6 @@ bool parse_float(const char* s, float& out) {
     catch (...) { return false; }
 }
 
-// CLIP restart selection: decrypt N candidates (candidate 0 unperturbed,
-// rest with seeded warm-start noise) and keep the highest-scoring one.
-// input_path is used for decrypt mode; encrypted (non-empty) for roundtrip.
-int run_clip_selection(const std::string& input_path, const cv::Mat& encrypted,
-    const std::string& output, const std::string& password,
-    int tiles, int overlap, int iterations, int threads, float coef,
-    bool show_preview, bool denoise, float tv_lambda, const std::string& dict_path,
-    bool full_res, const std::string& desc, int restarts, const std::string& clip_dir,
-    int solver = CS_SOLVER_OWLQN, int fista_iters = 0, int reweights = 2)
-{
-    ClipScorer clip;
-    if (!clip.load(clip_dir)) {
-        std::cerr << "Error: CLIP load failed: " << clip.error() << std::endl;
-        std::cerr << "Run scripts\\download_clip.ps1 first (models/clip/)" << std::endl;
-        return 2;
-    }
-    std::string best_path;
-    float best_score = -2.0f;
-    for (int k = 0; k < restarts; ++k) {
-        const int seed = (k == 0) ? -1 : (k - 1);
-        const std::string cand = output + ".cand" + std::to_string(k) + ".png";
-        int rc;
-        if (!input_path.empty())
-            rc = decrypt_image::decrypt_image_tiled(input_path, cand, password,
-                tiles, overlap, iterations, threads, coef, show_preview,
-                denoise, tv_lambda, dict_path, full_res, seed, solver, fista_iters, reweights);
-        else
-            rc = decrypt_image::decrypt_image_tiled(encrypted, cand, password,
-                tiles, overlap, iterations, threads, coef, show_preview,
-                denoise, tv_lambda, dict_path, full_res, seed, solver, fista_iters, reweights);
-        if (rc != 0) {
-            std::cerr << "candidate " << k << " decrypt failed (code " << rc << ")" << std::endl;
-            std::remove(cand.c_str());
-            return 1;
-        }
-        cv::Mat img = cv::imread(cand, cv::IMREAD_COLOR);
-        const float s = clip.score(img, desc);
-        std::printf("candidate %d (seed %d): CLIP %.4f\n", k, seed, s);
-        if (s > best_score) {
-            if (!best_path.empty()) std::remove(best_path.c_str());
-            best_score = s;
-            best_path = cand;
-        } else {
-            std::remove(cand.c_str());
-        }
-    }
-    std::printf("selected %s (CLIP %.4f)\n", best_path.c_str(), best_score);
-    std::remove(output.c_str());
-    if (std::rename(best_path.c_str(), output.c_str()) != 0) {
-        std::cerr << "Error: cannot rename best candidate to output" << std::endl;
-        return 1;
-    }
-    return 0;
-}
-
-// Measurement consistency: mean |candidate - measurement| over the sampled
-// pixels (in [0,1] units). Guards CLIP against rewarding confabulation that
-// contradicts the container. Candidate is the final full-res output; it is
-// downscaled to the solve geometry before comparison (unless --full-res).
-double measurement_mae(const cv::Mat& encrypted, const std::string& password,
-                       const cv::Mat& candidate) {
-    decrypt_image dimgs(encrypted, password);
-    cv::Mat sampled, masked;
-    dimgs.get_sampled_mat(sampled, masked);
-    if (sampled.empty() || candidate.empty()) return 1e9;
-    cv::Mat cand;
-    if (candidate.size() != sampled.size())
-        cv::resize(candidate, cand, sampled.size(), 0, 0, cv::INTER_AREA);
-    else
-        cand = candidate;
-    cv::Mat a, b;
-    cand.convertTo(a, CV_32FC3, 1.0 / 255.0);
-    sampled.convertTo(b, CV_32FC3, 1.0 / 255.0);
-    double sum = 0;
-    long n = 0;
-    for (int y = 0; y < a.rows; ++y) {
-        const cv::Vec3b* m = masked.ptr<cv::Vec3b>(y);
-        const cv::Vec3f* pa = a.ptr<cv::Vec3f>(y);
-        const cv::Vec3f* pb = b.ptr<cv::Vec3f>(y);
-        for (int x = 0; x < a.cols; ++x) {
-            if (m[x] == cv::Vec3b(1, 1, 1)) {
-                sum += std::fabs(pa[x][0] - pb[x][0])
-                     + std::fabs(pa[x][1] - pb[x][1])
-                     + std::fabs(pa[x][2] - pb[x][2]);
-                ++n;
-            }
-        }
-    }
-    if (n == 0) return 1e9;
-    return sum / (3.0 * n);
-}
-
-// CLIP-guided coordinate descent over (coef, tv, iterations): the gradient-
-// free stand-in for a clip_lambda term in evaluate(). Trial 0 is the AUTO
-// decrypt (incumbent, never-worse guarantee); phases then sweep one axis at
-// a time in MANUAL mode (tiles/overlap mirror AUTO: 24/24). Objective:
-// alpha*CLIP - beta*residual. Evaluated points are cached across rounds.
-int run_tune(const std::string& input_path, const cv::Mat& encrypted,
-    const std::string& output, const std::string& password,
-    int tiles, int overlap, int iterations, int threads, float coef,
-    bool show_preview, bool denoise, float tv_lambda, const std::string& dict_path,
-    bool full_res, const std::string& desc, const std::string& clip_dir,
-    int rounds, double alpha, double beta,
-    int solver = CS_SOLVER_OWLQN, int fista_iters = 0, int reweights = 2)
-{
-    ClipScorer clip;
-    if (!clip.load(clip_dir)) {
-        std::cerr << "Error: CLIP load failed: " << clip.error() << std::endl;
-        std::cerr << "Run scripts\\download_clip.ps1 first (models/clip/)" << std::endl;
-        return 2;
-    }
-    cv::Mat enc = input_path.empty() ? encrypted
-                                     : cv::imread(input_path, cv::IMREAD_COLOR);
-    if (enc.empty()) {
-        std::cerr << "Error: cannot load encrypted input" << std::endl;
-        return 1;
-    }
-    // text embedding is description-only: compute once, reuse for all trials
-    const std::vector<int> text_ids = clip.tokenize_public(desc);
-
-    const int saved_params = CSencryption::params;
-    std::map<std::string, double> cache;
-    std::string best_path;
-    double best_score = -1e100;
-    float best_coef = coef;
-    float best_tv = tv_lambda;
-    int best_iters = iterations;
-    int trial_no = 0;
-
-    const char* best_label = "auto";
-    auto eval_point = [&](float c, float tv, int it, const char* label) -> int {
-        // key includes the label: the AUTO trial's derived params are
-        // unknown to the CLI, so its score must not collide with a manual
-        // trial that happens to share the CLI-default numbers
-        char key[80];
-        std::snprintf(key, sizeof(key), "%s|%.4f|%.4f|%d", label, c, tv, it);
-        double s;
-        auto hit = cache.find(key);
-        if (hit != cache.end()) {
-            s = hit->second;
-            if (std::strcmp(label, "auto") == 0)
-                std::printf("trial %d [auto]: cached score %.4f\n", trial_no, s);
-            else
-                std::printf("trial %d [%s] coef=%.3f tv=%.3f iters=%d: cached score %.4f%s\n",
-                    trial_no, label, c, tv, it, s, s > best_score ? " *" : "");
-        } else {
-            const std::string cand = output + ".tune" + std::to_string(trial_no) + ".png";
-            int rc;
-            if (std::strcmp(label, "auto") == 0) {
-                CSencryption::params = AUTO_PARAM;
-                rc = decrypt_image::decrypt_image_tiled(enc, cand, password,
-                    tiles, overlap, iterations, threads, coef, show_preview,
-                    denoise, tv_lambda, dict_path, full_res, -1, solver, fista_iters, reweights);
-            } else {
-                CSencryption::params = MANUAL_PARAM;
-                rc = decrypt_image::decrypt_image_tiled(enc, cand, password,
-                    tiles, overlap, it, threads, c, show_preview,
-                    denoise, tv, dict_path, full_res, -1, solver, fista_iters, reweights);
-            }
-            if (rc != 0) {
-                std::cerr << "trial " << trial_no << " decrypt failed (code " << rc << ")" << std::endl;
-                std::remove(cand.c_str());
-                CSencryption::params = saved_params;
-                return 1;
-            }
-            cv::Mat img = cv::imread(cand, cv::IMREAD_COLOR);
-            const float cs = clip.score_embed(text_ids, img);
-            const double rs = measurement_mae(enc, password, img);
-            s = alpha * cs - beta * rs;
-            cache[key] = s;
-            const bool is_auto = std::strcmp(label, "auto") == 0;
-            if (is_auto)
-                std::printf("trial %d [auto, derived params]: CLIP %.4f resid %.4f score %.4f%s\n",
-                    trial_no, cs, rs, s, s > best_score ? " *" : "");
-            else
-                std::printf("trial %d [%s] coef=%.3f tv=%.3f iters=%d: CLIP %.4f resid %.4f score %.4f%s\n",
-                    trial_no, label, c, tv, it, cs, rs, s, s > best_score ? " *" : "");
-            if (s > best_score) {
-                if (!best_path.empty()) std::remove(best_path.c_str());
-                best_score = s;
-                best_path = cand;
-                best_coef = c; best_tv = tv; best_iters = it;
-                best_label = label;
-            } else {
-                std::remove(cand.c_str());
-            }
-        }
-        // note: a cache hit can never beat best_score (same value was
-        // already considered), so best_path always names a live file
-        ++trial_no;
-        return 0;
-    };
-
-    int rc = 0;
-    // coef grid spans the MANUAL legal range (0.01, 0.05); note AUTO derives
-    // its own coef inside decrypt (e.g. 0.075 at ratio 0.25), which may lie
-    // outside this range — the manual trials explore the legal neighborhood
-    const float coef_grid[] = { 0.01f, 0.02f, 0.03f, 0.045f };
-    const float tv_grid[] = { 0.0f, 0.05f, 0.2f };
-    const int iter_grid[] = { 5, 8, 12, 16 };
-    for (int r = 0; r < rounds && rc == 0; ++r) {
-        std::printf("--- tune round %d ---\n", r + 1);
-        rc = eval_point(coef, tv_lambda, iterations, r == 0 ? "auto" : "auto");
-        for (float c : coef_grid) {
-            if (rc != 0) break;
-            rc = eval_point(c, best_tv, best_iters, "coef");
-        }
-        for (float tv : tv_grid) {
-            if (rc != 0) break;
-            rc = eval_point(best_coef, tv, best_iters, "tv");
-        }
-        for (int it : iter_grid) {
-            if (rc != 0) break;
-            rc = eval_point(best_coef, best_tv, it, "iters");
-        }
-    }
-    CSencryption::params = saved_params;
-    if (rc != 0) {
-        if (!best_path.empty()) std::remove(best_path.c_str());
-        return rc;
-    }
-    if (std::strcmp(best_label, "auto") == 0)
-        std::printf("tuned: AUTO params kept (score %.4f)\n", best_score);
-    else
-        std::printf("tuned coef=%.3f tv=%.3f iters=%d (score %.4f)\n",
-            best_coef, best_tv, best_iters, best_score);
-    std::remove(output.c_str());
-    if (std::rename(best_path.c_str(), output.c_str()) != 0) {
-        std::cerr << "Error: cannot rename best trial to output" << std::endl;
-        return 1;
-    }
-    return 0;
-}
-
 } // namespace
 
 int main(int argc, char* argv[])
@@ -489,16 +295,19 @@ int main(int argc, char* argv[])
     float ratio = 1.0f;
     int tiles = 1, overlap = 24, iterations = 5, threads = 8;
     float coef = 0.01f;
+    bool per_tile_coef = false;
+    bool per_tile_tv = false;
     float tv_lambda = 0.0f;
-    std::string dict_path;
     bool manual = false;
     bool show_preview = true;
-    bool denoise = false;
+    CsPhotoUpscalerOptions photo_up;
     bool periodic = false;
     int tile_size = 64;
     bool adaptive = false;
-    int adaptive_floor = 32;
-    float adaptive_strength = 0.5f;
+    bool ycc420 = false;
+    bool hf_focus = false;
+    int adaptive_floor = 32;    float adaptive_strength = 0.5f;
+    int lod_full = 0;
     bool two_pass = false;
     float pilot_ratio = 0.05f;
     std::string regions_json;
@@ -506,17 +315,15 @@ int main(int argc, char* argv[])
     float lod_smooth = 0.0f;
     bool show_mask = false;
     bool full_res = false;
-    std::string desc;
+    int sample_bits = 8;
+    int chroma_sample_bits = 8;
     std::string solver_name = "owlqn";
     int solver = CS_SOLVER_OWLQN;
     int fista_iters = 0;
     int reweights = 2;
-    int restarts = 4;
-    std::string clip_dir;
-    bool tune = false;
-    int tune_rounds = 1;
-    double tune_alpha = 1.0;
-    double tune_beta = 0.005;
+    std::string basis_name = "dct";
+    int basis = CS_BASIS_DCT;
+    float wscale = 2.0f;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -562,25 +369,63 @@ int main(int argc, char* argv[])
             if (!v || !parse_float(v, coef)) return 64;
             manual = true;
         }
+        else if (a == "--per-tile-coef") {
+            // decrypt-side only; per-tile counts travel in the container,
+            // so this must not flip decrypt into manual parameter mode
+            per_tile_coef = true;
+        }
+        else if (a == "--per-tile-tv") {
+            // same, for the TV weight (independent flag: tv seams are the
+            // failure mode to watch, keep it separable from coef)
+            per_tile_tv = true;
+        }
         else if (a == "--manual") {
             manual = true;
         }
         else if (a == "--no-preview") {
             show_preview = false;
         }
-        else if (a == "--denoise") {
-            denoise = true;
+        else if (a == "--photo-upscaler") {
+            const char* v = next("avir or waifu2x");
+            if (!v) return 64;
+            if (v != std::string("avir") && v != std::string("waifu2x")) {
+                std::cerr << "Error: --photo-upscaler must be avir or waifu2x" << std::endl;
+                return 64;
+            }
+            photo_up.backend = v;
+        }
+        else if (a == "--waifu2x-cmd") {
+            const char* v = next("command");
+            if (!v) return 64;
+            photo_up.waifu2x_cmd = v;
+        }
+        else if (a == "--waifu2x-args") {
+            const char* v = next("arguments");
+            if (!v) return 64;
+            photo_up.waifu2x_args = v;
+        }
+        else if (a == "--waifu2x-method") {
+            const char* v = next("scale or noise_scale");
+            if (!v) return 64;
+            if (v != std::string("scale") && v != std::string("noise_scale")) {
+                std::cerr << "Error: --waifu2x-method must be scale or noise_scale" << std::endl;
+                return 64;
+            }
+            photo_up.waifu2x_method = v;
+        }
+        else if (a == "--waifu2x-noise") {
+            const char* v = next("integer in [0,3]");
+            if (!v || !parse_int(v, photo_up.waifu2x_noise)) return 64;
+            if (photo_up.waifu2x_noise < 0 || photo_up.waifu2x_noise > 3) {
+                std::cerr << "Error: --waifu2x-noise must be in [0, 3]" << std::endl;
+                return 64;
+            }
         }
         else if (a == "--tv") {
             // does NOT force manual mode: AUTO still derives coef/iterations
             // from the container ratio; only the TV weight is overridden
             const char* v = next("floating point");
             if (!v || !parse_float(v, tv_lambda)) return 64;
-        }
-        else if (a == "--dict") {
-            const char* v = next("dictionary file");
-            if (!v) return 64;
-            dict_path = v;
         }
         else if (a == "--periodic") {
             // encrypt-side only: decrypt auto-detects the mode from the
@@ -593,6 +438,14 @@ int main(int argc, char* argv[])
             const char* v = next("integer");
             if (!v || !parse_int(v, tile_size)) return 64;
         }
+        else if (a == "--ycc420") {
+            // encrypt-side only (same as --periodic): luma/chroma-split 4:2:0
+            // sampling; decrypt auto-detects mode 3 from the container header
+            ycc420 = true;
+        }
+        else if (a == "--hf-focus") {
+            hf_focus = true;
+        }
         else if (a == "--adaptive") {
             // encrypt-side only (same as --periodic): never forces manual
             // decrypt parameters — mode travels in the authenticated header
@@ -603,6 +456,16 @@ int main(int argc, char* argv[])
             if (!v || !parse_int(v, adaptive_floor)) return 64;
             if (adaptive_floor < 0 || adaptive_floor > 255) {
                 std::cerr << "Error: --adaptive-floor must be in [0, 255]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--lod-full") {
+            // encrypt-side detail guarantee; decrypt restores the threshold
+            // from the header, so this must not flip decrypt into manual
+            const char* v = next("integer in [0, 255]");
+            if (!v || !parse_int(v, lod_full)) return 64;
+            if (lod_full < 0 || lod_full > 255) {
+                std::cerr << "Error: --lod-full must be in [0, 255] (0 = off)" << std::endl;
                 return 64;
             }
         }
@@ -652,21 +515,39 @@ int main(int argc, char* argv[])
             // encrypt/roundtrip only: after sampling, save + open the mask
             show_mask = true;
         }
+        else if (a == "--sample-bits") {
+            // encrypt-side only (container size lever); decrypt auto-detects
+            // from the header, so this must not flip decrypt into manual
+            const char* v = next("L or L,C, each integer in [1, 8]");
+            if (!v) return 64;
+            const std::string arg(v);
+            const size_t comma = arg.find(',');
+            const std::string luma = arg.substr(0, comma);
+            if (!parse_int(luma.c_str(), sample_bits)) return 64;
+            chroma_sample_bits = sample_bits;
+            if (comma != std::string::npos) {
+                if (arg.find(',', comma + 1) != std::string::npos) {
+                    std::cerr << "Error: --sample-bits takes L or L,C" << std::endl;
+                    return 64;
+                }
+                const std::string chroma = arg.substr(comma + 1);
+                if (!parse_int(chroma.c_str(), chroma_sample_bits)) return 64;
+            }
+            if (sample_bits < 1 || sample_bits > 8 || chroma_sample_bits < 1 || chroma_sample_bits > 8) {
+                std::cerr << "Error: --sample-bits luma and chroma values must each be in [1, 8]" << std::endl;
+                return 64;
+            }
+        }
         else if (a == "--full-res") {
             // both sides: skip encrypt 2x downscale AND decrypt 2x upscale
             full_res = true;
-        }
-        else if (a == "--desc") {
-            const char* v = next("description text");
-            if (!v) return 64;
-            desc = v;
         }
         else if (a == "--solver") {
             const char* v = next("owlqn|fista|joint");
             if (!v) return 64;
             solver_name = v;
             if (cs_solver_from_name(solver_name, solver) != 0) {
-                std::cerr << "Error: unknown --solver '" << solver_name << "' (owlqn|fista|joint)" << std::endl;
+                std::cerr << "Error: unknown --solver '" << solver_name << "' (owlqn|fista|joint|admm)" << std::endl;
                 return 64;
             }
         }
@@ -686,39 +567,34 @@ int main(int argc, char* argv[])
                 return 64;
             }
         }
-        else if (a == "--restarts") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, restarts)) return 64;
-            if (restarts < 1) {
-                std::cerr << "Error: --restarts must be >= 1" << std::endl;
+        else if (a == "--basis") {
+            const char* v = next("dct|wavelet");
+            if (!v) return 64;
+            basis_name = v;
+            if (cs_basis_from_name(basis_name, basis) != 0) {
+                std::cerr << "Error: unknown --basis '" << basis_name << "' (dct|wavelet)" << std::endl;
                 return 64;
             }
         }
-        else if (a == "--clip-dir") {
-            const char* v = next("directory");
-            if (!v) return 64;
-            clip_dir = v;
-        }
-        else if (a == "--tune") {
-            tune = true;
-        }
-        else if (a == "--tune-rounds") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, tune_rounds)) return 64;
-            if (tune_rounds < 1) {
-                std::cerr << "Error: --tune-rounds must be >= 1" << std::endl;
+        else if (a == "--wscale") {
+            const char* v = next("float");
+            if (!v || !parse_float(v, wscale)) return 64;
+            if (wscale <= 0.0f || wscale > 16.0f) {
+                std::cerr << "Error: --wscale must be in (0, 16]" << std::endl;
                 return 64;
             }
         }
-        else if (a == "--tune-alpha") {
-            const char* v = next("floating point");
+        else if (a == "--device") {
+            const char* v = next("cpu|gpu");
             if (!v) return 64;
-            tune_alpha = std::atof(v);
-        }
-        else if (a == "--tune-beta") {
-            const char* v = next("floating point");
-            if (!v) return 64;
-            tune_beta = std::atof(v);
+            if (std::strcmp(v, "gpu") == 0) {
+                cs_gpu::set_enabled(true);
+            } else if (std::strcmp(v, "cpu") == 0) {
+                cs_gpu::set_enabled(false);
+            } else {
+                std::cerr << "Error: unknown --device '" << v << "' (cpu|gpu)" << std::endl;
+                return 64;
+            }
         }
         else {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
@@ -736,29 +612,33 @@ int main(int argc, char* argv[])
         return 64;
     }
 
-    if (!desc.empty() && mode == "encrypt") {
-        std::cerr << "Warning: --desc is decrypt-side only; ignoring for encrypt" << std::endl;
-        desc.clear();
-    }
     if (two_pass && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --two-pass is encrypt-side only; ignoring for decrypt" << std::endl;
         two_pass = false;
+    }
+    if (lod_full > 0 && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --lod-full is encrypt-side only; ignoring for decrypt" << std::endl;
+        lod_full = 0;
     }
     if (!regions_json.empty() && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --regions is encrypt-side only; ignoring for decrypt" << std::endl;
         regions_json.clear();
     }
-    if (tune && mode == "encrypt") {
-        std::cerr << "Warning: --tune is decrypt-side only; ignoring for encrypt" << std::endl;
-        tune = false;
+    if (ycc420 && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --ycc420 is encrypt-side only; ignoring for decrypt" << std::endl;
+        ycc420 = false;
     }
-    if (tune && desc.empty()) {
-        std::cerr << "Error: --tune requires --desc" << std::endl;
+    if (ycc420 && periodic) {
+        std::cerr << "Warning: --periodic is meaningless with --ycc420; ignoring" << std::endl;
+        periodic = false;
+    }
+    if (hf_focus && periodic) {
+        std::cerr << "Error: --hf-focus cannot be combined with --periodic" << std::endl;
         return 64;
     }
-    if (tune && restarts != 4) {
-        std::cerr << "Error: --tune cannot be combined with --restarts" << std::endl;
-        return 64;
+    if (hf_focus && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --hf-focus is encrypt-side only; ignoring for decrypt" << std::endl;
+        hf_focus = false;
     }
 
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;
@@ -770,44 +650,24 @@ int main(int argc, char* argv[])
         // tile_size > 0 selects periodic sampling on the encrypt side; the
         // mode travels inside the authenticated container, so decrypt needs
         // no sampling flags. --adaptive/--two-pass win over --periodic when
-        // combined (--two-pass implies the adaptive container).
-        const bool use_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f;
+        // combined (--two-pass implies the adaptive container), unless
+        // --ycc420 is set: then the adaptive-family flags are absorbed into
+        // the LOD-luma variant of the split container instead.
+        const bool use_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full);
         }
         else if (mode == "decrypt") {
-            if (tune) {
-                rc = run_tune(input, cv::Mat(), output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview, denoise,
-                    tv_lambda, dict_path, full_res, desc, clip_dir,
-                    tune_rounds, tune_alpha, tune_beta, solver, fista_iters, reweights);
-            } else if (desc.empty()) {
-                rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res, -1, solver, fista_iters, reweights);
-            } else {
-                rc = run_clip_selection(input, cv::Mat(), output, password,
-                    tiles, overlap, iterations, threads, coef, show_preview, denoise,
-                    tv_lambda, dict_path, full_res, desc, restarts, clip_dir, solver, fista_iters, reweights);
-            }
+            rc = decrypt_image::decrypt_image_tiled(input, output, password,
+                tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv);
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full);
             if (rc == 0) {
-                if (tune) {
-                    rc = run_tune(std::string(), encrypted, output, password,
-                        tiles, overlap, iterations, threads, coef, show_preview, denoise,
-                        tv_lambda, dict_path, full_res, desc, clip_dir,
-                        tune_rounds, tune_alpha, tune_beta, solver, fista_iters, reweights);
-                } else if (desc.empty()) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                        tiles, overlap, iterations, threads, coef, show_preview, denoise, tv_lambda, dict_path, full_res, -1, solver, fista_iters, reweights);
-                } else {
-                    rc = run_clip_selection(std::string(), encrypted, output, password,
-                        tiles, overlap, iterations, threads, coef, show_preview, denoise,
-                        tv_lambda, dict_path, full_res, desc, restarts, clip_dir, solver, fista_iters, reweights);
-                }
+                        tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv);
             }
         }
     }
