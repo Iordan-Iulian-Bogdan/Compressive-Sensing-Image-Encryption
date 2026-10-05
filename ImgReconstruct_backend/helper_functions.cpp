@@ -17,10 +17,6 @@
 #include <stdexcept>
 #include <utility>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
-
 cs_solve_profile g_solveprof;
 
 namespace {
@@ -168,15 +164,8 @@ void cs_solveprof_reset() {
     g_solveprof.wrap_setup_ns = 0; g_solveprof.wrap_core_ns = 0;
     g_solveprof.wrap_rw_ns = 0; g_solveprof.wrap_tail_ns = 0;
     g_solveprof.wrap_calls = 0; g_solveprof.rw_passes = 0;
-    g_solveprof.admm_setup_ns = 0; g_solveprof.admm_rhs_ns = 0;
-    g_solveprof.admm_x_ns = 0; g_solveprof.admm_cg_ns = 0;
-    g_solveprof.admm_z_ns = 0; g_solveprof.admm_dual_ns = 0;
-    g_solveprof.admm_iters = 0;
     g_solveprof.fs_grad_ns = 0; g_solveprof.fs_shrink_ns = 0;
     g_solveprof.fs_mom_ns = 0; g_solveprof.fs_iters = 0;
-    g_solveprof.owl_setup_ns = 0; g_solveprof.owl_lbfgs_ns = 0; g_solveprof.owl_tail_ns = 0;
-    g_solveprof.owl_eval_idct_ns = 0; g_solveprof.owl_eval_data_ns = 0;
-    g_solveprof.owl_eval_dct_ns = 0; g_solveprof.owl_evals = 0;
 }
 
 // one "profile[solve ...]" line; all times in milliseconds
@@ -190,9 +179,7 @@ void cs_solveprof_dump(int num_tiles, int num_threads, long long wall_ns) {
         "profile[solve tiles=%d threads=%d]: wall=%.1f warm=%.1f ctor=%.1f call=%.1f"
         " | wave wall=%.1f cap=%.1f eff=%.1f%% tiles=%lld m_sum=%lld"
         " | wrap setup=%.1f core=%.1f rw=%.1f tail=%.1f calls=%lld rwp=%lld"
-        " | admm setup=%.1f rhs=%.1f x=%.1f cg=%.1f z=%.1f dual=%.1f iters=%lld"
-        " | fsta grad=%.1f shrink=%.1f mom=%.1f iters=%lld"
-        " | owl setup=%.1f lbfgs=%.1f tail=%.1f eval idct=%.1f data=%.1f dct=%.1f evals=%lld\n",
+        " | fsta grad=%.1f shrink=%.1f mom=%.1f iters=%lld\n",
         num_tiles, num_threads, wall_ns * ms,
         g_solveprof.warm_ns.load() * ms, g_solveprof.ctor_ns.load() * ms, g_solveprof.call_ns.load() * ms,
         g_solveprof.wave_wall_ns.load() * ms, g_solveprof.wave_cap_ns.load() * ms, eff,
@@ -200,16 +187,8 @@ void cs_solveprof_dump(int num_tiles, int num_threads, long long wall_ns) {
         g_solveprof.wrap_setup_ns.load() * ms, g_solveprof.wrap_core_ns.load() * ms,
         g_solveprof.wrap_rw_ns.load() * ms, g_solveprof.wrap_tail_ns.load() * ms,
         g_solveprof.wrap_calls.load(), g_solveprof.rw_passes.load(),
-        g_solveprof.admm_setup_ns.load() * ms, g_solveprof.admm_rhs_ns.load() * ms,
-        g_solveprof.admm_x_ns.load() * ms, g_solveprof.admm_cg_ns.load() * ms,
-        g_solveprof.admm_z_ns.load() * ms, g_solveprof.admm_dual_ns.load() * ms,
-        g_solveprof.admm_iters.load(),
         g_solveprof.fs_grad_ns.load() * ms, g_solveprof.fs_shrink_ns.load() * ms,
-        g_solveprof.fs_mom_ns.load() * ms, g_solveprof.fs_iters.load(),
-        g_solveprof.owl_setup_ns.load() * ms, g_solveprof.owl_lbfgs_ns.load() * ms,
-        g_solveprof.owl_tail_ns.load() * ms, g_solveprof.owl_eval_idct_ns.load() * ms,
-        g_solveprof.owl_eval_data_ns.load() * ms, g_solveprof.owl_eval_dct_ns.load() * ms,
-        g_solveprof.owl_evals.load());
+        g_solveprof.fs_mom_ns.load() * ms, g_solveprof.fs_iters.load());
     cs_solveprof_reset();
 }
 
@@ -225,184 +204,12 @@ int nextClosestDivisible(int x, int y) {
     return nextMultiple;
 }
 
-inline void updateAxb2AndComputeFx(float* x_copy, const int* ri_x, const int* ri_y,
-    float* Axb2_vec, const float* b, int cols, float& fx, int n) {
-    __m256 fx_vec = _mm256_setzero_ps();  // Accumulator for fx
-
-    int i = 0;
-    for (; i <= n - 8; i += 8) {
-        // Gather indices (aka coordinates of sampled pixels)
-        int idx[8];
-        for (int k = 0; k < 8; k++) {
-            idx[k] = ri_x[i + k] * cols + ri_y[i + k];
-        }
-
-        // Load x_copy values using gather
-        __m256 x_val = _mm256_i32gather_ps(x_copy, _mm256_load_si256((__m256i*) & idx[0]), 4);
-
-        // Load b values (measurment aka sampled tile)
-        __m256 b_val = _mm256_load_ps(&b[i]);
-
-        // Compute differences
-        __m256 diff = _mm256_sub_ps(x_val, b_val);
-
-        // Accumulate fx (diff * diff)
-        fx_vec = _mm256_fmadd_ps(diff, diff, fx_vec);
-
-        // Store differences to Axb2_vec
-        alignas(32) float temp[8];
-        _mm256_store_ps(temp, diff);
-        for (int k = 0; k < 8; k++) {
-            Axb2_vec[idx[k]] = temp[k];
-        }
-    }
-
-    // Handle remaining elements
-    float fx_temp = 0.0f;
-    for (; i < n; ++i) {
-        int idx = ri_x[i] * cols + ri_y[i];
-        float diff = x_copy[idx] - b[i];
-        fx_temp += diff * diff;
-        Axb2_vec[idx] = diff;
-    }
-
-    // Reduce fx_vec to scalar
-    __m128 hi = _mm256_extractf128_ps(fx_vec, 1);
-    __m128 lo = _mm256_castps256_ps128(fx_vec);
-    __m128 sum = _mm_add_ps(hi, lo);
-    sum = _mm_hadd_ps(sum, sum);
-    sum = _mm_hadd_ps(sum, sum);
-    fx = _mm_cvtss_f32(sum) + fx_temp;
-}
-
-inline void eval_g(float* Axb2, float* g, int n) {
-    __m256 scalar = _mm256_set1_ps(2.0f); // Set scalar to 2.0f
-    int i = 0;
-
-    for (; i <= n - 8; i += 8) {
-        __m256 vecData = _mm256_load_ps(&Axb2[i]); 
-        _mm256_store_ps(&g[i], _mm256_mul_ps(vecData, scalar));  // Multiply and store
-    }
-
-    // Process remaining elements
-    for (; i < n; ++i) {
-        g[i] = Axb2[i] * 2.0f;
-    }
-}
-
-inline void copy_x(float* x_copy, float* x, float* Axb2_vec, int n) {
-    __m256 factor = _mm256_set1_ps(0.0f);
-    int i = 0;
-    // Process multiples of 8
-    for (; i <= n - 8; i += 8) {
-        __m256 vecData = _mm256_load_ps(&x[i]);
-        _mm256_store_ps(&x_copy[i], vecData);  // Copy to x_copy
-        _mm256_store_ps(&Axb2_vec[i], factor); // Set Axb2_vec to 0
-    }
-
-    // Process remaining elements
-    for (; i < n; ++i) {
-        x_copy[i] = x[i];
-        Axb2_vec[i] = 0.0f;
-    }
-}
+// (OWL-QN helpers updateAxb2AndComputeFx/eval_g/copy_x removed with the
+// solver; FISTA cores below are self-contained.)
 
 
-// here we are basically evaluating the objective function
-// as well as evaluating the error
-// looks very unreadable because I tried to optimize it as much as possible
-// DCTs are the limiting performance factor
-float evaluate(
-    void* instance,
-    const float* x,
-    eval_data data,
-    float* g,
-    const int n,
-    const float step
-)
-{
-    float fx = 0;
-    const bool sp = g_solveprof.on;
-    auto sp_t = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    copy_x(data.x_copy, (float*)x, data.Axb2, n);
-    cv::Mat Ax(data.rows, data.cols, CV_32F, data.x_copy);
-    dct(Ax, Ax, cv::DCT_INVERSE);
-    if (sp) { g_solveprof.owl_eval_idct_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
-    updateAxb2AndComputeFx(data.x_copy, data.ri_x, data.ri_y, data.Axb2, data.b, data.cols, fx, data.m);
-    if (sp) { g_solveprof.owl_eval_data_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
-    cv::Mat Axb2(data.rows, data.cols, CV_32F, data.Axb2);
-    dct(Axb2, Axb2);
-    eval_g(data.Axb2, g, n);
-    if (sp) { g_solveprof.owl_eval_dct_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
-
-    // Optional total-variation fusion (smoothed isotropic TV on the
-    // pixel-domain plane, which data.x_copy holds at this point):
-    //   fx += tv_lambda * sum(sqrt(dx^2 + dy^2 + eps^2) - eps)
-    //   gradient back-projected through the DCT and added to g.
-    // The gradient is accumulated into the Axb2 buffer, which is free after
-    // eval_g consumed its DCT of the data residual.
-    if (data.tv_lambda > 0.0f) {
-        const int rows = data.rows, cols = data.cols;
-        const float eps = 1e-3f; // normalized-domain smoothing (x in [0,1])
-        float* xpix = data.x_copy;
-        float* tvgrad = data.Axb2;
-        float phi = 0.0f;
-        std::memset(tvgrad, 0, sizeof(float) * n);
-        for (int i = 0; i < rows; ++i) {
-            const bool has_down = i + 1 < rows;
-            for (int j = 0; j < cols; ++j) {
-                const int idx = i * cols + j;
-                const float a = has_down ? xpix[idx + cols] - xpix[idx] : 0.0f;
-                const float b = (j + 1 < cols) ? xpix[idx + 1] - xpix[idx] : 0.0f;
-                const float d = std::sqrt(a * a + b * b + eps * eps);
-                phi += d - eps;
-                const float ua = a / d;
-                const float vb = b / d;
-                // phi = sum(sqrt(a^2+b^2)); dphi/dx[p,q] = -div(u, v)
-                tvgrad[idx] -= ua + vb;
-                if (has_down) {
-                    tvgrad[idx + cols] += ua;
-                }
-                if (j + 1 < cols) {
-                    tvgrad[idx + 1] += vb;
-                }
-            }
-        }
-        cv::Mat tvgrad_m(data.rows, data.cols, CV_32F, tvgrad);
-        dct(tvgrad_m, tvgrad_m);
-        for (int i = 0; i < n; ++i) {
-            g[i] += data.tv_lambda * tvgrad[i];
-        }
-        fx += data.tv_lambda * phi;
-    }
-    // optional TV tail folded into the dct bucket (tv=0 in profile runs)
-    if (sp) { g_solveprof.owl_eval_dct_ns += sp_ns_since(sp_t); g_solveprof.owl_evals += 1; }
-
-    return fx;
-}
-
-// prints out convergence metrics with every iterations
-// this is more for debugging purposes, it's not necesarry to be called
-int progress(
-    void* instance,
-    const float* x,
-    const float* g,
-    const float fx,
-    const float xnorm,
-    const float gnorm,
-    const float step,
-    int n,
-    int k,
-    int ls
-)
-{
-    printf("Iteration %d:\n", k);
-    printf("  fx = %f, x[0] = %f, x[1] = %f\n", fx, x[0], x[1]);
-    printf("  xnorm = %f, gnorm = %f, step = %f\n", xnorm, gnorm, step);
-    printf("\n");
-
-    return 0;
-}
+// (OWL-QN objective evaluate() and its progress printer removed with the
+// solver; FISTA cores below are self-contained.)
 
 // this function creates initial solutions for each color channel
 // we use a generic reference image to create them
@@ -432,88 +239,17 @@ std::vector<cv::Mat> createRefSolutions(const int& rows, const int& cols) {
     return c;
 }
 
-// reconstructs a color channel using LBFGS
-void reconstruct_color_channel(const cv::Mat& pixel_measurements, const int& k, const float& param_c, const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations, cv::Mat& ref, bool copy_next_ref, cv::Mat& next_ref, float tv) {
-
-    const bool sp = g_solveprof.on;
-    auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    int n = rows * cols; // size of solution (size of vectorized image)
-    float fx;
-    /* Initialize the parameters for the optimization. */
-    lbfgs_parameter_t param;
-    lbfgs_parameter_init(&param);
-    param.orthantwise_c = (float)param_c; // this tells lbfgs to do OWL-QN
-    param.linesearch = LBFGS_LINESEARCH_BACKTRACKING;
-    param.max_iterations = iterations;
-    int lbfgs_ret;
-    std::vector<float> b;
-
-    // reserving space to avoid realocations
-    b.reserve(ri_x.size());
-
-    //auto update_progress = progress;
-    lbfgs_progress_t update_progress = NULL;
-    eval_data data;
-    std::vector<float> Axb2(n);
-    std::vector<float> x_copy(n);
-
-    // extracting pixel measurements from encrypted image
-    for (int i = CS_HEADER_PIXELS; i < ri_x.size() + CS_HEADER_PIXELS && i < pixel_measurements.total(); i++) {
-        b.push_back(pixel_measurements.at<cv::Vec3b>(i)[k] / 255.0f);
-    }
-
-    // sometimes the number of sampled pixels in a tile wont be exactly ri_x.size()
-    // so we just make the rest of them 0
-    for (int i = b.size(); i < ri_x.size(); i++) {
-        b.push_back(0.0f);
-    }
-
-    data.b = b.data();
-    data.Axb2 = Axb2.data();
-    data.x_copy = x_copy.data();
-    data.m = ri_x.size();
-    data.ri_x = ri_x.data();
-    data.ri_y = ri_y.data();
-    data.rows = rows;
-    data.cols = cols;
-    data.tv_lambda = tv;
-
-    // LBFGS optimization
-    if (sp) {
-        g_solveprof.owl_setup_ns += sp_ns_since(sp_t0);
-        g_solveprof.wrap_calls += 1;
-        g_solveprof.samples += (long long)ri_x.size();
-    }
-    auto sp_l = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    lbfgs_ret = lbfgs(n, (float*)ref.data, data, &fx, evaluate, update_progress, NULL, &param);
-    if (sp) g_solveprof.owl_lbfgs_ns += sp_ns_since(sp_l);
-
-    // we are copying the current solution to the next solution for faster convergence.
-    // NOTE: this used to stride i in bytes against total() (an element count),
-    // copying only the first quarter of the float plane; a full memcpy carries
-    // the whole solved plane (including correlated high frequencies) forward.
-    auto sp_t1 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    if (copy_next_ref && !next_ref.empty()) {
-        if (!next_ref.isContinuous()) next_ref = next_ref.clone();
-        std::memcpy(next_ref.data, ref.data, sizeof(float) * (size_t)n);
-    }
-
-    cv::Mat AtAxb2(rows, cols, CV_32F, (float*)ref.data);
-    dct(AtAxb2, AtAxb2, cv::DCT_INVERSE);
-    AtAxb2 = AtAxb2 * 255.0f;
-    if (sp) g_solveprof.owl_tail_ns += sp_ns_since(sp_t1);
-}
+// (OWL-QN channel solve reconstruct_color_channel removed; FISTA below is
+// the only solver.)
 
 // ---------------------------------------------------------------------------
 // FISTA + reweighted L1 + SOMP-structured joint sparsity
 // ---------------------------------------------------------------------------
-// Alternative to the OWL-QN (liblbfgs) path in reconstruct_color_channel.
 // Under DCT the forward operator A = P * IDCT is a row-selected orthonormal
 // transform, so ||A|| = 1 and the data term f(x) = ||Ax - b||^2 has
 // Lipschitz constant L = 2 exactly (plus ~8*tv when the smoothed-TV fusion
 // is enabled). That makes FISTA's proximal step exact and cheap: one IDCT +
-// one DCT per iteration, no line search, versus several evaluate() calls per
-// OWL-QN step. Under CDF97 (biorthogonal, multilevel) the step is chosen by
+// one DCT per iteration with no line search. Under CDF97 (biorthogonal, multilevel) the step is chosen by
 // backtracking instead. Reweighting (Candes et al.) runs 2 outer passes with normalized
 // weights w = eps/(|x|+eps) so large coefficients are protected while small
 // ones are pushed harder toward zero. The joint mode replaces the
@@ -532,33 +268,47 @@ int cs_solver_from_name(const std::string& name, int& out) {
         if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
         s.push_back(c);
     }
-    if (s == "owlqn" || s == "lbfgs" || s == "owl-qn" || s == "0") { out = CS_SOLVER_OWLQN; return 0; }
     if (s == "fista" || s == "1") { out = CS_SOLVER_FISTA; return 0; }
     if (s == "joint" || s == "fista-joint" || s == "fistajoint" || s == "somp" || s == "2") { out = CS_SOLVER_FISTA_JOINT; return 0; }
-    if (s == "admm" || s == "3") { out = CS_SOLVER_ADMM; return 0; }
     return -1;
 }
 
-// Smoothed isotropic TV energy + gradient in the pixel domain (same
-// convention as evaluate()). tvgrad must hold n floats; returns phi.
+// Smoothed isotropic TV energy + gradient in the pixel domain.
+// Gather formulation: each output pixel is computed from the
+// forward-difference cells that touch it (own + above + left), so every
+// iteration writes only its own pixel -- no scatter-carried dependence,
+// no memset, and ~40% fewer instructions than the scatter form
+// (microbenched 0.100 vs 0.166 ms/call at 259x343; max diff 7e-7).
+// tvgrad must hold n floats; returns phi.
 static float cs_tv_grad_phi(const float* pix, float* tvgrad, int rows, int cols) {
     const int n = rows * cols;
     const float eps = 1e-3f;
-    std::memset(tvgrad, 0, sizeof(float) * (size_t)n);
     float phi = 0.0f;
     for (int i = 0; i < rows; ++i) {
         const bool has_down = i + 1 < rows;
         for (int j = 0; j < cols; ++j) {
-            const int idx = i * cols + j;
-            const float a = has_down ? pix[idx + cols] - pix[idx] : 0.0f;
-            const float bb = (j + 1 < cols) ? pix[idx + 1] - pix[idx] : 0.0f;
-            const float d = std::sqrt(a * a + bb * bb + eps * eps);
-            phi += d - eps;
-            const float ua = a / d;
-            const float vb = bb / d;
-            tvgrad[idx] -= ua + vb;
-            if (has_down) tvgrad[idx + cols] += ua;
-            if (j + 1 < cols) tvgrad[idx + 1] += vb;
+            const int t = i * cols + j;
+            const float c = pix[t];
+            const float a0 = has_down ? pix[t + cols] - c : 0.0f;
+            const float b0 = (j + 1 < cols) ? pix[t + 1] - c : 0.0f;
+            const float d0 = std::sqrt(a0 * a0 + b0 * b0 + eps * eps);
+            phi += d0 - eps;
+            float acc = -(a0 / d0 + b0 / d0);
+            if (i > 0) {
+                const float up = pix[t - cols];
+                const float aT = c - up;
+                const float bT = (j + 1 < cols) ? pix[t - cols + 1] - up : 0.0f;
+                const float dT = std::sqrt(aT * aT + bT * bT + eps * eps);
+                acc += aT / dT;
+            }
+            if (j > 0) {
+                const float lf = pix[t - 1];
+                const float aL = has_down ? pix[t - 1 + cols] - lf : 0.0f;
+                const float bL = c - lf;
+                const float dL = std::sqrt(aL * aL + bL * bL + eps * eps);
+                acc += bL / dL;
+            }
+            tvgrad[t] = acc;
         }
     }
     return phi;
@@ -671,6 +421,8 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
             for (int trial = 0; ; ++trial) {
                 step = 1.0f / L;
                 const float base = lambda * step;
+                // simd-safe: z is local; yy/grad/w/wscale are distinct inputs.
+                #pragma omp simd
                 for (int i = 0; i < n; ++i) {
                     const float v = yy[i] - step * grad[i];
                     const float thr = base * w[i] * bx.wscale[i];
@@ -690,6 +442,8 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
             }
         } else {
             const float base = lambda * step;
+            // simd-safe: z is local; yy/grad/w/wscale are distinct inputs.
+            #pragma omp simd
             for (int i = 0; i < n; ++i) {
                 const float v = yy[i] - step * grad[i];
                 const float thr = base * w[i] * bx.wscale[i];
@@ -700,6 +454,8 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
         if (sp) { g_solveprof.fs_shrink_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
         const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
         const float mom = (t - 1.0f) / t_new;
+        // simd-safe: yy/x_prev are distinct caller vectors, z is local.
+        #pragma omp simd
         for (int i = 0; i < n; ++i) yy[i] = z[(size_t)i] + mom * (z[(size_t)i] - x_prev[(size_t)i]);
         std::memcpy(x_prev.data(), z.data(), sizeof(float) * (size_t)n);
         t = t_new;
@@ -745,6 +501,8 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
             for (int trial = 0; ; ++trial) {
                 const float step = 1.0f / L;
                 const float base = lambda * step;
+                // simd-safe: zc is local; yc/gc/w/wscale are distinct inputs.
+                #pragma omp simd
                 for (int i = 0; i < n; ++i) {
                     const float v0 = yc[0][i] - step * gc[0][i];
                     const float v1 = yc[1][i] - step * gc[1][i];
@@ -773,6 +531,8 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
         } else {
             const float step = 1.0f / L;
             const float base = lambda * step;
+            // simd-safe: zc is local; yc/gc/w/wscale are distinct inputs.
+            #pragma omp simd
             for (int i = 0; i < n; ++i) {
                 const float v0 = yc[0][i] - step * gc[0][i];
                 const float v1 = yc[1][i] - step * gc[1][i];
@@ -785,7 +545,9 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
         }
         const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
         const float mom = (t - 1.0f) / t_new;
+        // simd-safe: yc/xp are distinct caller vectors, zc is local.
         for (int c = 0; c < 3; ++c) {
+            #pragma omp simd
             for (int i = 0; i < n; ++i) {
                 yc[c][i] = zc[c][i] + mom * (zc[c][i] - pc[c][i]);
                 pc[c][i] = zc[c][i];
@@ -911,6 +673,76 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     }
 }
 
+void fista_channel_begin(fista_channel_task& t, const cv::Mat& pixel_measurements,
+    const int& channel, const float& param_c, const int& rows, const int& cols,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations,
+    cv::Mat& ref, float tv, int reweights, int fista_iters, int basis, float wscale)
+{
+    if (!ref.isContinuous()) ref = ref.clone();
+    t.basis = basis;
+    t.wscale = wscale;
+    const bool sp = g_solveprof.on;
+    auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97) {
+        const int m = (int)ri_x.size();
+        const int inner = cs_fista_inner_iters(iterations, fista_iters);
+        if (reweights < 1) reweights = 1;
+        if (reweights > 5) reweights = 5;
+        cs_extract_channel_measurements(pixel_measurements, channel, m, t.b);
+        cs_gpu::FistaProblem& pb = t.pb;
+        pb.tv = tv;
+        pb.b = t.b.data();
+        pb.rix = ri_x.data();
+        pb.riy = ri_y.data();
+        pb.m = m;
+        pb.rows = rows;
+        pb.cols = cols;
+        pb.x = (float*)ref.data;
+        pb.lambda = param_c;
+        pb.inner = inner;
+        pb.reweights = reweights;
+        if (sp) g_solveprof.wrap_setup_ns += sp_ns_since(sp_t0);
+        // enqueue only: the caller submits every independent channel of the
+        // tile/wave before any wait, so the worker's queue never drains
+        t.h = cs_gpu::fista_solve_submit(pb);
+        if (sp) { g_solveprof.rw_passes += (reweights > 1) ? (reweights - 1) : 0; }
+    } else {
+        // CPU (or CDF97): unchanged full blocking solve + tail inline
+        reconstruct_color_channel_fista(pixel_measurements, channel, param_c, rows, cols,
+            ri_x, ri_y, iterations, ref, false, cs_null_mat(), tv, reweights, fista_iters,
+            basis, wscale);
+        t.h = nullptr;
+    }
+}
+
+void fista_channel_end(fista_channel_task& t, cv::Mat& ref)
+{
+    if (!t.h) return;  // CPU path or device fallback: begin() ran it all
+    const bool sp = g_solveprof.on;
+    auto sp_g = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    cs_gpu::fista_solve_wait(t.h);
+    t.h = nullptr;
+    auto sp_t1 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    if (sp) {
+        g_solveprof.wrap_core_ns += sp_ns_since(sp_g);
+        g_solveprof.wrap_calls += 1;
+        g_solveprof.samples += t.pb.m;
+    }
+    if (t.basis == CS_BASIS_CDF97) {
+        // never on the GPU path (begin routes CDF97 to the CPU), kept for
+        // parity with the single-phase tail
+        cs_fista_basis bx = cs_make_basis(ref.rows, ref.cols, t.basis, t.wscale);
+        cs_dwt_inverse((float*)ref.data, ref.rows, ref.cols, bx.levels);
+        cv::Mat plane(ref.rows, ref.cols, CV_32F, ref.data);
+        plane = plane * 255.0f;
+    } else {
+        cv::Mat AtAxb2(ref.rows, ref.cols, CV_32F, (float*)ref.data);
+        cv::dct(AtAxb2, AtAxb2, cv::DCT_INVERSE);
+        AtAxb2 = AtAxb2 * 255.0f;
+    }
+    if (sp) g_solveprof.wrap_tail_ns += sp_ns_since(sp_t1);
+}
+
 void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     const int& iterations, cv::Mat refs[3], float tv, int reweights, int fista_iters, int basis, float wscale)
@@ -989,194 +821,8 @@ void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const floa
     }
 }
 
-// One consensus-ADMM run: min f(x) + g(z) s.t. x = z with
-//   f(x) = ||P(S x) - b||^2 (+ tv*TV(S x)),  g(z) = lambda*sum(w*wscale*|z|).
-// The x-update keeps the data term exact (quadratic) and linearizes TV at
-// x^k with the (tau/2)||x - x^k||^2 stabilizer (tau = 8*tv, the same TV
-// gradient bound FISTA uses), which gives the linear system
-//   (2 S^T M S + sigma I) x = 2 S^T P^T b - tv*S^T gradTV(S x^k)
-//                             + tau*x^k + rho*(z - u),   sigma = rho + tau.
-// Orthonormal synthesis (DCT): S^T(2M + sigma*I)S equals that matrix, so the
-// solve is closed form, x = S^T D^{-1} S rhs with D = 2M + sigma*I diagonal
-// in the pixel domain (two transforms + one division).
-// Biorthogonal CDF97: S^{-1} != S^T, so the identity fails; solve the same
-// SPD system with CG instead (sigma > 0 bounds the condition number and the
-// previous x warm-starts it; the relative-residual exit keeps the cost at a
-// few matvecs once ADMM settles).
-// z is the exact soft-threshold, u the scaled dual, and rho follows Boyd's
-// residual balancing (check every step, mu = 10, tau = 2) so a fixed
-// 16-40 step budget is not wasted on a badly scaled penalty. x is warm
-// start in, solution out; z/u are reset from x at entry (each reweight pass
-// starts a fresh consensus on the new weights).
-static void cs_admm_core(float* x, const float* b, const int* rix, const int* riy, int m,
-    int rows, int cols, const float* w, float lambda, float tv_lambda, int iters,
-    const cs_fista_basis& bx,
-    std::vector<float>& z, std::vector<float>& u,
-    std::vector<float>& rhs, std::vector<float>& pix,
-    std::vector<float>& sc, std::vector<float>& cgp)
-{
-    const int n = rows * cols;
-    const bool closed = (bx.basis == CS_BASIS_DCT);
-    const bool sp = g_solveprof.on;
-    const auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-
-    // constant pieces of the x-update: Atb = 2*S^T P^T b and the diagonal
-    // 2M of the data-term Hessian (2 per measured pixel, 0 elsewhere)
-    std::vector<float> atb((size_t)n, 0.0f), mask2((size_t)n, 0.0f);
-    std::memset(pix.data(), 0, sizeof(float) * (size_t)n);
-    for (int k = 0; k < m; ++k) {
-        const int idx = rix[k] * cols + riy[k];
-        pix[(size_t)idx] += b[k];
-        mask2[(size_t)idx] += 2.0f;
-    }
-    cs_synth_adj(pix.data(), rows, cols, bx);
-    for (int i = 0; i < n; ++i) atb[(size_t)i] = 2.0f * pix[(size_t)i];
-
-    // initial penalty at the data-Hessian mean eigenvalue
-    // (trace(2 S^T M S) = 2m over n dims) so the first x-update balances
-    // measurement fit against consensus; residual balancing adjusts from there
-    std::memcpy(z.data(), x, sizeof(float) * (size_t)n);
-    std::memset(u.data(), 0, sizeof(float) * (size_t)n);
-    float rho = 2.0f * (float)m / (float)n;
-    if (rho < 0.05f) rho = 0.05f;
-
-    const float tau = 8.0f * tv_lambda;
-    std::vector<float> zprev((size_t)n);
-    if (sp) g_solveprof.admm_setup_ns += sp_ns_since(sp_t0);
-    for (int k = 0; k < iters; ++k) {
-        auto sp_t = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-        const float sigma = rho + tau;
-
-        // RHS = 2*Atb - tv*S^T gradTV(S x^k) + tau*x^k + rho*(z - u)
-        for (int i = 0; i < n; ++i)
-            rhs[(size_t)i] = atb[(size_t)i] + tau * x[i] + rho * (z[(size_t)i] - u[(size_t)i]);
-        if (tv_lambda > 0.0f) {
-            std::memcpy(pix.data(), x, sizeof(float) * (size_t)n);
-            cs_synth(pix.data(), rows, cols, bx);
-            cs_tv_grad_phi(pix.data(), sc.data(), rows, cols); // grad TV in pixels
-            cs_synth_adj(sc.data(), rows, cols, bx);           // S^T gradTV
-            for (int i = 0; i < n; ++i) rhs[(size_t)i] -= tv_lambda * sc[(size_t)i];
-        }
-        if (sp) { g_solveprof.admm_rhs_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
-
-        if (closed) {
-            // x = S^T (2M + sigma*I)^{-1} S rhs  (S orthonormal)
-            std::memcpy(pix.data(), rhs.data(), sizeof(float) * (size_t)n);
-            cs_synth(pix.data(), rows, cols, bx);
-            for (int i = 0; i < n; ++i) pix[(size_t)i] /= (mask2[(size_t)i] + sigma);
-            cs_synth_adj(pix.data(), rows, cols, bx);
-            std::memcpy(x, pix.data(), sizeof(float) * (size_t)n);
-        } else {
-            // CG on (2 S^T M S + sigma I) x = rhs, warm-started at x^k.
-            // r lives in rhs afterwards (the RHS is not needed again), the
-            // direction in cgp, Ap in sc, and pix is synthesis scratch.
-            std::memcpy(pix.data(), x, sizeof(float) * (size_t)n);
-            cs_synth(pix.data(), rows, cols, bx);
-            for (int i = 0; i < n; ++i) pix[(size_t)i] *= mask2[(size_t)i];
-            cs_synth_adj(pix.data(), rows, cols, bx);
-            for (int i = 0; i < n; ++i) rhs[(size_t)i] -= pix[(size_t)i] + sigma * x[i];
-            double rr = 0.0;
-            for (int i = 0; i < n; ++i) {
-                cgp[(size_t)i] = rhs[(size_t)i];
-                rr += (double)rhs[(size_t)i] * rhs[(size_t)i];
-            }
-            const double rr0 = rr;
-            for (int cg = 0; cg < 20 && rr > 1e-10 * (rr0 + 1e-30); ++cg) {
-                std::memcpy(pix.data(), cgp.data(), sizeof(float) * (size_t)n);
-                cs_synth(pix.data(), rows, cols, bx);
-                for (int i = 0; i < n; ++i) pix[(size_t)i] *= mask2[(size_t)i];
-                cs_synth_adj(pix.data(), rows, cols, bx);
-                for (int i = 0; i < n; ++i) sc[(size_t)i] = pix[(size_t)i] + sigma * cgp[(size_t)i];
-                double pAp = 0.0;
-                for (int i = 0; i < n; ++i) pAp += (double)cgp[(size_t)i] * sc[(size_t)i];
-                if (!(pAp > 0.0)) break;
-                const double alpha = rr / pAp;
-                for (int i = 0; i < n; ++i) {
-                    x[i] += (float)alpha * cgp[(size_t)i];
-                    rhs[(size_t)i] -= (float)alpha * sc[(size_t)i];
-                }
-                double rr_new = 0.0;
-                for (int i = 0; i < n; ++i) rr_new += (double)rhs[(size_t)i] * rhs[(size_t)i];
-                const float beta = (float)(rr_new / rr);
-                for (int i = 0; i < n; ++i) cgp[(size_t)i] = rhs[(size_t)i] + beta * cgp[(size_t)i];
-                rr = rr_new;
-            }
-        }
-        if (sp) {
-            if (closed) g_solveprof.admm_x_ns += sp_ns_since(sp_t);
-            else g_solveprof.admm_cg_ns += sp_ns_since(sp_t);
-            sp_t = std::chrono::steady_clock::now();
-        }
-
-        // z-update: exact soft-threshold of (x + u) at lambda*w*wscale/rho
-        std::memcpy(zprev.data(), z.data(), sizeof(float) * (size_t)n);
-        for (int i = 0; i < n; ++i) {
-            const float v = x[i] + u[i];
-            const float thr = lambda * w[i] * bx.wscale[(size_t)i] / rho;
-            const float av = std::fabs(v);
-            z[(size_t)i] = (av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f;
-        }
-        if (sp) { g_solveprof.admm_z_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
-
-        // scaled-dual update + residual norms for balancing
-        double rnorm2 = 0.0, snorm2 = 0.0;
-        for (int i = 0; i < n; ++i) {
-            u[(size_t)i] += x[i] - z[(size_t)i];
-            const double r = (double)x[i] - z[(size_t)i];
-            const double s = (double)rho * (z[(size_t)i] - zprev[(size_t)i]);
-            rnorm2 += r * r;
-            snorm2 += s * s;
-        }
-
-        // Boyd residual balancing: grow/shrink rho by 2x and rescale the
-        // scaled dual to keep y = rho*u fixed
-        const double rnorm = std::sqrt(rnorm2), snorm = std::sqrt(snorm2);
-        if (rnorm > 10.0 * snorm && rho < 100.0f) {
-            const float old = rho;
-            rho *= 2.0f;
-            const float s = old / rho;
-            for (int i = 0; i < n; ++i) u[(size_t)i] *= s;
-        }
-        else if (snorm > 10.0 * rnorm && rho > 1e-3f) {
-            const float old = rho;
-            rho /= 2.0f;
-            const float s = old / rho;
-            for (int i = 0; i < n; ++i) u[(size_t)i] *= s;
-        }
-        if (sp) { g_solveprof.admm_dual_ns += sp_ns_since(sp_t); g_solveprof.admm_iters += 1; }
-    }
-}
-
-// CPU re-execution of the DCT/tv=0 ADMM wrapper contract for the GPU worker:
-// runs when the device fails mid-batch. The problem arrives with inner and
-// reweights already clamped, so this mirrors the wrapper loop exactly.
-static void cs_gpu_cpu_fallback(const cs_gpu::AdmmProblem& p)
-{
-    const int n = p.rows * p.cols;
-    const cs_fista_basis bx = cs_make_basis(p.rows, p.cols, CS_BASIS_DCT, 1.0f);
-    std::vector<float> w((size_t)n, 1.0f);
-    std::vector<float> z((size_t)n), u((size_t)n), rhs((size_t)n),
-        pix((size_t)n), sc((size_t)n), cgp((size_t)n);
-    for (int r = 0; r < p.reweights; ++r) {
-        cs_admm_core(p.x, p.b, p.rix, p.riy, p.m, p.rows, p.cols, w.data(),
-            p.lambda, 0.0f, p.inner, bx, z, u, rhs, pix, sc, cgp);
-        if (r + 1 < p.reweights) {
-            float mx = 0.0f;
-            for (int i = 0; i < n; ++i) {
-                const float av = std::fabs(p.x[i]);
-                if (av > mx) mx = av;
-            }
-            float eps = 0.02f * mx;
-            if (eps < 1e-3f) eps = 1e-3f;
-            for (int i = 0; i < n; ++i)
-                w[(size_t)i] = eps / (std::fabs(p.x[i]) + eps);
-        }
-    }
-}
-
-static const struct CsGpuFallbackReg {
-    CsGpuFallbackReg() { cs_gpu::register_cpu_fallback(&cs_gpu_cpu_fallback); }
-} cs_gpu_fallback_reg;
+// (Consensus-ADMM core cs_admm_core and its CPU fallback removed; FISTA is
+// the only solver.)
 
 // CPU re-execution of the DCT FISTA wrapper contract for the GPU
 // worker: runs when the device fails mid-batch. The problem arrives with
@@ -1205,6 +851,8 @@ static void cs_gpu_cpu_fallback_fista(const cs_gpu::FistaProblem& p)
                 }
                 float eps = 0.02f * mx;
                 if (eps < 1e-3f) eps = 1e-3f;
+                // simd-safe: w is local; p.x[012] are caller inputs.
+                #pragma omp simd
                 for (int i = 0; i < n; ++i) {
                     const float rn = std::sqrt(p.x[i] * p.x[i] +
                         p.x1[i] * p.x1[i] + p.x2[i] * p.x2[i]);
@@ -1228,6 +876,8 @@ static void cs_gpu_cpu_fallback_fista(const cs_gpu::FistaProblem& p)
             }
             float eps = 0.02f * mx;
             if (eps < 1e-3f) eps = 1e-3f;
+            // simd-safe: w is local; p.x is a caller input.
+            #pragma omp simd
             for (int i = 0; i < n; ++i)
                 w[(size_t)i] = eps / (std::fabs(p.x[i]) + eps);
         }
@@ -1238,168 +888,10 @@ static const struct CsGpuFallbackRegFista {
     CsGpuFallbackRegFista() { cs_gpu::register_cpu_fallback_fista(&cs_gpu_cpu_fallback_fista); }
 } cs_gpu_fallback_reg_fista;
 
-// Reweighted-L1 consensus ADMM for one channel. Same driver structure as
-// reconstruct_color_channel_fista (outer IRLS reweights, same ref in/out
-// convention), only the core optimizer differs.
-void reconstruct_color_channel_admm(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
-    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
-    const int& iterations, cv::Mat& ref, bool copy_next_ref, cv::Mat& next_ref,
-    float tv, int reweights, int admm_iters, int basis, float wscale)
-{
-    if (!ref.isContinuous()) ref = ref.clone();
-    const bool sp = g_solveprof.on;
-    auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    const int n = rows * cols;
-    const int m = (int)ri_x.size();
-    if (reweights < 1) reweights = 1;
-    if (reweights > 5) reweights = 5;
-    const cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+// (ADMM channel wrapper removed with the solver.)
 
-    std::vector<float> b;
-    cs_extract_channel_measurements(pixel_measurements, channel, m, b);
+// (OWL-QN subsampled-chroma solve evaluate_coarse +
+// reconstruct_color_channel_subchroma removed with the solver.)
 
-    std::vector<float> w((size_t)n, 1.0f);
-    std::vector<float> z((size_t)n), u((size_t)n), rhs((size_t)n), pix((size_t)n), sc((size_t)n), cgp((size_t)n);
-    const int inner = cs_fista_inner_iters(iterations, admm_iters);
-    float* x = (float*)ref.data;
-    if (sp) g_solveprof.wrap_setup_ns += sp_ns_since(sp_t0);
-    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && tv == 0.0f) {
-        // GPU path: batched with concurrent callers inside cs_gpu; the tail
-        // (ref chain copy + IDCT + 255) stays on the CPU below, unchanged.
-        cs_gpu::AdmmProblem pb;
-        pb.b = b.data();
-        pb.rix = ri_x.data();
-        pb.riy = ri_y.data();
-        pb.m = m;
-        pb.rows = rows;
-        pb.cols = cols;
-        pb.x = x;
-        pb.lambda = param_c;
-        pb.inner = inner;
-        pb.reweights = reweights;
-        auto sp_g = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-        cs_gpu::admm_solve_blocking(pb);
-        if (sp) {
-            g_solveprof.wrap_core_ns += sp_ns_since(sp_g);
-            g_solveprof.rw_passes += (reweights > 1) ? (reweights - 1) : 0;
-        }
-    } else for (int r = 0; r < reweights; ++r) {
-        auto sp_c = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-        cs_admm_core(x, b.data(), ri_x.data(), ri_y.data(), m, rows, cols,
-            w.data(), param_c, tv, inner, bx, z, u, rhs, pix, sc, cgp);
-        if (sp) g_solveprof.wrap_core_ns += sp_ns_since(sp_c);
-        if (r + 1 < reweights) {
-            auto sp_w = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-            float mx = 0.0f;
-            for (int i = 0; i < n; ++i) {
-                const float av = std::fabs(x[i]);
-                if (av > mx) mx = av;
-            }
-            float eps = 0.02f * mx;
-            if (eps < 1e-3f) eps = 1e-3f;
-            for (int i = 0; i < n; ++i) w[(size_t)i] = eps / (std::fabs(x[i]) + eps);
-            if (sp) { g_solveprof.wrap_rw_ns += sp_ns_since(sp_w); g_solveprof.rw_passes += 1; }
-        }
-    }
-
-    auto sp_t1 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    if (copy_next_ref && !next_ref.empty()) {
-        if (!next_ref.isContinuous()) next_ref = next_ref.clone();
-        std::memcpy(next_ref.data, ref.data, sizeof(float) * (size_t)n);
-    }
-
-    if (bx.basis == CS_BASIS_CDF97) {
-        cs_dwt_inverse((float*)ref.data, rows, cols, bx.levels);
-        cv::Mat plane(rows, cols, CV_32F, ref.data);
-        plane = plane * 255.0f;
-    } else {
-        cv::Mat AtAxb2(rows, cols, CV_32F, (float*)ref.data);
-        dct(AtAxb2, AtAxb2, cv::DCT_INVERSE);
-        AtAxb2 = AtAxb2 * 255.0f;
-    }
-    if (sp) {
-        g_solveprof.wrap_tail_ns += sp_ns_since(sp_t1);
-        g_solveprof.wrap_calls += 1;
-        g_solveprof.samples += m;
-    }
-}
-
-float evaluate_coarse(void* instance, const float* x, eval_data data, float* g, const int n, const float step)
-{
-    float fx = 0;
-
-    // x: coarse-plane DCT coefficients -> pixel plane (coarse)
-    copy_x(data.x_copy, (float*)x, data.Axb2, n);
-    cv::Mat C(data.rows, data.cols, CV_32F, data.x_copy);
-    cv::dct(C, C, cv::DCT_INVERSE);
-
-    // forward operator: upsample the coarse chroma plane to the full tile
-    // grid and gather the scattered full-res measurements there
-    cv::Mat full;
-    cv::resize(C, full, cv::Size(data.full_cols, data.full_rows), 0, 0, cv::INTER_LINEAR);
-
-    const int mm = data.m;
-    cv::Mat R(data.full_rows, data.full_cols, CV_32F, cv::Scalar(0));
-    float* rp = (float*)R.data;
-    for (int k = 0; k < mm; ++k) {
-        const int r = data.ri_x[k], c = data.ri_y[k];
-        const float diff = full.at<float>(r, c) - data.b[k];
-        R.at<float>(r, c) = diff;
-        fx += diff * diff;
-    }
-
-    // gradient: 2x2 area-average the full-res residual back to the coarse
-    // grid, then DCT it and scale
-    cv::resize(R, C, cv::Size(data.cols, data.rows), 0, 0, cv::INTER_AREA);
-    cv::dct(C, C, 0);
-    eval_g((float*)C.data, g, n);
-
-    return fx;
-}
-
-void reconstruct_color_channel_subchroma(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
-    const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
-    const int& iterations, cv::Mat& ref)
-{
-    const int crows = (rows + 1) / 2, ccols = (cols + 1) / 2;
-    const int nC = crows * ccols;
-    lbfgs_parameter_t param;
-    lbfgs_parameter_init(&param);
-    param.orthantwise_c = (float)param_c; // OWL-QN
-    param.linesearch = LBFGS_LINESEARCH_BACKTRACKING;
-    param.max_iterations = iterations;
-
-    // measurements for this channel at the scattered full-res positions
-    std::vector<float> b;
-    b.reserve(ri_x.size());
-    for (int i = CS_HEADER_PIXELS; i < (int)ri_x.size() + CS_HEADER_PIXELS && i < pixel_measurements.total(); i++) {
-        b.push_back(pixel_measurements.at<cv::Vec3b>(i)[channel] / 255.0f);
-    }
-    for (int i = (int)b.size(); i < (int)ri_x.size(); i++) {
-        b.push_back(0.0f);
-    }
-
-    eval_data data;
-    std::vector<float> Axb2(nC), x_copy(nC);
-    data.b = b.data();
-    data.Axb2 = Axb2.data();
-    data.x_copy = x_copy.data();
-    data.m = (int)ri_x.size();
-    data.ri_x = ri_x.data();
-    data.ri_y = ri_y.data();
-    data.rows = crows;      // coarse unknown dims
-    data.cols = ccols;
-    data.full_rows = rows;  // full-res measurement grid
-    data.full_cols = cols;
-
-    float fx = 0.0f;
-    lbfgs(nC, (float*)ref.data, data, &fx, evaluate_coarse, NULL, NULL, &param);
-
-    // solved coarse DCT plane -> pixel plane -> upsample to the full tile size
-    cv::Mat C(crows, ccols, CV_32F, ref.data);
-    cv::dct(C, C, cv::DCT_INVERSE);
-    C *= 255.0f;
-    cv::resize(C, ref, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
-}
 
 

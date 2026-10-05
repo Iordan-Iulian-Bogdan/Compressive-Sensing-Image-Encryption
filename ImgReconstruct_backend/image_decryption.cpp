@@ -124,85 +124,29 @@ void decrypt_image::unpack_container_measurements(
     encrypted_img = raw.reshape(0, (int)raw_pixels);
 }
 
-void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, bool ycrcb, bool chroma_sub, float tv, int solver, int fista_iters, int reweights, int basis, float wscale) {
+void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, float tv, int solver, int fista_iters, int reweights, int basis, float wscale) {
 
-    // A packed 3-channel L-BFGS solve was measured ~2.3x slower than the
-    // staggered per-channel solver because all channels shared convergence.
-    // 2. YCrCb solve: the first attempt (15.6 dB, looked hopeless) was later
-    //    traced to a channel-ordering bug -- the manual BGR->YCrCb conversion
-    //    packed (Cb, Cr, Y) while cvtColor/warm-strips use (Y, Cr, Cb), so the
-    //    solver got a permuted measurement space. Re-tested correctly on top
-    //    of wavefront warm-starts (chroma strips from neighbors, half chroma
-    //    l1, no luma->chroma forwarding): 26.71 / 30.29 dB synthetic / photo,
-    //    i.e. a tie with BGR (26.77 / 30.39) at strictly higher cost
-    //    (O(m) re-encoding per tile + extra cvtColor). BGR stays the default;
-    //    ycrcb=true keeps the path alive for future tuning experiments.
-    // 3. Chroma subsampling (4:2:0-style: chroma solved at half resolution,
-    //    see reconstruct_color_channel_subchroma): 25.18 / 28.73 dB
-    //    synthetic/photo (-1.6/-1.7 dB vs full-res BGR) for only ~7% faster
-    //    wall time on the 20MP photo and slightly slower on small images --
-    //    the per-eval resize overhead eats the 4x unknown reduction. Off by
-    //    default; a viable opt-in when speed matters more than color accuracy
-    //    (e.g. previews). Revisit only after making evaluate_coarse
-    //    allocation-free (the residual buffer is reallocated per lbfgs eval).
+    // FISTA solvers (BGR only): reweighted-L1 per channel, or
+    // SOMP-structured joint group-L2,1 over all three channels. Same
+    // warm-start refs and the same IDCT+255 tail convention throughout,
+    // so the merge/convert below applies unchanged.
     int num_iterations_offset = (num_iterations / 2);
 
-    if (ycrcb) {
-        // YCrCb solve on top of wavefront warm-starts: luma carries most of
-        // the structure while the chroma planes are much smoother, so the
-        // chroma l1 penalty is softened (half coefficient). The stored
-        // measurements are sampled BGR pixels; they are re-encoded to YCrCb
-        // once here (O(m)) and the solved planes are merged back.
-        cv::Mat ycc_measurements = encrypted_img.clone();
-        const int measurement_pixels = std::min<int>((int)ycc_measurements.total(), m + CS_HEADER_PIXELS);
-        for (int i = CS_HEADER_PIXELS; i < measurement_pixels; i++) {
-            const cv::Vec3b bgr = ycc_measurements.at<cv::Vec3b>(i);
-            // same coefficients as cv::BGR2YCrCb; packed (Y, Cr, Cb) to match
-            // cv::COLOR_BGR2YCrCb / COLOR_YCrCb2BGR channel order
-            const float y  = 0.299f * bgr[2] + 0.587f * bgr[1] + 0.114f * bgr[0];
-            const float cr = (bgr[2] - y) * 0.713f + 128.0f;
-            const float cb = (bgr[0] - y) * 0.564f + 128.0f;
-            ycc_measurements.at<cv::Vec3b>(i) = cv::Vec3b(
-                cv::saturate_cast<uchar>(y + 0.5f),
-                cv::saturate_cast<uchar>(cr + 0.5f),
-                cv::saturate_cast<uchar>(cb + 0.5f));
-        }
-
-        // Y gets full iterations and no in-tile forwarding: the chroma solves
-        // warm-start from the neighbor strips' CHROMA content (x0[1]/x0[2]) and
-        // from each other (Cr -> Cb), not from luma-like planes.
-        const float chroma_coef = coef * 0.5f;
-        if (chroma_sub) {
-            // 4:2:0-style subsampling: chroma solved at half resolution --
-            // 4x fewer unknowns per chroma plane; content is smooth so the
-            // upsampled result is expected to be near-lossless. x0[1]/x0[2]
-            // hold coarse chroma warm-starts from the neighbor strips.
-            const int chroma_iters = num_iterations - num_iterations_offset;
-            reconstruct_color_channel(ycc_measurements, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], false, ref[1]);
-            reconstruct_color_channel_subchroma(ycc_measurements, 1, chroma_coef, rows, cols, ri_x_g, ri_y_g, chroma_iters, ref[1]);
-            reconstruct_color_channel_subchroma(ycc_measurements, 2, chroma_coef, rows, cols, ri_x_g, ri_y_g, chroma_iters, ref[2]);
-        }
-        else {
-            reconstruct_color_channel(ycc_measurements, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], false, ref[1], tv);
-            reconstruct_color_channel(ycc_measurements, 1, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2], tv);
-            reconstruct_color_channel(ycc_measurements, 2, chroma_coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false, ref[2], tv);
-        }
-
-        cv::merge(ref, 3, out);
-        out.convertTo(out, CV_8UC3);
-        cv::cvtColor(out, out, cv::COLOR_YCrCb2BGR);
-        return;
-    }
-
-    // FISTA solvers (BGR only; the ycrcb/chroma_sub experiments above stay on
-    // the OWL-QN path): reweighted-L1 per channel, or SOMP-structured joint
-    // group-L2,1 over all three channels. Same warm-start refs and the same
-    // IDCT+255 tail convention as reconstruct_color_channel, so the
-    // merge/convert below applies unchanged.
     if (solver == CS_SOLVER_FISTA) {
-        reconstruct_color_channel_fista(encrypted_img, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], true, ref[1], tv, reweights, fista_iters, basis, wscale);
-        reconstruct_color_channel_fista(encrypted_img, 1, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2], tv, reweights, fista_iters, basis, wscale);
-        reconstruct_color_channel_fista(encrypted_img, 2, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false, ref[2], tv, reweights, fista_iters, basis, wscale);
+        // The three channels are independent solves: each warm-starts from
+        // the neighbor field built before decrypt(). Submit all three first,
+        // then finish them -- the GPU worker sees 3x the jobs per wave and
+        // its pipelined kernels overlap instead of draining between one-
+        // channel passes (the old copy_next_ref chain serialized them and
+        // clobbered the neighbor warm starts of ch1/ch2).
+        fista_channel_task ct[3];
+        for (int ch = 0; ch < 3; ++ch)
+            fista_channel_begin(ct[ch], encrypted_img, ch, coef, rows, cols,
+                ri_x_g, ri_y_g,
+                ch == 0 ? num_iterations : num_iterations - num_iterations_offset,
+                ref[ch], tv, reweights, fista_iters, basis, wscale);
+        for (int ch = 0; ch < 3; ++ch)
+            fista_channel_end(ct[ch], ref[ch]);
         cv::merge(ref, 3, out);
         out.convertTo(out, CV_8UC3);
         return;
@@ -213,26 +157,8 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
         out.convertTo(out, CV_8UC3);
         return;
     }
-    // Consensus ADMM: same per-channel/reweight structure and same warm-start
-    // chain as the FISTA block above, only the optimizer differs.
-    if (solver == CS_SOLVER_ADMM) {
-        reconstruct_color_channel_admm(encrypted_img, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], true, ref[1], tv, reweights, fista_iters, basis, wscale);
-        reconstruct_color_channel_admm(encrypted_img, 1, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2], tv, reweights, fista_iters, basis, wscale);
-        reconstruct_color_channel_admm(encrypted_img, 2, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false, ref[2], tv, reweights, fista_iters, basis, wscale);
-        cv::merge(ref, 3, out);
-        out.convertTo(out, CV_8UC3);
-        return;
-    }
 
-    // BGR per-channel solve (best measured configuration so far):
-    // c1/c2 get half the iterations: later channels are warm-started from the previous
-    // channel's solution, so they need far fewer iterations to converge; capping them
-    // harder trims nearly-free solver time (~30% less solver work at same quality target)
-    reconstruct_color_channel(encrypted_img, 0, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref[0], true, ref[1], tv);
-    reconstruct_color_channel(encrypted_img, 1, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[1], true, ref[2], tv);
-    reconstruct_color_channel(encrypted_img, 2, coef, rows, cols, ri_x_g, ri_y_g, num_iterations - num_iterations_offset, ref[2], false, ref[2], tv);
-    cv::merge(ref, 3, out);
-    out.convertTo(out, CV_8UC3);
+    throw std::runtime_error("unknown solver id (only fista and joint remain)");
 }
 
 void decrypt_image::get_mat(cv::Mat& dest) {
@@ -475,10 +401,10 @@ cv::Size decrypt_image::get_org_size() {
 // the generic reference. Pixel-domain copy first, then the solver-domain
 // transform (DCT or multilevel CDF 9/7, chosen by basis) with the /10
 // convention createRefSolutions uses, so the solvers accept it unchanged.
-// With ycrcb = true the strips (and the fallback refs) are produced in the
-// YCrCb domain instead, to match a YCrCb solve. With chroma_sub the chroma
-// warm-start planes are additionally downsampled to half resolution so they
-// match the subsampled-chroma solver's unknown space.
+// ycrcb/chroma_sub serve the ycc420 pipeline only (BGR passes false):
+// strips and fallback refs are produced in the YCrCb domain and chroma
+// warm-start planes are downsampled to half resolution to match the
+// half-res chroma solves.
 static void build_neighbor_warm_start(cv::Mat refs[3],
     const std::vector<cv::Mat>& generic_refs,
     const std::vector<std::vector<cv::Mat>>& solved,
@@ -554,15 +480,15 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
                 cv::Mat coarse, seed;
                 cv::resize(thumbnail_planes[ch], coarse,
                     cv::Size((thumbnail_seed.cols + 1) / 2,
-                             (thumbnail_seed.rows + 1) / 2), 0, 0, cv::INTER_AREA);
+                        (thumbnail_seed.rows + 1) / 2), 0, 0, cv::INTER_AREA);
                 coarse(chroma_rect).convertTo(seed, CV_32F, 1.0 / 255.0);
                 to_basis(seed);
                 refs[ch] = seed;
             }
             return;
         }
-        if (!ycrcb && !chroma_sub && !thumbnail_seed.empty() &&
-            thumbnail_seed.type() == CV_8UC3 && t_rect.x >= 0 && t_rect.y >= 0 &&
+        if (!thumbnail_seed.empty() && thumbnail_seed.type() == CV_8UC3 &&
+            t_rect.x >= 0 && t_rect.y >= 0 &&
             t_rect.x + t_rect.width <= thumbnail_seed.cols &&
             t_rect.y + t_rect.height <= thumbnail_seed.rows) {
             cv::Mat crop;
@@ -576,7 +502,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
             return;
         }
         // first wave (or failed neighbors): generic reference, resized to
-        // this tile's grid so merge/lbfgs always see the split tile's shape
+        // this tile's grid so merge/FISTA always see the split tile's shape
         // (tile_size is only the last processed tile and can disagree with
         // edge/clamped tiles — that size mismatch left the top tile row
         // short and produced black gaps in the composite)
@@ -619,7 +545,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
     for (int ch = 0; ch < 3; ++ch) {
         cv::Mat plane = planes[ch];
         if (chroma_sub && ch > 0) {
-            // match the subsampled-chroma solver's unknown space
+            // match the half-res chroma solves' unknown space (ycc420)
             cv::resize(plane, plane, cv::Size((plane.cols + 1) / 2, (plane.rows + 1) / 2), 0, 0, cv::INTER_AREA);
         }
         to_basis(plane);
@@ -630,7 +556,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, bool ycrcb, bool chroma_sub, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -638,10 +564,13 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     auto sp_wall0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
     // GPU mode: solver threads block on their channel solve, so threads =
-    // in-flight problems = batch size. A wave never exceeds num_tiles tiles,
-    // so threads past that only add warm-phase contention on this machine.
+    // in-flight problems = batch size. A wave holds num_tiles tiles; each
+    // tile has one outstanding job at a time, so num_tiles threads already
+    // fill the batch (pend caps there) -- extra threads just contend with
+    // the CPU-side blend/PNG stages on this machine.
     if (cs_gpu::enabled()) {
-        int want = num_tiles < 48 ? num_tiles : 48;
+        int want = num_tiles;
+        if (want > 96) want = 96;
         if (want < num_threads) want = num_threads;
         if (want > num_threads) {
             std::cerr << "[gpu] raising solve threads " << num_threads << " -> "
@@ -687,7 +616,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
 
                 auto sp_a = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, ycrcb, chroma_sub, basis, thumbnail_seed);
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, false, false, basis, thumbnail_seed);
                 auto sp_b = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 if (sp) g_solveprof.warm_ns += cs_solveprof_ns_since(sp_a);
 
@@ -703,7 +632,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 const float tile_tv = per_tile_tv
                     ? cs_per_tile_coef(tv, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
                     : tv;
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, tile_coef, mats_out[i][j], ycrcb, chroma_sub, tile_tv, solver, fista_iters, reweights, basis, wscale);
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, tile_coef, mats_out[i][j], tile_tv, solver, fista_iters, reweights, basis, wscale);
                 if (sp) { g_solveprof.call_ns += cs_solveprof_ns_since(sp_c); g_solveprof.tiles += 1; }
                 // fused AVIR upscale: this tile is final the moment its solve
                 // finishes (same op as the post-join batch, so bit-identical).
@@ -736,8 +665,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
 
 // YCC 4:2:0 tile solver: wavefront (anti-diagonal) order mirroring
 // decrypt_tiles, but each tile solves luma at full resolution and each chroma
-// plane natively on its coarse grid — no per-eval upsample/downsample, which
-// is what made the old chroma_sub path slower than full-res BGR. Warm starts
+// plane natively on its coarse grid with per-channel FISTA. Warm starts
 // come from the already-solved BGR neighbors via build_neighbor_warm_start
 // (ycrcb + chroma_sub), whose ref layout (full-res Y, coarse chroma) matches
 // this solve exactly. Solved planes merge YCrCb -> BGR per tile.
@@ -759,8 +687,25 @@ static void decrypt_tiles_ycc420(int num_threads,
     const int iters_off = iterations / 2;
     const int iters_c = iterations - iters_off;
     const float coef_c = coef * 0.5f;
-    // joint group-sparsity needs one shared RGB grid; degrade to per-channel
-    const int plane_solver = (solver == CS_SOLVER_FISTA_JOINT) ? CS_SOLVER_FISTA : solver;
+    // joint group-sparsity needs one shared RGB grid; the per-plane calls
+    // below are per-channel FISTA either way, so no dispatch is needed.
+
+    // GPU mode: same batching requirement as decrypt_tiles -- solver threads
+    // block on each plane solve, so threads = in-flight problems = batch
+    // size. Without this the default 8 threads cap every flush at 8 jobs
+    // (measured: 1731 micro-flushes of P<=8 on the 64x64 grid) and the
+    // per-flush pack/H2D/launch tax outweighs the GPU solve. A wave holds
+    // num_tiles tiles, so num_tiles threads fill the batch.
+    if (cs_gpu::enabled()) {
+        int want = num_tiles;
+        if (want > 96) want = 96;
+        if (want < num_threads) want = num_threads;
+        if (want > num_threads) {
+            std::cerr << "[gpu] raising solve threads " << num_threads << " -> "
+                      << want << " (batching)" << std::endl;
+            num_threads = want;
+        }
+    }
 
     // per-tile coef (--per-tile-coef): mean luma sample count over non-empty
     // tiles; only the luma draw varies per tile (chroma stays uniform)
@@ -827,49 +772,24 @@ static void decrypt_tiles_ycc420(int num_threads,
                 const float tile_tv_y = per_tile_tv
                     ? cs_per_tile_coef(tv, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
                     : tv;
-                if (plane_solver == CS_SOLVER_FISTA || plane_solver == CS_SOLVER_ADMM) {
-                    // per-plane proximal solve on the shared reweighted-L1
-                    // objective: FISTA or consensus ADMM (same call shape)
-                    const bool use_admm = (plane_solver == CS_SOLVER_ADMM);
-                    auto solve_plane = [&](const cv::Mat& meas, float c, int R, int C,
-                        const std::vector<int>& rx, const std::vector<int>& ry,
-                        int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t) {
-                        if (use_admm) {
-                            reconstruct_color_channel_admm(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, reweights, fista_iters, basis, wscale);
-                        } else {
-                            reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, reweights, fista_iters, basis, wscale);
-                        }
-                    };
-                    solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                        y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations, x0[0],
-                        false, dummy, tile_tv_y);
-                    solve_plane(cr_meas[i][j], coef_c, cTh, cTw,
-                        cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, iters_c, x0[1],
-                        true, x0[2], 0.0f);
-                    solve_plane(cb_meas[i][j], coef_c, cTh, cTw,
-                        cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, iters_c, x0[2],
-                        false, dummy, 0.0f);
-                } else {
-                    reconstruct_color_channel(y_meas[i][j], 0, tile_coef_y, Th, Tw,
-                        y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations, x0[0],
-                        false, dummy, tile_tv_y);
-                    // Chroma always takes the proximal (FISTA) update, even
-                    // under --solver owlqn: the chroma warm start is near-flat
-                    // (DC-only, all AC exactly zero), where OWL-QN's orthant
-                    // projection needs 2-3x the iteration budget to discover
-                    // the AC support while proximal soft-thresholding is exact
-                    // at zero-crossings. FISTA's inner count maps from the
-                    // full budget (same as an all-FISTA solve, which measures
-                    // ~37 MSE per chroma plane where OWL-QN stalls at ~1500).
-                    // Cost is contained: the coarse grid holds 1/4 the
-                    // unknowns. Cr -> Cb chaining mirrors the BGR ycrcb path.
-                    reconstruct_color_channel_fista(cr_meas[i][j], 0, coef_c, cTh, cTw,
-                        cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, iterations, x0[1],
-                        true, x0[2], 0.0f, reweights, fista_iters, basis, wscale);
-                    reconstruct_color_channel_fista(cb_meas[i][j], 0, coef_c, cTh, cTw,
-                        cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, iterations, x0[2],
-                        false, dummy, 0.0f, reweights, fista_iters, basis, wscale);
-                }
+                // FISTA-only (joint degrades to per-channel FISTA at the
+                // dispatcher): luma at full tile resolution, chroma natively
+                // on the half-resolution grid, where proximal updates are
+                // exact at the near-flat warm starts.
+                auto solve_plane = [&](const cv::Mat& meas, float c, int R, int C,
+                    const std::vector<int>& rx, const std::vector<int>& ry,
+                    int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t) {
+                    reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, reweights, fista_iters, basis, wscale);
+                };
+                solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
+                    y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations, x0[0],
+                    false, dummy, tile_tv_y);
+                solve_plane(cr_meas[i][j], coef_c, cTh, cTw,
+                    cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, iters_c, x0[1],
+                    true, x0[2], 0.0f);
+                solve_plane(cb_meas[i][j], coef_c, cTh, cTw,
+                    cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, iters_c, x0[2],
+                    false, dummy, 0.0f);
 
                 cv::Mat cr_full, cb_full;
                 cv::resize(x0[1], cr_full, cv::Size(Tw, Th), 0, 0, cv::INTER_LINEAR);
@@ -944,17 +864,13 @@ int decrypt_image::decrypt_image_tiled(
     bool per_tile_tv
 ) {
     PhaseLog prof;
-    if (solver < CS_SOLVER_OWLQN || solver > CS_SOLVER_ADMM) {
-        std::cerr << "Error: unknown solver id " << solver << " (0=owlqn, 1=fista, 2=joint, 3=admm)" << std::endl;
+    if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT) {
+        std::cerr << "Error: unknown solver id " << solver << " (1=fista, 2=joint)" << std::endl;
         return -1;
     }
     if (basis != CS_BASIS_DCT && basis != CS_BASIS_CDF97) {
         std::cerr << "Error: unknown basis id " << basis << " (0=dct, 1=wavelet)" << std::endl;
         return -1;
-    }
-    if (basis == CS_BASIS_CDF97 && solver == CS_SOLVER_OWLQN) {
-        std::cerr << "Warning: --basis wavelet applies to the fista/joint/admm solvers; OWL-QN stays DCT" << std::endl;
-        basis = CS_BASIS_DCT;
     }
     if (fista_iters < 0 || fista_iters > 500) {
         std::cerr << "Error: --fista-iters must be in [0, 500] (0 = auto-map from --iterations)" << std::endl;
@@ -1117,12 +1033,6 @@ int decrypt_image::decrypt_image_tiled(
     }
 
     std::thread decrypt_tiles_thread;
-    // chroma_sub = true runs the subsampled-chroma solve (requires ycrcb);
-    // measured (wavefront, half chroma l1): 25.18 / 28.73 dB synthetic/photo
-    // vs 26.77 / 30.39 dB full-res BGR, for only ~7% faster wall time on the
-    // 20MP photo (3.8s vs 4.1s) and slightly slower on small images -- the
-    // resize-heavy coarse operators eat the 4x unknown reduction. Off by
-    // default; kept as an opt-in speed/quality trade via the flags.
     // Fused AVIR upscale (default backend, non-full-res): each worker
     // upscales its tile into hr_tiles the moment its solve finishes, so
     // tiles are final without waiting for the wavefront. waifu2x stays one
@@ -1134,7 +1044,7 @@ int decrypt_image::decrypt_image_tiled(
         decrypt_tiles_thread = std::thread([&]() {
             decrypt_tiles(nun_threads, encrypted_image_tiles, indices_reconfigured,
                 decrypted_image_tiles, coordinates, num_tiles, overlap, iterations,
-                tile_size, coef, false, false, tv, solver,
+                tile_size, coef, tv, solver,
                 fista_iters, reweights, basis, wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
                 &hr_tiles, fuse_upscale);
         });

@@ -1,26 +1,19 @@
-// HIP implementation of the batched consensus-ADMM solve offload.
+// HIP implementation of the batched reweighted-L1 FISTA solve offload
+// (per-channel and SOMP-structured joint).
 //
-// Contract (cs_gpu.h): admm_solve_blocking(p) must leave p.x holding the same
-// solution the CPU cs_admm_core wrapper would produce (DCT basis, tv = 0).
-// Concurrent callers enqueue into a shared queue; one worker thread coalesces
-// arrivals (short grace window) into batches keyed by (rows, cols, inner,
-// reweights) -- m varies per tile, packed at the group max -- and runs them
-// as a single GPU session:
+// Contract (cs_gpu.h): fista_solve_blocking(p) must leave p.x holding the
+// same solution the CPU cs_fista_core_single / cs_fista_core_joint wrapper
+// would produce (DCT basis). Concurrent callers enqueue into a shared queue;
+// one worker thread coalesces arrivals (short grace window) into batches
+// keyed by (rows, cols, inner, reweights) -- m varies per tile, packed at
+// the group max -- and runs them as a single GPU session (per-iteration
+// sampled gradient + proximal shrink + Nesterov momentum).
 //
-//   setup   scatter b/mask2, one FDCT for Atb, z=x0/u=0, rho = 2m/n
-//   pass    for each IRLS pass: [reweight kernel], then inner steps of
-//             rhs = Atb + rho*(z-u)                    (kernel)
-//             IDCT:  tmp = rhs*Ac;  rhs = Ar^T*tmp     (2 batched GEMMs)
-//             x = rhs / (mask2 + rho)                  (kernel)
-//             FDCT:  tmp = rhs*Ac^T; x = Ar*tmp        (2 batched GEMMs)
-//             z = soft(x+u, lambda*w/rho); Boyd rho balance; u update
-//   down   copy each problem's x back and wake its caller
-//
-// Transforms use a cosine-matrix GEMM (no FFT dependency); the DCT matrices
-// are the orthonormal DCT-II that OpenCV's cv::dct uses, so synth/adj match
-// cs_synth/cs_synth_adj. On any device error the batch is recomputed on the
-// CPU through the registered fallback and the module stays dead (queue still
-// serves every later call, straight to the CPU).
+// Transforms use the hipFFT fast-DCT (GEMM fallback); the DCT matrices
+// match the orthonormal DCT-II that OpenCV's cv::dct uses, so synth/adj
+// match cs_synth/cs_synth_adj. On any device error the batch is recomputed
+// on the CPU through the registered fallback and the module stays dead
+// (queue still serves every later call, straight to the CPU).
 
 #include "cs_gpu.h"
 
@@ -65,14 +58,48 @@ namespace {
 
 constexpr int kBlock = 256;       // threads for elementwise / reduce kernels
 constexpr int kTile = 16;         // GEMM tile edge
-constexpr int kGraceUs = 800;     // straggler wait before flushing a batch
-constexpr int kBatchTarget = 24;  // flush early once this many are pending
+constexpr int kGraceUs = 150;      // straggler wait before flushing a batch
+constexpr int kBatchTarget = 64;  // flush early once this many are pending
+
+// Tunables (env, read once): CS_GPU_GRACE_US overrides the soft coalescing
+// window (default 150 us with the 2-deep pipeline -- shorter waits win now
+// because early launches overlap anyway; the old serial path liked 250).
+// The hard cap tracks soft + 3 ms; the stall rule (CS_GPU_QUIET_US,
+// default 100 us) still drains small waves promptly.
+int grace_us()
+{
+    static int v = -1;
+    if (v < 0) {
+        v = kGraceUs;
+        if (const char* e = std::getenv("CS_GPU_GRACE_US")) {
+            const int x = std::atoi(e);
+            if (x > 0) v = x;
+        }
+    }
+    return v;
+}
+
+// Arrival-stall rule: flush once no new job landed for this long (after the
+// soft window). Splitting a wave at every 150 us stall restarts the ramp
+// (solve is ~2.5 ms per flush regardless of P<=40), so longer stall tolerance
+// trades idle-vs-launch overhead; hard cap still bounds the wait.
+int quiet_us()
+{
+    static int v = -1;
+    if (v < 0) {
+        v = 100;
+        if (const char* e = std::getenv("CS_GPU_QUIET_US")) {
+            const int x = std::atoi(e);
+            if (x > 0) v = x;
+        }
+    }
+    return v;
+}
 
 std::atomic<bool> g_enabled{false};
 std::atomic<bool> g_dead{false};  // device failed: route everything to CPU
 std::atomic<bool> g_probed{false};
 bool g_has_device = false;
-CpuFallbackFn g_fb = nullptr;
 FistaFallbackFn g_fb_fista = nullptr;
 
 // rocBLAS library GEMM path: handle created once in set_enabled (main
@@ -186,7 +213,8 @@ __global__ void gemm_k(float* __restrict__ C, const float* __restrict__ A,
 }
 
 void gemm(const float* A, const float* B, float* C, int M, int N, int K,
-    int ta, int tb, size_t sA, size_t sB, size_t sC, int batch)
+    int ta, int tb, size_t sA, size_t sB, size_t sC, int batch,
+    hipStream_t stream = 0)
 {
     // Library path: row-major C(MxN) = opA(A)(MxK) * opB(B)(KxN) is issued as
     // column-major C^T(NxM) = opB(B)^T * opA(A)^T, i.e. rocBLAS operands are
@@ -216,13 +244,13 @@ void gemm(const float* A, const float* B, float* C, int M, int N, int K,
     const dim3 blk(kTile, kTile, 1);
     const dim3 grid((N + kTile - 1) / kTile, (M + kTile - 1) / kTile, batch);
     if (ta == 0 && tb == 0)
-        hipLaunchKernelGGL((gemm_k<0, 0>), grid, blk, 0, 0, C, A, B, M, N, K, sA, sB, sC);
+        hipLaunchKernelGGL((gemm_k<0, 0>), grid, blk, 0, stream, C, A, B, M, N, K, sA, sB, sC);
     else if (ta == 1 && tb == 0)
-        hipLaunchKernelGGL((gemm_k<1, 0>), grid, blk, 0, 0, C, A, B, M, N, K, sA, sB, sC);
+        hipLaunchKernelGGL((gemm_k<1, 0>), grid, blk, 0, stream, C, A, B, M, N, K, sA, sB, sC);
     else if (ta == 0 && tb == 1)
-        hipLaunchKernelGGL((gemm_k<0, 1>), grid, blk, 0, 0, C, A, B, M, N, K, sA, sB, sC);
+        hipLaunchKernelGGL((gemm_k<0, 1>), grid, blk, 0, stream, C, A, B, M, N, K, sA, sB, sC);
     else
-        hipLaunchKernelGGL((gemm_k<1, 1>), grid, blk, 0, 0, C, A, B, M, N, K, sA, sB, sC);
+        hipLaunchKernelGGL((gemm_k<1, 1>), grid, blk, 0, stream, C, A, B, M, N, K, sA, sB, sC);
 }
 
 // 1D DCT halves over R x C planes (batch P, stride n): synthesis (IDCT
@@ -231,13 +259,13 @@ void gemm(const float* A, const float* B, float* C, int M, int N, int K,
 // falls back to the GEMM kernel on any FFT failure. Defined after the pool
 // (they need FFT scratch); prototypes here for idct/fdct_batch below.
 void row_synth(const float* src, float* dst, const float* ac,
-    int R, int C, int P, size_t n);
+    int R, int C, int P, size_t n, hipStream_t stream = 0);
 void col_synth(const float* src, float* dst, const float* ar,
-    int R, int C, int P, size_t n);
+    int R, int C, int P, size_t n, hipStream_t stream = 0);
 void row_anlys(const float* src, float* dst, const float* ac,
-    int R, int C, int P, size_t n);
+    int R, int C, int P, size_t n, hipStream_t stream = 0);
 void col_anlys(const float* src, float* dst, const float* ar,
-    int R, int C, int P, size_t n);
+    int R, int C, int P, size_t n, hipStream_t stream = 0);
 
 // dst = Ar^T * (src * Ac): coefficient -> pixel, batched, strided n per problem.
 void idct_batch(const float* ar, const float* ac, const float* src, float* tmp,
@@ -255,120 +283,9 @@ void fdct_batch(const float* ar, const float* ac, const float* src, float* tmp,
     col_anlys(tmp, dst, ar, R, C, P, n);  // dst = Ar * tmp
 }
 
-// pix[idx] += 2b, mask2[idx] += 2 at every measured coordinate. One block per
-// problem: m varies per tile (random sampling count), so indexing is per
-// problem with the b/rix/riy arrays packed at an mmax stride.
-__global__ void scatter_k(float* pix, float* mask2, const float* b2,
-    const int* rix, const int* riy, const int* ms, int mmax, int cols, int n)
-{
-    const int p = blockIdx.x;
-    const int mp = ms[p];
-    const long long base = (long long)p * n;
-    const long long ib = (long long)p * mmax;
-    for (int k = threadIdx.x; k < mp; k += blockDim.x) {
-        const int idx = (int)rix[ib + k] * cols + (int)riy[ib + k];
-        atomicAdd(&pix[base + idx], b2[ib + k]);
-        atomicAdd(&mask2[base + idx], 2.0f);
-    }
-}
+// (ADMM kernels scatter/init_xu/rho_init/rhs/div removed with the solver.)
 
-__global__ void init_xu_k(float* z, float* u, const float* x, long long total)
-{
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         i < total; i += (long long)gridDim.x * blockDim.x) {
-        z[i] = x[i];
-        u[i] = 0.0f;
-    }
-}
-
-// Fresh-consensus penalty per reweight pass (mirrors cs_admm_core entry):
-// rho = max(2*m/n, 0.05). One thread per problem.
-__global__ void rho_init_k(float* rho, const int* ms, int n, int P)
-{
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= P) return;
-    float r = 2.0f * (float)ms[p] / (float)n;
-    if (r < 0.05f) r = 0.05f;
-    rho[p] = r;
-}
-
-// rhs = Atb + rho*(z - u)  (tv = 0, so the tau*x and TV terms vanish)
-__global__ void rhs_k(float* rhs, const float* atb, const float* z,
-    const float* u, const float* rho, int n)
-{
-    const int p = blockIdx.x;
-    const float r = rho[p];
-    const long long base = (long long)p * n;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-        rhs[base + i] = atb[base + i] + r * (z[base + i] - u[base + i]);
-}
-
-// closed-form x-update division: v /= mask2 + sigma, sigma = rho (tv = 0)
-__global__ void div_k(float* v, const float* mask2, const float* rho, int n)
-{
-    const int p = blockIdx.x;
-    const float r = rho[p];
-    const long long base = (long long)p * n;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-        v[base + i] /= (mask2[base + i] + r);
-}
-
-// exact soft-threshold z, scaled-dual u update, Boyd residual balancing
-// (mu = 10, tau = 2, rho clamped to [1e-3, 100] on the down branch) -- the
-// same sequence and rounding pattern as cs_admm_core.
-__global__ void z_dual_k(float* z, const float* x, float* u, const float* w,
-    float* rho, const float* lambda, int n)
-{
-    const int p = blockIdx.x;
-    const int tid = threadIdx.x;
-    __shared__ float s_rho, s_scale;
-    __shared__ double s_r[kBlock], s_s[kBlock];
-    const float r0 = rho[p];
-    const float lam = lambda[p];
-    const long long base = (long long)p * n;
-    double pr = 0.0, ps = 0.0;
-    for (int i = tid; i < n; i += blockDim.x) {
-        const long long g = base + i;
-        const float zold = z[g];
-        const float v = x[g] + u[g];
-        const float thr = (lam * w[g]) / r0;
-        const float av = fabsf(v);
-        const float znew = (av > thr) ? copysignf(av - thr, v) : 0.0f;
-        z[g] = znew;
-        const double rr = (double)x[g] - (double)znew;
-        const double ss = (double)r0 * ((double)znew - (double)zold);
-        pr += rr * rr;
-        ps += ss * ss;
-    }
-    s_r[tid] = pr;
-    s_s[tid] = ps;
-    __syncthreads();
-    for (int off = kBlock / 2; off > 0; off >>= 1) {
-        if (tid < off) {
-            s_r[tid] += s_r[tid + off];
-            s_s[tid] += s_s[tid + off];
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        const double rn = sqrt(s_r[0]);
-        const double sn = sqrt(s_s[0]);
-        float nr = r0;
-        if (rn > 10.0 * sn && r0 < 100.0f)
-            nr = r0 * 2.0f;
-        else if (sn > 10.0 * rn && r0 > 1e-3f)
-            nr = r0 * 0.5f;
-        s_scale = r0 / nr;
-        s_rho = nr;
-    }
-    __syncthreads();
-    const float sc = s_scale;
-    for (int i = tid; i < n; i += blockDim.x) {
-        const long long g = base + i;
-        u[g] = (u[g] + (x[g] - z[g])) * sc;
-    }
-    if (tid == 0) rho[p] = s_rho;
-}
+// (ADMM z-dual kernel removed with the solver.)
 
 // Sampled synthesis (fused IDCT tail + residual): r[k] = synth(y)[pos_k] -
 // b[k] WITHOUT materializing the full image. tmp = y*Ac is still a full
@@ -693,9 +610,7 @@ struct Completion {
 };
 
 struct Job {
-    int kind;  // 0 = ADMM (p), 1 = FISTA (fp); same device layout either way
-    AdmmProblem p;
-    FistaProblem fp;
+    FistaProblem fp;  // joint selects via fp.joint (b1/b2/x1/x2 set)
     std::shared_ptr<Completion> c;
 };
 
@@ -720,29 +635,24 @@ void finish(Job& j, bool use_fb)
     std::lock_guard<std::mutex> lk(j.c->m);
     if (j.c->done) return;
     if (use_fb) {
-        if (j.kind == 1) {
-            if (g_fb_fista) g_fb_fista(j.fp);
-        } else if (g_fb) {
-            g_fb(j.p);
-        }
+        if (g_fb_fista) g_fb_fista(j.fp);
     }
     j.c->done = true;
     j.c->cv.notify_all();
 }
 
 struct Key {
-    int kind, joint, rows, cols, inner, rews;
-    explicit Key(const AdmmProblem& p)
-        : kind(0), joint(0), rows(p.rows), cols(p.cols), inner(p.inner), rews(p.reweights)
+    int joint, rows, cols, inner, rews;
+    Key()
+        : joint(0), rows(0), cols(0), inner(0), rews(0)
     {
     }
     explicit Key(const FistaProblem& p)
-        : kind(1), joint(p.joint), rows(p.rows), cols(p.cols), inner(p.inner), rews(p.reweights)
+        : joint(p.joint), rows(p.rows), cols(p.cols), inner(p.inner), rews(p.reweights)
     {
     }
     bool operator<(const Key& o) const
     {
-        if (kind != o.kind) return kind < o.kind;
         if (joint != o.joint) return joint < o.joint;
         if (rows != o.rows) return rows < o.rows;
         if (cols != o.cols) return cols < o.cols;
@@ -768,6 +678,11 @@ template <typename T> struct Buf {
     bool ensure(size_t bytes)
     {
         if (cap >= bytes) return true;
+        // geometric growth: P steps 1,2,3,... during a run, and exact-fit
+        // would hipFree+hipMalloc every pool buffer on every step (~13 ms
+        // per growth event measured at ens). Double instead (~log2 reallocs).
+        const size_t doubled = cap ? cap * 2 : 0;
+        if (doubled > bytes) bytes = doubled;
         if (p) (void)hipFree(p);
         p = nullptr;
         cap = 0;
@@ -780,11 +695,14 @@ template <typename T> struct Buf {
     }
 };
 struct Pool {
-    Buf<float> din;  // packed H2D: rho,lam,ms,b,rix,riy,x,w (byte layout below)
-    Buf<float> z, u, pix, rhs, atb, mask2;
-    Buf<float> tmp;  // FISTA GEMM scratch (ADMM reuses rhs/atb in place)
-    Buf<int> rowptr;  // FISTA row-grouped measurement index (P*(R+1) ints)
-    Buf<float> tv0, tv1;  // TV branch: full-pix image + TV grad/adjoint (PnB)
+    Buf<float> din[2];  // packed H2D: rho,lam,ms,b,rix,riy,x,w -- ping-pong so
+                        // H2D(i) can run while kernel(i-1) reads the other slot
+    Buf<float> z[2], u[2], pix[2], rhs[2], atb[2], mask2[2];
+    // solve scratch, ping-pong with din: two persistent kernels may be in
+    // flight (odd/even flushes on separate streams) and never share these
+    Buf<float> tmp[2];  // FISTA GEMM scratch between the row/col halves
+    Buf<int> rowptr[2];  // row-grouped measurement index, ping-pong with din
+    Buf<float> tv0[2], tv1[2];  // TV branch: full-pix image + TV grad/adjoint
     Buf<float> tg0, tg1, tg2;  // joint TV branch: per-plane TV adjoints (PnB)
     Buf<float> ffts;  // FFT-DCT scratch: lines*(2N+2) floats per phase
     // joint stacked planes (one PnB each); sequential per-plane use shares
@@ -802,6 +720,8 @@ struct Pin {
     bool ensure(size_t bytes)
     {
         if (cap >= bytes) return true;
+        const size_t doubled = cap ? cap * 2 : 0;  // grow like Buf::ensure
+        if (doubled > bytes) bytes = doubled;
         if (p) (void)hipHostFree(p);
         p = nullptr;
         cap = 0;
@@ -813,11 +733,63 @@ struct Pin {
         return true;
     }
 };
-Pin& pin()
+Pin& pin(int slot)
 {
-    static Pin* q = new Pin;
-    return *q;
+    static Pin* q = new Pin[2];  // ping-pong with din: writer of slot i's H2D
+    return q[slot & 1];          // finished two flushes before slot i is reused
 }
+
+// Side stream for H2D of the flush being packed while the previous flush's
+// kernel occupies stream 0. Falls back to stream 0 if creation fails (still
+// correct, just serialized).
+hipStream_t xfer_stream()
+{
+    static hipStream_t s = [] {
+        hipStream_t v = nullptr;
+        if (hipStreamCreate(&v) != hipSuccess) v = nullptr;
+        return v;
+    }();
+    return s;
+}
+
+// Solve stream for a flush: odd/even slots alternate between stream 0 and a
+// second compute stream so two independent kernels can be in flight (each
+// uses its own din/rowptr/pin/scratch slot; same-stream FIFO serializes the
+// slots' reuse). Falls back to stream 0 if creation fails.
+hipStream_t kernel_stream(int slot)
+{
+    if ((slot & 1) == 0) return nullptr;  // stream 0
+    static hipStream_t b = [] {
+        hipStream_t v = nullptr;
+        if (hipStreamCreate(&v) != hipSuccess) v = nullptr;
+        return v;
+    }();
+    return b;  // null => stream 0 fallback (still correct, no 2-deep overlap)
+}
+
+// per-slot events: h0/h1 around the side-stream H2D, k0/k1 around the solve
+// on stream 0 (elapsed times are read in gf_finish, before slot reuse).
+struct PipeEv {
+    hipEvent_t h0 = nullptr, h1 = nullptr, k0 = nullptr, k1 = nullptr;
+};
+PipeEv& pipe_ev(int slot)
+{
+    static PipeEv e[2];
+    static bool inited = false;
+    if (!inited) {  // worker thread only; plain flag is enough there
+        inited = true;
+        for (int i = 0; i < 2; ++i) {
+            (void)hipEventCreateWithFlags(&e[i].h0, hipEventDefault);
+            (void)hipEventCreateWithFlags(&e[i].h1, hipEventDefault);
+            (void)hipEventCreateWithFlags(&e[i].k0, hipEventDefault);
+            (void)hipEventCreateWithFlags(&e[i].k1, hipEventDefault);
+        }
+    }
+    return e[slot & 1];
+}
+
+// flush counter for slot alternation (worker thread only)
+unsigned long long g_flush_id = 0;
 
 // Forward: row-grouped counting sort of one problem's measurements, defined
 // near run_jobs (worker thread only). Reorders (b,rix,riy), fills row_ptr.
@@ -878,6 +850,30 @@ bool fft_disabled()
         off = (e && *e == '0') ? 1 : 0;
     }
     return off == 1;
+}
+
+// Size gate: below CS_GPU_FFT_MIN_N (default 128, env-tunable) the GEMM
+// halves are sub-millisecond anyway, so FFT would buy nothing while its
+// ~250 ms per-plan creation tax dominates. Small tiles never create plans.
+bool fft_big_enough(int N)
+{
+    static int min_n = -1;
+    if (min_n < 0) {
+        min_n = 128;
+        if (const char* e = std::getenv("CS_GPU_FFT_MIN_N")) {
+            const int v = std::atoi(e);
+            if (v > 0) min_n = v;
+        }
+    }
+    return N >= min_n;
+}
+
+// One routing predicate per half-transform: FFT only when enabled, smooth,
+// and large enough to amortize plan creation; otherwise the GEMM kernel.
+inline bool fft_use(int N)
+{
+    return !g_fft_dead.load(std::memory_order_relaxed) && !fft_disabled() &&
+           fft_smooth(2 * N) && fft_big_enough(N);
 }
 
 bool fft_twiddle(int N, float2*& fwd, float2*& inv){
@@ -1099,190 +1095,275 @@ bool fft_lines(const float* src, float* dst, int lines, int N, int split,
 }
 
 // Row/col halves: synthesis (IDCT direction: row = src*Ac, col = Ar^T*src)
-// and analysis (FDCT direction: row = src*Ac^T, col = Ar*src). FFT first,
-// GEMM fallback (exact previous behavior) on any FFT failure.
+// and analysis (FDCT direction: row = src*Ac^T, col = Ar*src). FFT when the
+// length is smooth and large enough to amortize plan creation (fft_use);
+// GEMM otherwise and on any FFT failure (exact previous behavior).
 void row_synth(const float* src, float* dst, const float* ac,
-    int R, int C, int P, size_t n)
+    int R, int C, int P, size_t n, hipStream_t stream)
 {
-    if (!g_fft_dead.load(std::memory_order_relaxed) && !fft_disabled() &&
-        fft_smooth(2 * C) &&
-        fft_lines(src, dst, P * R, C, R, n, C, true, false))
+    if (fft_use(C) && fft_lines(src, dst, P * R, C, R, n, C, true, false))
         return;
-    gemm(src, ac, dst, R, C, C, 0, 0, n, 0, n, P);  // tmp = src * Ac
+    gemm(src, ac, dst, R, C, C, 0, 0, n, 0, n, P, stream);  // tmp = src * Ac
 }
 
 void col_synth(const float* src, float* dst, const float* ar,
-    int R, int C, int P, size_t n)
+    int R, int C, int P, size_t n, hipStream_t stream)
 {
-    if (!g_fft_dead.load(std::memory_order_relaxed) && !fft_disabled() &&
-        fft_smooth(2 * R) &&
-        fft_lines(src, dst, P * C, R, C, n, C, false, false))
+    if (fft_use(R) && fft_lines(src, dst, P * C, R, C, n, C, false, false))
         return;
-    gemm(ar, src, dst, R, C, R, 1, 0, 0, n, n, P);  // dst = Ar^T * tmp
+    gemm(ar, src, dst, R, C, R, 1, 0, 0, n, n, P, stream);  // dst = Ar^T * tmp
 }
 
 void row_anlys(const float* src, float* dst, const float* ac,
-    int R, int C, int P, size_t n)
+    int R, int C, int P, size_t n, hipStream_t stream)
 {
-    if (!g_fft_dead.load(std::memory_order_relaxed) && !fft_disabled() &&
-        fft_smooth(2 * C) &&
-        fft_lines(src, dst, P * R, C, R, n, C, true, true))
+    if (fft_use(C) && fft_lines(src, dst, P * R, C, R, n, C, true, true))
         return;
-    gemm(src, ac, dst, R, C, C, 0, 1, n, 0, n, P);  // tmp = src * Ac^T
+    gemm(src, ac, dst, R, C, C, 0, 1, n, 0, n, P, stream);  // tmp = src * Ac^T
 }
 
 void col_anlys(const float* src, float* dst, const float* ar,
-    int R, int C, int P, size_t n)
+    int R, int C, int P, size_t n, hipStream_t stream)
 {
-    if (!g_fft_dead.load(std::memory_order_relaxed) && !fft_disabled() &&
-        fft_smooth(2 * R) &&
-        fft_lines(src, dst, P * C, R, C, n, C, false, true))
+    if (fft_use(R) && fft_lines(src, dst, P * C, R, C, n, C, false, true))
         return;
-    gemm(ar, src, dst, R, C, R, 0, 0, 0, n, n, P);  // dst = Ar * tmp
+    gemm(ar, src, dst, R, C, R, 0, 0, 0, n, n, P, stream);  // dst = Ar * tmp
 }
 
-bool run_group(std::vector<Job*>& jobs, const Key& key)
+// (ADMM run_group removed with the solver; FISTA groups below stay.)
+
+
+// ---------------------------------------------------------------------------
+// Persistent single-launch FISTA (GEMM halves): one block per problem runs
+// every reweight pass and inner iteration -- including the TV branch
+// (idct / tvgrad / fdct / shrink_tvmom) -- entirely on-chip, replacing
+// ~5*inner*rews device dispatches with a single launch and dropping all
+// inter-iteration global traffic. Momentum and reweight mirror the
+// streaming loop (same IEEE expressions). Falls back to the streaming
+// loop when the FFT halves apply (N >= smoothness gate) or the LDS budget
+// for the tile shape exceeds one block. Worker thread only.
+// ---------------------------------------------------------------------------
+
+bool persist_disabled()
 {
-    using clk = std::chrono::steady_clock;
-    const auto ms = [](clk::time_point a, clk::time_point b) {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    };
-    const bool dbg = dbg_flag();
-    const int P = (int)jobs.size();
-    const int n = key.rows * key.cols;
-    // m varies per tile; pack measurements at the group max so one stride works
-    int mmax = 0;
-    for (int q = 0; q < P; ++q)
-        if (jobs[q]->p.m > mmax) mmax = jobs[q]->p.m;
-    if (P <= 0 || n <= 0 || mmax <= 0 || key.inner <= 0 || key.rews <= 0) return false;
-    const size_t nB = (size_t)n * 4, mB = (size_t)mmax * 4;
-    const size_t PnB = (size_t)P * nB, PmB = (size_t)P * mB;
-    // one packed buffer, host and device share this layout (bytes):
-    // [rho P][lam P][ms P][b P*mmax][rix P*mmax][riy P*mmax][x P*n][w P*n]
-    const size_t offLam = (size_t)P * 4;
-    const size_t offMs = (size_t)P * 8;
-    const size_t offB = (size_t)P * 12;
-    const size_t offRix = offB + PmB;
-    const size_t offRiy = offRix + PmB;
-    const size_t offX = offRiy + PmB;
-    const size_t offW = offX + PnB;
-    const size_t total = offW + PnB;
-    const clk::time_point t0 = clk::now();
-
-    Pool& pl = pool();
-    if (!pl.din.ensure(total) || !pl.z.ensure(PnB) || !pl.u.ensure(PnB) ||
-        !pl.pix.ensure(PnB) || !pl.rhs.ensure(PnB) || !pl.atb.ensure(PnB) ||
-        !pl.mask2.ensure(PnB))
-        return false;
-    if (!pin().ensure(total)) return false;
-
-    char* hst = (char*)pin().p;
-    float* h_rho = (float*)(hst + 0);
-    float* h_lam = (float*)(hst + offLam);
-    int* h_ms = (int*)(hst + offMs);
-    float* h_b = (float*)(hst + offB);
-    int* h_rix = (int*)(hst + offRix);
-    int* h_riy = (int*)(hst + offRiy);
-    float* h_x = (float*)(hst + offX);
-    float* h_w = (float*)(hst + offW);
-    // fill host staging; b pre-scaled x2 so Atb = 2*S^T P^T b without a pass.
-    // bytes beyond p.m in b/rix/riy are never read (scatter loops k < ms[p]).
-    for (int q = 0; q < P; ++q) {
-        const AdmmProblem& p = jobs[q]->p;
-        float* bd = h_b + (size_t)q * mmax;
-        for (int k = 0; k < p.m; ++k) bd[k] = 2.0f * p.b[k];
-        std::memcpy(h_rix + (size_t)q * mmax, p.rix, (size_t)p.m * 4);
-        std::memcpy(h_riy + (size_t)q * mmax, p.riy, (size_t)p.m * 4);
-        std::memcpy(h_x + (size_t)q * n, p.x, nB);
-        float rho = 2.0f * (float)p.m / (float)n;
-        h_rho[q] = (rho < 0.05f) ? 0.05f : rho;
-        h_lam[q] = p.lambda;
-        h_ms[q] = p.m;
+    static int off = -1;
+    if (off < 0) {
+        const char* e = std::getenv("CS_GPU_PERSIST");
+        off = (e && *e == '0') ? 1 : 0;
     }
-    for (size_t i = 0; i < PnB / 4; ++i) h_w[i] = 1.0f;
-
-    char* dst = (char*)pl.din.p;
-    float* d_rho = (float*)(dst + 0);
-    float* d_lam = (float*)(dst + offLam);
-    int* d_ms = (int*)(dst + offMs);
-    float* d_b = (float*)(dst + offB);
-    int* d_rix = (int*)(dst + offRix);
-    int* d_riy = (int*)(dst + offRiy);
-    float* d_x = (float*)(dst + offX);
-    float* d_w = (float*)(dst + offW);
-
-    float* ar = nullptr;
-    float* ac = nullptr;
-    if (!dct_get(key.rows, key.cols, ar, ac)) return false;
-
-    GPU_CHECK(hipMemcpyAsync(pl.din.p, hst, total, hipMemcpyHostToDevice, 0));
-
-    // setup: scatter into pix/mask2, Atb = FDCT(scatter), z = x0, u = 0
-    GPU_CHECK(hipMemsetAsync(pl.pix.p, 0, PnB, 0));
-    GPU_CHECK(hipMemsetAsync(pl.mask2.p, 0, PnB, 0));
-    hipLaunchKernelGGL(scatter_k, dim3(P), dim3(kBlock), 0, 0,
-        pl.pix.p, pl.mask2.p, d_b, d_rix, d_riy, d_ms, mmax, key.cols, n);
-    {
-        const long long totalX = (long long)P * n;
-        const int grid = (int)((totalX + kBlock - 1) / kBlock);
-        hipLaunchKernelGGL(init_xu_k, dim3(grid > 0 ? grid : 1), dim3(kBlock),
-            0, 0, pl.z.p, pl.u.p, d_x, totalX);
-    }
-    GPU_LAUNCH_CHECK();
-    fdct_batch(ar, ac, pl.pix.p, pl.rhs.p, pl.atb.p, key.rows, key.cols, P, n);
-    GPU_LAUNCH_CHECK();
-    const clk::time_point t1 = dbg ? clk::now() : t0;
-    if (dbg && !gpu_ok("sync setup", hipStreamSynchronize(0))) return false;
-
-    for (int r = 0; r < key.rews; ++r) {
-        if (r > 0) {
-            hipLaunchKernelGGL(reweight_k, dim3(P), dim3(kBlock), 0, 0,
-                d_w, d_x, n);
-            GPU_LAUNCH_CHECK();
-            // fresh consensus per pass, mirroring cs_admm_core entry:
-            // z = x (d_x holds the previous pass solution), u = 0, rho reset
-            {
-                const long long totalX = (long long)P * n;
-                const int grid = (int)((totalX + kBlock - 1) / kBlock);
-                hipLaunchKernelGGL(init_xu_k, dim3(grid > 0 ? grid : 1),
-                    dim3(kBlock), 0, 0, pl.z.p, pl.u.p, d_x, totalX);
-                const int rg = (P + kBlock - 1) / kBlock;
-                hipLaunchKernelGGL(rho_init_k, dim3(rg > 0 ? rg : 1),
-                    dim3(kBlock), 0, 0, d_rho, d_ms, n, P);
-                GPU_LAUNCH_CHECK();
-            }
-        }
-        for (int k = 0; k < key.inner; ++k) {
-            hipLaunchKernelGGL(rhs_k, dim3(P), dim3(kBlock), 0, 0,
-                pl.rhs.p, pl.atb.p, pl.z.p, pl.u.p, d_rho, n);
-            idct_batch(ar, ac, pl.rhs.p, pl.pix.p, pl.rhs.p, key.rows, key.cols, P, n);
-            hipLaunchKernelGGL(div_k, dim3(P), dim3(kBlock), 0, 0,
-                pl.rhs.p, pl.mask2.p, d_rho, n);
-            fdct_batch(ar, ac, pl.rhs.p, pl.pix.p, d_x, key.rows, key.cols, P, n);
-            hipLaunchKernelGGL(z_dual_k, dim3(P), dim3(kBlock), 0, 0,
-                pl.z.p, d_x, pl.u.p, d_w, d_rho, d_lam, n);
-        }
-    }
-    GPU_LAUNCH_CHECK();  // sticky launch errors from the loop above
-    const clk::time_point t2 = dbg ? clk::now() : t0;
-    if (dbg && !gpu_ok("sync solve", hipStreamSynchronize(0))) return false;
-
-    GPU_CHECK(hipGetLastError());   // promote any execution error
-    GPU_CHECK(hipMemcpyAsync(h_x, d_x, PnB, hipMemcpyDeviceToHost, 0));
-    GPU_CHECK(hipStreamSynchronize(0));  // single drain: kernels + D2H
-    const clk::time_point t3 = clk::now();
-    for (int q = 0; q < P; ++q)
-        std::memcpy(jobs[q]->p.x, h_x + (size_t)q * n, nB);
-    if (dbg)
-        fprintf(stderr,
-            "[gpu] flush P=%d %dx%d mmax=%d inner=%d rw=%d | up=%.1f solve=%.1f "
-            "down=%.1f tot=%.1f ms\n",
-            P, key.rows, key.cols, mmax, key.inner, key.rews, ms(t0, t1),
-            ms(t1, t2), ms(t2, t3), ms(t0, t3));
-    return true;
+    return off == 1;
 }
 
-// FISTA twin of run_group: reweighted-L1 proximal gradient with Nesterov
+// C(MxN) = opA(A)(MxK) * opB(B)(KxN), all operands in LDS; nt threads
+// stride the output row-major (one output per thread keeps 1280-way
+// parallelism, i.e. 4 waves per SIMD at blockDim 1024, so the K chain
+// hides LDS latency) with a 4-way unrolled K chain for ILP. No barriers
+// inside -- the caller syncs across phases. TA/TB mirror gemm_k: TA reads
+// A[i*M+j] (transpose), TB reads B[l*K+i].
+template <int TA, int TB>
+__device__ void lds_mm(const float* A, const float* B, float* C,
+    int M, int N, int K, int tid, int nt)
+{
+#define LDS_AT(i2) (TA ? A[(size_t)(i2) * M + j] : A[(size_t)j * K + (i2)])
+#define LDS_BT(iu, lv) \
+    (TB ? B[(size_t)(lv) * K + (iu)] : B[(size_t)(iu) * N + (lv)])
+    const int total = M * N;
+    for (int t = tid; t < total; t += nt) {
+        const int j = t / N, l = t - j * N;
+        // 4 independent accumulators: the K-chain is a serial fadd dependency
+        // (~576 iterations); splitting it 4 ways hides fma/LDS latency.
+        float a0s = 0.0f, a1s = 0.0f, a2s = 0.0f, a3s = 0.0f;
+        int i = 0;
+        for (; i + 4 <= K; i += 4) {
+            a0s += LDS_AT(i) * LDS_BT(i, l);
+            a1s += LDS_AT(i + 1) * LDS_BT(i + 1, l);
+            a2s += LDS_AT(i + 2) * LDS_BT(i + 2, l);
+            a3s += LDS_AT(i + 3) * LDS_BT(i + 3, l);
+        }
+        float acc = (a0s + a1s) + (a2s + a3s);
+        for (; i < K; ++i) acc += LDS_AT(i) * LDS_BT(i, l);
+        C[(size_t)j * N + l] = acc;
+    }
+#undef LDS_AT
+#undef LDS_BT
+}
+
+// One block per problem p (blockDim = 1024). sm layout:
+// [y n][xp n][z n][tmp n][t2 n][tv0 n][tv1 n][r mmax][Ar R*R][Ac C*C],
+// where tv0/tv1 collapse for non-TV flushes (r follows t2 directly).
+// xres may alias x0: it is only written after the last x0 read. useTv is
+// flush-global (mirrors the streaming anyTv branch); tv[] is per problem.
+__global__ void fista_persist_k(float* xres, const float* x0, const float* b,
+    const int* rix, const int* riy, const int* ms, const int* rowptr,
+    const float* ac, const float* ar, const float* lam, float* w,
+    const float* tv, int useTv, int mmax, int R, int C, int inner, int rews)
+{
+    extern __shared__ float sm[];
+    const int p = blockIdx.x;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const int n = R * C;
+    float* y = sm;
+    float* xp = y + n;
+    float* z = xp + n;
+    float* tmp = z + n;
+    float* t2 = tmp + n;
+    float* tv0 = t2 + n;
+    float* tv1 = tv0 + n;
+    // tv0/tv1 only exist when useTv (the caller sizes sm to 5n or 7n);
+    // non-TV packs r right after t2 so the 5n layout stays contiguous.
+    float* r = (useTv ? tv1 : t2) + n;
+    float* ARS = r + mmax;
+    float* ACS = ARS + (size_t)R * R;
+    const long long ib = (long long)p * mmax;
+    const long long nb = (long long)p * n;
+    const long long rb = (long long)p * (R + 1);
+    const int mp = ms[p];
+    const float lam_p = lam[p];
+    const float tvp = tv[p];
+    // 1024 threads = 4 waves per SIMD; 512 (2 waves) measured slower -- the
+    // scheduler spreads blocks across empty CUs, so 2-per-CU never engages.
+    __shared__ float sred[1024], seps;
+
+    for (int i = tid; i < n; i += nt) {
+        y[i] = x0[nb + i];
+        xp[i] = x0[nb + i];
+    }
+    for (int i = tid; i < R * R; i += nt) ARS[i] = ar[i];
+    for (int i = tid; i < C * C; i += nt) ACS[i] = ac[i];
+    __syncthreads();
+
+    for (int pass = 0; pass < rews; ++pass) {
+        if (pass > 0) {
+            // reweight_k: eps = max(0.02*max|z|, 1e-3); w = eps/(|z|+eps)
+            float mx = 0.0f;
+            for (int i = tid; i < n; i += nt) {
+                const float a = fabsf(z[i]);
+                if (a > mx) mx = a;
+            }
+            sred[tid] = mx;
+            __syncthreads();
+            for (int off = nt / 2; off > 0; off >>= 1) {
+                if (tid < off) sred[tid] = fmaxf(sred[tid], sred[tid + off]);
+                __syncthreads();
+            }
+            if (tid == 0) {
+                float eps = 0.02f * sred[0];
+                seps = (eps < 1e-3f) ? 1e-3f : eps;
+            }
+            __syncthreads();
+            const float eps = seps;
+            for (int i = tid; i < n; i += nt)
+                w[nb + i] = eps / (fabsf(z[i]) + eps);
+            for (int i = tid; i < n; i += nt) {
+                y[i] = z[i];
+                xp[i] = z[i];
+            }
+            __syncthreads();
+        }
+        float t = 1.0f;
+        for (int k = 0; k < inner; ++k) {
+            // tmp = y * Ac (matches row_synth GEMM)
+            lds_mm<0, 0>(y, ACS, tmp, R, C, C, tid, nt);
+            __syncthreads();
+            // residual r = sampled synth - b (matches synth_sample_k)
+            for (int q = tid; q < mp; q += nt) {
+                const int ix = rix[ib + q], iy = riy[ib + q];
+                float acc = 0.0f;
+                for (int j = 0; j < R; ++j)
+                    acc += ARS[(size_t)j * R + ix] * tmp[(size_t)j * C + iy];
+                r[q] = acc - b[ib + q];
+            }
+            __syncthreads();
+            // t2 = row-grouped sparse adjoint (matches sadjoint_k)
+            for (int u = tid; u < n; u += nt) {
+                const int j = u / C, l = u - j * C;
+                float acc = 0.0f;
+                for (int q = rowptr[rb + j]; q < rowptr[rb + j + 1]; ++q)
+                    acc += r[q] * ACS[(size_t)l * C + riy[ib + q]];
+                t2[u] = acc;
+            }
+            __syncthreads();
+            // gd = Ar * t2 (matches col_anlys GEMM); tmp keeps gd for shrink
+            lds_mm<0, 0>(ARS, t2, tmp, R, C, R, tid, nt);
+            __syncthreads();
+            if (useTv) {
+                // idct: tv0 = Ar^T * (y * Ac)  (idct_batch: row_synth +
+                // col_synth with the transpose folded into lds_mm<1,0>)
+                lds_mm<0, 0>(y, ACS, t2, R, C, C, tid, nt);
+                __syncthreads();
+                lds_mm<1, 0>(ARS, t2, tv0, R, C, R, tid, nt);
+                __syncthreads();
+                // isotropic TV gradient (matches tvgrad_k exactly)
+                constexpr float eps = 1e-3f;
+                for (int u = tid; u < n; u += nt) {
+                    const int i = u / C, j = u % C;
+                    const float c = tv0[u];
+                    float acc = 0.0f;
+                    {
+                        const float a = (i + 1 < R) ? tv0[u + C] - c : 0.0f;
+                        const float b2 = (j + 1 < C) ? tv0[u + 1] - c : 0.0f;
+                        const float d = sqrtf(a * a + b2 * b2 + eps * eps);
+                        acc -= a / d + b2 / d;
+                    }
+                    if (i > 0) {
+                        const float up = tv0[u - C];
+                        const float aT = c - up;
+                        const float bT = (j + 1 < C) ? tv0[u - C + 1] - up : 0.0f;
+                        const float dT = sqrtf(aT * aT + bT * bT + eps * eps);
+                        acc += aT / dT;
+                    }
+                    if (j > 0) {
+                        const float lf = tv0[u - 1];
+                        const float aL = (i + 1 < R) ? tv0[u - 1 + C] - lf : 0.0f;
+                        const float bL = c - lf;
+                        const float dL = sqrtf(aL * aL + bL * bL + eps * eps);
+                        acc += bL / dL;
+                    }
+                    tv1[u] = acc;
+                }
+                __syncthreads();
+                // fdct: tv0 = Ar * (tv1 * Ac^T)  (row_anlys + col_anlys)
+                lds_mm<0, 1>(tv1, ACS, t2, R, C, C, tid, nt);
+                __syncthreads();
+                lds_mm<0, 0>(ARS, t2, tv0, R, C, R, tid, nt);
+                __syncthreads();
+            }
+            const float t_new = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t * t));
+            const float mom = (t - 1.0f) / t_new;
+            if (!useTv) {
+                // shrink_mom (matches shrink_mom_k)
+                const float bs = 0.5f * lam_p;
+                for (int i = tid; i < n; i += nt) {
+                    const float v = y[i] - tmp[i];
+                    const float thr = bs * w[nb + i];
+                    const float av = fabsf(v);
+                    const float zv = (av > thr) ? copysignf(av - thr, v) : 0.0f;
+                    z[i] = zv;
+                    y[i] = zv + mom * (zv - xp[i]);
+                    xp[i] = zv;
+                }
+            } else {
+                // shrink_tvmom (matches shrink_tvmom_k): gd = tmp, gt = tv0
+                const float step = 1.0f / (2.0f + 8.0f * tvp);
+                const float bs = lam_p * step;
+                for (int i = tid; i < n; i += nt) {
+                    const float v = y[i] - step * (2.0f * tmp[i] + tvp * tv0[i]);
+                    const float thr = bs * w[nb + i];
+                    const float av = fabsf(v);
+                    const float zv = (av > thr) ? copysignf(av - thr, v) : 0.0f;
+                    z[i] = zv;
+                    y[i] = zv + mom * (zv - xp[i]);
+                    xp[i] = zv;
+                }
+            }
+            __syncthreads();
+            t = t_new;
+        }
+    }
+    for (int i = tid; i < n; i += nt) xres[nb + i] = z[i];
+}
+
+// FISTA reweighted-L1 proximal gradient with Nesterov
 // momentum, mirroring cs_fista_core_single (init y = xp = x0, per-pass
 // reweight, x = z out). DCT only; per-problem tv selects the branch:
 // tv = 0 uses the sampled gradient with the exact fixed step 1/L, L = 2;
@@ -1296,22 +1377,46 @@ bool run_group(std::vector<Job*>& jobs, const Key& key)
 //   grad = Ar * tmp2                  (1 batched GEMM)
 //   prox : z = shrink(y - grad, lam/2 * w)   [step=1/2 folded: v = y - g]
 //   mom  : y = z + mom*(z-xp); xp = z (t updated on the host, as on CPU)
-bool run_group_fista(std::vector<Job*>& jobs, const Key& key)
+// ---------------------------------------------------------------------------
+// Pipelined single-channel flush: split so flush i is packed on the host and
+// uploaded on the side stream while flush i-1's kernel still runs on stream 0.
+//   gf_pack   (CPU: layout, copies, row sort, DCT tables, persist gate)
+//   gf_h2d    (async din[rowptr] slot -> device on xfer stream, h-events)
+//   gf_finish (sync stream 0, D2H out, event ms, completions; takes the PREVIOUS run)
+//   gf_launch (wait upload, seed y/xp, launch solve, k-events; takes the CURRENT run)
+// din/rowptr/pin ping-pong by slot (flushId & 1): H2D(i) never races
+// kernel(i-1), which reads the other slot. Scratch (z,u,..) stays single:
+// gf_launch runs only after gf_finish drained stream 0.
+// ---------------------------------------------------------------------------
+struct GroupRun {
+    std::vector<Job> jobs;
+    std::vector<Job*> jb;  // views into jobs (stable: built once, no push)
+    Key key;
+    int P = 0, n = 0, mmax = 0;
+    size_t nB = 0, PnB = 0, total = 0, rpB = 0, ldsBytes = 0;
+    size_t offTv = 0, offMs = 0, offB = 0, offRix = 0, offRiy = 0, offX = 0, offW = 0;
+    int slot = 0;
+    bool ok = false, anyTv = false, persist = false, issued = false;
+    float* ar = nullptr;
+    float* ac = nullptr;
+    std::vector<int> h_rowptr;
+    std::chrono::steady_clock::time_point t0 {}, tH {}, tS {};
+    double ensMs = 0, packMs = 0;
+};
+
+bool gf_pack(GroupRun& r)
 {
     using clk = std::chrono::steady_clock;
-    const auto ms = [](clk::time_point a, clk::time_point b) {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    };
-    const bool dbg = dbg_flag();
-    const int P = (int)jobs.size();
-    const int n = key.rows * key.cols;
+    const Key& key = r.key;
+    const int P = (int)r.jobs.size();
     int mmax = 0;
     for (int q = 0; q < P; ++q)
-        if (jobs[q]->fp.m > mmax) mmax = jobs[q]->fp.m;
-    if (P <= 0 || n <= 0 || mmax <= 0 || key.inner <= 0 || key.rews <= 0) return false;
+        if (r.jobs[q].fp.m > mmax) mmax = r.jobs[q].fp.m;
+    const int n = key.rows * key.cols;
+    if (P <= 0 || n <= 0 || mmax <= 0 || key.inner <= 0 || key.rews <= 0)
+        return false;
     const size_t nB = (size_t)n * 4, mB = (size_t)mmax * 4;
     const size_t PnB = (size_t)P * nB, PmB = (size_t)P * mB;
-    // packed H2D layout (bytes): [lam P][tv P][ms P][b P*mmax][rix][riy][x P*n][w P*n]
     const size_t offTv = (size_t)P * 4;
     const size_t offMs = (size_t)P * 8;
     const size_t offB = (size_t)P * 12;
@@ -1319,19 +1424,28 @@ bool run_group_fista(std::vector<Job*>& jobs, const Key& key)
     const size_t offRiy = offRix + PmB;
     const size_t offX = offRiy + PmB;
     const size_t offW = offX + PnB;
-    const size_t total = offW + PnB;
+    r.P = P;
+    r.n = n;
+    r.mmax = mmax;
+    r.nB = nB;
+    r.PnB = PnB;
+    r.total = offW + PnB;
+    r.rpB = (size_t)P * (key.rows + 1) * 4;
+    r.offTv = offTv;
+    r.offMs = offMs;
+    r.offB = offB;
+    r.offRix = offRix;
+    r.offRiy = offRiy;
+    r.offX = offX;
+    r.offW = offW;
+    r.slot = (int)(g_flush_id++ & 1);
     const clk::time_point t0 = clk::now();
 
-    Pool& pl = pool();
-    if (!pl.din.ensure(total) || !pl.z.ensure(PnB) || !pl.u.ensure(PnB) ||
-        !pl.pix.ensure(PnB) || !pl.rhs.ensure(PnB) || !pl.atb.ensure(PnB) ||
-        !pl.mask2.ensure(PnB) || !pl.tmp.ensure(PnB) ||
-        !pl.tv0.ensure(PnB) || !pl.tv1.ensure(PnB) ||
-        !pl.rowptr.ensure((size_t)P * (key.rows + 1) * 4))
-        return false;
-    if (!pin().ensure(total)) return false;
+    // host staging is per-slot: growth here can never free a buffer the side
+    // stream is still reading (that slot's last read was 2 flushes ago).
+    if (!pin(r.slot).ensure(r.total)) return false;
 
-    char* hst = (char*)pin().p;
+    char* hst = (char*)pin(r.slot).p;
     float* h_lam = (float*)(hst + 0);
     float* h_tv = (float*)(hst + offTv);
     int* h_ms = (int*)(hst + offMs);
@@ -1340,13 +1454,10 @@ bool run_group_fista(std::vector<Job*>& jobs, const Key& key)
     int* h_riy = (int*)(hst + offRiy);
     float* h_x = (float*)(hst + offX);
     float* h_w = (float*)(hst + offW);
-    // row-grouped order for the sparse adjoint: reorders (b,rix,riy) per
-    // problem and fills h_rowptr[q*(R+1)..]; the compact residual shares
-    // this order everywhere downstream.
-    std::vector<int> h_rowptr((size_t)P * (key.rows + 1));
+    r.h_rowptr.resize((size_t)P * (key.rows + 1));
     bool anyTv = false;
     for (int q = 0; q < P; ++q) {
-        const FistaProblem& p = jobs[q]->fp;
+        const FistaProblem& p = r.jobs[q].fp;
         float* bd = h_b + (size_t)q * mmax;
         for (int k = 0; k < p.m; ++k) bd[k] = p.b[k];
         std::memcpy(h_rix + (size_t)q * mmax, p.rix, (size_t)p.m * 4);
@@ -1358,98 +1469,192 @@ bool run_group_fista(std::vector<Job*>& jobs, const Key& key)
         h_ms[q] = p.m;
         sort_measurements_by_row(bd, h_rix + (size_t)q * mmax,
             h_riy + (size_t)q * mmax, p.m, key.rows,
-            h_rowptr.data() + (size_t)q * (key.rows + 1));
+            r.h_rowptr.data() + (size_t)q * (key.rows + 1));
     }
     for (size_t i = 0; i < PnB / 4; ++i) h_w[i] = 1.0f;
+    if (!dct_get(key.rows, key.cols, r.ar, r.ac)) return false;
 
-    char* dst = (char*)pl.din.p;
+    const size_t ldsBytes = ((size_t)(anyTv ? 7 : 5) * n + (size_t)mmax +
+        (size_t)key.rows * key.rows + (size_t)key.cols * key.cols) * 4;
+    r.ldsBytes = ldsBytes;
+    r.anyTv = anyTv;
+    r.persist = !persist_disabled() && !fft_use(key.cols) &&
+        !fft_use(key.rows) && ldsBytes <= 61400;
+    r.packMs = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    r.t0 = t0;
+    r.ok = true;
+    return true;
+}
+
+bool gf_h2d(GroupRun& r)
+{
+    using clk = std::chrono::steady_clock;
+    Pool& pl = pool();
+    PipeEv& ev = pipe_ev(r.slot);
+    const hipStream_t xs = xfer_stream();
+    char* hst = (char*)pin(r.slot).p;
+    (void)hipEventRecord(ev.h0, xs);
+    if (!gpu_ok("h2d", hipMemcpyAsync(pl.din[r.slot].p, hst, r.total,
+            hipMemcpyHostToDevice, xs)))
+        return false;
+    if (!gpu_ok("h2d", hipMemcpyAsync(pl.rowptr[r.slot].p, r.h_rowptr.data(),
+            r.rpB, hipMemcpyHostToDevice, xs)))
+        return false;
+    (void)hipEventRecord(ev.h1, xs);
+    r.tH = clk::now();
+    return true;
+}
+
+// device scratch (single-buffered): grow only after gf_finish drained the
+// previous kernel; the side stream touches only din/rowptr, never these.
+bool pool_ensure_scratch(int slot, size_t PnB)
+{
+    Pool& pl = pool();
+    return pl.z[slot].ensure(PnB) && pl.u[slot].ensure(PnB) &&
+        pl.pix[slot].ensure(PnB) && pl.rhs[slot].ensure(PnB) &&
+        pl.atb[slot].ensure(PnB) && pl.mask2[slot].ensure(PnB) &&
+        pl.tmp[slot].ensure(PnB) && pl.tv0[slot].ensure(PnB) &&
+        pl.tv1[slot].ensure(PnB);
+}
+
+bool gf_launch(GroupRun& r)
+{
+    using clk = std::chrono::steady_clock;
+    const Key& key = r.key;
+    const int P = r.P, n = r.n;
+    const size_t nB = r.nB, PnB = r.PnB;
+    Pool& pl = pool();
+    char* dst = (char*)pl.din[r.slot].p;
     float* d_lam = (float*)(dst + 0);
-    float* d_tv = (float*)(dst + offTv);
-    int* d_ms = (int*)(dst + offMs);
-    float* d_b = (float*)(dst + offB);
-    int* d_rix = (int*)(dst + offRix);
-    int* d_riy = (int*)(dst + offRiy);
-    float* d_x = (float*)(dst + offX);
-    float* d_w = (float*)(dst + offW);
+    float* d_tv = (float*)(dst + r.offTv);
+    int* d_ms = (int*)(dst + r.offMs);
+    float* d_b = (float*)(dst + r.offB);
+    int* d_rix = (int*)(dst + r.offRix);
+    int* d_riy = (int*)(dst + r.offRiy);
+    float* d_x = (float*)(dst + r.offX);
+    float* d_w = (float*)(dst + r.offW);
+    float *d_y = pl.z[r.slot].p, *d_xp = pl.u[r.slot].p, *d_z = pl.rhs[r.slot].p,
+          *d_g = pl.atb[r.slot].p;
+    float *d_r = pl.pix[r.slot].p, *d_tmp2 = pl.mask2[r.slot].p,
+          *d_tmp = pl.tmp[r.slot].p;
+    float *d_tv0 = pl.tv0[r.slot].p, *d_tv1 = pl.tv1[r.slot].p;
+    int* d_rowptr = pl.rowptr[r.slot].p;
+    float* ar = r.ar;
+    float* ac = r.ac;
+    // 2-deep: persist flushes alternate streams (own slot everywhere). The
+    // non-persist fallback stays on stream 0: its FFT path shares pl.ffts
+    // and plan streams, and it is only reached for FFT-sized transforms.
+    const hipStream_t s = r.persist ? kernel_stream(r.slot) : nullptr;
 
-    // Sampled-gradient buffer roles (ADMM-named pool, FISTA use): y=pl.z,
-    // xp=pl.u, zc=pl.rhs, grad=pl.atb, compact resid r=pl.pix (PmB<=PnB),
-    // sparse tmp2=pl.mask2, gemm scratch=pl.tmp. No full pix/sc image, no
-    // memset: synth_sample + sadjoint replace 2 GEMMs + memset + residual.
-    // TV branch additionally uses tv0 (full pix, then TV adjoint) + tv1.
-    float *d_y = pl.z.p, *d_xp = pl.u.p, *d_z = pl.rhs.p, *d_g = pl.atb.p;
-    float *d_r = pl.pix.p, *d_tmp2 = pl.mask2.p, *d_tmp = pl.tmp.p;
-    float *d_tv0 = pl.tv0.p, *d_tv1 = pl.tv1.p;
-    int* d_rowptr = pl.rowptr.p;
+    PipeEv& ev = pipe_ev(r.slot);
+    if (hipStreamWaitEvent(s, ev.h1, 0) != hipSuccess) return false;  // upload visible
+    GPU_CHECK(hipMemcpyAsync(d_y, d_x, PnB, hipMemcpyDeviceToDevice, s));
+    GPU_CHECK(hipMemcpyAsync(d_xp, d_x, PnB, hipMemcpyDeviceToDevice, s));
+    if (hipEventRecord(ev.k0, s) != hipSuccess) return false;
 
-    float* ar = nullptr;
-    float* ac = nullptr;
-    if (!dct_get(key.rows, key.cols, ar, ac)) return false;
-
-    GPU_CHECK(hipMemcpyAsync(pl.din.p, hst, total, hipMemcpyHostToDevice, 0));
-    GPU_CHECK(hipMemcpyAsync(d_rowptr, h_rowptr.data(),
-        (size_t)P * (key.rows + 1) * 4, hipMemcpyHostToDevice, 0));
-    GPU_CHECK(hipMemcpyAsync(d_y, d_x, PnB, hipMemcpyDeviceToDevice, 0));
-    GPU_CHECK(hipMemcpyAsync(d_xp, d_x, PnB, hipMemcpyDeviceToDevice, 0));
-
-    for (int r = 0; r < key.rews; ++r) {
-        if (r > 0) {
-            hipLaunchKernelGGL(reweight_k, dim3(P), dim3(kBlock), 0, 0,
+    // Persistent fast path: one launch runs every pass and inner iteration
+    // on-chip (TV included). Gated in gf_pack (LDS budget + FFT dims).
+    if (r.persist) {
+        hipLaunchKernelGGL(fista_persist_k, dim3(P), dim3(1024),
+            r.ldsBytes, s, d_x, d_x, d_b, d_rix, d_riy, d_ms, d_rowptr, ac, ar,
+            d_lam, d_w, d_tv, r.anyTv ? 1 : 0, r.mmax, key.rows, key.cols,
+            key.inner, key.rews);
+        GPU_LAUNCH_CHECK();
+    } else
+    for (int rw = 0; rw < key.rews; ++rw) {
+        if (rw > 0) {
+            hipLaunchKernelGGL(reweight_k, dim3(P), dim3(kBlock), 0, s,
                 d_w, d_x, n);
             GPU_LAUNCH_CHECK();
-            // per-pass restart, mirroring cs_fista_core_single: d_x already
-            // holds the previous pass solution (copied at the loop end).
-            GPU_CHECK(hipMemcpyAsync(d_y, d_x, PnB, hipMemcpyDeviceToDevice, 0));
-            GPU_CHECK(hipMemcpyAsync(d_xp, d_x, PnB, hipMemcpyDeviceToDevice, 0));
+            GPU_CHECK(hipMemcpyAsync(d_y, d_x, PnB, hipMemcpyDeviceToDevice, s));
+            GPU_CHECK(hipMemcpyAsync(d_xp, d_x, PnB, hipMemcpyDeviceToDevice, s));
         }
         float t = 1.0f;
         for (int k = 0; k < key.inner; ++k) {
-            // sampled gradient: tmp = y*Ac (full GEMM), r = sampled
-            // synth - b (m*R), tmp2 = sparse sc*Ac^T (m*C), grad = Ar*tmp2.
-            // Replaces idct + memset + resid + fdct (4 GEMMs -> 2 GEMMs).
             row_synth(d_y, d_tmp, ac, key.rows, key.cols, P, n);
-            hipLaunchKernelGGL(synth_sample_k, dim3(P), dim3(kBlock), 0, 0,
-                d_r, d_tmp, ar, d_b, d_rix, d_riy, d_ms, mmax,
+            hipLaunchKernelGGL(synth_sample_k, dim3(P), dim3(kBlock), 0, s,
+                d_r, d_tmp, ar, d_b, d_rix, d_riy, d_ms, r.mmax,
                 key.rows, key.cols);
-            hipLaunchKernelGGL(sadjoint_k, dim3(P), dim3(kBlock), 0, 0,
-                d_tmp2, d_r, d_riy, d_rowptr, ac, d_ms, mmax,
+            hipLaunchKernelGGL(sadjoint_k, dim3(P), dim3(kBlock), 0, s,
+                d_tmp2, d_r, d_riy, d_rowptr, ac, d_ms, r.mmax,
                 key.rows, key.cols);
             col_anlys(d_tmp2, d_g, ar, key.rows, key.cols, P, n);
             const float t_new = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t * t));
             const float mom = (t - 1.0f) / t_new;
-            if (!anyTv) {
-                hipLaunchKernelGGL(shrink_mom_k, dim3(P), dim3(kBlock), 0, 0,
+            if (!r.anyTv) {
+                hipLaunchKernelGGL(shrink_mom_k, dim3(P), dim3(kBlock), 0, s,
                     d_z, d_y, d_g, d_w, d_lam, d_xp, mom, n);
             } else {
-                // TV branch: full pix = IDCT(y), TV grad + adjoint, then
-                // v = y - step*(2*gd + tv*gt) with step = 1/(2+8*tv).
                 idct_batch(ar, ac, d_y, d_tmp, d_tv0, key.rows, key.cols, P, n);
-                hipLaunchKernelGGL(tvgrad_k, dim3(P), dim3(kBlock), 0, 0,
+                hipLaunchKernelGGL(tvgrad_k, dim3(P), dim3(kBlock), 0, s,
                     d_tv1, d_tv0, key.rows, key.cols);
                 fdct_batch(ar, ac, d_tv1, d_tmp, d_tv0, key.rows, key.cols, P, n);
-                hipLaunchKernelGGL(shrink_tvmom_k, dim3(P), dim3(kBlock), 0, 0,
+                hipLaunchKernelGGL(shrink_tvmom_k, dim3(P), dim3(kBlock), 0, s,
                     d_z, d_y, d_g, d_tv0, d_w, d_lam, d_tv, d_xp, mom, n);
             }
             t = t_new;
         }
-        if (r + 1 < key.rews)
-            GPU_CHECK(hipMemcpyAsync(d_x, d_z, PnB, hipMemcpyDeviceToDevice, 0));
+        if (rw + 1 < key.rews)
+            GPU_CHECK(hipMemcpyAsync(d_x, d_z, PnB, hipMemcpyDeviceToDevice, s));
     }
     GPU_LAUNCH_CHECK();
-    if (dbg && !gpu_ok("sync solve", hipStreamSynchronize(0))) return false;
-
+    if (!r.persist)  // persistent kernel wrote the solution to d_x itself
+        GPU_CHECK(hipMemcpyAsync(d_x, d_z, PnB, hipMemcpyDeviceToDevice, s));
+    if (hipEventRecord(ev.k1, s) != hipSuccess) return false;
     GPU_CHECK(hipGetLastError());
-    GPU_CHECK(hipMemcpyAsync(d_x, d_z, PnB, hipMemcpyDeviceToDevice, 0));
-    GPU_CHECK(hipMemcpyAsync(h_x, d_x, PnB, hipMemcpyDeviceToHost, 0));
-    GPU_CHECK(hipStreamSynchronize(0));  // single drain: kernels + D2H
-    const clk::time_point t3 = clk::now();
-    for (int q = 0; q < P; ++q)
-        std::memcpy(jobs[q]->fp.x, h_x + (size_t)q * n, nB);
-    if (dbg)
-        fprintf(stderr,
-            "[gpu] fista flush P=%d %dx%d mmax=%d inner=%d rw=%d tot=%.1f ms\n",
-            P, key.rows, key.cols, mmax, key.inner, key.rews, ms(t0, t3));
+    r.tS = clk::now();
+    r.issued = true;
     return true;
+}
+
+void gf_finish(std::unique_ptr<GroupRun>& g, bool fallback)
+{
+    if (!g) return;
+    std::unique_ptr<GroupRun> r = std::move(g);
+    auto fail = [&]() {
+        for (auto& j : r->jobs) finish(j, true);
+        r->jobs.clear();
+    };
+    if (fallback || !r->ok || !r->issued) return fail();
+    using clk = std::chrono::steady_clock;
+    const auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const bool dbg = dbg_flag();
+    const hipStream_t s = r->persist ? kernel_stream(r->slot) : nullptr;
+    if (!gpu_ok("solve", hipStreamSynchronize(s))) return fail();
+    const clk::time_point tE = clk::now();
+    PipeEv& ev = pipe_ev(r->slot);
+    (void)hipEventSynchronize(ev.h1);  // typically long done
+    float kms = 0.0f, hms = -1.0f;
+    (void)hipEventElapsedTime(&kms, ev.k0, ev.k1);
+    (void)hipEventElapsedTime(&hms, ev.h0, ev.h1);
+    char* hst = (char*)pin(r->slot).p;
+    float* h_x = (float*)(hst + r->offX);
+    float* d_x = (float*)((char*)pool().din[r->slot].p + r->offX);
+    if (!gpu_ok("d2h", hipGetLastError())) return fail();
+    if (!gpu_ok("d2h", hipMemcpyAsync(h_x, d_x, r->PnB, hipMemcpyDeviceToHost, s)))
+        return fail();
+    if (!gpu_ok("d2h", hipStreamSynchronize(s))) return fail();  // kernels + D2H
+    const clk::time_point t3 = clk::now();
+    for (int q = 0; q < r->P; ++q)
+        std::memcpy(r->jobs[q].fp.x, h_x + (size_t)q * r->n, r->nB);
+    const clk::time_point t4 = clk::now();
+    if (dbg) {
+        const auto abs_ms = [](clk::time_point tp) {
+            return std::chrono::duration<double, std::milli>(
+                tp.time_since_epoch()).count();
+        };
+        fprintf(stderr,
+            "[gpu] fista flush P=%d %dx%d mmax=%d inner=%d rw=%d tot=%.1f ms"
+            " ph: ens=%.1f pack=%.1f h2d=%.1f solve=%.1f d2h=%.1f out=%.1f"
+            " abs: L=%.2f E=%.2f\n",
+            r->P, r->key.rows, r->key.cols, r->mmax, r->key.inner, r->key.rews,
+            ms(r->t0, t4), r->ensMs, r->packMs, hms, kms, ms(tE, t3),
+            ms(t3, t4), abs_ms(r->tS), abs_ms(tE));
+    }
+    for (auto& j : r->jobs) finish(j, false);
+    r->jobs.clear();
 }
 
 // Joint twin: the same loop over stacked [x0|x1|x2] with row-coupled
@@ -1488,21 +1693,22 @@ bool run_group_fista_joint(std::vector<Job*>& jobs, const Key& key)
     const size_t total = offW + PnB;
     const clk::time_point t0 = clk::now();
 
+    const int slot = (int)(g_flush_id++ & 1);  // ping-pong slot (sync run)
     Pool& pl = pool();
-    if (!pl.din.ensure(total) || !pl.z.ensure(PnB) || !pl.u.ensure(PnB) ||
-        !pl.pix.ensure(PnB) || !pl.rhs.ensure(PnB) || !pl.atb.ensure(PnB) ||
-        !pl.mask2.ensure(PnB) || !pl.tmp.ensure(PnB) ||
-        !pl.tv0.ensure(PnB) || !pl.tv1.ensure(PnB) ||
+    if (!pl.din[slot].ensure(total) || !pl.z[slot].ensure(PnB) || !pl.u[slot].ensure(PnB) ||
+        !pl.pix[slot].ensure(PnB) || !pl.rhs[slot].ensure(PnB) || !pl.atb[slot].ensure(PnB) ||
+        !pl.mask2[slot].ensure(PnB) || !pl.tmp[slot].ensure(PnB) ||
+        !pl.tv0[slot].ensure(PnB) || !pl.tv1[slot].ensure(PnB) ||
         !pl.tg0.ensure(PnB) || !pl.tg1.ensure(PnB) || !pl.tg2.ensure(PnB) ||
-        !pl.rowptr.ensure((size_t)P * (key.rows + 1) * 4) ||
+        !pl.rowptr[slot].ensure((size_t)P * (key.rows + 1) * 4) ||
         !pl.y1.ensure(PnB) || !pl.y2.ensure(PnB) ||
         !pl.xp1.ensure(PnB) || !pl.xp2.ensure(PnB) ||
         !pl.z1.ensure(PnB) || !pl.z2.ensure(PnB) ||
         !pl.g1.ensure(PnB) || !pl.g2.ensure(PnB))
         return false;
-    if (!pin().ensure(total)) return false;
+    if (!pin(slot).ensure(total)) return false;
 
-    char* hst = (char*)pin().p;
+    char* hst = (char*)pin(slot).p;
     float* h_lam = (float*)(hst + 0);
     float* h_tv = (float*)(hst + offTv);
     int* h_ms = (int*)(hst + offMs);
@@ -1580,7 +1786,7 @@ bool run_group_fista_joint(std::vector<Job*>& jobs, const Key& key)
     }
     for (size_t i = 0; i < PnB / 4; ++i) h_w[i] = 1.0f;
 
-    char* dst = (char*)pl.din.p;
+    char* dst = (char*)pl.din[slot].p;
     float* d_lam = (float*)(dst + 0);
     float* d_tv = (float*)(dst + offTv);
     int* d_ms = (int*)(dst + offMs);
@@ -1598,20 +1804,20 @@ bool run_group_fista_joint(std::vector<Job*>& jobs, const Key& key)
     // r/tmp2/tmp + tv0/tv1 are shared sequentially (each plane's chain
     // completes before the next reuses the scratch); data grads persist in
     // g0/g1/g2 and TV adjoints in tg0/tg1/tg2 for the joint shrink.
-    float *d_y0 = pl.z.p, *d_y1 = pl.y1.p, *d_y2 = pl.y2.p;
-    float *d_xp0 = pl.u.p, *d_xp1 = pl.xp1.p, *d_xp2 = pl.xp2.p;
-    float *d_z0 = pl.rhs.p, *d_z1 = pl.z1.p, *d_z2 = pl.z2.p;
-    float *d_g0 = pl.atb.p, *d_g1 = pl.g1.p, *d_g2 = pl.g2.p;
-    float *d_r = pl.pix.p, *d_tmp2 = pl.mask2.p, *d_tmp = pl.tmp.p;
-    float *d_tv0 = pl.tv0.p, *d_tv1 = pl.tv1.p;
+    float *d_y0 = pl.z[slot].p, *d_y1 = pl.y1.p, *d_y2 = pl.y2.p;
+    float *d_xp0 = pl.u[slot].p, *d_xp1 = pl.xp1.p, *d_xp2 = pl.xp2.p;
+    float *d_z0 = pl.rhs[slot].p, *d_z1 = pl.z1.p, *d_z2 = pl.z2.p;
+    float *d_g0 = pl.atb[slot].p, *d_g1 = pl.g1.p, *d_g2 = pl.g2.p;
+    float *d_r = pl.pix[slot].p, *d_tmp2 = pl.mask2[slot].p, *d_tmp = pl.tmp[slot].p;
+    float *d_tv0 = pl.tv0[slot].p, *d_tv1 = pl.tv1[slot].p;
     float *d_tg0 = pl.tg0.p, *d_tg1 = pl.tg1.p, *d_tg2 = pl.tg2.p;
-    int* d_rowptr = pl.rowptr.p;
+    int* d_rowptr = pl.rowptr[slot].p;
 
     float* ar = nullptr;
     float* ac = nullptr;
     if (!dct_get(key.rows, key.cols, ar, ac)) return false;
 
-    GPU_CHECK(hipMemcpyAsync(pl.din.p, hst, total, hipMemcpyHostToDevice, 0));
+    GPU_CHECK(hipMemcpyAsync(pl.din[slot].p, hst, total, hipMemcpyHostToDevice, 0));
     GPU_CHECK(hipMemcpyAsync(d_rowptr, h_rowptr.data(),
         (size_t)P * (key.rows + 1) * 4, hipMemcpyHostToDevice, 0));
     GPU_CHECK(hipMemcpyAsync(d_y0, d_x0, PnB, hipMemcpyDeviceToDevice, 0));
@@ -1723,22 +1929,21 @@ bool run_group_fista_joint(std::vector<Job*>& jobs, const Key& key)
     return true;
 }
 
-void run_jobs(std::vector<Job>& batch)
+static std::vector<std::unique_ptr<GroupRun>> plan_groups(std::vector<Job>& batch)
 {
-    std::map<Key, std::vector<Job*>> groups;
-    for (auto& j : batch) {
-        if (j.kind == 1) groups[Key(j.fp)].push_back(&j);
-        else groups[Key(j.p)].push_back(&j);
-    }
+    std::map<Key, std::vector<Job>> groups;
+    for (auto& j : batch) groups[Key(j.fp)].push_back(std::move(j));
+    std::vector<std::unique_ptr<GroupRun>> runs;
+    runs.reserve(groups.size());
     for (auto& kv : groups) {
-        bool ok = false;
-        if (!g_dead.load(std::memory_order_relaxed)) {
-            if (kv.first.kind == 1 && kv.first.joint == 1) ok = run_group_fista_joint(kv.second, kv.first);
-            else if (kv.first.kind == 1) ok = run_group_fista(kv.second, kv.first);
-            else ok = run_group(kv.second, kv.first);
-        }
-        for (auto* j : kv.second) finish(*j, !ok);
+        std::unique_ptr<GroupRun> r(new GroupRun());
+        r->key = kv.first;
+        r->jobs = std::move(kv.second);
+        r->jb.reserve(r->jobs.size());
+        for (auto& j : r->jobs) r->jb.push_back(&j);
+        runs.push_back(std::move(r));
     }
+    return runs;
 }
 
 // Stable counting sort of one problem's measurements by row, in place over
@@ -1787,15 +1992,36 @@ void worker_main()
     QState& s = Q();
     std::unique_lock<std::mutex> lk(s.m);
     bool have_prev = false;
-    clk::time_point t_prev_end{};
+    clk::time_point t_prev_end {};
+    // last flushed run: its completions are released when the NEXT run issues
+    // (that is when its D2H lands), or when the queue stays empty for one
+    // grace window (wavefront tail: the next wave waits on those tiles).
+    // last two issued runs: p1 = most recent, p2 = two flushes back. Issue i
+    // finishes p2 FIRST: that drains run i-2 (kernel + H2D + D2H), freeing
+    // its slot (din/rowptr/pin/scratch/events) for reuse by run i, whose id
+    // has the same parity. Then i packs and launches while kernel(i-1) is
+    // still running (separate stream/slot) -- cadence becomes pack+launch
+    // (~0.3 ms), not kernel duration; steady state overlaps two kernels.
+    std::unique_ptr<GroupRun> p1, p2;
     for (;;) {
-        s.cv.wait(lk, [] { return !Q().q.empty(); });
+        if ((p1 || p2) && s.q.empty()) {
+            if (!s.cv.wait_for(lk, std::chrono::microseconds(grace_us()),
+                    [] { return !Q().q.empty(); })) {
+                lk.unlock();
+                gf_finish(p2, false);
+                gf_finish(p1, false);
+                lk.lock();
+                continue;
+            }
+        } else {
+            s.cv.wait(lk, [] { return !Q().q.empty(); });
+        }
         // grace window: drop the lock, spin until the batch fills or arrivals
         // stall (keeps exact timing -- cv.wait_until would oversleep ~15ms)
         lk.unlock();
         const clk::time_point t_arrive = clk::now();
-        const auto soft = t_arrive + std::chrono::microseconds(kGraceUs);
-        const auto hard = t_arrive + std::chrono::milliseconds(3);
+        const auto soft = t_arrive + std::chrono::microseconds(grace_us());
+        const auto hard = soft + std::chrono::milliseconds(3);
         int last_p = s.pend.load(std::memory_order_acquire);
         clk::time_point t_grow = t_arrive;
         for (;;) {
@@ -1807,7 +2033,7 @@ void worker_main()
             if (p >= kBatchTarget) break;
             const clk::time_point now = clk::now();
             if (now >= hard) break;
-            if (now >= soft && now - t_grow > std::chrono::microseconds(150))
+            if (now >= soft && now - t_grow > std::chrono::microseconds(quiet_us()))
                 break;
             std::this_thread::yield();
         }
@@ -1824,14 +2050,106 @@ void worker_main()
             fprintf(stderr, "[gpu] sched gap=%.1f grace=%.1f pend=%d\n",
                 have_prev ? ms(t_prev_end, t_flush) : -1.0,
                 ms(t_arrive, t_flush), pend);
+        std::vector<std::unique_ptr<GroupRun>> runs;
         try {
-            run_jobs(batch);
+            runs = plan_groups(batch);
+            for (auto& rp : runs) {
+                GroupRun& R = *rp;
+                if (R.key.joint) {
+                    // joint stays fully synchronous (coarse, rarely on the
+                    // hot path): drain the pipeline first (p2 shares joint's
+                    // slot parity), run, release.
+                    gf_finish(p2, false);
+                    gf_finish(p1, false);
+                    bool ok = !g_dead.load(std::memory_order_relaxed)
+                        && run_group_fista_joint(R.jb, R.key);
+                    for (auto& j : R.jobs) finish(j, !ok);
+                    R.jobs.clear();
+                    continue;
+                }
+                // drain run i-2: its slot is the one run i is about to reuse
+                // (near-instant in steady state -- launched two cycles ago)
+                gf_finish(p2, false);
+                if (!g_dead.load(std::memory_order_relaxed) && !gf_pack(R))
+                    R.ok = false;
+                if (!R.ok) {  // pack failed / device dead -> CPU fallback
+                    for (auto& j : R.jobs) finish(j, true);
+                    R.jobs.clear();
+                    p2 = std::move(p1);  // id consumed: keep parity tracking
+                    p1.reset();
+                    continue;
+                }
+                double ens = 0;
+                if (pool().din[R.slot].cap < R.total ||
+                    pool().rowptr[R.slot].cap < R.rpB) {
+                    // rare staging growth: din/rowptr[p2-slot] were drained
+                    // above; belt: let any stale side-stream copy retire.
+                    const clk::time_point a = clk::now();
+                    (void)hipStreamSynchronize(xfer_stream());
+                    if (!pool().din[R.slot].ensure(R.total) ||
+                        !pool().rowptr[R.slot].ensure(R.rpB)) {
+                        for (auto& j : R.jobs) finish(j, true);
+                        R.jobs.clear();
+                        p2 = std::move(p1);
+                        p1.reset();
+                        continue;
+                    }
+                    ens += ms(a, clk::now());
+                }
+                const clk::time_point b = clk::now();
+                if (!pool_ensure_scratch(R.slot, R.PnB)) {
+                    // element-wise: slot's buffers are untouched by any
+                    // running kernel (kernel(prev) has the other parity)
+                    for (auto& j : R.jobs) finish(j, true);
+                    R.jobs.clear();
+                    p2 = std::move(p1);
+                    p1.reset();
+                    continue;
+                }
+                ens += ms(b, clk::now());
+                R.ensMs = ens;
+                if (!gf_h2d(R)) {
+                    for (auto& j : R.jobs) finish(j, true);
+                    R.jobs.clear();
+                    p2 = std::move(p1);
+                    p1.reset();
+                    continue;
+                }  // side stream: overlaps the running kernels
+                if (!gf_launch(R)) {
+                    (void)hipStreamSynchronize(kernel_stream(R.slot));
+                    for (auto& j : R.jobs) finish(j, true);
+                    R.jobs.clear();
+                    p2 = std::move(p1);
+                    p1.reset();
+                    continue;
+                }
+                p2 = std::move(p1);
+                p1 = std::move(rp);
+            }
+            // idle tail: nothing queued -> the next wave is blocked on these
+            // completions, so drain now instead of waiting for a next batch.
+            // Blocking here is NOT idle time: the GPU is running p1's kernel
+            // during the wait, and releasing at kernel end + ~1.7 ms
+            // (thread handoff + grace + pack) measured faster than lazy
+            // completion-gated drains, which left stale kernels to contend
+            // with the next launch (solve times stretched ~2.3x on gfx1100;
+            // A/B: 2051 ms blocked vs 2701 ms gated on enc64).
+            if (Q().pend.load(std::memory_order_acquire) == 0) {
+                gf_finish(p1, false);
+                gf_finish(p2, false);
+            }
         } catch (const std::exception& e) {
             fprintf(stderr, "[gpu] worker: %s\n", e.what());
-            for (auto& j : batch) finish(j, true);
+            gf_finish(p2, false);
+            gf_finish(p1, false);
+            for (auto& rp : runs)
+                if (rp) gf_finish(rp, false);
         } catch (...) {
             fprintf(stderr, "[gpu] worker: unknown exception\n");
-            for (auto& j : batch) finish(j, true);
+            gf_finish(p2, false);
+            gf_finish(p1, false);
+            for (auto& rp : runs)
+                if (rp) gf_finish(rp, false);
         }
         t_prev_end = clk::now();
         have_prev = true;
@@ -1844,11 +2162,6 @@ void worker_main()
 // ---------------------------------------------------------------------------
 // public API
 // ---------------------------------------------------------------------------
-
-void register_cpu_fallback(CpuFallbackFn fn)
-{
-    g_fb = fn;
-}
 
 void register_cpu_fallback_fista(FistaFallbackFn fn)
 {
@@ -1887,15 +2200,15 @@ void set_enabled(bool on)
     hipDeviceProp_t prop;
     std::memset(&prop, 0, sizeof(prop));
     if (hipGetDeviceProperties(&prop, 0) == hipSuccess)
-        fprintf(stderr, "[gpu] fista/admm solve offload enabled: %s\n", prop.name);
+        fprintf(stderr, "[gpu] fista solve offload enabled: %s\n", prop.name);
     else
-        fprintf(stderr, "[gpu] fista/admm solve offload enabled\n");
+        fprintf(stderr, "[gpu] fista solve offload enabled\n");
     // pay hip module/context/stream init now -- it lands on the first flush
     // otherwise (~165 ms) and hides better under PNG load + KDF here
     {
         float* wb = nullptr;
         if (hipMalloc((void**)&wb, 4096) == hipSuccess) {
-            hipLaunchKernelGGL(init_xu_k, dim3(1), dim3(kBlock), 0, 0, wb, wb, wb, 16);
+            (void)hipMemsetAsync(wb, 0, 4096, 0);
             (void)hipStreamSynchronize(0);
             (void)hipFree(wb);
         }
@@ -1905,37 +2218,11 @@ void set_enabled(bool on)
     g_enabled.store(true, std::memory_order_relaxed);
 }
 
-void admm_solve_blocking(const AdmmProblem& p)
-{
-    if (!enabled() || g_dead.load(std::memory_order_relaxed)) {
-        if (g_fb) g_fb(p);
-        return;
-    }
-    auto c = std::make_shared<Completion>();
-    QState& s = Q();
-    {
-        std::lock_guard<std::mutex> lk(s.m);
-        if (!s.started) {
-            s.started = true;
-            new std::thread(worker_main);  // blocks on s.m until we unlock
-        }
-        Job j;
-        j.kind = 0;
-        j.p = p;
-        j.c = c;
-        s.q.push_back(std::move(j));
-        s.pend.store((int)s.q.size(), std::memory_order_release);
-    }
-    s.cv.notify_one();
-    std::unique_lock<std::mutex> lk(c->m);
-    c->cv.wait(lk, [&] { return c->done; });
-}
-
-void fista_solve_blocking(const FistaProblem& p)
+FistaHandle fista_solve_submit(const FistaProblem& p)
 {
     if (!enabled() || g_dead.load(std::memory_order_relaxed)) {
         if (g_fb_fista) g_fb_fista(p);
-        return;
+        return nullptr;
     }
     auto c = std::make_shared<Completion>();
     QState& s = Q();
@@ -1946,15 +2233,28 @@ void fista_solve_blocking(const FistaProblem& p)
             new std::thread(worker_main);  // blocks on s.m until we unlock
         }
         Job j;
-        j.kind = 1;
         j.fp = p;
         j.c = c;
         s.q.push_back(std::move(j));
         s.pend.store((int)s.q.size(), std::memory_order_release);
     }
     s.cv.notify_one();
-    std::unique_lock<std::mutex> lk(c->m);
-    c->cv.wait(lk, [&] { return c->done; });
+    return new std::shared_ptr<Completion>(std::move(c));
+}
+
+void fista_solve_wait(FistaHandle h)
+{
+    if (!h) return;
+    std::shared_ptr<Completion>* pc =
+        static_cast<std::shared_ptr<Completion>*>(h);
+    std::unique_lock<std::mutex> lk((*pc)->m);
+    (*pc)->cv.wait(lk, [&] { return (*pc)->done; });
+    delete pc;
+}
+
+void fista_solve_blocking(const FistaProblem& p)
+{
+    fista_solve_wait(fista_solve_submit(p));
 }
 
 }  // namespace cs_gpu

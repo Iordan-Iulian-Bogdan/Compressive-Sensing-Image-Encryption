@@ -30,9 +30,9 @@ Outputs : 𝑥′ vectorized decrypted image
 
 This works only if the  measurement matrix ```𝜓``` is identical upon encryption and decryption. ```𝜓``` is meant to be a random matrix but by using a deterministic number generator which is seeded using a passphrase we can encrypt and decrypt an arbitrary signal. Keep in mind that this method is not lossless, the reconstructed signal will not be 100% identical, this is why you'd only want to use something like this for things like images. ```𝑦``` represents the encrypted image, since it's obtained by multiplying the original image with a random matrix it will contain a bunch of seemeingly random numbers.
 
-Because ```𝑥``` is a vectorized image which means it can have millions of elements the dictionary ```𝐴``` is going to be a matrix with potentially billions of elements (so dozens of GB in size). The challenge in doing something like this comes from the fact that the matrices involved occupy so much memory that it's impossible to solve this problem on a regular computer as is, however, we can divide the original image in smaller chunks that can fit in the memory of a typical computer. 
+Because ```𝑥``` is a vectorized image which means it can have millions of elements the dictionary ```𝐴``` is going to be a matrix with potentially billions of elements (so dozens of GB in size). The challenge in doing something like this comes from the fact that the matrices involved occupy so much memory that it's impossible to solve this problem on a regular computer as is, however, we can divide the original image in smaller chunks that can fit in the memory of a typical computer.
 
-GPU acceleration no longer needed since switching to Limited-memory BFGS using [this](https://github.com/chokkan/liblbfgs) library. This brought unpon a huge speed increase and lower memory consumption. (Update: the ADMM solver now has an optional HIP GPU path, see `--device` below.)
+The tile solves run reweighted-L1 FISTA (per-channel, or SOMP-structured joint over R/G/B), with an optional HIP GPU path (see `--device` below).
 
 This method processes the image in tiles, it should be noted that this is technically not equivalent to solving this problem for one single large image, however for something like images it works quite well and can even improve quality in some ways (lower noise) when the compression ratio is higher.
 
@@ -43,7 +43,7 @@ The passphrase is the single root secret. It is stretched with **PBKDF2-HMAC-SHA
 The 256-bit key is used for three things:
 
 - **Header encryption** — the metadata header (`m|rows|cols|height|width`) is AES-256-CTR encrypted, so image dimensions are no longer recoverable from the ciphertext without the passphrase.
-- **Authentication** — an HMAC-SHA256 tag (truncated to 128 bits), computed encrypt-then-MAC over the encrypted header *and* the entire measurement body, is stored in the header. Decryption verifies it first: a wrong password or any tampering with the container is rejected before the expensive L-BFGS solve starts.
+- **Authentication** — an HMAC-SHA256 tag (truncated to 128 bits), computed encrypt-then-MAC over the encrypted header *and* the entire measurement body, is stored in the header. Decryption verifies it first: a wrong password or any tampering with the container is rejected before the expensive tile solves start.
 - **Index regeneration** — MT19937 is seeded via `std::seed_seq` directly from the key bytes; the pixel shuffle seed is the first 4 key bytes. Both sides derive identical sampling indices from passphrase + salt alone.
 
 Header layout (v2, 32 pixels = 96 bytes at the start of the container):
@@ -178,7 +178,17 @@ Performance note : the PBKDF2 stretch adds ~0.2–0.4s per encrypt/decrypt opera
 
 Requirements: C++17 compiler, OpenCV (developed against 4.13.0; any 4.x with core, imgproc, imgcodecs, highgui, photo), OpenMP, and a crypto backend (Windows CNG is built in; Linux/macOS use OpenSSL). x86-64 with AVX2+FMA is assumed for the solver kernels.
 
-### Visual Studio (Windows)
+### Clang (Windows, default)
+
+`build_clang.bat` is the default build: LLVM `clang-cl` 23 (via `winget install LLVM.LLVM`) with VS 2022 headers/link, ROCm HIP for `cs_gpu.hip`, OpenCV at `C:\opencv` (main binary, 4.90 world) plus the static 4.13 set with contrib under `Documents\opencv\Release` (test binary, mirrors the vcxproj split):
+
+```bat
+.\build_clang.bat
+```
+
+Outputs land in `x64\Clang\` (`ImgReconstruct_backend.exe`, `cs_tests.exe`), leaving the MSVC outputs untouched.
+
+### Visual Studio (Windows, legacy)
 
 1. Open `ImgReconstruct_backend.sln` (MSVC v143 / VS 2022 or newer).
 2. The project expects OpenCV headers/libs at `C:\opencv\include` and `C:\opencv\lib` (see the `IncludePath`/`LibraryPath` entries in `ImgReconstruct_backend.vcxproj`); adjust if yours differs.
@@ -237,7 +247,7 @@ Python/nunif needs a custom launcher; `--waifu2x-cmd` and `--waifu2x-args`
 override it. To denoise while upscaling, use
 `--waifu2x-method noise_scale --waifu2x-noise 2` (noise range 0–3).
 
-`--device gpu` (decrypt, `--solver admm|fista|joint`) offloads the batched tile solves to an AMD GPU over HIP: tile/channel solves queue up and flush as batched kernel groups (ADMM: closed-form consensus updates; FISTA: proximal-gradient + momentum over GEMM-DCT transforms; joint: row-coupled group threshold over stacked planes), while CDF97 and TV modes and any device failure silently fall back to the CPU path (output differs from CPU only by float rounding: ~49 dB FISTA / ~47 dB joint PSNR between the two on a 20MP photo, bit-identical on small tiles). On the 7900 + RX 7900 XT bench (24 tiles, ratio 0.25, 8 iterations) FISTA runs ~1.9x faster on the solve stage (1.16 s vs 2.22 s) and ~1.6x end-to-end (1.7 s vs 2.8 s); joint ~2.1x end-to-end (1.8 s vs 3.8 s). Set `CS_GPU_DEBUG=1` for per-batch timing lines. Building requires an AMD HIP SDK (7.2 tested) with the target GPU in `HipArch` (`hip_build.targets` compiles `cs_gpu.hip` through `hipcc` at link time).
+`--device gpu` (decrypt, `--solver fista|joint`) offloads the batched tile solves to an AMD GPU over HIP: tile/channel solves queue up and flush as batched kernel groups (proximal-gradient + momentum over FFT-DCT transforms with sampled gradients; joint: row-coupled group threshold over stacked planes), while CDF97 and any device failure silently fall back to the CPU path (output differs from CPU only by float rounding). Set `CS_GPU_DEBUG=1` for per-batch timing lines. Building requires an AMD HIP SDK (7.2 tested) with the target GPU in `HipArch` (`hip_build.targets` compiles `cs_gpu.hip` through `hipcc` at link time).
 
 Quality notes: tiles are composited with a **cosine-feathered** weight ramp (width = tile overlap) instead of a fixed alpha blend — overlap zones sum to a smooth transition and the composite is order-independent. Tiles are solved in **wavefront (anti-diagonal) order**: every tile is warm-started from the already-solved west/north neighbors' overlap strips, which turned out to be by far the largest quality lever — roundtrip baselines went from ~19.2/16.7 dB (independent solves) to **~26.8/30.4 dB** (synthetic/photo) with no wall-time penalty, since the better warm-starts converge faster than the wave barriers cost. A YCrCb-domain solve was re-tested properly on top of the wavefront (neighbor chroma strips, softened chroma l1) after the first attempt turned out to have a channel-ordering bug — the corrected result is a tie with BGR (26.7/30.3 vs 26.8/30.4 dB) at higher cost, so BGR remains the default; the path is kept behind a flag for future tuning experiments (see `decrypt_image::decrypt`).
 

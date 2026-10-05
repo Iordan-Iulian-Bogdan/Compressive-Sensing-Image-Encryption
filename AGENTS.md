@@ -1,16 +1,16 @@
 # AGENTS.md
 
 ## Project
-C++ image encryption via compressive sensing with L-BFGS reconstruction (proof of concept). MSVC / Visual Studio solution `ImgReconstruct_backend.sln`, x64. Dependencies resolved via vcpkg manifest (`vcpkg.json`). Uses liblbfgs (`lbfgs.cpp/hpp`), Windows CNG crypto (`crypto_utils`).
+C++ image encryption via compressive sensing with FISTA reconstruction (per-channel + SOMP-structured joint; HIP GPU offload). MSVC / Visual Studio solution `ImgReconstruct_backend.sln`, x64. Dependencies resolved via vcpkg manifest (`vcpkg.json`). Uses Windows CNG crypto (`crypto_utils`).
 
 ## Layout
-- `ImgReconstruct_backend/` - main sources (`ImgReconstruct_backend.vcxproj`): `CS_encryption`, `image_encryption`, `image_decryption`, `helper_functions`, `crypto_utils`, `lbfgs`
+- `ImgReconstruct_backend/` - main sources (`ImgReconstruct_backend.vcxproj`): `CS_encryption`, `image_encryption`, `image_decryption`, `helper_functions`, `crypto_utils`, `cs_gpu` (HIP)
 - `tests/` - test and bench programs (`test_main.cpp`, `bench_*.cpp`, `train_dictionary.cpp`)
 - `x64/`, `.vs/`, `.obj`/`.exe` files in root - build output (never read/edit)
 
 ## Build
-- Build the solution with msbuild, x64: `msbuild ImgReconstruct_backend.sln /p:Configuration=Release /p:Platform=x64`
-- Use x64 unless told otherwise. Build the specific vcxproj when possible instead of the whole solution.
+- Default toolchain is Clang (LLVM 23 `clang-cl`, installed via `winget install LLVM.LLVM`): run `.\build_clang.bat` (Release, x64, outputs to `x64\Clang\`). It mirrors the MSVC Release flags plus both OpenCV variants (4.90 world for the main binary, static 4.13+contrib for tests) and builds `cs_gpu.hip` with hipcc.
+- Legacy MSVC build: `msbuild ImgReconstruct_backend.sln /p:Configuration=Release /p:Platform=x64`. Use x64 unless told otherwise. Build the specific vcxproj when possible instead of the whole solution.
 
 ## rtk (command-output condenser)
 - The shell environment pipes big-output commands (`rg`, `grep`, `git log/diff/status`, test runners, etc.) through `rtk`, which condenses output: every signal kept, noise dropped.

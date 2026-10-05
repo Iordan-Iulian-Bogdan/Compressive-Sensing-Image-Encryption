@@ -257,15 +257,15 @@ cv::Mat encrypted;
 }
 
 // ---------------------------------------------------------------------------
-// 4b. proximal solvers (reweighted-L1 FISTA + SOMP joint + consensus ADMM)
+// 4b. proximal solvers (reweighted-L1 FISTA + SOMP joint)
 // ---------------------------------------------------------------------------
 void test_fista_solvers() {
     int s = -1;
-    check(cs_solver_from_name("owlqn", s) == 0 && s == CS_SOLVER_OWLQN, "fista: owlqn parses to 0");
     check(cs_solver_from_name("fista", s) == 0 && s == CS_SOLVER_FISTA, "fista: fista parses to 1");
     check(cs_solver_from_name("joint", s) == 0 && s == CS_SOLVER_FISTA_JOINT, "fista: joint parses to 2");
     check(cs_solver_from_name("somp", s) == 0 && s == CS_SOLVER_FISTA_JOINT, "fista: somp aliases joint");
-    check(cs_solver_from_name("admm", s) == 0 && s == CS_SOLVER_ADMM, "fista: admm parses to 3");
+    check(cs_solver_from_name("owlqn", s) != 0, "fista: removed owlqn name rejected");
+    check(cs_solver_from_name("admm", s) != 0, "fista: removed admm name rejected");
     check(cs_solver_from_name("bogus", s) != 0, "fista: unknown solver name rejected");
 
     const std::string password = "fista-test-password";
@@ -281,9 +281,9 @@ void test_fista_solvers() {
         return;
     }
 
-    const int solvers[3] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT, CS_SOLVER_ADMM };
-    const char* names[3] = { "fista", "joint", "admm" };
-    for (int k = 0; k < 3; ++k) {
+    const int solvers[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
+    const char* names[2] = { "fista", "joint" };
+    for (int k = 0; k < 2; ++k) {
         char tag[64];
         std::snprintf(tag, sizeof(tag), "fista: %s decrypt succeeds", names[k]);
         const int rc = decrypt_image::decrypt_image_tiled(
@@ -318,16 +318,15 @@ void test_fista_solvers() {
             check(std::isfinite(p) && p > 10.0, "fista: override PSNR finite and sane");
         }
     }
-    // under compression (ratio 0.5): FISTA vs ADMM on the same container --
+    // under compression (ratio 0.5): FISTA vs joint on the same container --
     // the regime where the data Hessian only fills half the grid
-    // (ADMM starts at rho = 2m/n = 1 there instead of 2)
     {
         cv::Mat enc_half;
         if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc_half) != 0) {
             check(false, "fista: ratio-0.5 encrypt");
         } else {
-            const int half[2] = { CS_SOLVER_FISTA, CS_SOLVER_ADMM };
-            const char* hnames[2] = { "fista", "admm" };
+            const int half[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
+            const char* hnames[2] = { "fista", "joint" };
             for (int k = 0; k < 2; ++k) {
                 char tag[64];
                 std::snprintf(tag, sizeof(tag), "fista: %s ratio-0.5 decrypt succeeds", hnames[k]);
@@ -476,9 +475,9 @@ void test_wavelet_basis() {
         return;
     }
 
-    const int solvers[3] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT, CS_SOLVER_ADMM };
-    const char* names[3] = { "fista", "joint", "admm" };
-    for (int k = 0; k < 3; ++k) {
+    const int solvers[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
+    const char* names[2] = { "fista", "joint" };
+    for (int k = 0; k < 2; ++k) {
         char tag[64];
         std::snprintf(tag, sizeof(tag), "wavelet: %s+wavelet decrypt succeeds", names[k]);
         const int rc = decrypt_image::decrypt_image_tiled(
@@ -497,11 +496,6 @@ void test_wavelet_basis() {
             check(std::isfinite(p) && p > 12.0, tag);
         }
     }
-    // wavelet requested with OWL-QN warns and stays DCT (still solves)
-    check(decrypt_image::decrypt_image_tiled(
-        encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false,
-        CS_SOLVER_OWLQN, 0, 2, CS_BASIS_CDF97) == 0, "wavelet: owlqn+wavelet falls back to DCT");
-
     std::remove(tmp_in.c_str());
     std::remove(tmp_out.c_str());
 }
@@ -797,20 +791,21 @@ void test_ycc420_roundtrip() {
     if (s >= 0.0) check(s > 0.4, "ycc420 roundtrip: SSIM > 0.4");
     else check(false, "ycc420 roundtrip: SSIM unavailable");
 
-    // consensus ADMM through the same split pipeline (per-plane dispatch)
-    const std::string tmp_out_admm = ".cs_test_ycc420_admm.png";
-    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out_admm, password, 4, 24, 5, 4, 0.01f, false,
-        0.0f, false, CS_SOLVER_ADMM) == 0, "ycc420 roundtrip: admm decrypt succeeds");
-    cv::Mat dec_admm = cv::imread(tmp_out_admm, cv::IMREAD_COLOR);
-    check(!dec_admm.empty(), "ycc420 roundtrip: admm output readable");
-    if (!dec_admm.empty()) {
-        cv::Mat admm_sized;
-        cv::resize(dec_admm, admm_sized, original.size());
-        const double pa = cs_quality::psnr(original, admm_sized);
-        std::printf("       ycc420 admm PSNR (ratio 0.5): %.2f dB\n", pa);
-        check(std::isfinite(pa) && pa > 14.0, "ycc420 roundtrip: admm PSNR > 14 dB");
+    // joint SOMP through the same split pipeline (degrades to per-channel
+    // FISTA on the ycc420 grid)
+    const std::string tmp_out_joint = ".cs_test_ycc420_joint.png";
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out_joint, password, 4, 24, 5, 4, 0.01f, false,
+        0.0f, false, CS_SOLVER_FISTA_JOINT) == 0, "ycc420 roundtrip: joint decrypt succeeds");
+    cv::Mat dec_joint = cv::imread(tmp_out_joint, cv::IMREAD_COLOR);
+    check(!dec_joint.empty(), "ycc420 roundtrip: joint output readable");
+    if (!dec_joint.empty()) {
+        cv::Mat joint_sized;
+        cv::resize(dec_joint, joint_sized, original.size());
+        const double pa = cs_quality::psnr(original, joint_sized);
+        std::printf("       ycc420 joint PSNR (ratio 0.5): %.2f dB\n", pa);
+        check(std::isfinite(pa) && pa > 14.0, "ycc420 roundtrip: joint PSNR > 14 dB");
     }
-    std::remove(tmp_out_admm.c_str());
+    std::remove(tmp_out_joint.c_str());
 
     // manual mode with overlap 0: tiles solve independently and composite
     // without feathering (previously rejected by the overlap validation)
@@ -1125,6 +1120,61 @@ void test_photo_upscaler() {
         check(cs_waifu2x_effective_args(opt) == "--custom",
             "photo-upscaler: explicit args override method/noise");
     }
+    {
+        // Native ncnn backends share method/noise; -n -1 = pure upscale.
+        CsPhotoUpscalerOptions opt;
+        opt.backend = "waifu2x-ncnn";
+        opt.waifu2x_ncnn_cmd = "cs-nonexistent-ncnn-cmd";
+        auto grid = make_grid();
+        cs_upscale_tiles_2x(grid, opt);
+        check(all_2x(grid), "photo-upscaler: waifu2x-ncnn failure falls back to AVIR");
+        check(cs_waifu2x_ncnn_effective_args(opt) == "-n -1 -s 2",
+            "photo-upscaler: ncnn default args are pure 2x upscale");
+        opt.waifu2x_method = "noise_scale";
+        opt.waifu2x_noise = 2;
+        check(cs_waifu2x_ncnn_effective_args(opt) == "-n 2 -s 2",
+            "photo-upscaler: ncnn method/noise compose into args");
+        opt.waifu2x_ncnn_args = "--custom";
+        check(cs_waifu2x_ncnn_effective_args(opt) == "--custom",
+            "photo-upscaler: ncnn explicit args override method/noise");
+    }
+    {
+        CsPhotoUpscalerOptions opt;
+        opt.backend = "realcugan";
+        opt.realcugan_cmd = "cs-nonexistent-realcugan-cmd";
+        auto grid = make_grid();
+        cs_upscale_tiles_2x(grid, opt);
+        check(all_2x(grid), "photo-upscaler: realcugan failure falls back to AVIR");
+        check(cs_realcugan_effective_args(opt) == "-n -1 -s 2 -m models-se",
+            "photo-upscaler: realcugan default args select models-se");
+        opt.waifu2x_method = "noise_scale";
+        opt.waifu2x_noise = 1;
+        opt.realcugan_model = "models-pro";
+        check(cs_realcugan_effective_args(opt) == "-n 1 -s 2 -m models-pro",
+            "photo-upscaler: realcugan method/noise/model compose into args");
+        opt.realcugan_args = "--custom";
+        check(cs_realcugan_effective_args(opt) == "--custom",
+            "photo-upscaler: realcugan explicit args override everything");
+    }
+    {
+        // Short model names map to model dirs; explicit paths pass through.
+        CsPhotoUpscalerOptions opt;
+        opt.realcugan_model = "pro";
+        check(cs_realcugan_model_dir(opt) == "models-pro",
+            "photo-upscaler: pro maps to models-pro");
+        opt.realcugan_model = "se";
+        check(cs_realcugan_model_dir(opt) == "models-se",
+            "photo-upscaler: se maps to models-se");
+        opt.realcugan_model = "nose";
+        check(cs_realcugan_model_dir(opt) == "models-nose",
+            "photo-upscaler: nose maps to models-nose");
+        opt.realcugan_model = "C:/m/models-se";
+        check(cs_realcugan_model_dir(opt) == "C:/m/models-se",
+            "photo-upscaler: explicit model path passes through");
+        check(cs_realcugan_effective_args(opt) ==
+            "-n -1 -s 2 -m C:/m/models-se",
+            "photo-upscaler: explicit model path composes into args");
+    }
 }
 
 void test_hf_focus_roundtrip() {
@@ -1423,9 +1473,9 @@ void test_per_tile_coef() {
 // ---------------------------------------------------------------------------
 // GPU/CPU FISTA agreement (--device gpu): without a HIP device,
 // set_enabled(true) stays off and both runs take the CPU path (trivially
-// identical); on GPU machines this measures real device-vs-host agreement
-// (ADMM precedent: ~53.5 dB). Always restores CPU-only afterwards so later
-// tests (none, this runs last) and profiling stay deterministic.
+// identical); on GPU machines this measures real device-vs-host agreement.
+// Always restores CPU-only afterwards so later tests (none, this runs
+// last) and profiling stay deterministic.
 // ---------------------------------------------------------------------------
 void test_gpu_fista_agreement() {
     const std::string password = "gpu-fista-test-password";

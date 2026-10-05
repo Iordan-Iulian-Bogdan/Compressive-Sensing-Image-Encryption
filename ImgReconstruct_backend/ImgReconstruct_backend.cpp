@@ -50,9 +50,13 @@ void print_usage(const char* exe) {
         "                        derives tiles/overlap/iterations/coef from the image)\n"
         "  --no-preview          disable the live decryption preview window\n"
         "  --photo-upscaler <b>  per-tile 2x upscaler backend: avir (default,\n"
-        "                        vendored resampler) or waifu2x (one batched\n"
-        "                        nunif subprocess; needs python + nunif, warns\n"
-        "                        and falls back to AVIR when unavailable)\n"
+        "                        vendored resampler), waifu2x (one batched\n"
+        "                        nunif subprocess), waifu2x-ncnn (native\n"
+        "                        waifu2x-ncnn-vulkan binary) or realcugan\n"
+        "                        (native realcugan-ncnn-vulkan binary); the\n"
+        "                        ncnn binaries run on Vulkan (AMD included)\n"
+        "                        with no Python, and fall back to AVIR when\n"
+        "                        unavailable)\n"
         "  --waifu2x-cmd <s>     waifu2x command prefix (default\n"
         "                        \"python -m waifu2x.cli\" or $CS_WAIFU2X_CMD;\n"
         "                        e.g. \"py -m waifu2x.cli\" on Windows)\n"
@@ -66,28 +70,24 @@ void print_usage(const char* exe) {
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off)\n"
-  "  --solver <name>      tile solver: owlqn (default, liblbfgs),\n"
-  "                        fista (reweighted-L1 FISTA per channel),\n"
-  "                        joint (SOMP-structured group-sparsity FISTA\n"
-  "                        over R/G/B together + reweighting),\n"
-  "                        admm (consensus ADMM per channel: exact\n"
-  "                        quadratic x-update + soft-threshold z-update)\n"
-  "  --fista-iters <n>    steps per reweight pass (fista/joint/admm only,\n"
-  "                        0 = auto-map from --iterations as N*4 clamped\n"
-  "                        to [16,40]; max 500)\n"
-  "  --reweights <n>      outer reweight passes for fista/joint/admm (1-5,\n"
-  "                        default 2; 1 = plain unweighted solve)\n"
-  "  --basis <name>       sparsifying basis for fista/joint/admm: dct\n"
-  "                        (default, block-DCT) or wavelet (multilevel\n"
-  "                        CDF 9/7, sparser on natural images; OWL-QN\n"
-  "                        stays DCT)\n"
-  "  --wscale <f>         wavelet per-scale threshold ramp for fista/joint/admm\n"
+  "  --solver <name>      tile solver: fista (default, reweighted-L1\n"
+  "                        FISTA per channel), joint (SOMP-structured\n"
+  "                        group-sparsity FISTA over R/G/B together +\n"
+  "                        reweighting)\n"
+  "  --fista-iters <n>    steps per reweight pass (0 = auto-map from\n"
+  "                        --iterations as N*4 clamped to [16,40]; max 500)\n"
+  "  --reweights <n>      outer reweight passes (1-5, default 2;\n"
+  "                        1 = plain unweighted solve)\n"
+  "  --basis <name>       sparsifying basis: dct (default, block-DCT)\n"
+  "                        or wavelet (multilevel CDF 9/7, sparser on\n"
+  "                        natural images)\n"
+  "  --wscale <f>         wavelet per-scale threshold ramp\n"
   "                        (in (0,16], default 2: coarsest band x1, finest\n"
   "                        band x wscale, LL protected; 1 = uniform;\n"
   "                        DCT ignores it)\n"
-        "  --device <name>      solve device for --solver admm|fista|joint: cpu\n"
-        "                        (default) or gpu (HIP offload; dct basis,\n"
-        "                        any tv; other combinations fall back to cpu per call)\n"
+        "  --device <name>      solve device: cpu (default) or gpu\n"
+        "                        (HIP offload; dct basis, any tv; other\n"
+        "                        combinations fall back to cpu per call)\n"
         "  --periodic            encrypt with periodic tile sampling: one random\n"
         "                        per-tile pattern repeated across the image\n"
         "                        (encrypt/roundtrip only; decrypt auto-detects\n"
@@ -317,8 +317,8 @@ int main(int argc, char* argv[])
     bool full_res = false;
     int sample_bits = 8;
     int chroma_sample_bits = 8;
-    std::string solver_name = "owlqn";
-    int solver = CS_SOLVER_OWLQN;
+    std::string solver_name = "fista";
+    int solver = CS_SOLVER_FISTA;
     int fista_iters = 0;
     int reweights = 2;
     std::string basis_name = "dct";
@@ -386,10 +386,11 @@ int main(int argc, char* argv[])
             show_preview = false;
         }
         else if (a == "--photo-upscaler") {
-            const char* v = next("avir or waifu2x");
+            const char* v = next("avir, waifu2x, waifu2x-ncnn or realcugan");
             if (!v) return 64;
-            if (v != std::string("avir") && v != std::string("waifu2x")) {
-                std::cerr << "Error: --photo-upscaler must be avir or waifu2x" << std::endl;
+            if (v != std::string("avir") && v != std::string("waifu2x") &&
+                v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
+                std::cerr << "Error: --photo-upscaler must be avir, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
                 return 64;
             }
             photo_up.backend = v;
@@ -420,6 +421,31 @@ int main(int argc, char* argv[])
                 std::cerr << "Error: --waifu2x-noise must be in [0, 3]" << std::endl;
                 return 64;
             }
+        }
+        else if (a == "--waifu2x-ncnn-cmd") {
+            const char* v = next("command");
+            if (!v) return 64;
+            photo_up.waifu2x_ncnn_cmd = v;
+        }
+        else if (a == "--waifu2x-ncnn-args") {
+            const char* v = next("arguments");
+            if (!v) return 64;
+            photo_up.waifu2x_ncnn_args = v;
+        }
+        else if (a == "--realcugan-cmd") {
+            const char* v = next("command");
+            if (!v) return 64;
+            photo_up.realcugan_cmd = v;
+        }
+        else if (a == "--realcugan-args") {
+            const char* v = next("arguments");
+            if (!v) return 64;
+            photo_up.realcugan_args = v;
+        }
+        else if (a == "--realcugan-model") {
+            const char* v = next("se, pro, nose or an explicit model-dir path");
+            if (!v) return 64;
+            photo_up.realcugan_model = v;
         }
         else if (a == "--tv") {
             // does NOT force manual mode: AUTO still derives coef/iterations
@@ -543,11 +569,11 @@ int main(int argc, char* argv[])
             full_res = true;
         }
         else if (a == "--solver") {
-            const char* v = next("owlqn|fista|joint");
+            const char* v = next("fista|joint");
             if (!v) return 64;
             solver_name = v;
             if (cs_solver_from_name(solver_name, solver) != 0) {
-                std::cerr << "Error: unknown --solver '" << solver_name << "' (owlqn|fista|joint|admm)" << std::endl;
+                std::cerr << "Error: unknown --solver '" << solver_name << "' (fista|joint)" << std::endl;
                 return 64;
             }
         }

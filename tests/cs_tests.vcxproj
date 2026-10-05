@@ -60,7 +60,6 @@
     <ClCompile Include="..\ImgReconstruct_backend\image_preview.cpp" />
     <ClCompile Include="..\ImgReconstruct_backend\photo_upscaler.cpp" />
     <ClCompile Include="..\ImgReconstruct_backend\image_tiles.cpp" />
-    <ClCompile Include="..\ImgReconstruct_backend\lbfgs.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <PropertyGroup>

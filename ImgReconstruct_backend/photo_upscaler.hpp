@@ -22,11 +22,18 @@
 //   comes back at the wrong size falls back to AVIR with a warning, so a
 //   missing Python/nunif install degrades to AVIR instead of failing the
 //   decrypt.
+// - "waifu2x-ncnn": same harness around the native waifu2x-ncnn-vulkan
+//   binary (Vulkan, runs on AMD/NVIDIA/Intel GPUs): same models and
+//   quality as nunif waifu2x, no Python. Args are `-n <noise|-1> -s 2`
+//   (`scale` method maps to `-n -1`, i.e. no denoise).
+// - "realcugan": same harness around realcugan-ncnn-vulkan (Vulkan):
+//   `-n <noise|-1> -s 2 -m <model>` with `models-se` default; the `-n`
+//   levels are the direct analog of waifu2x `noise_scale` denoising.
 //
-// Env defaults (read at startup): CS_WAIFU2X_CMD / CS_WAIFU2X_ARGS.
-// They let a machine without `python` on PATH (e.g. a portable embedded
-// interpreter) keep working with plain `--photo-upscaler waifu2x`.
-// Explicit --waifu2x-cmd/--waifu2x-args flags always win over the env.
+// Env defaults (read at startup): CS_WAIFU2X_CMD / CS_WAIFU2X_ARGS,
+// CS_WAIFU2X_NCNN_CMD / CS_WAIFU2X_NCNN_ARGS, CS_REALCUGAN_CMD /
+// CS_REALCUGAN_ARGS / CS_REALCUGAN_MODEL. Explicit --*-cmd/--*-args flags
+// always win over the env.
 //
 // Requires nunif importable for the waifu2x backend:
 //   pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -44,6 +51,12 @@ inline std::string cs_waifu2x_args_default() {
   return "";
 }
 
+inline std::string cs_env_or(const char* var, const std::string& fallback) {
+  if (const char* env = std::getenv(var))
+    if (env[0]) return std::string(env);
+  return fallback;
+}
+
 struct CsPhotoUpscalerOptions {
   std::string backend = "avir";
   std::string waifu2x_cmd = cs_waifu2x_cmd_default();
@@ -56,11 +69,32 @@ struct CsPhotoUpscalerOptions {
   // upscale, so it cannot satisfy the 2x tile contract.)
   std::string waifu2x_method = "scale";
   int waifu2x_noise = 0;
+  // Native ncnn backends share the method/noise fields above.
+  std::string waifu2x_ncnn_cmd = cs_env_or("CS_WAIFU2X_NCNN_CMD", "waifu2x-ncnn-vulkan");
+  std::string waifu2x_ncnn_args = cs_env_or("CS_WAIFU2X_NCNN_ARGS", "");
+  std::string realcugan_cmd = cs_env_or("CS_REALCUGAN_CMD", "realcugan-ncnn-vulkan");
+  std::string realcugan_args = cs_env_or("CS_REALCUGAN_ARGS", "");
+  std::string realcugan_model = cs_env_or("CS_REALCUGAN_MODEL", "models-se");
 };
 
 // Effective args for the subprocess: the explicit override when set,
 // otherwise `--style photo --method <method> -n <noise> -g -1`.
 std::string cs_waifu2x_effective_args(const CsPhotoUpscalerOptions& opt);
+
+// Effective args for waifu2x-ncnn-vulkan: `-n <noise> -s 2`, or `-n -1 -s 2`
+// for pure upscale (`scale` method). Returns the explicit override when set.
+std::string cs_waifu2x_ncnn_effective_args(const CsPhotoUpscalerOptions& opt);
+
+// Effective args for realcugan-ncnn-vulkan: `-n <noise> -s 2 -m <model>`,
+// `-n -1` for pure upscale. Returns the explicit override when set.
+std::string cs_realcugan_effective_args(const CsPhotoUpscalerOptions& opt);
+
+// Effective -m directory for realcugan: accepts short names (se/pro/nose,
+// with or without the models- prefix) or an explicit path. Short names
+// resolve against the realcugan binary's directory first (models ship next
+// to the exe), then against the current directory; explicit paths (absolute
+// or containing a separator) pass through untouched.
+std::string cs_realcugan_model_dir(const CsPhotoUpscalerOptions& opt);
 
 // Upscale every non-empty CV_8UC3 tile of the grid exactly 2x, in place.
 // The caller then scales the tile origins by 2 (all of them; empty tiles

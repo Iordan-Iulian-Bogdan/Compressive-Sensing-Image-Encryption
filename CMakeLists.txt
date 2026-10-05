@@ -34,7 +34,6 @@ add_library(cs_core STATIC
     ImgReconstruct_backend/helper_functions.cpp
     ImgReconstruct_backend/image_decryption.cpp
     ImgReconstruct_backend/image_encryption.cpp
-    ImgReconstruct_backend/lbfgs.cpp
 )
 target_include_directories(cs_core PUBLIC ImgReconstruct_backend)
 if(WIN32)

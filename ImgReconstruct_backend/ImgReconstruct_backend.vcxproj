@@ -129,10 +129,8 @@
     <ClCompile Include="image_preview.cpp" />
     <ClCompile Include="photo_upscaler.cpp" />
     <ClCompile Include="ImgReconstruct_backend.cpp" />
-    <ClCompile Include="lbfgs.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="arithmetic_ansi.h" />
     <ClInclude Include="avir.h" />
     <ClInclude Include="avir_dil.h" />
     <ClInclude Include="avir_float4_sse.h" />
@@ -147,7 +145,6 @@
     <ClInclude Include="image_tiles.hpp" />
     <ClInclude Include="cs_wavelet.hpp" />
     <ClInclude Include="lancir.h" />
-    <ClInclude Include="lbfgs.hpp" />
     <ClInclude Include="quality_utils.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

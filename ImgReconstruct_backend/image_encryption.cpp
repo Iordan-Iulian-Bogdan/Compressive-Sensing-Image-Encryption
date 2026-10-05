@@ -1,5 +1,6 @@
 #include "image_encryption.hpp"
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 #include <cstring>
 #include <cmath>
 #include <cctype>
