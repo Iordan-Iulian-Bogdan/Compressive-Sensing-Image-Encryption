@@ -49,7 +49,11 @@ void ImagePreview::Run(
   while (!stop_requested_.load(std::memory_order_acquire)) {
     cv::waitKey(33);
     reconstructed = reconstructImage(image_tiles, coordinates);
-  cv::Mat preview = reconstructed.clone();
+    // Progressive HR grids start all-empty (a tile appears only once
+    // upscaled): nothing to show yet, keep the window hidden rather than
+    // resizing an empty Mat (which would throw inside this thread).
+    if (reconstructed.empty()) continue;
+    cv::Mat preview = reconstructed.clone();
   cv::resize(preview, preview,
                cv::Size(static_cast<int>(kPreviewScale * horizontal),
                         static_cast<int>(kPreviewScale * vertical * aspect_ratio)));

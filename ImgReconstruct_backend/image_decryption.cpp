@@ -1038,13 +1038,6 @@ int decrypt_image::decrypt_image_tiled(
 
         cv::Mat reconstructed = cv::Mat::zeros(sampled_mat.rows, sampled_mat.cols, CV_8UC3);
 
-    // this updates and displays the image as it is being decrypted
-    // (opt-in: --no-preview on the CLI, and always skipped in headless tests)
-    ImagePreview preview;
-    if (show_preview) {
-        preview.Start(windowName, reconstructed, coordinates, decrypted_image_tiles);
-    }
-
     std::thread decrypt_tiles_thread;
     // Fused AVIR upscale (default backend, non-full-res): each worker
     // upscales its tile into hr_tiles the moment its solve finishes, so
@@ -1061,6 +1054,25 @@ int decrypt_image::decrypt_image_tiled(
         !full_res && !fuse_upscale &&
         (photo_up.backend == "waifu2x" || photo_up.backend == "waifu2x-ncnn" ||
          photo_up.backend == "realcugan");
+
+    // Live preview reads the HR grid when tiles upscale during the solve:
+    // a tile appears only once its upscale has landed (pending cells stay
+    // black). Otherwise it reads the LR grid as before.
+    ImagePreview preview;
+    std::vector<std::vector<TileCoord>> hr_coordinates;
+    if ((fuse_upscale || pipe_upscale) && show_preview) {
+        hr_coordinates = coordinates;
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j) {
+                hr_coordinates[i][j].x = coordinates[i][j].x * 2;
+                hr_coordinates[i][j].y = coordinates[i][j].y * 2;
+            }
+        preview.Start(windowName, reconstructed, hr_coordinates, hr_tiles);
+    }
+    else if (show_preview) {
+        preview.Start(windowName, reconstructed, coordinates, decrypted_image_tiles);
+    }
+
     CsUpscalePipeline pipe;
     if (pipe_upscale) pipe.start(photo_up, decrypted_image_tiles, hr_tiles);
         decrypt_tiles_thread = std::thread([&]() {
@@ -1239,11 +1251,6 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
 
         cv::Mat reconstructed = cv::Mat::zeros(rows, cols, CV_8UC3);
 
-        ImagePreview preview;
-        if (show_preview) {
-            preview.Start(windowName, reconstructed, coordinates, decrypted);
-        }
-
         // Fused AVIR upscale like the BGR pipeline; subprocess backends
         // stream through the background pipeline while solving continues.
         std::vector<std::vector<cv::Mat>> ycc_hr_tiles(
@@ -1254,6 +1261,25 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             (photo_up.backend == "waifu2x" ||
              photo_up.backend == "waifu2x-ncnn" ||
              photo_up.backend == "realcugan");
+
+        // Preview follows the HR grid when tiles upscale during the solve
+        // (a tile appears only once upscaled), the LR grid otherwise.
+        ImagePreview preview;
+        std::vector<std::vector<TileCoord>> ycc_hr_coordinates;
+        if ((ycc_fuse || ycc_pipe) && show_preview) {
+            ycc_hr_coordinates = coordinates;
+            for (int i = 0; i < num_tiles; ++i)
+                for (int j = 0; j < num_tiles; ++j) {
+                    ycc_hr_coordinates[i][j].x = coordinates[i][j].x * 2;
+                    ycc_hr_coordinates[i][j].y = coordinates[i][j].y * 2;
+                }
+            preview.Start(windowName, reconstructed, ycc_hr_coordinates,
+                          ycc_hr_tiles);
+        }
+        else if (show_preview) {
+            preview.Start(windowName, reconstructed, coordinates, decrypted);
+        }
+
         CsUpscalePipeline ycc_upipe;
         if (ycc_pipe) ycc_upipe.start(photo_up, decrypted, ycc_hr_tiles);
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
