@@ -282,7 +282,15 @@ int cs_solver_from_name(const std::string& name, int& out) {
 // tvgrad must hold n floats; returns phi.
 static float cs_tv_grad_phi(const float* pix, float* tvgrad, int rows, int cols) {
     const int n = rows * cols;
-    const float eps = 1e-3f;
+    // Smoothing corner: the smoothed-TV gradient's local curvature scales as
+    // tv/eps, but the DCT path steps with the fixed 1/(lip + 8*tv) assuming
+    // curvature ~8*tv. With eps much smaller than that bound the step is
+    // locally far too big in flat zones, and FISTA momentum sustains the
+    // resulting Nyquist flip-flop as a checkerboard dot pattern (visible
+    // only with tv > 0, only in smooth areas). eps = 1e-2 keeps the corner
+    // at 1% intensity (real edges have far larger gradients) while cutting
+    // the stiffness 10x vs 1e-3. Keep in sync with tvgrad_k in cs_gpu.hip.
+    const float eps = 1e-2f;
     float phi = 0.0f;
     for (int i = 0; i < rows; ++i) {
         const bool has_down = i + 1 < rows;
@@ -403,7 +411,14 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
     std::vector<float>& grad, std::vector<float>& pix, std::vector<float>& sc)
 {
     const int n = rows * cols;
-    const bool bt = (bx.basis == CS_BASIS_CDF97);
+    // Backtrack whenever the fixed step is not known-safe: CDF97
+    // (biorthogonal, no exact Lipschitz) or any tv > 0. The smoothed-TV
+    // gradient's local curvature scales as tv/eps, far above the 8*tv
+    // folded into L in flat zones; stepping 1/L blindly there sustains a
+    // Nyquist flip-flop (checkerboard dots, only with tv > 0). Growing L
+    // until the quadratic upper bound holds guarantees a stable step.
+    // tv = 0 keeps the exact fixed step (previous behavior, bit-identical).
+    const bool bt = (bx.basis == CS_BASIS_CDF97) || (tv_lambda > 0.0f);
     const bool sp = g_solveprof.on;
     float L = bx.lip + 8.0f * tv_lambda;
     std::memcpy(y.data(), x, sizeof(float) * (size_t)n);
@@ -479,7 +494,10 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
     std::vector<float>& pix, std::vector<float>& sc)
 {
     const int n = rows * cols;
-    const bool bt = (bx.basis == CS_BASIS_CDF97);
+    // Backtrack under tv > 0 for the same reason as cs_fista_core_single:
+    // the fixed 1/(lip + 8*tv) step is unsafe against the smoothed-TV
+    // local curvature in flat zones. tv = 0 keeps the exact fixed step.
+    const bool bt = (bx.basis == CS_BASIS_CDF97) || (tv_lambda > 0.0f);
     float L = bx.lip + 8.0f * tv_lambda;
     float* xx[3] = { x0, x1, x2 };
     const float* bb[3] = { b0, b1, b2 };

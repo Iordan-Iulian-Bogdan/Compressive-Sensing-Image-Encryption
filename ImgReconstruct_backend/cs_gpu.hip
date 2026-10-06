@@ -340,13 +340,13 @@ __global__ void sadjoint_k(float* tmp2, const float* r,
 //                        acc -= a/d + b/d
 //   cell above (i-1,j):  its down-edge add aT/dT  (i > 0)
 //   cell left (i,j-1):   its right-edge add bL/dL (j > 0)
-// d = sqrt(a^2 + b^2 + eps^2), eps = 1e-3, same as the CPU.
+// d = sqrt(a^2 + b^2 + eps^2), eps = 1e-2, same as the CPU.
 __global__ void tvgrad_k(float* tvg, const float* pix, int R, int C)
 {
     const int p = blockIdx.x;
     const long long tb = (long long)p * R * C;
     const int n = R * C;
-    constexpr float eps = 1e-3f;
+    constexpr float eps = 1e-2f;
     for (int t = threadIdx.x; t < n; t += blockDim.x) {
         const int i = t / C, j = t % C;
         const float c = pix[tb + t];
@@ -1294,7 +1294,7 @@ __global__ void fista_persist_k(float* xres, const float* x0, const float* b,
                 lds_mm<1, 0>(ARS, t2, tv0, R, C, R, tid, nt);
                 __syncthreads();
                 // isotropic TV gradient (matches tvgrad_k exactly)
-                constexpr float eps = 1e-3f;
+                constexpr float eps = 1e-2f;
                 for (int u = tid; u < n; u += nt) {
                     const int i = u / C, j = u % C;
                     const float c = tv0[u];
