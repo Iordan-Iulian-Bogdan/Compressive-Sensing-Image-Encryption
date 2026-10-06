@@ -23,6 +23,11 @@ struct CsUpscalePipeline {
     const CsPhotoUpscalerOptions* opt = nullptr;
     const std::vector<std::vector<cv::Mat>>* lr = nullptr;
     std::vector<std::vector<cv::Mat>>* hr = nullptr;
+    // Serializes HR cell writes (consumer) against HR grid reads (preview).
+    // Either owned here or bound to the caller's hr_grid_mutex via start();
+    // never nested with m below (taken separately, in either order).
+    std::mutex owned_grid_m;
+    std::mutex* grid_m = nullptr;
     std::mutex m;
     std::condition_variable cv;
     std::vector<std::pair<int, int>> q;
@@ -36,10 +41,12 @@ struct CsUpscalePipeline {
 
     void start(const CsPhotoUpscalerOptions& o,
                const std::vector<std::vector<cv::Mat>>& lr_tiles,
-               std::vector<std::vector<cv::Mat>>& hr_tiles) {
+               std::vector<std::vector<cv::Mat>>& hr_tiles,
+               std::mutex* grid_mutex = nullptr) {
         opt = &o;
         lr = &lr_tiles;
         hr = &hr_tiles;
+        grid_m = grid_mutex ? grid_mutex : &owned_grid_m;
         running = true;
         worker = std::thread([this] { loop(); });
     }
@@ -85,9 +92,12 @@ struct CsUpscalePipeline {
                 cv::Mat out;
                 const bool ok =
                     cs_upscale_one_tile_2x((*lr)[i][j], out, *opt);
-                std::lock_guard<std::mutex> lk(m);
                 if (!out.empty()) {
-                    (*hr)[i][j] = std::move(out);
+                    {
+                        std::lock_guard<std::mutex> gl(*grid_m);
+                        (*hr)[i][j] = std::move(out);
+                    }
+                    std::lock_guard<std::mutex> lk(m);
                     if (ok) ++upscaled;
                     else ++fallback;
                 }
@@ -198,5 +208,5 @@ generic reference solution when no neighbor exists, e.g. the first wave).
 */
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe);
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe, std::mutex* hr_grid_mutex);
 #endif

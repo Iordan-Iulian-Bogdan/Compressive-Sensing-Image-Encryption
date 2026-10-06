@@ -556,7 +556,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe, std::mutex* hr_grid_mutex) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -648,7 +648,15 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
                     cs_upscale_2x_avir(mats_out[i][j], hr);
-                    if (!hr.empty()) hr.copyTo((*hr_out)[i][j]);
+                    // Cell header replacement races the preview's
+                    // reconstructImage: serialize it under the grid mutex.
+                    if (!hr.empty() && hr_grid_mutex) {
+                        std::lock_guard<std::mutex> lk(*hr_grid_mutex);
+                        hr.copyTo((*hr_out)[i][j]);
+                    }
+                    else if (!hr.empty()) {
+                        hr.copyTo((*hr_out)[i][j]);
+                    }
                 }
             }
             catch (const std::exception& e) {
@@ -690,7 +698,7 @@ static void decrypt_tiles_ycc420(int num_threads,
     int solver, int fista_iters, int reweights, int basis, float wscale,
     const cv::Mat& thumbnail_seed, bool per_tile_coef = false, bool per_tile_tv = false,
     std::vector<std::vector<cv::Mat>>* hr_out = nullptr, bool fuse_upscale = false,
-    CsUpscalePipeline* pipe = nullptr) {
+    CsUpscalePipeline* pipe = nullptr, std::mutex* hr_grid_mutex = nullptr) {
 
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
     const int iters_off = iterations / 2;
@@ -817,7 +825,15 @@ static void decrypt_tiles_ycc420(int num_threads,
                 else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
                     cs_upscale_2x_avir(mats_out[i][j], hr);
-                    if (!hr.empty()) hr.copyTo((*hr_out)[i][j]);
+                    // Serialize the cell write under the grid mutex (see
+                    // the BGR path above).
+                    if (!hr.empty() && hr_grid_mutex) {
+                        std::lock_guard<std::mutex> lk(*hr_grid_mutex);
+                        hr.copyTo((*hr_out)[i][j]);
+                    }
+                    else if (!hr.empty()) {
+                        hr.copyTo((*hr_out)[i][j]);
+                    }
                 }
             }
             catch (const std::exception& e) {
@@ -1057,8 +1073,10 @@ int decrypt_image::decrypt_image_tiled(
 
     // Live preview reads the HR grid when tiles upscale during the solve:
     // a tile appears only once its upscale has landed (pending cells stay
-    // black). Otherwise it reads the LR grid as before.
+    // black). Otherwise it reads the LR grid as before. hr_grid_mutex
+    // serializes cell writes against the preview's reconstructImage.
     ImagePreview preview;
+    std::mutex hr_grid_mutex;
     std::vector<std::vector<TileCoord>> hr_coordinates;
     if ((fuse_upscale || pipe_upscale) && show_preview) {
         hr_coordinates = coordinates;
@@ -1067,20 +1085,23 @@ int decrypt_image::decrypt_image_tiled(
                 hr_coordinates[i][j].x = coordinates[i][j].x * 2;
                 hr_coordinates[i][j].y = coordinates[i][j].y * 2;
             }
-        preview.Start(windowName, reconstructed, hr_coordinates, hr_tiles);
+        preview.Start(windowName, reconstructed, hr_coordinates, hr_tiles,
+                      &hr_grid_mutex);
     }
     else if (show_preview) {
         preview.Start(windowName, reconstructed, coordinates, decrypted_image_tiles);
     }
 
     CsUpscalePipeline pipe;
-    if (pipe_upscale) pipe.start(photo_up, decrypted_image_tiles, hr_tiles);
+    if (pipe_upscale)
+        pipe.start(photo_up, decrypted_image_tiles, hr_tiles, &hr_grid_mutex);
         decrypt_tiles_thread = std::thread([&]() {
             decrypt_tiles(nun_threads, encrypted_image_tiles, indices_reconfigured,
                 decrypted_image_tiles, coordinates, num_tiles, overlap, iterations,
                 tile_size, coef, tv, solver,
                 fista_iters, reweights, basis, wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
-                &hr_tiles, fuse_upscale, pipe_upscale ? &pipe : nullptr);
+                &hr_tiles, fuse_upscale, pipe_upscale ? &pipe : nullptr,
+                (fuse_upscale || pipe_upscale) ? &hr_grid_mutex : nullptr);
         });
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
@@ -1265,6 +1286,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // Preview follows the HR grid when tiles upscale during the solve
         // (a tile appears only once upscaled), the LR grid otherwise.
         ImagePreview preview;
+        std::mutex ycc_hr_grid_mutex;
         std::vector<std::vector<TileCoord>> ycc_hr_coordinates;
         if ((ycc_fuse || ycc_pipe) && show_preview) {
             ycc_hr_coordinates = coordinates;
@@ -1274,19 +1296,22 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                     ycc_hr_coordinates[i][j].y = coordinates[i][j].y * 2;
                 }
             preview.Start(windowName, reconstructed, ycc_hr_coordinates,
-                          ycc_hr_tiles);
+                          ycc_hr_tiles, &ycc_hr_grid_mutex);
         }
         else if (show_preview) {
             preview.Start(windowName, reconstructed, coordinates, decrypted);
         }
 
         CsUpscalePipeline ycc_upipe;
-        if (ycc_pipe) ycc_upipe.start(photo_up, decrypted, ycc_hr_tiles);
+        if (ycc_pipe)
+            ycc_upipe.start(photo_up, decrypted, ycc_hr_tiles,
+                            &ycc_hr_grid_mutex);
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
             decrypted, coordinates, num_tiles, overlap, iterations, tile_size, coef, tv,
             solver, fista_iters, reweights, basis, wscale,
             std::cref(dimgs.thumb_seed), per_tile_coef, per_tile_tv,
-            &ycc_hr_tiles, ycc_fuse, ycc_pipe ? &ycc_upipe : nullptr);
+            &ycc_hr_tiles, ycc_fuse, ycc_pipe ? &ycc_upipe : nullptr,
+            (ycc_fuse || ycc_pipe) ? &ycc_hr_grid_mutex : nullptr);
         if (ycc_pipe) ycc_upipe.finish();
 
         if (show_preview) {

@@ -12,12 +12,13 @@ ImagePreview::~ImagePreview() { Stop(); }
 void ImagePreview::Start(
     const std::string& window_name, cv::Mat& reconstructed,
     const std::vector<std::vector<TileCoord>>& coordinates,
-    const std::vector<std::vector<cv::Mat>>& image_tiles) {
+    const std::vector<std::vector<cv::Mat>>& image_tiles,
+    std::mutex* grid_mutex) {
   Stop();
   stop_requested_.store(false, std::memory_order_release);
   thread_ = std::thread(&ImagePreview::Run, this, window_name,
                         std::ref(reconstructed), std::cref(coordinates),
-                        std::cref(image_tiles));
+                        std::cref(image_tiles), grid_mutex);
 }
 
 void ImagePreview::Stop() {
@@ -30,7 +31,8 @@ void ImagePreview::Stop() {
 void ImagePreview::Run(
     const std::string& window_name, cv::Mat& reconstructed,
     const std::vector<std::vector<TileCoord>>& coordinates,
-    const std::vector<std::vector<cv::Mat>>& image_tiles) {
+    const std::vector<std::vector<cv::Mat>>& image_tiles,
+    std::mutex* grid_mutex) {
 #if defined(_WIN32)
   RECT desktop;
   const HWND desktop_window = GetDesktopWindow();
@@ -48,7 +50,12 @@ void ImagePreview::Run(
 
   while (!stop_requested_.load(std::memory_order_acquire)) {
     cv::waitKey(33);
-    reconstructed = reconstructImage(image_tiles, coordinates);
+    if (grid_mutex) {
+      std::lock_guard<std::mutex> lk(*grid_mutex);
+      reconstructed = reconstructImage(image_tiles, coordinates);
+    } else {
+      reconstructed = reconstructImage(image_tiles, coordinates);
+    }
     // Progressive HR grids start all-empty (a tile appears only once
     // upscaled): nothing to show yet, keep the window hidden rather than
     // resizing an empty Mat (which would throw inside this thread).
