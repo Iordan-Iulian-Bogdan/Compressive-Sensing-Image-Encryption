@@ -4,7 +4,10 @@ REM plus /fsanitize=address (+use-after-scope). Output: x64\ClangAsan.
 setlocal
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 ( echo ERROR: vcvars64 failed & exit /b 1 )
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+set "LLVM_ROOT=C:\Program Files\LLVM"
+if not exist "%LLVM_ROOT%\bin\clang-cl.exe" set "LLVM_ROOT=%LOCALAPPDATA%\llvm-portable\clang+llvm-23.1.2-x86_64-pc-windows-msvc"
+if not exist "%LLVM_ROOT%\bin\clang-cl.exe" ( echo ERROR: clang-cl not found under "C:\Program Files\LLVM" or "%LOCALAPPDATA%\llvm-portable" & exit /b 1 )
+set "PATH=%LLVM_ROOT%\bin;%PATH%"
 set "ROOT=%~dp0"
 set "OUT=%ROOT%x64\ClangAsan"
 set "OBJ=%OUT%\obj"
@@ -32,11 +35,11 @@ if not exist "%OBJ%\cs_gpu.obj" ( echo ERROR cs_gpu.obj missing from normal buil
 
 echo [link] ImgReconstruct_backend.exe [ASAN]
 :link
-link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:C:\opencv\build\x64\vc16\lib /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:C:\Program Files\LLVM\lib" "/LIBPATH:C:\Program Files\LLVM\lib\clang\23\lib\windows" /fsanitize=address "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" opencv_world490.lib clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_dynamic_runtime_thunk-x86_64.lib %SYSLIBS%
+link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:C:\opencv\build\x64\vc16\lib /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "/LIBPATH:%LLVM_ROOT%\lib\clang\23\lib\windows" /fsanitize=address "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" opencv_world490.lib clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_dynamic_runtime_thunk-x86_64.lib %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking exe & exit /b 1 )
 
-copy "C:\Program Files\LLVM\lib\clang\23\lib\windows\clang_rt.asan_dynamic-x86_64.dll" "%OUT%\" >nul
-copy "C:\Program Files\LLVM\bin\libomp.dll" "%OUT%\" >nul
+copy "%LLVM_ROOT%\lib\clang\23\lib\windows\clang_rt.asan_dynamic-x86_64.dll" "%OUT%\" >nul
+copy "%LLVM_ROOT%\bin\libomp.dll" "%OUT%\" >nul
 copy "C:\Program Files\AMD\ROCm\7.2\bin\amdhip64_7.dll" "%OUT%\" >nul
 copy "C:\Program Files\AMD\ROCm\7.2\bin\hipfft.dll" "%OUT%\" >nul
 copy "C:\Program Files\AMD\ROCm\7.2\bin\rocfft.dll" "%OUT%\" >nul
