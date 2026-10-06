@@ -4,6 +4,102 @@
 #include "CS_encryption.hpp"
 #include "photo_upscaler.hpp"
 
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
+
+/** @brief streaming upscale pipeline: solver workers enqueue (i,j) as tiles
+solve; one background thread upscales tiles one at a time (one serialized
+subprocess per tile via cs_upscale_one_tile_2x) into hr while solving
+continues, so upscale latency hides behind the solve instead of running as
+a post-join batch. The LR grid is never mutated (warm-start reads stay
+safe); HR cells are written once by the consumer and adopted post-join
+exactly like the fused-AVIR path. finish() joins the worker; the
+destructor also joins, so an early throw cannot std::terminate.
+*/
+struct CsUpscalePipeline {
+    const CsPhotoUpscalerOptions* opt = nullptr;
+    const std::vector<std::vector<cv::Mat>>* lr = nullptr;
+    std::vector<std::vector<cv::Mat>>* hr = nullptr;
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<std::pair<int, int>> q;
+    bool done = false;
+    bool running = false;
+    std::thread worker;
+    long upscaled = 0;
+    long fallback = 0;
+
+    ~CsUpscalePipeline() { finish(); }
+
+    void start(const CsPhotoUpscalerOptions& o,
+               const std::vector<std::vector<cv::Mat>>& lr_tiles,
+               std::vector<std::vector<cv::Mat>>& hr_tiles) {
+        opt = &o;
+        lr = &lr_tiles;
+        hr = &hr_tiles;
+        running = true;
+        worker = std::thread([this] { loop(); });
+    }
+
+    void enqueue(int i, int j) {
+        std::lock_guard<std::mutex> lk(m);
+        if (!running) return;
+        q.emplace_back(i, j);
+        cv.notify_one();
+    }
+
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (!running) return;
+            done = true;
+            cv.notify_all();
+        }
+        if (worker.joinable()) worker.join();
+        running = false;
+    }
+
+    void loop() {
+        for (;;) {
+            int i = -1, j = -1;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return done || !q.empty(); });
+                if (!q.empty()) {
+                    const auto p = q.back();
+                    q.pop_back();
+                    i = p.first;
+                    j = p.second;
+                }
+                else if (done) {
+                    break;
+                }
+                else {
+                    continue;
+                }
+            }
+            try {
+                cv::Mat out;
+                const bool ok =
+                    cs_upscale_one_tile_2x((*lr)[i][j], out, *opt);
+                std::lock_guard<std::mutex> lk(m);
+                if (!out.empty()) {
+                    (*hr)[i][j] = std::move(out);
+                    if (ok) ++upscaled;
+                    else ++fallback;
+                }
+            }
+            catch (...) {
+                // leave the cell empty; the post-join adoption pass
+                // AVIR-fills any tile the pipeline missed
+            }
+        }
+    }
+};
+
 class decrypt_image : CSencryption {
 private:
     /** @brief shared header parsing + MAC verification for both constructors.
@@ -102,5 +198,5 @@ generic reference solution when no neighbor exists, e.g. the first wave).
 */
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale);
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe);
 #endif

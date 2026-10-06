@@ -249,6 +249,76 @@ void avir_fallback(std::vector<std::vector<cv::Mat>>& tiles) {
       if (!tile.empty() && tile.type() == CV_8UC3) UpscaleAvirInplace(tile);
 }
 
+// Single-tile variant of UpscaleSubprocessBatch: one temp dir, one input,
+// one 2x output. Same contract style (true = backend produced a valid 2x
+// tile, false = caller should AVIR-fallback).
+bool UpscaleSubprocessSingle(const cv::Mat& src, cv::Mat& dst,
+                             const std::string& cmd, const std::string& args,
+                             const char* tag) {
+  dst.release();
+  if (src.empty() || src.type() != CV_8UC3) return false;
+
+  static std::atomic<long> single_sequence{0};
+  std::filesystem::path root;
+  try {
+    root = std::filesystem::temp_directory_path() /
+           ("cs_upscale1_" + std::to_string(CurrentProcessId()) + "_" +
+            std::to_string(single_sequence.fetch_add(1)));
+    std::filesystem::create_directories(root / "in");
+    std::filesystem::create_directories(root / "out");
+  } catch (const std::exception& e) {
+    std::cerr << "Warning: --photo-upscaler " << tag << ": temp dir failed ("
+              << e.what() << "); falling back to AVIR" << std::endl;
+    return false;
+  }
+
+  struct TempGuard {
+    std::filesystem::path root;
+    ~TempGuard() {
+      try {
+        std::filesystem::remove_all(root);
+      } catch (...) {
+      }
+    }
+  } guard{root};
+
+  try {
+    if (!cv::imwrite((root / "in" / "tile.png").string(), src)) {
+      std::cerr << "Warning: --photo-upscaler " << tag
+                << ": tile write failed; falling back to AVIR" << std::endl;
+      return false;
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Warning: --photo-upscaler " << tag << ": tile write failed ("
+              << e.what() << "); falling back to AVIR" << std::endl;
+    return false;
+  }
+
+  const std::string full =
+      cmd + " -i \"" + (root / "in").string() + "\" -o \"" +
+      (root / "out").string() + "\" " + args;
+  const int rc = std::system(full.c_str());
+  if (rc != 0) {
+    std::cerr << "Warning: --photo-upscaler " << tag << ": command failed (code "
+              << rc << "); falling back to AVIR" << std::endl;
+    return false;
+  }
+
+  cv::Mat up;
+  try {
+    up = cv::imread((root / "out" / "tile.png").string(), cv::IMREAD_COLOR);
+  } catch (...) {
+  }
+  if (up.empty() || up.type() != CV_8UC3 || up.cols != src.cols * 2 ||
+      up.rows != src.rows * 2) {
+    std::cerr << "Warning: --photo-upscaler " << tag
+              << ": tile output unusable; falling back to AVIR" << std::endl;
+    return false;
+  }
+  dst = std::move(up);
+  return true;
+}
+
 void cs_upscale_tiles_2x(std::vector<std::vector<cv::Mat>>& tiles,
                          const CsPhotoUpscalerOptions& opt) {
   if (opt.backend == "waifu2x") {
@@ -278,4 +348,37 @@ void cs_upscale_tiles_2x(std::vector<std::vector<cv::Mat>>& tiles,
               << "'; using AVIR" << std::endl;
   }
   avir_fallback(tiles);
+}
+
+bool cs_upscale_one_tile_2x(const cv::Mat& src_lr, cv::Mat& dst_hr,
+                            const CsPhotoUpscalerOptions& opt) {
+  dst_hr.release();
+  if (src_lr.empty() || src_lr.type() != CV_8UC3) return false;
+  if (opt.backend == "avir") {
+    cs_upscale_2x_avir(src_lr, dst_hr);
+    return !dst_hr.empty();
+  }
+  const char* tag = nullptr;
+  std::string cmd, args;
+  if (opt.backend == "waifu2x") {
+    tag = "waifu2x";
+    cmd = opt.waifu2x_cmd;
+    args = cs_waifu2x_effective_args(opt);
+  } else if (opt.backend == "waifu2x-ncnn") {
+    tag = "waifu2x-ncnn";
+    cmd = opt.waifu2x_ncnn_cmd;
+    args = cs_waifu2x_ncnn_effective_args(opt);
+  } else if (opt.backend == "realcugan") {
+    tag = "realcugan";
+    cmd = opt.realcugan_cmd;
+    args = cs_realcugan_effective_args(opt);
+  } else {
+    std::cerr << "Warning: unknown --photo-upscaler '" << opt.backend
+              << "'; using AVIR" << std::endl;
+    cs_upscale_2x_avir(src_lr, dst_hr);
+    return false;
+  }
+  if (UpscaleSubprocessSingle(src_lr, dst_hr, cmd, args, tag)) return true;
+  cs_upscale_2x_avir(src_lr, dst_hr);  // warning already printed
+  return false;
 }

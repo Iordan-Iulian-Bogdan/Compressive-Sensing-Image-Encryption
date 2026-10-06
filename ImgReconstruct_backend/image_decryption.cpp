@@ -556,7 +556,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -634,10 +634,18 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                     : tv;
                 dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, tile_coef, mats_out[i][j], tile_tv, solver, fista_iters, reweights, basis, wscale);
                 if (sp) { g_solveprof.call_ns += cs_solveprof_ns_since(sp_c); g_solveprof.tiles += 1; }
+                // streaming pipeline (subprocess backends): hand the solved
+                // tile to the background upscaler now; it writes the 2x
+                // result into the separate hr grid while solving continues.
+                // (Checked first: pipe and fuse_upscale are mutually
+                // exclusive by construction at the call sites.)
+                if (pipe && !mats_out[i][j].empty()) {
+                    pipe->enqueue(i, j);
+                }
                 // fused AVIR upscale: this tile is final the moment its solve
                 // finishes (same op as the post-join batch, so bit-identical).
                 // A separate grid keeps the live preview's LR reads safe.
-                if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
+                else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
                     cs_upscale_2x_avir(mats_out[i][j], hr);
                     if (!hr.empty()) hr.copyTo((*hr_out)[i][j]);
@@ -681,7 +689,8 @@ static void decrypt_tiles_ycc420(int num_threads,
     int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv,
     int solver, int fista_iters, int reweights, int basis, float wscale,
     const cv::Mat& thumbnail_seed, bool per_tile_coef = false, bool per_tile_tv = false,
-    std::vector<std::vector<cv::Mat>>* hr_out = nullptr, bool fuse_upscale = false) {
+    std::vector<std::vector<cv::Mat>>* hr_out = nullptr, bool fuse_upscale = false,
+    CsUpscalePipeline* pipe = nullptr) {
 
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
     const int iters_off = iterations / 2;
@@ -799,9 +808,13 @@ static void decrypt_tiles_ycc420(int num_threads,
                 cv::merge(chs, 3, ycc_tile);
                 ycc_tile.convertTo(ycc_tile, CV_8UC3);
                 cv::cvtColor(ycc_tile, mats_out[i][j], cv::COLOR_YCrCb2BGR);
+                // streaming pipeline: same handoff as decrypt_tiles above
+                if (pipe && !mats_out[i][j].empty()) {
+                    pipe->enqueue(i, j);
+                }
                 // fused AVIR upscale: same op as the post-join batch, so
                 // bit-identical; separate grid keeps preview reads safe
-                if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
+                else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
                     cs_upscale_2x_avir(mats_out[i][j], hr);
                     if (!hr.empty()) hr.copyTo((*hr_out)[i][j]);
@@ -1035,20 +1048,30 @@ int decrypt_image::decrypt_image_tiled(
     std::thread decrypt_tiles_thread;
     // Fused AVIR upscale (default backend, non-full-res): each worker
     // upscales its tile into hr_tiles the moment its solve finishes, so
-    // tiles are final without waiting for the wavefront. waifu2x stays one
-    // post-join batch (a subprocess per tile would reload the model 576x).
+    // tiles are final without waiting for the wavefront. Subprocess
+    // backends (waifu2x/ncnn/realcugan) stream instead: solved tiles are
+    // handed to one background upscaler thread tile-by-tile while the
+    // wavefront keeps solving, so upscale latency hides behind the solve
+    // instead of running as one post-join batch.
     std::vector<std::vector<cv::Mat>> hr_tiles(
         num_tiles, std::vector<cv::Mat>(num_tiles));
     const bool fuse_upscale =
         !full_res && photo_up.backend == "avir";
+    const bool pipe_upscale =
+        !full_res && !fuse_upscale &&
+        (photo_up.backend == "waifu2x" || photo_up.backend == "waifu2x-ncnn" ||
+         photo_up.backend == "realcugan");
+    CsUpscalePipeline pipe;
+    if (pipe_upscale) pipe.start(photo_up, decrypted_image_tiles, hr_tiles);
         decrypt_tiles_thread = std::thread([&]() {
             decrypt_tiles(nun_threads, encrypted_image_tiles, indices_reconfigured,
                 decrypted_image_tiles, coordinates, num_tiles, overlap, iterations,
                 tile_size, coef, tv, solver,
                 fista_iters, reweights, basis, wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
-                &hr_tiles, fuse_upscale);
+                &hr_tiles, fuse_upscale, pipe_upscale ? &pipe : nullptr);
         });
     decrypt_tiles_thread.join();
+    if (pipe_upscale) pipe.finish();
 
     if (show_preview) {
         preview.Stop();
@@ -1058,10 +1081,10 @@ int decrypt_image::decrypt_image_tiled(
         // 2x upscale via the selected photo backend (AVIR default, waifu2x
         // opt-in): every tile ends up 2x, so all origins scale. full_res
         // solves at native geometry, so its tiles are already final.
-        // Fused tiles are adopted (with an AVIR fallback for any tile the
-        // worker missed); otherwise the batch upscale runs as before.
+        // Fused/pipelined tiles are adopted (with an AVIR fallback for any
+        // tile the worker missed); otherwise the batch upscale runs as before.
         int blend_feather = overlap;
-        if (fuse_upscale) {
+        if (fuse_upscale || pipe_upscale) {
             for (int i = 0; i < num_tiles; ++i)
                 for (int j = 0; j < num_tiles; ++j) {
                     if (hr_tiles[i][j].empty() && !decrypted_image_tiles[i][j].empty())
@@ -1069,7 +1092,7 @@ int decrypt_image::decrypt_image_tiled(
                 }
             decrypted_image_tiles = std::move(hr_tiles);
         }
-        if (!full_res && !fuse_upscale) {
+        if (!full_res && !fuse_upscale && !pipe_upscale) {
             cs_upscale_tiles_2x(decrypted_image_tiles, photo_up);
         }
         if (!full_res) {
@@ -1221,15 +1244,24 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             preview.Start(windowName, reconstructed, coordinates, decrypted);
         }
 
-        // Fused AVIR upscale like the BGR pipeline (waifu2x stays batched).
+        // Fused AVIR upscale like the BGR pipeline; subprocess backends
+        // stream through the background pipeline while solving continues.
         std::vector<std::vector<cv::Mat>> ycc_hr_tiles(
             num_tiles, std::vector<cv::Mat>(num_tiles));
         const bool ycc_fuse = !full_res && photo_up.backend == "avir";
+        const bool ycc_pipe =
+            !full_res && !ycc_fuse &&
+            (photo_up.backend == "waifu2x" ||
+             photo_up.backend == "waifu2x-ncnn" ||
+             photo_up.backend == "realcugan");
+        CsUpscalePipeline ycc_upipe;
+        if (ycc_pipe) ycc_upipe.start(photo_up, decrypted, ycc_hr_tiles);
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
             decrypted, coordinates, num_tiles, overlap, iterations, tile_size, coef, tv,
             solver, fista_iters, reweights, basis, wscale,
             std::cref(dimgs.thumb_seed), per_tile_coef, per_tile_tv,
-            &ycc_hr_tiles, ycc_fuse);
+            &ycc_hr_tiles, ycc_fuse, ycc_pipe ? &ycc_upipe : nullptr);
+        if (ycc_pipe) ycc_upipe.finish();
 
         if (show_preview) {
             preview.Stop();
@@ -1238,9 +1270,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // Per-tile 2x upscale via the selected photo backend (same as the
         // BGR pipeline); blending happens in 2x solve geometry. full_res
         // solves at native geometry, so its tiles are already final.
-        // Fused tiles are adopted (AVIR fallback for misses).
+        // Fused/pipelined tiles are adopted (AVIR fallback for misses).
         int ycc_blend_feather = overlap;
-        if (ycc_fuse) {
+        if (ycc_fuse || ycc_pipe) {
             for (int i = 0; i < num_tiles; ++i)
                 for (int j = 0; j < num_tiles; ++j) {
                     if (ycc_hr_tiles[i][j].empty() && !decrypted[i][j].empty())
@@ -1248,7 +1280,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 }
             decrypted = std::move(ycc_hr_tiles);
         }
-        if (!full_res && !ycc_fuse) {
+        if (!full_res && !ycc_fuse && !ycc_pipe) {
             cs_upscale_tiles_2x(decrypted, photo_up);
         }
         if (!full_res) {

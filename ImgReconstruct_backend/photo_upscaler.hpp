@@ -96,6 +96,17 @@ std::string cs_realcugan_effective_args(const CsPhotoUpscalerOptions& opt);
 // or containing a separator) pass through untouched.
 std::string cs_realcugan_model_dir(const CsPhotoUpscalerOptions& opt);
 
+// Upscale one LR tile to 2x HR with the selected backend: AVIR runs
+// in-process; waifu2x / waifu2x-ncnn / realcugan run one subprocess on the
+// single tile (same -i/-o dir contract as the batch path, one temp dir per
+// call). Any backend failure (bad output size, nonzero exit, missing
+// binary) falls back to AVIR for the tile. Returns true when the selected
+// backend produced dst_hr, false when the AVIR fallback (or nothing) did.
+// Used by the streaming upscale pipeline: one serialized subprocess per
+// tile while solving continues, instead of one post-join batch.
+bool cs_upscale_one_tile_2x(const cv::Mat& src_lr, cv::Mat& dst_hr,
+                            const CsPhotoUpscalerOptions& opt);
+
 // Upscale every non-empty CV_8UC3 tile of the grid exactly 2x, in place.
 // The caller then scales the tile origins by 2 (all of them; empty tiles
 // are skipped by reconstruct/blend regardless of their coordinates).
