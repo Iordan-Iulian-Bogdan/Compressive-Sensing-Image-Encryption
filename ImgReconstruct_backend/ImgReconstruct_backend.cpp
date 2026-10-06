@@ -432,6 +432,11 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             photo_up.waifu2x_ncnn_args = v;
         }
+        else if (a == "--waifu2x-ncnn-model") {
+            const char* v = next("model-dir name or explicit path");
+            if (!v) return 64;
+            photo_up.waifu2x_ncnn_model = v;
+        }
         else if (a == "--realcugan-cmd") {
             const char* v = next("command");
             if (!v) return 64;

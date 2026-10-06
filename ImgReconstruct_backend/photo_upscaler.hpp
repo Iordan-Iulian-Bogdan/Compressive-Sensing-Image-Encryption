@@ -24,8 +24,9 @@
 //   decrypt.
 // - "waifu2x-ncnn": same harness around the native waifu2x-ncnn-vulkan
 //   binary (Vulkan, runs on AMD/NVIDIA/Intel GPUs): same models and
-//   quality as nunif waifu2x, no Python. Args are `-n <noise|-1> -s 2`
-//   (`scale` method maps to `-n -1`, i.e. no denoise).
+//   quality as nunif waifu2x, no Python. Args are `-n <noise|-1> -s 2
+//   -m <model>` (`scale` method maps to `-n -1`, i.e. no denoise; the
+//   default model is the photo one, models-upconv_7_photo).
 // - "realcugan": same harness around realcugan-ncnn-vulkan (Vulkan):
 //   `-n <noise|-1> -s 2 -m <model>` with `models-se` default; the `-n`
 //   levels are the direct analog of waifu2x `noise_scale` denoising.
@@ -72,6 +73,10 @@ struct CsPhotoUpscalerOptions {
   // Native ncnn backends share the method/noise fields above.
   std::string waifu2x_ncnn_cmd = cs_env_or("CS_WAIFU2X_NCNN_CMD", "waifu2x-ncnn-vulkan");
   std::string waifu2x_ncnn_args = cs_env_or("CS_WAIFU2X_NCNN_ARGS", "");
+  // Model dir (or short name resolved against the binary's directory):
+  // photo default; use models-cunet for anime-style content.
+  std::string waifu2x_ncnn_model =
+      cs_env_or("CS_WAIFU2X_NCNN_MODEL", "models-upconv_7_photo");
   std::string realcugan_cmd = cs_env_or("CS_REALCUGAN_CMD", "realcugan-ncnn-vulkan");
   std::string realcugan_args = cs_env_or("CS_REALCUGAN_ARGS", "");
   std::string realcugan_model = cs_env_or("CS_REALCUGAN_MODEL", "models-se");
@@ -81,9 +86,16 @@ struct CsPhotoUpscalerOptions {
 // otherwise `--style photo --method <method> -n <noise> -g -1`.
 std::string cs_waifu2x_effective_args(const CsPhotoUpscalerOptions& opt);
 
-// Effective args for waifu2x-ncnn-vulkan: `-n <noise> -s 2`, or `-n -1 -s 2`
-// for pure upscale (`scale` method). Returns the explicit override when set.
+// Effective args for waifu2x-ncnn-vulkan: `-n <noise> -s 2 -m <model>`, or
+// `-n -1 -s 2 -m <model>` for pure upscale (`scale` method). Returns the
+// explicit override when set.
 std::string cs_waifu2x_ncnn_effective_args(const CsPhotoUpscalerOptions& opt);
+
+// Effective -m directory for waifu2x-ncnn: a model-dir name (default
+// models-upconv_7_photo) or an explicit path. Plain names resolve against
+// the ncnn binary's directory first (models ship next to the exe), then
+// against the current directory; explicit paths pass through untouched.
+std::string cs_waifu2x_ncnn_model_dir(const CsPhotoUpscalerOptions& opt);
 
 // Effective args for realcugan-ncnn-vulkan: `-n <noise> -s 2 -m <model>`,
 // `-n -1` for pure upscale. Returns the explicit override when set.

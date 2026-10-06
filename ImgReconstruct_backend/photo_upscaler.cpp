@@ -181,7 +181,7 @@ int ncnn_noise_level(const CsPhotoUpscalerOptions& opt, const char* tag) {
 std::string cs_waifu2x_ncnn_effective_args(const CsPhotoUpscalerOptions& opt) {
   if (!opt.waifu2x_ncnn_args.empty()) return opt.waifu2x_ncnn_args;
   return "-n " + std::to_string(ncnn_noise_level(opt, "waifu2x-ncnn")) +
-         " -s 2";
+         " -s 2 -m " + cs_waifu2x_ncnn_model_dir(opt);
 }
 
 std::string cs_realcugan_effective_args(const CsPhotoUpscalerOptions& opt) {
@@ -232,6 +232,25 @@ std::string cs_realcugan_model_dir(const CsPhotoUpscalerOptions& opt) {
   if (looks_like_path) return opt.realcugan_model;  // explicit path: untouched
   // short name: prefer the models shipped next to the binary ...
   const std::string dir = exe_sibling_dir(opt.realcugan_cmd);
+  auto exists_dir = [](const std::string& p) {
+    std::error_code ec;
+    return !p.empty() && std::filesystem::is_directory(p, ec);
+  };
+  if (!dir.empty() && exists_dir(dir + "/" + m)) return dir + "/" + m;
+  // ... then the current directory; otherwise hand the name through and let
+  // the tool resolve it (preserves old behavior for CWD-relative layouts).
+  if (exists_dir(m)) return m;
+  return m;
+}
+
+std::string cs_waifu2x_ncnn_model_dir(const CsPhotoUpscalerOptions& opt) {
+  const std::string& m = opt.waifu2x_ncnn_model;
+  const bool looks_like_path =
+      m.find_first_of("/\\") != std::string::npos ||
+      (m.size() > 1 && m[1] == ':');
+  if (looks_like_path) return m;  // explicit path: untouched
+  // plain name: prefer the models shipped next to the binary ...
+  const std::string dir = exe_sibling_dir(opt.waifu2x_ncnn_cmd);
   auto exists_dir = [](const std::string& p) {
     std::error_code ec;
     return !p.empty() && std::filesystem::is_directory(p, ec);
