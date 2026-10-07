@@ -95,6 +95,8 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_YCC420    3            // luma/chroma-split 4:2:0 sampling (pad = 3)
 #define CS_MODE_HF_FOCUS  5            // encrypted thumbnail + HF-weighted BGR sampling
 #define CS_MODE_YCC420_HF 6            // HF-weighted luma + uniform coarse chroma
+#define CS_MODE_YCC422    7            // luma/chroma-split 4:2:2 sampling (pad = 7)
+#define CS_MODE_YCC422_HF 8            // HF-weighted luma + uniform 4:2:2 chroma (pad = 8)
 
 // Adaptive pad layout (mode = 2), all little-endian:
 //   [0]      mode (= 2)
@@ -103,7 +105,7 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 //   [5..6]   weight_base (uint16): w = tile_pixels * (weight_base + lod)
 //            0 is treated as the default 256 on parse (pre-strength containers)
 #define CS_OFF_ADAPTIVE_BASE 5         // offset from CS_OFF_PAD
-#define CS_OFF_HF_THUMBLEN 7          // modes 5/6: encrypted thumbnail length (u32 LE)
+#define CS_OFF_HF_THUMBLEN 7          // modes 5/6/8: encrypted thumbnail length (u32 LE)
 #define CS_OFF_SAMPLE_BITS 11         // offset from CS_OFF_PAD: bits per stored
                                       // sample value, 1..8 (0 = legacy 8-bit)
 #define CS_OFF_SAMPLE_BITS_CHROMA 12  // chroma bits; 0 = legacy/same as luma
@@ -150,19 +152,47 @@ inline int cs_lod_pixels(int rows, int cols, int tile_size) {
 // layout after the 32-pixel header is raw bytes:
 //   [Y x m_luma][Cr x m_chroma][Cb x m_chroma], zero-padded to whole pixels.
 // At the same --ratio this stores ~1.5 bytes/px instead of 3 (BGR modes).
-inline void cs_ycc420_chroma_dims(int rows, int cols, int& crows, int& ccols) {
-    crows = (rows + 1) / 2;
-    ccols = (cols + 1) / 2;
+//
+// YCC 4:2:2 (modes 7/8) is the same construction with chroma downsampled
+// horizontally only (full height, half width): ~2 bytes/px, sharper chroma
+// edges than 4:2:0 at a larger container. cs_chroma_dims/cs_chroma_count
+// parameterize all four split modes (3/6 halve both axes, 7/8 halve width
+// only); the cs_ycc420_* names remain for older 4:2:0-only call sites.
+inline void cs_chroma_dims(int mode, int rows, int cols, int& crows, int& ccols) {
+    if (mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF) {
+        crows = rows;
+        ccols = (cols + 1) / 2;
+    } else {
+        crows = (rows + 1) / 2;
+        ccols = (cols + 1) / 2;
+    }
 }
-inline int cs_ycc420_chroma_count(int m_luma, int rows, int cols) {
+inline int cs_chroma_count(int mode, int m_luma, int rows, int cols) {
     int crows, ccols;
-    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    cs_chroma_dims(mode, rows, cols, crows, ccols);
     if (rows <= 0 || cols <= 0) return 0;
     int mc = (int)(((long long)m_luma * crows * ccols) / ((long long)rows * cols));
     if (mc < 1) mc = 1;
     const int cap = crows * ccols;
     if (mc > cap) mc = cap;
     return mc;
+}
+// Any luma/chroma-split container (uniform, adaptive-luma, or HF-luma).
+inline bool cs_is_ycc(int mode) {
+    return mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 ||
+        mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF;
+}
+inline bool cs_is_ycc422(int mode) {
+    return mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF;
+}
+inline bool cs_is_ycc_hf(int mode) {
+    return mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF;
+}
+inline void cs_ycc420_chroma_dims(int rows, int cols, int& crows, int& ccols) {
+    cs_chroma_dims(CS_MODE_YCC420, rows, cols, crows, ccols);
+}
+inline int cs_ycc420_chroma_count(int m_luma, int rows, int cols) {
+    return cs_chroma_count(CS_MODE_YCC420, m_luma, rows, cols);
 }
 // Domain separation for the three per-plane RNG streams: luma uses the key
 // as-is (tag 0), chroma planes use tagged copies. Deterministic on both

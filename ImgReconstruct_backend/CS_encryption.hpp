@@ -64,7 +64,8 @@ protected:
     int lod_full_threshold = 0;      // --lod-full detail guarantee from header (0 = off)
     cv::Mat thumb_seed;
 
-    // Mode 3 (CS_MODE_YCC420): coarse chroma sampling positions on the
+    // Mode 3/7 (CS_MODE_YCC420/CS_MODE_YCC422): coarse chroma sampling
+    // positions on the mode's chroma grid + per-plane chroma sample count.
     // half-resolution chroma grid + per-plane chroma sample count. Filled by
     // returnYcc420Indices; ri_x/ri_y keep the full-res luma positions.
     std::vector<int> ri_cx1, ri_cy1, ri_cx2, ri_cy2;
@@ -74,12 +75,12 @@ protected:
     // plus m_chroma coarse-grid positions per chroma plane from tagged key
     // copies (see cs_ycc420_channel_key). Fully deterministic from
     // (key, m_luma, geometry) so encryption and decryption agree.
-    void returnYcc420Indices(int xm, int ym, int m_luma, const uint8_t key[32]);
+    void returnYcc420Indices(int xm, int ym, int m_luma, const uint8_t key[32], int mode = CS_MODE_YCC420);
 
     // Coarse-grid chroma half: fills ri_cx1/ri_cy1 (Cr), ri_cx2/ri_cy2 (Cb)
     // and m_chroma from (key, m_luma, geometry). Shared by the uniform-luma
     // path above and the LOD-luma path (whose luma draw differs).
-    void returnYcc420ChromaIndices(int xm, int ym, int m_luma, const uint8_t key[32]);
+    void returnYcc420ChromaIndices(int xm, int ym, int m_luma, const uint8_t key[32], int mode = CS_MODE_YCC420);
 
 public:
     static int params;

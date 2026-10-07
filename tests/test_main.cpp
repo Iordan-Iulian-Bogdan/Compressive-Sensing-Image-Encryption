@@ -5,6 +5,7 @@
 #include "crypto_utils.hpp"
 #include "image_encryption.hpp"
 #include "image_decryption.hpp"
+#include "cs_dict.hpp"
 #include "quality_utils.hpp"
 #include "cs_gpu.h"
 
@@ -38,6 +39,7 @@ void check(bool ok, const char* name) {
         std::printf("[FAIL] %s\n", name);
         g_failures++;
     }
+    std::fflush(stdout); // crash diagnostics: never lose the tail to buffering
 }
 
 // procedural test image: smooth gradient + shapes (structure, no noise)
@@ -671,6 +673,74 @@ void test_adaptive_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// 4a2. Spectral-DCT LOD scorer: unit behavior + adaptive-container roundtrip
+// ---------------------------------------------------------------------------
+void test_spectral_lod() {
+    // flat image: DCT has DC only (weight 0) -> every tile scores the floor
+    cv::Mat flat(256, 256, CV_8UC3, cv::Scalar(128, 128, 128));
+    const std::vector<uint8_t> lod_flat = compute_spectral_lod(flat, 64, 32);
+    check(lod_flat.size() == 16, "spectral lod: 4x4 grid for 256px/64px tiles");
+    bool all_floor = true;
+    for (uint8_t b : lod_flat) if (b != 32) all_floor = false;
+    check(all_floor, "spectral lod: flat image scores uniform floor");
+
+    // structured image: scores spread across [floor, 255] and are stable
+    cv::Mat shaped = make_test_image(256, 256);
+    const std::vector<uint8_t> a = compute_spectral_lod(shaped, 64, 32);
+    const std::vector<uint8_t> b = compute_spectral_lod(shaped, 64, 32);
+    check(a == b, "spectral lod: deterministic on identical input");
+    uint8_t mn = 255, mx = 0;
+    for (uint8_t v : a) { mn = (uint8_t)(std::min)(mn, v); mx = (uint8_t)(std::max)(mx, v); }
+    check(mx > mn, "spectral lod: structure spreads scores");
+    check(mn >= 32 && mx <= 255, "spectral lod: scores within [floor, 255]");
+
+    const std::string password = "spectral-test-password";
+    const int W = 480, H = 360;
+    cv::Mat original = make_test_image(W, H);
+    const std::string tmp_in = ".cs_test_spectral_in.png";
+    const std::string tmp_out = ".cs_test_spectral_out.png";
+    cv::imwrite(tmp_in, original);
+
+    // two-pass and spectral are mutually exclusive scorers
+    cv::Mat enc_none;
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &enc_none,
+        /*adaptive*/ false, 32, 0.5f, false, false, /*two_pass*/ true, 0.05f,
+        "", 0.5f, 0.0f, false, false, 8, 0, 0, false, /*spectral*/ true) == -1,
+        "spectral lod: two-pass + spectral rejected");
+
+    // spectral encrypt ships the standard adaptive container (mode 2)
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &encrypted,
+            /*adaptive*/ false, 32, 0.5f, false, false, false, 0.05f,
+            "", 0.5f, 0.0f, false, false, 8, 0, 0, false, /*spectral*/ true) != 0) {
+        check(false, "spectral lod: encrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+    const cv::Mat flat_enc = encrypted.reshape(0, (int)encrypted.total());
+    check(flat_enc.data[CS_OFF_PAD] == CS_MODE_ADAPTIVE, "spectral lod: header mode=2");
+
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+        "spectral lod: decrypt succeeds");
+    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    check(!decrypted.empty(), "spectral lod: decrypted file readable");
+    if (!decrypted.empty()) {
+        cv::Mat dec_sized;
+        cv::resize(decrypted, dec_sized, original.size());
+        const double p = cs_quality::psnr(original, dec_sized);
+        const double s = cs_quality::ssim(original, dec_sized);
+        std::printf("       spectral lod PSNR (ratio 0.5): %.2f dB\n", p);
+        std::printf("       spectral lod SSIM: %.4f\n", s);
+        check(p > 14.0, "spectral lod: PSNR > 14 dB at ratio 0.5");
+        if (s >= 0.0) check(s > 0.25, "spectral lod: SSIM > 0.25");
+        else check(false, "spectral lod: SSIM unavailable");
+    }
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // 4b. --lod-full detail guarantee roundtrip (mode 2 + threshold byte)
 // ---------------------------------------------------------------------------
 void test_lod_full_roundtrip() {
@@ -847,6 +917,89 @@ void test_ycc420_roundtrip() {
             check(pl > 14.0, "ycc420 regions: PSNR > 14 dB at ratio 0.5");
         } else {
             check(false, "ycc420 regions: decrypted file readable");
+        }
+    }
+
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+// ---------------------------------------------------------------------------
+// YCC 4:2:2 (mode 7): luma at full resolution, chroma full-height /
+// half-width. Container sits between 4:2:0 and BGR (~2 bytes/px).
+void test_ycc422_roundtrip() {
+    const std::string password = "ycc422-test-password";
+    const int W = 480, H = 360;
+    cv::Mat original = make_test_image(W, H);
+
+    const std::string tmp_in = ".cs_test_ycc422_in.png";
+    const std::string tmp_out = ".cs_test_ycc422_out.png";
+    cv::imwrite(tmp_in, original);
+
+    cv::Mat encrypted;
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &encrypted,
+            /*adaptive*/ false, 32, 0.5f, /*show_mask*/ false, /*full_res*/ false,
+            /*two_pass*/ false, 0.05f, "", 0.5f, 0.0f, /*ycc420*/ false,
+            /*hf_focus*/ false, /*sample_bits*/ 8, /*chroma_bits*/ 0,
+            /*lod_full*/ 0, /*ycc422*/ true) != 0) {
+        check(false, "ycc422 roundtrip: encrypt");
+        std::remove(tmp_in.c_str());
+        return;
+    }
+    check(!encrypted.empty(), "ycc422 roundtrip: encrypt to memory");
+
+    const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+    check(flat.data[CS_OFF_PAD] == CS_MODE_YCC422, "ycc422 roundtrip: header mode=7");
+
+    // 4:2:2 stores ~2 B/px: well under BGR (3 B/px), above 4:2:0 (~1.5 B/px)
+    cv::Mat enc_bgr, enc_420;
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc_bgr) == 0,
+        "ycc422 roundtrip: reference BGR encrypt");
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc_420,
+        false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, true) == 0,
+        "ycc422 roundtrip: reference 420 encrypt");
+    std::printf("       ycc422 container px: %d vs 420: %d vs BGR: %d\n",
+        (int)encrypted.total(), (int)enc_420.total(), (int)enc_bgr.total());
+    check(encrypted.total() * 4 < enc_bgr.total() * 3, "ycc422 roundtrip: container < 3/4 of BGR");
+    check(encrypted.total() >= enc_420.total(), "ycc422 roundtrip: container >= 420");
+
+    check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+        "ycc422 roundtrip: decrypt succeeds");
+    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
+    check(!decrypted.empty(), "ycc422 roundtrip: decrypted file readable");
+    if (!decrypted.empty()) {
+        cv::Mat dec_sized;
+        cv::resize(decrypted, dec_sized, original.size());
+        const double p = cs_quality::psnr(original, dec_sized);
+        const double s = cs_quality::ssim(original, dec_sized);
+        std::printf("       ycc422 roundtrip PSNR (ratio 0.5): %.2f dB\n", p);
+        std::printf("       ycc422 roundtrip SSIM: %.4f\n", s);
+        check(p > 14.0, "ycc422 roundtrip: PSNR > 14 dB at ratio 0.5");
+        if (s >= 0.0) check(s > 0.4, "ycc422 roundtrip: SSIM > 0.4");
+        else check(false, "ycc422 roundtrip: SSIM unavailable");
+    }
+
+    // LOD-driven luma under 4:2:2: same mode 7 with shipped lod bytes
+    cv::Mat enc_lod;
+    const std::string regions = "{'regions': [{'box': [250,250,750,750], 'detail': 1.0}]}";
+    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 64, &enc_lod,
+            /*adaptive*/ false, 8, 0.66f, false, false, false, 0.05f,
+            regions, 0.5f, 1.0f, /*ycc420*/ false, false, 8, 0, 0, /*ycc422*/ true) != 0) {
+        check(false, "ycc422 regions: encrypt");
+    } else {
+        const cv::Mat flat2 = enc_lod.reshape(0, (int)enc_lod.total());
+        check(flat2.data[CS_OFF_PAD] == CS_MODE_YCC422, "ycc422 regions: header mode=7");
+        const int tile_written = flat2.data[CS_OFF_PAD + 1] | (flat2.data[CS_OFF_PAD + 2] << 8);
+        check(tile_written == 64, "ycc422 regions: header carries tile_size 64");
+        check(decrypt_image::decrypt_image_tiled(enc_lod, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "ycc422 regions: decrypt succeeds");
+        cv::Mat dec_lod = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        if (!dec_lod.empty()) {
+            cv::resize(dec_lod, dec_lod, original.size());
+            const double pl = cs_quality::psnr(original, dec_lod);
+            std::printf("       ycc422 regions PSNR (ratio 0.5): %.2f dB\n", pl);
+            check(pl > 14.0, "ycc422 regions: PSNR > 14 dB at ratio 0.5");
+        } else {
+            check(false, "ycc422 regions: decrypted file readable");
         }
     }
 
@@ -1097,6 +1250,39 @@ void test_photo_upscaler() {
         check(all_2x(grid), "photo-upscaler: unknown backend warns and uses AVIR");
     }
     {
+        // FSRCNN without weights: clean failure contract (no crash, AVIR
+        // fallback owned by the caller).
+        cv::Mat dst;
+        check(!cs_fsrcnn_upscale_2x(cv::Mat(16, 16, CV_8UC3, cv::Scalar(1, 2, 3)), dst,
+            ".cs_test_nope.pb"), "photo-upscaler: fsrcnn missing model fails cleanly");
+        check(!cs_fsrcnn_upscale_2x(cv::Mat(), dst, ".cs_test_nope.pb"),
+            "photo-upscaler: fsrcnn empty input rejected");
+    }
+    {
+        // FSRCNN with weights (opt-in asset): exact 2x, deterministic.
+        std::string model;
+        if (const char* env = std::getenv("CS_TEST_FSRCNN")) model = env;
+        if (model.empty()) model = "FSRCNN_x2.pb";
+        if (!std::ifstream(model.c_str(), std::ios::binary).good()) model = "../FSRCNN_x2.pb";
+        if (!std::ifstream(model.c_str(), std::ios::binary).good()) {
+            std::printf("[SKIP] fsrcnn: no weights found (set CS_TEST_FSRCNN=<path>)\n");
+        } else {
+            cv::Mat tile = make_test_image(48, 32);
+            cv::Mat up1, up2;
+            check(cs_fsrcnn_upscale_2x(tile, up1, model), "photo-upscaler: fsrcnn upscales");
+            check(!up1.empty() && up1.cols == 96 && up1.rows == 64 && up1.type() == CV_8UC3,
+                "photo-upscaler: fsrcnn exact 2x geometry and type");
+            check(cs_fsrcnn_upscale_2x(tile, up2, model), "photo-upscaler: fsrcnn second run");
+            check(cv::norm(up1, up2, cv::NORM_INF) == 0, "photo-upscaler: fsrcnn deterministic");
+            CsPhotoUpscalerOptions opt;
+            opt.backend = "fsrcnn";
+            opt.fsrcnn_model = model;
+            auto grid = make_grid();
+            cs_upscale_tiles_2x(grid, opt);
+            check(all_2x(grid), "photo-upscaler: fsrcnn batch upscales every tile exactly 2x");
+        }
+    }
+    {
         // No nunif here: a bogus command must degrade to AVIR, not fail.
         CsPhotoUpscalerOptions opt;
         opt.backend = "waifu2x";
@@ -1128,11 +1314,13 @@ void test_photo_upscaler() {
         auto grid = make_grid();
         cs_upscale_tiles_2x(grid, opt);
         check(all_2x(grid), "photo-upscaler: waifu2x-ncnn failure falls back to AVIR");
-        check(cs_waifu2x_ncnn_effective_args(opt) == "-n -1 -s 2",
+        check(cs_waifu2x_ncnn_effective_args(opt) ==
+            "-n -1 -s 2 -m models-upconv_7_photo",
             "photo-upscaler: ncnn default args are pure 2x upscale");
         opt.waifu2x_method = "noise_scale";
         opt.waifu2x_noise = 2;
-        check(cs_waifu2x_ncnn_effective_args(opt) == "-n 2 -s 2",
+        check(cs_waifu2x_ncnn_effective_args(opt) ==
+            "-n 2 -s 2 -m models-upconv_7_photo",
             "photo-upscaler: ncnn method/noise compose into args");
         opt.waifu2x_ncnn_args = "--custom";
         check(cs_waifu2x_ncnn_effective_args(opt) == "--custom",
@@ -1177,6 +1365,371 @@ void test_photo_upscaler() {
     }
 }
 
+void test_cs_super_resolution() {
+    check(cs_is_superres_backend("cs-sr") && !cs_is_superres_backend("avir"),
+        "cs-sr: backend selection");
+    // Simulate an imperfect LR reconstruction: measurements come from the
+    // clean LR image, while the solved tile has a small brightness bias.
+    const cv::Mat original = make_test_image(80, 80);
+    cv::Mat measured, solved;
+    cv::resize(original, measured, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+    cv::add(measured, cv::Scalar(8, 8, 8), solved);
+    const int m = measured.rows * measured.cols;
+    // NOTE: packed is (N x 1): at<>(k) addresses rows. A 1xN row mat with
+    // the same pattern would read/write out of bounds (step mismatch).
+    cv::Mat packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+    std::vector<int> rx, ry;
+    rx.reserve(m); ry.reserve(m);
+    for (int row = 0; row < measured.rows; ++row)
+        for (int col = 0; col < measured.cols; ++col) {
+            rx.push_back(row); ry.push_back(col);
+            packed.at<cv::Vec3b>(CS_HEADER_PIXELS + row * measured.cols + col) =
+                measured.at<cv::Vec3b>(row, col);
+        }
+    cv::Mat baseline, refined;
+    cs_upscale_2x_avir(solved, baseline);
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, refined);
+    check(refined.size() == original.size() && refined.type() == CV_8UC3,
+        "cs-sr: 2x geometry and color type");
+    if (!refined.empty()) {
+        cv::Mat base_lr, sr_lr;
+        cv::resize(baseline, base_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        cv::resize(refined, sr_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        check(cv::norm(sr_lr, measured, cv::NORM_L2) <
+              cv::norm(base_lr, measured, cv::NORM_L2),
+            "cs-sr: refinement reduces LR measurement residual");
+    }
+    cv::Mat fallback;
+    cs_sr_upscale_tile_2x(solved, packed, {}, {}, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, fallback);
+    check(cv::norm(fallback, baseline, cv::NORM_INF) == 0,
+        "cs-sr: missing measurements fall back to AVIR");
+    // RED-lite plumbing: explicit red=0 matches the default call exactly,
+    // and a mid-strength RED pass completes with valid geometry.
+    cv::Mat red0, red05;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, red0, 0.0f);
+    check(cv::norm(red0, refined, cv::NORM_INF) == 0,
+        "cs-sr: red=0 is bit-identical to default");
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, red05, 0.5f);
+    check(red05.size() == original.size() && red05.type() == CV_8UC3,
+        "cs-sr: red=0.5 keeps 2x geometry and color type");
+    if (!red05.empty()) {
+        cv::Mat red_lr;
+        cv::resize(red05, red_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        const double n = cv::norm(red_lr, measured, cv::NORM_L2);
+        check(std::isfinite(n), "cs-sr: red=0.5 residual is finite");
+    }
+}
+
+// Single-stage vs two-stage SR experiment: the same LR samples feed (a)
+// the production two-stage path (BGR LR solve with bias + HR refine) and
+// (b) cs_sr_direct_luma (float-consistent HR solve, no LR stage), from
+// zeros and from an AVIR-demosaic init. Prints PSNR/time for the
+// integration decision; asserts only pipeline integrity (finite, sane).
+void test_sr_direct() {
+    cv::Mat truth_bgr = make_test_image(80, 80);
+    cv::Mat truth_gray;
+    cv::cvtColor(truth_bgr, truth_gray, cv::COLOR_BGR2GRAY);
+    cv::Mat truth_f;
+    truth_gray.convertTo(truth_f, CV_32F, 1.0 / 255.0);
+    cv::Mat lr;
+    cv::resize(truth_f, lr, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+    // random 50% sample positions (fixed seed: deterministic fixture)
+    std::mt19937 rng(1234);
+    std::vector<int> rx, ry;
+    std::vector<float> b;
+    for (int r = 0; r < 40; ++r) {
+        for (int c = 0; c < 40; ++c) {
+            if ((rng() % 100) < 50) {
+                rx.push_back(r); ry.push_back(c);
+                b.push_back(lr.at<float>(r, c));
+            }
+        }
+    }
+    const int m = (int)b.size();
+    check(m > 400, "sr-direct: fixture holds enough samples");
+    // (a) two-stage through the production wrapper (biased LR like a solver).
+    // NOTE: packed is (N x 1) to mirror the container convention (header
+    // pixels then body rows); at<>() flat-indexes continuous mats either
+    // way, but Nx1 matches what cs_extract_channel_measurements reads.
+    cv::Mat lr8, solved_bgr, packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+    lr.convertTo(lr8, CV_8U, 255.0);
+    cv::cvtColor(lr8, lr8, cv::COLOR_GRAY2BGR);
+    cv::add(lr8, cv::Scalar(8, 8, 8), solved_bgr);
+    for (int k = 0; k < m; ++k) {
+        packed.at<cv::Vec3b>(CS_HEADER_PIXELS + k) = solved_bgr.at<cv::Vec3b>(rx[k], ry[k]);
+    }
+    cv::Mat two;
+    const double t0 = (double)cv::getTickCount();
+    cs_sr_upscale_tile_2x(solved_bgr, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, two);
+    const double t_two = ((double)cv::getTickCount() - t0) / cv::getTickFrequency();
+    double p_two = -1.0;
+    if (!two.empty()) {
+        cv::Mat two_g;
+        cv::cvtColor(two, two_g, cv::COLOR_BGR2GRAY);
+        p_two = cs_quality::psnr(truth_gray, two_g);
+    }
+    // (b) direct HR solves: zeros init, then demosaic init + anchor
+    std::vector<float> hr0(80 * 80, 0.0f), hr1(80 * 80, 0.0f);
+    const double t1 = (double)cv::getTickCount();
+    cs_sr_direct_luma(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0.0f,
+        8, 2, 0, 2.0f, 0, 0.0f, hr0.data());
+    const double t_d0 = ((double)cv::getTickCount() - t1) / cv::getTickFrequency();
+    const double t2 = (double)cv::getTickCount();
+    cs_sr_direct_luma(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0.0f,
+        8, 2, 0, 2.0f, 1, 0.25f, hr1.data());
+    const double t_d1 = ((double)cv::getTickCount() - t2) / cv::getTickFrequency();
+    cv::Mat m0(80, 80, CV_32F, hr0.data()), m1(80, 80, CV_32F, hr1.data());
+    cv::Mat m08, m18;
+    m0.convertTo(m08, CV_8U, 255.0);
+    m1.convertTo(m18, CV_8U, 255.0);
+    const double p_d0 = cs_quality::psnr(truth_gray, m08);
+    const double p_d1 = cs_quality::psnr(truth_gray, m18);
+    std::printf("       sr-direct: two-stage %.2f dB / %.3fs | zero-init %.2f dB / %.3fs | demosaic %.2f dB / %.3fs\n",
+        p_two, t_two, p_d0, t_d0, p_d1, t_d1);
+    check(std::isfinite(p_d0) && std::isfinite(p_d1), "sr-direct: both inits finite");
+    check(p_d0 > 8.0 && p_d1 > 8.0, "sr-direct: both inits sane");
+    // (c) zeros init, 4x iteration budget: can the direct solve reach the
+    // two-stage quality at all, and at what cost?
+    std::vector<float> hrC(80 * 80, 0.0f);
+    const double t3 = (double)cv::getTickCount();
+    cs_sr_direct_luma(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0.0f,
+        8, 2, 128, 2.0f, 0, 0.0f, hrC.data());
+    const double t_dC = ((double)cv::getTickCount() - t3) / cv::getTickFrequency();
+    cv::Mat mC(80, 80, CV_32F, hrC.data()), mC8;
+    mC.convertTo(mC8, CV_8U, 255.0);
+    const double p_dC = cs_quality::psnr(truth_gray, mC8);
+    // (d) cheap LR warm start in FLOAT (no 8U quantize): 1-pass LR FISTA on
+    // B, AVIR-upscaled, then the standard HR solve + anchor. Isolates the
+    // 8-bit quantization hypothesis from warm-start economics.
+    double p_dD = -1.0, t_dD = 0.0;
+    {
+        const double t4 = (double)cv::getTickCount();
+        cv::Mat lr_ref = cv::Mat::zeros(40, 40, CV_32F);
+        cv::dct(lr_ref, lr_ref, 0);
+        lr_ref /= 10.0f;
+        cv::Mat dummy;
+        reconstruct_color_channel_fista(packed, 0, 0.0375f, 40, 40, rx, ry,
+            2, lr_ref, false, dummy, 0.0f, 1, 8, CS_BASIS_DCT, 2.0f);
+        cv::Mat lr_f;
+        lr_ref.convertTo(lr_f, CV_32F, 1.0 / 255.0);
+        cv::Mat hr_warm;
+        cv::resize(lr_f, hr_warm, cv::Size(80, 80), 0, 0, cv::INTER_LINEAR);
+        if (!hr_warm.isContinuous()) hr_warm = hr_warm.clone();
+        std::vector<float> hrD(80 * 80, 0.0f);
+        cs_sr_direct_luma(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0.0f,
+            8, 2, 0, 2.0f, 2, 0.25f, hrD.data(), (const float*)hr_warm.data);
+        t_dD = ((double)cv::getTickCount() - t4) / cv::getTickFrequency();
+        cv::Mat mD(80, 80, CV_32F, hrD.data()), mD8;
+        mD.convertTo(mD8, CV_8U, 255.0);
+        p_dD = cs_quality::psnr(truth_gray, mD8);
+    }
+    std::printf("       sr-direct: 4x-budget %.2f dB / %.3fs | cheapLR-float %.2f dB / %.3fs\n",
+        p_dC, t_dC, p_dD, t_dD);
+    check(std::isfinite(p_dC) && std::isfinite(p_dD), "sr-direct: extended configs finite");
+    // (e) bias sensitivity: identical 4x-budget solve on uniformly biased
+    // samples (+0.031, like the BGR-packed driver input). A convex solver
+    // cannot diverge from a DC shift; if this collapses, the instability is
+    // b-dependent and the Lipschitz bound (not the driver) is at fault.
+    {
+        std::vector<float> bb = b;
+        for (float& v : bb) v += 0.031f;
+        std::vector<float> hrE(80 * 80, 0.0f);
+        cs_sr_direct_luma(bb.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0.0f,
+            8, 2, 128, 2.0f, 0, 0.0f, hrE.data());
+        cv::Mat mE(80, 80, CV_32F, hrE.data()), mE8;
+        mE.convertTo(mE8, CV_8U, 255.0);
+        const double p_dE = cs_quality::psnr(truth_gray, mE8);
+        cv::Scalar mnE = cv::mean(mE8);
+        std::printf("       sr-direct: biased-4x %.2f dB (mean %.1f)\n", p_dE, mnE[0]);
+        check(std::isfinite(p_dE), "sr-direct: biased config finite");
+    }
+    // (f) cascade init + STANDARD budget: the premium-killer test. If this
+    // matches zeros+4x above, the blocker was cold-start theory (init
+    // quality), not iteration count — and production could drop the 4x tax.
+    {
+        std::vector<float> hrF(80 * 80, 0.0f), hrF2(80 * 80, 0.0f);
+        cs_sr_cascade_init(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0, 2.0f, hrF.data());
+        cs_sr_cascade_init(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0, 2.0f, hrF2.data());
+        check(hrF == hrF2, "sr-direct: cascade deterministic");
+        bool finite = true;
+        for (float v : hrF) if (!std::isfinite(v)) finite = false;
+        check(finite, "sr-direct: cascade output finite");
+        std::vector<float> hrG(80 * 80, 0.0f);
+        const double t5 = (double)cv::getTickCount();
+        cs_sr_direct_luma(b.data(), rx.data(), ry.data(), m, 40, 40, 0.018f, 0.0f,
+            8, 2, 0, 2.0f, 2, 0.25f, hrG.data(), hrF.data());
+        const double t_dF = ((double)cv::getTickCount() - t5) / cv::getTickFrequency();
+        cv::Mat mF(80, 80, CV_32F, hrG.data()), mF8;
+        mF.convertTo(mF8, CV_8U, 255.0);
+        const double p_dF = cs_quality::psnr(truth_gray, mF8);
+        std::printf("       sr-direct: cascade+1x %.2f dB / %.3fs\n", p_dF, t_dF);
+        check(std::isfinite(p_dF) && p_dF > 8.0, "sr-direct: cascade config sane");
+    }
+}
+
+void test_coupled_dict() {
+    // OMP single-atom recovery: y = 3*e2 + tiny fixed noise over a dict
+    // whose first 4 atoms are unit axes. Greedy correlation must pick 2.
+    {
+        const int dim = 8, atoms = 8;
+        std::vector<float> D((size_t)atoms * dim, 0.0f);
+        for (int a = 0; a < 4; ++a) D[(size_t)a * dim + a] = 1.0f;
+        std::mt19937 rng(7);
+        std::normal_distribution<float> gauss(0.0f, 1.0f);
+        for (int a = 4; a < atoms; ++a) {
+            double nrm = 0.0;
+            for (int p = 0; p < dim; ++p) {
+                D[(size_t)a * dim + p] = gauss(rng);
+                nrm += (double)D[(size_t)a * dim + p] * D[(size_t)a * dim + p];
+            }
+            nrm = std::sqrt(nrm);
+            for (int p = 0; p < dim; ++p) D[(size_t)a * dim + p] = (float)(D[(size_t)a * dim + p] / nrm);
+        }
+        float y[8] = { 0.01f, -0.01f, 3.0f, 0.01f, -0.01f, 0.01f, -0.01f, 0.01f };
+        float code[8] = {};
+        cs_omp_encode_vec(y, D.data(), dim, atoms, 1, code);
+        check(code[2] != 0.0f, "dict omp: dominant atom selected");
+        int nnz = 0;
+        for (int a = 0; a < atoms; ++a) if (code[a] != 0.0f) ++nnz;
+        check(nnz == 1 && std::fabs(code[2] - 3.0f) < 0.1f, "dict omp: exact support and amplitude");
+    }
+    // CSD2 save/load roundtrip preserves bits
+    {
+        cs_coupled_dict d;
+        d.atoms = 4; d.plr = 8; d.phr = 16; d.feat = 256;
+        d.Dh.assign(4 * 256, 0.5f);
+        d.Dl.assign(4 * 256, 0.25f);
+        const std::string path = ".cs_test_dict.csd2";
+        check(cs_save_coupled_dictionary(path, d), "dict csd2: save");
+        cs_coupled_dict back;
+        check(cs_load_coupled_dictionary(path, back), "dict csd2: load");
+        check(back.atoms == 4 && back.plr == 8 && back.phr == 16 && back.feat == 256 &&
+            back.Dh == d.Dh && back.Dl == d.Dl, "dict csd2: roundtrip identical");
+        cs_coupled_dict bad;
+        check(!cs_load_coupled_dictionary(".cs_test_nope.csd2", bad), "dict csd2: missing file rejected");
+        check(cs_sr_dict_cached(".cs_test_nope.csd2") == nullptr, "dict cache: missing file -> null");
+        std::remove(path.c_str());
+    }
+    // micro joint training: 2 tiny images, 16 atoms, 2 iters (seconds)
+    cs_coupled_dict micro;
+    {
+        cv::Mat a = make_test_image(128, 128);
+        cv::Mat b;
+        cv::flip(a, b, 1);
+        check(cs_train_coupled_dictionary({ a, b }, 16, 2, 400, 8, micro), "dict train: micro joint training succeeds");
+        check(micro.atoms == 16 && (int)micro.Dh.size() == 16 * 256 && (int)micro.Dl.size() == 16 * 256,
+            "dict train: shapes");
+        double dl_norm0 = 0.0;
+        for (int q = 0; q < 256; ++q) dl_norm0 += (double)micro.Dl[q] * micro.Dl[q];
+        check(std::fabs(std::sqrt(dl_norm0) - 1.0) < 1e-4, "dict train: Dl atoms unit norm");
+        bool finite = true;
+        for (float v : micro.Dh) if (!std::isfinite(v)) finite = false;
+        check(finite, "dict train: Dh finite");
+    }
+    // dict SR on a biased tile: geometry, determinism, AVIR fallback
+    {
+        const cv::Mat original = make_test_image(80, 80);
+        cv::Mat measured, solved;
+        cv::resize(original, measured, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+        cv::add(measured, cv::Scalar(8, 8, 8), solved);
+        cv::Mat baseline, out1, out2, fb;
+        cs_upscale_2x_avir(solved, baseline);
+        cs_sr_upscale_dict_2x(solved, &micro, out1);
+        cs_sr_upscale_dict_2x(solved, &micro, out2);
+        check(out1.size() == original.size() && out1.type() == CV_8UC3,
+            "dict sr: 2x geometry and color type");
+        check(cv::norm(out1, out2, cv::NORM_INF) == 0, "dict sr: deterministic");
+        cs_sr_upscale_dict_2x(solved, nullptr, fb);
+        check(cv::norm(fb, baseline, cv::NORM_INF) == 0, "dict sr: null dict falls back to AVIR");
+    }
+}
+
+// Model asset for the DnCNN tests (mirrors the opt-in photo pattern):
+// $CS_TEST_DNCNN, dncnn_color.onnx next to the test binary, or the
+// vendored models/dncnn/dncnn_color.onnx.
+static std::string cs_test_dncnn_model() {
+    if (const char* env = std::getenv("CS_TEST_DNCNN")) return env;
+    const char* cands[] = { "dncnn_color.onnx", "models/dncnn/dncnn_color.onnx" };
+    for (auto c : cands) {
+        std::ifstream f(c, std::ios::binary);
+        if (f.good()) return c;
+    }
+    return "";
+}
+
+void test_dncnn_red() {
+    check(!cs_dncnn_available(".cs_test_nope.onnx"), "dncnn: missing model rejected");
+    cv::Mat probe, out;
+    check(!cs_dncnn_denoise_bgr(probe, out, ".cs_test_nope.onnx"), "dncnn: missing model run fails");
+    check(!cs_dncnn_denoise_bgr(cv::Mat(), out, "whatever"), "dncnn: empty input rejected");
+    const std::string model = cs_test_dncnn_model();
+    if (model.empty()) {
+        std::printf("[SKIP] dncnn: no model found (set CS_TEST_DNCNN=<path>)\n");
+        return;
+    }
+    check(cs_dncnn_available(model), "dncnn: model loads");
+    // residual convention probe: a clean image must come back nearly
+    // unchanged (small residual), or the [0,1]/residual assumption is wrong
+    cv::Mat clean = make_test_image(128, 128);
+    cv::Mat dn;
+    check(cs_dncnn_denoise_bgr(clean, dn, model), "dncnn: denoise runs");
+    if (dn.empty()) {
+        check(false, "dncnn: output readable");
+        return;
+    }
+    check(dn.size() == clean.size() && dn.type() == CV_8UC3, "dncnn: geometry preserved");
+    const double stay = cs_quality::psnr(clean, dn);
+    std::printf("       dncnn clean-in PSNR: %.2f dB\n", stay);
+    check(stay > 28.0, "dncnn: near-identity on clean input");
+    // noisy image must move toward clean (validates the denoiser does work
+    // in this harness, not just pass through)
+    cv::Mat cleanf, nse, noisyf, noisy, dn_noisy;
+    clean.convertTo(cleanf, CV_32F);
+    nse.create(clean.size(), CV_32FC3);
+    cv::randn(nse, 0.0, 25.0);
+    noisyf = cleanf + nse;
+    noisyf.convertTo(noisy, CV_8U);
+    const double p_noisy = cs_quality::psnr(clean, noisy);
+    check(cs_dncnn_denoise_bgr(noisy, dn_noisy, model), "dncnn: noisy denoise runs");
+    const double p_dn = cs_quality::psnr(clean, dn_noisy);
+    std::printf("       dncnn noisy %.2f dB -> denoised %.2f dB\n", p_noisy, p_dn);
+    check(p_dn > p_noisy + 2.0, "dncnn: noisy input improves >= 2 dB");
+    cv::Mat dn2;
+    cs_dncnn_denoise_bgr(clean, dn2, model);
+    check(cv::norm(dn, dn2, cv::NORM_INF) == 0, "dncnn: deterministic");
+    // RED integration: dncnn branch of the cs-sr tile solve completes sanely
+    {
+        cv::Mat original = make_test_image(80, 80);
+        cv::Mat measured, solved;
+        cv::resize(original, measured, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+        cv::add(measured, cv::Scalar(8, 8, 8), solved);
+        const int m = measured.rows * measured.cols;
+        cv::Mat packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+        std::vector<int> rx, ry;
+        for (int row = 0; row < measured.rows; ++row)
+            for (int col = 0; col < measured.cols; ++col) {
+                rx.push_back(row); ry.push_back(col);
+                packed.at<cv::Vec3b>(CS_HEADER_PIXELS + row * measured.cols + col) =
+                    measured.at<cv::Vec3b>(row, col);
+            }
+        cv::Mat refined;
+        cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+            8, 2, 0, CS_BASIS_DCT, 2.0f, refined, 0.5f, "dncnn", model);
+        check(refined.size() == original.size() && refined.type() == CV_8UC3,
+            "dncnn red: 2x geometry and color type");
+        if (!refined.empty()) {
+            cv::Mat rl;
+            cv::resize(refined, rl, measured.size(), 0, 0, cv::INTER_AREA);
+            check(std::isfinite(cv::norm(rl, measured, cv::NORM_L2)), "dncnn red: residual finite");
+        }
+    }
+}
+
 void test_hf_focus_roundtrip() {
     const std::string input_path = ".cs_test_hf_input.png";
     const std::string output_path = ".cs_test_hf_output.png";
@@ -1184,26 +1737,38 @@ void test_hf_focus_roundtrip() {
     cv::Mat original = make_test_image(320, 240);
     check(cv::imwrite(input_path, original), "hf-focus: write source image");
 
-    for (bool ycc420 : {false, true}) {
+    // 0 = BGR HF (mode 5), 1 = 4:2:0 HF (mode 6), 2 = 4:2:2 HF (mode 8)
+    for (int splitmode : {0, 1, 2}) {
+        const bool ycc420 = (splitmode == 1);
+        const bool ycc422 = (splitmode == 2);
+        const char* tag = (splitmode == 0) ? "hf-focus" :
+            (splitmode == 1) ? "hf-focus ycc420" : "hf-focus ycc422";
         cv::Mat encrypted;
         const int encrypt_rc = encrypt_image::encrypt_image_tiled(
             input_path, "", password, 0.25f, 32, &encrypted, false, 32, 0.5f,
-            false, false, false, 0.05f, "", 0.5f, 0.0f, ycc420, true);
-        check(encrypt_rc == 0, ycc420 ? "hf-focus ycc: encrypt" : "hf-focus: encrypt");
+            false, false, false, 0.05f, "", 0.5f, 0.0f, ycc420, true,
+            8, 0, 0, ycc422);
+        check(encrypt_rc == 0, (std::string(tag) + ": encrypt").c_str());
         if (encrypt_rc != 0) continue;
 
         decrypt_image container(encrypted, password);
-        const int expected_mode = ycc420 ? CS_MODE_YCC420_HF : CS_MODE_HF_FOCUS;
+        const int expected_mode = (splitmode == 0) ? CS_MODE_HF_FOCUS :
+            (splitmode == 1) ? CS_MODE_YCC420_HF : CS_MODE_YCC422_HF;
         check(container.get_sampling_mode() == expected_mode,
-              ycc420 ? "hf-focus ycc: mode 6 header" : "hf-focus: mode 5 header");
+            (std::string(tag) + ": mode header").c_str());
         CSencryption::params = AUTO_PARAM;
         const int decrypt_rc = decrypt_image::decrypt_image_tiled(
             encrypted, output_path, password, 1, 24, 5, 4, 0.01f, false);
-        check(decrypt_rc == 0,
-              ycc420 ? "hf-focus ycc: decrypt" : "hf-focus: decrypt");
+        check(decrypt_rc == 0, (std::string(tag) + ": decrypt").c_str());
         const cv::Mat decoded = cv::imread(output_path, cv::IMREAD_COLOR);
-        check(!decoded.empty(),
-              ycc420 ? "hf-focus ycc: output readable" : "hf-focus: output readable");
+        check(!decoded.empty(), (std::string(tag) + ": output readable").c_str());
+        if (!decoded.empty()) {
+            cv::Mat sized;
+            cv::resize(decoded, sized, original.size());
+            const double p = cs_quality::psnr(original, sized);
+            std::printf("       %s PSNR (ratio 0.25): %.2f dB\n", tag, p);
+            check(p > 8.0, (std::string(tag) + ": PSNR sane").c_str());
+        }
         std::remove(output_path.c_str());
     }
 
@@ -1534,12 +2099,18 @@ int main() {
     test_wavelet_basis();
     test_adaptive_counts();
     test_adaptive_roundtrip();
+    test_spectral_lod();
     test_lod_full_roundtrip();
     test_ycc420_roundtrip();
+    test_ycc422_roundtrip();
     test_twopass_roundtrip();
     test_regions_roundtrip();
     test_photo_roundtrip();
     test_photo_upscaler();
+    test_cs_super_resolution();
+    test_sr_direct();
+    test_coupled_dict();
+    test_dncnn_red();
     test_hf_focus_roundtrip();
     test_sample_bits();
     test_per_tile_coef();

@@ -353,23 +353,24 @@ void CSencryption::returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int
     shuffle(ri_y, shuffle_seed);
 }
 
-// YCC 4:2:0 index generation (mode 3): m_luma full-res luma positions from
-// the key plus m_chroma coarse-grid positions per chroma plane from tagged
-// key copies. Fills ri_x/ri_y (luma) and ri_cx1/ri_cy1 (Cr), ri_cx2/ri_cy2
-// (Cb); m_chroma derives deterministically via cs_ycc420_chroma_count.
-void CSencryption::returnYcc420Indices(int xm, int ym, int m_luma, const uint8_t key[32]) {
+// YCC 4:2:0 index generation (mode 3; mode 7 = 4:2:2): m_luma full-res luma
+// positions from the key plus m_chroma coarse-grid positions per chroma
+// plane from tagged key copies. Fills ri_x/ri_y (luma) and ri_cx1/ri_cy1
+// (Cr), ri_cx2/ri_cy2 (Cb); m_chroma derives deterministically via
+// cs_chroma_count for the given mode.
+void CSencryption::returnYcc420Indices(int xm, int ym, int m_luma, const uint8_t key[32], int mode) {
     ri_x.resize((size_t)m_luma);
     ri_y.resize((size_t)m_luma);
     returnRandomIndices(ri_x, ri_y, xm, ym, m_luma, key);
-    returnYcc420ChromaIndices(xm, ym, m_luma, key);
+    returnYcc420ChromaIndices(xm, ym, m_luma, key, mode);
 }
 
 // Coarse-grid chroma draws with domain-separated keys (Cr 0xA5, Cb 0x5A).
-// m_chroma derives deterministically via cs_ycc420_chroma_count.
-void CSencryption::returnYcc420ChromaIndices(int xm, int ym, int m_luma, const uint8_t key[32]) {
+// m_chroma derives deterministically via cs_chroma_count for the mode.
+void CSencryption::returnYcc420ChromaIndices(int xm, int ym, int m_luma, const uint8_t key[32], int mode) {
     int crows, ccols;
-    cs_ycc420_chroma_dims(xm, ym, crows, ccols);
-    m_chroma = cs_ycc420_chroma_count(m_luma, xm, ym);
+    cs_chroma_dims(mode, xm, ym, crows, ccols);
+    m_chroma = cs_chroma_count(mode, m_luma, xm, ym);
 
     ri_cx1.resize((size_t)m_chroma);
     ri_cy1.resize((size_t)m_chroma);

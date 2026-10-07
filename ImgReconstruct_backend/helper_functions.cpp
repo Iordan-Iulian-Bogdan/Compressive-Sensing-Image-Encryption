@@ -1,10 +1,13 @@
-﻿#include "helper_functions.hpp"
+#include "helper_functions.hpp"
 #include "cs_gpu.h"
 #include "crypto_utils.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-
+#include <opencv2/photo.hpp>
+#ifdef _WIN32
+#include <onnxruntime_cxx_api.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +15,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -836,6 +841,754 @@ void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const floa
             dct(plane, plane, cv::DCT_INVERSE);
             plane = plane * 255.0f;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CS super-resolution 2x refinement (DCT + TV, CPU)
+// ---------------------------------------------------------------------------
+// Replaces the AVIR 2x interpolation of a solved LR tile with a small sparse
+// recovery: the HR tile (2H x 2W DCT coefficients) is solved so that its
+// 2x2-box downsample matches the original LR random samples, regularized by
+// reweighted-L1 on the DCT correction + optional smoothed TV on the HR grid.
+// The AVIR upscale of the solved LR tile is the anchor: LR measurements
+// cannot determine the missing HR frequencies, so preserve its nullspace
+// estimate rather than shrinking the whole HR image toward zero.
+// Forward operator A = P*D*IDCT with D = 2x2 average (||D|| = 0.5, so the
+// data-term Lipschitz is 0.25*lip, not lip): the fixed step 1/L stays exact
+// at tv = 0 and backtracking covers tv > 0 — same policy as
+// cs_fista_core_single. DCT-only; other bases fall back to AVIR.
+
+bool cs_is_superres_backend(const std::string& backend) {
+    std::string s;
+    s.reserve(backend.size());
+    for (char c : backend) {
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        s.push_back(c);
+    }
+    return s == "cs" || s == "cs-sr" || s == "cssr" || s == "cs_sr";
+}
+
+// 2x2-box downsample HR (Hr x Wc) -> LR (Lr x Lc), Hr = 2*Lr, Wc = 2*Lc.
+static void cs_sr_downsample(const float* hr, float* lr, int Lr, int Lc) {
+    const int Wc = Lc * 2;
+    for (int i = 0; i < Lr; ++i) {
+        for (int j = 0; j < Lc; ++j) {
+            const int h0 = (i * 2) * Wc + (j * 2);
+            lr[i * Lc + j] = 0.25f * (hr[h0] + hr[h0 + 1] + hr[h0 + Wc] + hr[h0 + Wc + 1]);
+        }
+    }
+}
+
+// Gradient of the smooth part in the HR coefficient domain:
+//   g = 2*IDCT^T(D^T(scatter(D(IDCT(y)) - b))) [+ tv*IDCT^T(tvgrad(IDCT(y)))].
+// pix_hr/up_hr are n_hr scratch, lr_buf/sc_lr are n_lr scratch. Returns the
+// smooth-objective value f(y) = ||Ax-b||^2 (+ tv*TV) for backtracking.
+static float cs_sr_fista_grad(const float* y, float* pix_hr, float* lr_buf, float* sc_lr,
+    float* up_hr, float* g, const float* b, const float* anchor, float anchor_weight,
+    const int* rix, const int* riy, int m, int Hr, int Wc, int Lr, int Lc, float tv_lambda)
+{
+    const int n_hr = Hr * Wc;
+    const int n_lr = Lr * Lc;
+    std::memcpy(pix_hr, y, sizeof(float) * (size_t)n_hr);
+    cv::Mat P(Hr, Wc, CV_32F, pix_hr);
+    cv::dct(P, P, cv::DCT_INVERSE);
+    cs_sr_downsample(pix_hr, lr_buf, Lr, Lc);
+    std::memset(sc_lr, 0, sizeof(float) * (size_t)n_lr);
+    float fx = 0.0f;
+    for (int k = 0; k < m; ++k) {
+        const int idx = rix[k] * Lc + riy[k];
+        if ((unsigned)idx >= (unsigned)n_lr) continue;
+        const float diff = lr_buf[idx] - b[k];
+        sc_lr[idx] = diff;
+        fx += diff * diff;
+    }
+    // Adjoint of the 2x2 average: replicate the LR residual into each of
+    // the 4 HR children, scaled by d(avg)/d(child) = 0.25.
+    for (int i = 0; i < Lr; ++i) {
+        for (int j = 0; j < Lc; ++j) {
+            const float v = 0.25f * sc_lr[i * Lc + j];
+            const int h0 = (i * 2) * Wc + (j * 2);
+            up_hr[h0] = v; up_hr[h0 + 1] = v;
+            up_hr[h0 + Wc] = v; up_hr[h0 + Wc + 1] = v;
+        }
+    }
+    cv::Mat G(Hr, Wc, CV_32F, up_hr);
+    cv::dct(G, G, 0);
+    for (int i = 0; i < n_hr; ++i) g[i] = 2.0f * up_hr[i];
+
+    if (tv_lambda > 0.0f) {
+        float* tvgrad = up_hr; // data grad already folded into g
+        const float phi = cs_tv_grad_phi(pix_hr, tvgrad, Hr, Wc);
+        cv::Mat T(Hr, Wc, CV_32F, tvgrad);
+        cv::dct(T, T, 0);
+        for (int i = 0; i < n_hr; ++i) g[i] += tv_lambda * tvgrad[i];
+        fx += tv_lambda * phi;
+    }
+    for (int i = 0; i < n_hr; ++i) {
+        const float diff = y[i] - anchor[i];
+        g[i] += 2.0f * anchor_weight * diff;
+        fx += anchor_weight * diff * diff;
+    }
+    return fx;
+}
+
+// Smooth-objective value f(xc) for a backtracking candidate.
+static float cs_sr_smooth_fx(const float* xc, float* pix_hr, float* lr_buf,
+    const float* b, const float* anchor, float anchor_weight,
+    const int* rix, const int* riy, int m,
+    int Hr, int Wc, int Lr, int Lc, float tv_lambda, float* tv_scratch)
+{
+    const int n_hr = Hr * Wc;
+    const int n_lr = Lr * Lc;
+    std::memcpy(pix_hr, xc, sizeof(float) * (size_t)n_hr);
+    cv::Mat P(Hr, Wc, CV_32F, pix_hr);
+    cv::dct(P, P, cv::DCT_INVERSE);
+    cs_sr_downsample(pix_hr, lr_buf, Lr, Lc);
+    float fx = 0.0f;
+    for (int k = 0; k < m; ++k) {
+        const int idx = rix[k] * Lc + riy[k];
+        if ((unsigned)idx >= (unsigned)n_lr) continue;
+        const float diff = lr_buf[idx] - b[k];
+        fx += diff * diff;
+    }
+    if (tv_lambda > 0.0f) {
+        fx += tv_lambda * cs_tv_grad_phi(pix_hr, tv_scratch, Hr, Wc);
+    }
+    for (int i = 0; i < n_hr; ++i) {
+        const float diff = xc[i] - anchor[i];
+        fx += anchor_weight * diff * diff;
+    }
+    return fx;
+}
+
+// RED-lite proximal step (Romano et al., "Regularization by Denoising"):
+// x <- x - red*(x - D(x)) in the pixel domain, with D = fastNlMeans.
+// Applied once per outer FISTA pass (not per inner iteration: a full
+// denoiser call per gradient step is infeasible on CPU at auto single-tile
+// 12MP geometries; per-pass application is the standard practical PnP/RED
+// cadence for expensive denoisers). red in [0,1], 0 = no-op. pix is CV_32F
+// single-channel, full scale; x stays in the coefficient domain for the
+// caller (synth/analy round-trip around the blend).
+// NOTE: D is swappable — BM3D (xphoto) fits this exact slot but costs
+// minutes per call on CPU at these sizes, so NLM (photo, already linked)
+// is the CPU-feasible choice.
+static void cs_sr_red_proximal(float* x, int Hr, int Wc, float red)
+{
+    if (!(red > 0.0f)) return;
+    if (red > 1.0f) red = 1.0f;
+    cv::Mat pix(Hr, Wc, CV_32F, x);
+    cv::dct(pix, pix, cv::DCT_INVERSE);
+    cv::Mat u8, dn, dnf;
+    // full scale here is [0,1]: expand to 8U for the denoiser (a bare
+    // convertTo would quantize everything to 0/1 and darken the tile).
+    pix.convertTo(u8, CV_8U, 255.0);
+    cv::fastNlMeansDenoising(u8, dn, 5.0f, 7, 15);
+    dn.convertTo(dnf, CV_32F, 1.0 / 255.0);
+    pix -= red * (pix - dnf);
+    cv::dct(pix, pix, 0);
+}
+
+#ifdef _WIN32
+// In-process DnCNN color denoiser (repo-vendored ONNX model) for the dncnn
+// RED branch. Sessions are cached per path (load once, warn once); Run is
+// thread-safe so fused tile workers may share one session. Model contract
+// (verified by unit test, not assumed): RGB planar [0,1] in, CLEAN image
+// out (not residual) — a clean input comes back nearly unchanged, so the
+// first implementation's residual assumption failed loudly here and was
+// flipped.
+struct CsDncnnEntry {
+    Ort::Env env{ ORT_LOGGING_LEVEL_WARNING, "cs-dncnn" };
+    std::unique_ptr<Ort::Session> session;
+    std::string in_name, out_name;
+};
+static std::mutex g_dncnn_mutex;
+static std::map<std::string, std::unique_ptr<CsDncnnEntry>> g_dncnn_cache;
+static std::map<std::string, bool> g_dncnn_failed;
+
+static CsDncnnEntry* cs_dncnn_entry(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_dncnn_mutex);
+    auto it = g_dncnn_cache.find(path);
+    if (it != g_dncnn_cache.end()) return it->second.get();
+    if (g_dncnn_failed.find(path) != g_dncnn_failed.end()) return nullptr;
+    try {
+        auto e = std::make_unique<CsDncnnEntry>();
+        Ort::SessionOptions opt;
+        opt.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        const std::wstring wpath(path.begin(), path.end());
+        e->session = std::make_unique<Ort::Session>(e->env, wpath.c_str(), opt);
+        Ort::AllocatorWithDefaultOptions alloc;
+        e->in_name = e->session->GetInputNameAllocated(0, alloc).get();
+        e->out_name = e->session->GetOutputNameAllocated(0, alloc).get();
+        auto ti = e->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+        if (ti.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+            ti.GetDimensionsCount() != 4) {
+            throw Ort::Exception("dncnn: expected float NCHW input", ORT_INVALID_ARGUMENT);
+        }
+        auto r = g_dncnn_cache.emplace(path, std::move(e));
+        return r.first->second.get();
+    }
+    catch (const Ort::Exception& ex) {
+        std::fprintf(stderr, "Warning: DnCNN model '%s' failed to load: %s\n",
+            path.c_str(), ex.what());
+        g_dncnn_failed[path] = true;
+        return nullptr;
+    }
+}
+
+static bool cs_dncnn_run_tile(CsDncnnEntry* e, const float* rgb01, float* clean,
+    int h, int w)
+{
+    int64_t shape[4] = { 1, 3, h, w };
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value in = Ort::Value::CreateTensor<float>(mem,
+        const_cast<float*>(rgb01), (size_t)3 * h * w, shape, 4);
+    const char* inn[1] = { e->in_name.c_str() };
+    const char* outn[1] = { e->out_name.c_str() };
+    std::vector<Ort::Value> out;
+    try {
+        out = e->session->Run(Ort::RunOptions{ nullptr }, inn, &in, 1, outn, 1);
+    }
+    catch (const Ort::Exception& ex) {
+        std::fprintf(stderr, "Warning: DnCNN run failed: %s\n", ex.what());
+        return false;
+    }
+    if (out.size() != 1 || !out[0].IsTensor()) return false;
+    const std::vector<int64_t> dims = out[0].GetTensorTypeAndShapeInfo().GetShape();
+    if (dims.size() != 4 || dims[0] != 1 || dims[1] != 3 || dims[2] != h || dims[3] != w) return false;
+    const float* src = out[0].GetTensorData<float>();
+    std::memcpy(clean, src, sizeof(float) * (size_t)3 * h * w);
+    return true;
+}
+
+bool cs_dncnn_available(const std::string& model_path) {
+    if (model_path.empty()) return false;
+    return cs_dncnn_entry(model_path) != nullptr;
+}
+
+bool cs_dncnn_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path)
+{
+    dst_bgr.release();
+    if (src_bgr.empty() || src_bgr.type() != CV_8UC3) return false;
+    CsDncnnEntry* e = cs_dncnn_entry(model_path);
+    if (!e) return false;
+    const int H = src_bgr.rows, W = src_bgr.cols;
+    cv::Mat rgb;
+    cv::cvtColor(src_bgr, rgb, cv::COLOR_BGR2RGB);
+    std::vector<cv::Mat> chs;
+    cv::split(rgb, chs);
+    // tiled runner: 512px tiles, 48px feathered overlap (activation memory
+    // of a 20-layer 64ch net is ~70MB per 512 tile; a 12MP single run
+    // would need gigabytes).
+    constexpr int T = 512, OV = 48;
+    std::vector<int> ys, xs;
+    for (int y = 0; y < H; y += T - OV) ys.push_back(y);
+    for (int x = 0; x < W; x += T - OV) xs.push_back(x);
+    if (ys.back() + T < H) ys.push_back(H - T);
+    if (xs.back() + T < W) xs.push_back(W - T);
+    cv::Mat acc(H, W, CV_32FC3, cv::Scalar(0, 0, 0));
+    cv::Mat weight(H, W, CV_32F, cv::Scalar(0));
+    std::vector<float> in, rs;
+    for (size_t t = 0; t < ys.size() * xs.size(); ++t) {
+        const int y0 = ys[t / xs.size()], x0 = xs[t % xs.size()];
+        const int th = (std::min)(T, H - y0), tw = (std::min)(T, W - x0);
+        in.assign((size_t)3 * th * tw, 0.0f);
+        rs.assign((size_t)3 * th * tw, 0.0f);
+        for (int c = 0; c < 3; ++c) {
+            float* dst = &in[(size_t)c * th * tw];
+            for (int r = 0; r < th; ++r) {
+                const uint8_t* srow = chs[(size_t)c].ptr<uint8_t>(y0 + r) + x0;
+                for (int k = 0; k < tw; ++k) dst[(size_t)r * tw + k] = srow[k] * (1.0f / 255.0f);
+            }
+        }
+        if (!cs_dncnn_run_tile(e, in.data(), rs.data(), th, tw)) return false;
+        for (int r = 0; r < th; ++r) {
+            const int gy = y0 + r;
+            cv::Vec3f* arow = acc.ptr<cv::Vec3f>(gy);
+            float* wrow = weight.ptr<float>(gy);
+            // linear feather over OV at interior tile borders; full weight
+            // where the tile touches the image edge (no neighbor there)
+            const int dt = (y0 == 0) ? OV : r;
+            const int db = (y0 + th == H) ? OV : th - 1 - r;
+            const float wy = (std::min)(1.0f, (std::min)(dt, db) / (float)OV);
+            for (int k = 0; k < tw; ++k) {
+                const int gx = x0 + k;
+                const int dl = (x0 == 0) ? OV : k;
+                const int dr = (x0 + tw == W) ? OV : tw - 1 - k;
+                const float wx = (std::min)(1.0f, (std::min)(dl, dr) / (float)OV);
+                const float wt = wx * wy;
+                const size_t o = (size_t)r * tw + k;
+                // clean-output convention: the model output IS the denoised
+                // estimate (convertTo saturates to [0,255] at the end).
+                const cv::Vec3f clean_rgb(
+                    rs[o],
+                    rs[(size_t)th * tw + o],
+                    rs[(size_t)2 * th * tw + o]);
+                arow[gx] += clean_rgb * wt;
+                wrow[gx] += wt;
+            }
+        }
+    }
+    cv::Mat clean_rgb(H, W, CV_32FC3);
+    for (int i = 0; i < H; ++i) {
+        const cv::Vec3f* arow = acc.ptr<cv::Vec3f>(i);
+        const float* wrow = weight.ptr<float>(i);
+        cv::Vec3f* crow = clean_rgb.ptr<cv::Vec3f>(i);
+        for (int j = 0; j < W; ++j) {
+            const float w = wrow[j] > 0.0f ? wrow[j] : 1.0f;
+            crow[j] = arow[j] / w;
+        }
+    }
+    cv::Mat clean_bgr;
+    cv::cvtColor(clean_rgb, clean_bgr, cv::COLOR_RGB2BGR);
+    clean_bgr.convertTo(dst_bgr, CV_8U, 255.0);
+    return true;
+}
+#else
+bool cs_dncnn_available(const std::string& model_path) {
+    (void)model_path;
+    return false;
+}
+bool cs_dncnn_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path)
+{
+    (void)src_bgr;
+    dst_bgr.release();
+    (void)model_path;
+    return false;
+}
+#endif
+
+// One weighted-L1 FISTA run over the HR coefficients (DCT-only). The composed
+// operator A = P*D*IDCT has ||A|| <= ||D|| = 0.5 (2x2 averaging is a
+// contraction by 2: ||D||_2 = 0.5), so the data-term Lipschitz is
+// 2*||A||^2 <= 0.25*lip (lip = 2 for the P*IDCT path) — NOT lip itself.
+// Using lip would step 4x too small and strand coefficient growth.
+static void cs_sr_core_single(float* x, const float* b, const float* anchor,
+    float anchor_weight, const int* rix, const int* riy, int m,
+    int Hr, int Wc, int Lr, int Lc, const float* w, float lambda, float tv_lambda, int iters,
+    const cs_fista_basis& bx,
+    std::vector<float>& y, std::vector<float>& x_prev,
+    std::vector<float>& grad, std::vector<float>& pix_hr,
+    std::vector<float>& lr_buf, std::vector<float>& sc_lr, std::vector<float>& up_hr)
+{
+    const int n_hr = Hr * Wc;
+    const bool bt = (tv_lambda > 0.0f);
+    // Data-term Lipschitz for P*D*IDCT: 2*||A||^2 <= 0.25*lip. TV keeps the
+    // same 8*tv curvature fold + backtracking policy as the LR core.
+    // (Always-on backtracking was trialed here after a white-output scare
+    // that turned out to be a white-input test fixture, not instability:
+    // biased samples solve fine at 32.47 dB. Kept off: the fixed step is
+    // exact-safe and ~40% cheaper per iteration.)
+    float L = 0.25f * bx.lip + 2.0f * anchor_weight + 8.0f * tv_lambda;
+    std::memcpy(y.data(), x, sizeof(float) * (size_t)n_hr);
+    std::memcpy(x_prev.data(), x, sizeof(float) * (size_t)n_hr);
+    std::vector<float> z((size_t)n_hr);
+    float* yy = y.data();
+    float t = 1.0f;
+    for (int k = 0; k < iters; ++k) {
+        const float fy = cs_sr_fista_grad(yy, pix_hr.data(), lr_buf.data(), sc_lr.data(),
+            up_hr.data(), grad.data(), b, anchor, anchor_weight,
+            rix, riy, m, Hr, Wc, Lr, Lc, tv_lambda);
+        float step = 1.0f / L;
+        if (bt) {
+            for (int trial = 0; ; ++trial) {
+                step = 1.0f / L;
+                const float base = lambda * step;
+                #pragma omp simd
+                for (int i = 0; i < n_hr; ++i) {
+                    const float v = yy[i] - step * grad[i] - anchor[i];
+                    const float thr = base * w[i] * bx.wscale[i];
+                    const float av = std::fabs(v);
+                    z[(size_t)i] = anchor[i] + ((av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f);
+                }
+                const float fz = cs_sr_smooth_fx(z.data(), pix_hr.data(), lr_buf.data(),
+                    b, anchor, anchor_weight, rix, riy, m, Hr, Wc, Lr, Lc, tv_lambda, up_hr.data());
+                double dot = 0.0, dz2 = 0.0;
+                for (int i = 0; i < n_hr; ++i) {
+                    const double dz = (double)z[(size_t)i] - yy[i];
+                    dot += (double)grad[i] * dz;
+                    dz2 += dz * dz;
+                }
+                const double Q = (double)fy + dot + 0.5 * (double)L * dz2;
+                if ((double)fz <= Q + 1e-7 * (1.0 + std::fabs((double)fy)) || trial >= 24) break;
+                L *= 2.0f;
+            }
+        } else {
+            const float base = lambda * step;
+            #pragma omp simd
+            for (int i = 0; i < n_hr; ++i) {
+                const float v = yy[i] - step * grad[i] - anchor[i];
+                const float thr = base * w[i] * bx.wscale[i];
+                const float av = std::fabs(v);
+                z[(size_t)i] = anchor[i] + ((av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f);
+            }
+        }
+        const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
+        const float mom = (t - 1.0f) / t_new;
+        #pragma omp simd
+        for (int i = 0; i < n_hr; ++i) yy[i] = z[(size_t)i] + mom * (z[(size_t)i] - x_prev[(size_t)i]);
+        std::memcpy(x_prev.data(), z.data(), sizeof(float) * (size_t)n_hr);
+        t = t_new;
+    }
+    std::memcpy(x, z.data(), sizeof(float) * (size_t)n_hr);
+}
+
+void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
+    cv::Mat& hr_out, float red, const std::string& red_denoiser, const std::string& dncnn_model)
+{
+    hr_out.release();
+    if (lr_tile.empty() || lr_tile.type() != CV_8UC3) return;
+    const int Lr = lr_tile.rows, Lc = lr_tile.cols;
+    if (Lr < 8 || Lc < 8) { cs_upscale_2x_avir(lr_tile, hr_out); return; }
+    if (basis != CS_BASIS_DCT || ri_x.size() != ri_y.size() || ri_x.empty()) {
+        cs_upscale_2x_avir(lr_tile, hr_out);
+        return;
+    }
+    const int Hr = Lr * 2, Wc = Lc * 2;
+    const int n_hr = Hr * Wc;
+    const int n_lr = Lr * Lc;
+    const int m = (int)ri_x.size();
+    if (pixel_measurements.total() < (size_t)CS_HEADER_PIXELS + (size_t)m) {
+        cs_upscale_2x_avir(lr_tile, hr_out);
+        return;
+    }
+    if (reweights < 1) reweights = 1;
+    if (reweights > 2) reweights = 2;
+    // Full LR per-pass budget: the warm start below is already at full scale
+    // (not the /10 generic-ref convention — the solved LR tile IS a good
+    // estimate), so every step refines rather than regrows coefficients.
+    // An explicit --fista-iters override is honored as-is.
+    const int inner = cs_fista_inner_iters(iterations, fista_iters);
+    const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, wscale);
+
+    // AVIR warm start: solved LR content carries the low frequencies, so
+    // the SR passes only need to fill in the sparse high frequencies.
+    // Luminance-only solve (benchmark convention: SR lives in Y, chroma is
+    // smooth enough to interpolate): the AVIR HR image below supplies both
+    // the Y warm start and the final Cr/Cb planes, so only one HR FISTA
+    // solve runs instead of three.
+    cv::Mat init_hr;
+    cs_upscale_2x_avir(lr_tile, init_hr);
+    if (init_hr.empty() || init_hr.rows != Hr || init_hr.cols != Wc) {
+        cs_upscale_2x_avir(lr_tile, hr_out);
+        return;
+    }
+    cv::Mat init_ycc;
+    cv::cvtColor(init_hr, init_ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> init_ycc_chs;
+    cv::split(init_ycc, init_ycc_chs);
+
+    // Y measurements: OpenCV BGR2YCrCb luma weights over the sampled BGR
+    // triplets (same weights the Y plane below was built with).
+    std::vector<float> bB, bG, bR, b((size_t)m);
+    cs_extract_channel_measurements(pixel_measurements, 0, m, bB);
+    cs_extract_channel_measurements(pixel_measurements, 1, m, bG);
+    cs_extract_channel_measurements(pixel_measurements, 2, m, bR);
+    for (int k = 0; k < m; ++k) {
+        b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
+    }
+
+    // Scratch for the single luma solve.
+    std::vector<float> y((size_t)n_hr), x_prev((size_t)n_hr), grad((size_t)n_hr),
+        pix_hr((size_t)n_hr), up_hr((size_t)n_hr);
+    std::vector<float> lr_buf((size_t)n_lr), sc_lr((size_t)n_lr);
+    std::vector<float> w((size_t)n_hr, 1.0f);
+    cv::Mat xf;
+    init_ycc_chs[0].convertTo(xf, CV_32F, 1.0 / 255.0);
+    cv::dct(xf, xf, 0);
+    // Full-scale warm start (no /10): the AVIR upscale of the solved tile
+    // is already close to the truth, so FISTA refines in place. The /10
+    // convention is only for generic gray references that must regrow.
+    if (!xf.isContinuous()) xf = xf.clone();
+    float* x = (float*)xf.data;
+    const std::vector<float> anchor(x, x + n_hr);
+    // The LR samples constrain only one quarter of the HR dimensions.
+    // A modest anchor protects unmeasured detail; sparse corrections
+    // remove sample inconsistencies without re-solving the entire image.
+    constexpr float anchor_weight = 0.25f;
+    const float correction_coef = coef * 0.1f;
+    std::fill(w.begin(), w.end(), 1.0f);
+    for (int r = 0; r < reweights; ++r) {
+        cs_sr_core_single(x, b.data(), anchor.data(), anchor_weight,
+            ri_x.data(), ri_y.data(), m, Hr, Wc, Lr, Lc,
+            w.data(), correction_coef, tv, inner, bx,
+            y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr);
+        // RED-lite: pull the pass solution toward the denoiser manifold
+        // before reweighting, so the reweights protect denoised structure.
+        // red = 0 skips exactly (bit-identical to the unregularized path).
+        // "dncnn" denoises the merged BGR tile (the color model needs all
+        // three channels); the Y plane is re-extracted for the next pass.
+        // A failed DnCNN run keeps the un-denoised pass (graceful).
+        if (red > 0.0f && red_denoiser == "dncnn") {
+            cv::Mat px(Hr, Wc, CV_32F, x);
+            cv::dct(px, px, cv::DCT_INVERSE);
+            cv::Mat y8;
+            {
+                cv::Mat tmp = px * 255.0f;
+                tmp.convertTo(y8, CV_8U);
+            }
+            std::vector<cv::Mat> bgr_ycc{ y8, init_ycc_chs[1], init_ycc_chs[2] };
+            cv::Mat bgr_hr, dn_hr;
+            cv::Mat merged_ycc;
+            cv::merge(bgr_ycc, merged_ycc);
+            cv::cvtColor(merged_ycc, bgr_hr, cv::COLOR_YCrCb2BGR);
+            const float rl = red > 1.0f ? 1.0f : red;
+            if (cs_dncnn_denoise_bgr(bgr_hr, dn_hr, dncnn_model)) {
+                cv::Mat dn_ycc;
+                cv::cvtColor(dn_hr, dn_ycc, cv::COLOR_BGR2YCrCb);
+                std::vector<cv::Mat> dn_chs;
+                cv::split(dn_ycc, dn_chs);
+                cv::Mat dnf;
+                dn_chs[0].convertTo(dnf, CV_32F, 1.0 / 255.0);
+                px -= rl * (px - dnf);
+            }
+            cv::dct(px, px, 0);
+        }
+        else {
+            cs_sr_red_proximal(x, Hr, Wc, red);
+        }
+        if (r + 1 < reweights) {
+            float mx = 0.0f;
+            for (int i = 0; i < n_hr; ++i) {
+                const float av = std::fabs(x[i] - anchor[i]);
+                if (av > mx) mx = av;
+            }
+            float eps = 0.02f * mx;
+            if (eps < 1e-3f) eps = 1e-3f;
+            for (int i = 0; i < n_hr; ++i)
+                w[(size_t)i] = eps / (std::fabs(x[i] - anchor[i]) + eps);
+        }
+    }
+    cv::Mat plane(Hr, Wc, CV_32F, x);
+    cv::dct(plane, plane, cv::DCT_INVERSE);
+    plane = plane * 255.0f;
+    cv::Mat out_y;
+    plane.convertTo(out_y, CV_8U);
+    std::vector<cv::Mat> out_ycc{ out_y, init_ycc_chs[1], init_ycc_chs[2] };
+    cv::Mat merged;
+    cv::merge(out_ycc, merged);
+    cv::cvtColor(merged, hr_out, cv::COLOR_YCrCb2BGR);
+}
+
+// ---------------------------------------------------------------------------
+// Single-stage (integrated) HR solve: full HR-coefficient FISTA against the
+// LR samples with NO LR-solve warm start. init_mode 0 = zeros (pure
+// single-stage); 1 = AVIR-upscaled zero-filled scatter (cheap demosaic,
+// also used as the anchor when anchor_w > 0). Exists to measure whether
+// collapsing the two-stage pipeline (LR solve -> 8U quantize -> HR refine)
+// into one float-consistent solve wins on quality/time. Caller sizes inner
+// via iterations/fista_iters exactly like the two-stage path, so budgets
+// are comparable by construction.
+void cs_sr_direct_luma(const float* b, const int* rix, const int* riy, int m,
+    int Lr, int Lc, float coef, float tv, int iterations, int reweights,
+    int fista_iters, float wscale, int init_mode, float anchor_w,
+    float* hr_out, const float* warm_px)
+{
+    const int Hr = Lr * 2, Wc = Lc * 2;
+    const int n_hr = Hr * Wc;
+    if (!b || !rix || !riy || m <= 0 || !hr_out) return;
+    if (reweights < 1) reweights = 1;
+    if (reweights > 2) reweights = 2;
+    const int inner = cs_fista_inner_iters(iterations, fista_iters);
+    const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, wscale);
+
+    std::vector<float> y((size_t)n_hr), x_prev((size_t)n_hr), grad((size_t)n_hr),
+        pix_hr((size_t)n_hr), up_hr((size_t)n_hr);
+    std::vector<float> lr_buf((size_t)Lr * Lc), sc_lr((size_t)Lr * Lc);
+    std::vector<float> w((size_t)n_hr, 1.0f);
+    std::vector<float> x((size_t)n_hr, 0.0f), anchor((size_t)n_hr, 0.0f);
+    if (init_mode == 1) {
+        // scatter samples into a zero LR tile, upscale, DCT: cheap demosaic
+        std::vector<float> lr((size_t)Lr * Lc, 0.0f);
+        const int n_lr = Lr * Lc;
+        for (int k = 0; k < m; ++k) {
+            const int idx = rix[k] * Lc + riy[k];
+            if ((unsigned)idx < (unsigned)n_lr) lr[(size_t)idx] = b[k];
+        }
+        cv::Mat lrm(Lr, Lc, CV_32F, lr.data());
+        cv::Mat hrm;
+        cv::resize(lrm, hrm, cv::Size(Wc, Hr), 0, 0, cv::INTER_LINEAR);
+        cv::dct(hrm, hrm, 0);
+        std::memcpy(x.data(), hrm.data, sizeof(float) * (size_t)n_hr);
+        anchor = x;
+    }
+    else if (init_mode == 2 && warm_px) {
+        // external float warm start (Hr x Wc pixels, [0,1]); also anchored
+        cv::Mat wm(Hr, Wc, CV_32F, (void*)warm_px);
+        cv::Mat xm;
+        wm.convertTo(xm, CV_32F);
+        cv::dct(xm, xm, 0);
+        std::memcpy(x.data(), xm.data, sizeof(float) * (size_t)n_hr);
+        anchor = x;
+    }
+    // correction-scale lambda mirrors the two-stage path (coef*0.1)
+    const float lambda = coef * 0.1f;
+    for (int r = 0; r < reweights; ++r) {
+        cs_sr_core_single(x.data(), b, anchor.data(), anchor_w,
+            rix, riy, m, Hr, Wc, Lr, Lc, w.data(), lambda, tv, inner, bx,
+            y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr);
+        if (r + 1 < reweights) {
+            float mx = 0.0f;
+            for (int i = 0; i < n_hr; ++i) {
+                const float av = std::fabs(x[(size_t)i] - anchor[(size_t)i]);
+                if (av > mx) mx = av;
+            }
+            float eps = 0.02f * mx;
+            if (eps < 1e-3f) eps = 1e-3f;
+            for (int i = 0; i < n_hr; ++i)
+                w[(size_t)i] = eps / (std::fabs(x[(size_t)i] - anchor[(size_t)i]) + eps);
+        }
+    }
+    cv::Mat plane(Hr, Wc, CV_32F, x.data());
+    cv::dct(plane, plane, cv::DCT_INVERSE);
+    std::memcpy(hr_out, plane.data, sizeof(float) * (size_t)n_hr);
+}
+
+// ---------------------------------------------------------------------------
+// Multiscale cascade warm start for single-stage SR. The LR samples are
+// binned into progressively coarser cells (cell value = sample mean,
+// unobserved cells absent from the data term); each level runs a short
+// unweighted DCT-FISTA solve (reusing cs_fista_core_single: at coarse
+// scales the problem is tiny and well-conditioned, so a handful of steps
+// from any start converges); the solution is bilinearly upsampled to seed
+// the next finer level. The chain ends with HR pixels for a direct solve.
+// This converts one impossible cold start into a chain of easy warm starts
+// (LapSRN/pyramid philosophy applied to the solver, not the network); the
+// thumbnail some containers already ship (HF-focus) is the same idea at
+// image scale and could seed level 0 in the future.
+// Cost is negligible next to the final solve (grids shrink 4x per level;
+// coarse iters fixed at 12).
+static void cs_bilinear_up(const float* src, int sh, int sw,
+    float* dst, int dh, int dw)
+{
+    // Forward-only bilinear upsample (no adjoint needed: warm-start
+    // propagation only; mapping matches INTER_LINEAR convention).
+    if (!src || !dst || sh < 2 || sw < 2 || dh <= 0 || dw <= 0) return;
+    const double sy = (double)sh / dh, sx = (double)sw / dw;
+    for (int i = 0; i < dh; ++i) {
+        double fy = (i + 0.5) * sy - 0.5;
+        if (fy < 0.0) fy = 0.0;
+        if (fy > sh - 1.0) fy = (double)(sh - 1);
+        int y0 = (int)fy;
+        double wy = fy - y0;
+        if (y0 >= sh - 1) { y0 = sh - 2; wy = 1.0; }
+        for (int j = 0; j < dw; ++j) {
+            double fx = (j + 0.5) * sx - 0.5;
+            if (fx < 0.0) fx = 0.0;
+            if (fx > sw - 1.0) fx = (double)(sw - 1);
+            int x0 = (int)fx;
+            double wx = fx - x0;
+            if (x0 >= sw - 1) { x0 = sw - 2; wx = 1.0; }
+            const float a = src[(size_t)y0 * sw + x0];
+            const float b2 = src[(size_t)y0 * sw + x0 + 1];
+            const float c = src[(size_t)(y0 + 1) * sw + x0];
+            const float d = src[(size_t)(y0 + 1) * sw + x0 + 1];
+            dst[(size_t)i * dw + j] = (float)(
+                a * (1 - wy) * (1 - wx) + b2 * (1 - wy) * wx +
+                c * wy * (1 - wx) + d * wy * wx);
+        }
+    }
+}
+
+void cs_sr_cascade_init(const float* b, const int* rix, const int* riy, int m,
+    int Lr, int Lc, float coef, int fista_iters, float wscale, float* hr_init)
+{
+    const int Hr = Lr * 2, Wc = Lc * 2;
+    const int n_hr = Hr * Wc;
+    if (!b || !rix || !riy || m <= 0 || !hr_init || Lr < 8 || Lc < 8) {
+        if (hr_init && Lr >= 8 && Lc >= 8) std::memset(hr_init, 0, sizeof(float) * (size_t)n_hr);
+        return;
+    }
+    // coarse FISTA budget: explicit override or 12 fixed steps (coarse
+    // levels converge in a handful from any start; fixed keeps the
+    // cascade overhead negligible next to the final solve).
+    const int coarse_iters = fista_iters > 0
+        ? ((std::min)(64, (std::max)(4, fista_iters))) : 12;
+    // level grids, coarse-first: halve (floor) while >= 16px, then the LR
+    // grid itself. Each level bins the samples into its cells and runs one
+    // short unweighted FISTA pass; the solution upscales to seed
+    // the next level. A final bilinear step lands HR pixels (no solve).
+    struct Lv { int h, w; };
+    std::vector<Lv> levels;
+    for (int h = Lr / 2, w = Lc / 2; h >= 16 && w >= 16; h /= 2, w /= 2)
+        levels.push_back({ h, w });
+    std::reverse(levels.begin(), levels.end());
+    levels.push_back({ Lr, Lc });
+
+    std::vector<float> cur;
+    int ch = 0, cw = 0;
+    for (size_t li = 0; li < levels.size(); ++li) {
+        const int gh = levels[li].h, gw = levels[li].w;
+        const int n = gh * gw;
+        // bin samples into level cells (mean per observed cell)
+        std::vector<double> sum((size_t)n, 0.0);
+        std::vector<int> cnt((size_t)n, 0);
+        for (int k = 0; k < m; ++k) {
+            int i = (int)((long long)rix[k] * gh / Lr);
+            int j = (int)((long long)riy[k] * gw / Lc);
+            if ((unsigned)i >= (unsigned)gh || (unsigned)j >= (unsigned)gw) continue;
+            sum[(size_t)i * gw + j] += b[k];
+            cnt[(size_t)i * gw + j] += 1;
+        }
+        std::vector<int> ox, oy;
+        std::vector<float> ob;
+        ox.reserve((size_t)n);
+        oy.reserve((size_t)n);
+        ob.reserve((size_t)n);
+        for (int i = 0; i < gh; ++i) {
+            for (int j = 0; j < gw; ++j) {
+                const int c = cnt[(size_t)i * gw + j];
+                if (c > 0) {
+                    ox.push_back(i);
+                    oy.push_back(j);
+                    ob.push_back((float)(sum[(size_t)i * gw + j] / c));
+                }
+            }
+        }
+        const int mo = (int)ob.size();
+        std::vector<float> xc((size_t)n, 0.0f);
+        if (mo > 0) {
+            // warm start: previous level upsampled (zeros for level 0)
+            if (ch > 0) {
+                std::vector<float> up((size_t)n);
+                cs_bilinear_up(cur.data(), ch, cw, up.data(), gh, gw);
+                cv::Mat wm(gh, gw, CV_32F, up.data());
+                cv::dct(wm, wm, 0);
+                std::memcpy(xc.data(), wm.data, sizeof(float) * (size_t)n);
+            }
+            const cs_fista_basis bx = cs_make_basis(gh, gw, CS_BASIS_DCT, wscale);
+            std::vector<float> w((size_t)n, 1.0f), y((size_t)n), xp((size_t)n),
+                grad((size_t)n), pix((size_t)n), sc((size_t)n);
+            cs_fista_core_single(xc.data(), ob.data(), ox.data(), oy.data(), mo,
+                gh, gw, w.data(), coef, 0.0f, coarse_iters, bx,
+                y, xp, grad, pix, sc);
+            cv::Mat pm(gh, gw, CV_32F, xc.data());
+            cv::dct(pm, pm, cv::DCT_INVERSE);
+            cur.assign((size_t)n, 0.0f);
+            std::memcpy(cur.data(), pm.data, sizeof(float) * (size_t)n);
+        }
+        else if (ch > 0) {
+            // unobserved level: propagate the upsampled previous solution
+            std::vector<float> up((size_t)n, 0.0f);
+            cs_bilinear_up(cur.data(), ch, cw, up.data(), gh, gw);
+            cur.swap(up);
+        }
+        else {
+            cur.assign((size_t)n, 0.0f);
+        }
+        ch = gh;
+        cw = gw;
+    }
+    // final landing: LR pixels -> HR pixels (no solve at HR here)
+    if (ch > 0 && !cur.empty()) {
+        cs_bilinear_up(cur.data(), ch, cw, hr_init, Hr, Wc);
+    }
+    else {
+        std::memset(hr_init, 0, sizeof(float) * (size_t)n_hr);
     }
 }
 

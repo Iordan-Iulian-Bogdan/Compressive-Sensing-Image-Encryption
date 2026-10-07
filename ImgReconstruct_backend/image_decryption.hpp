@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+struct cs_coupled_dict; // cs_dict.hpp (pointer only: model handle)
+
 /** @brief streaming upscale pipeline: solver workers enqueue (i,j) as tiles
 solve; one background thread upscales tiles one at a time (one serialized
 subprocess per tile via cs_upscale_one_tile_2x) into hr while solving
@@ -165,9 +167,10 @@ public:
 
     /** @brief unpacks a split-color container into per-plane
     sampled images + binary masks: luma at full resolution (CV_8U), each
-    chroma plane on its half-resolution grid (CV_8U). Masks hold 0/1.
+    chroma plane on its coarse grid (CV_8U; 4:2:0 halves both axes, 4:2:2
+    halves the width only). Masks hold 0/1.
     Regenerates the identical index sets from (key, m, geometry). Supports
-    uniform YCC420 and HF-focus YCC420 containers.
+    uniform and HF-focus YCC420 plus uniform/adaptive-luma YCC422 containers.
     */
     void get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         cv::Mat& cr, cv::Mat& cr_mask, cv::Mat& cb, cv::Mat& cb_mask);
@@ -208,5 +211,7 @@ generic reference solution when no neighbor exists, e.g. the first wave).
 */
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe, std::mutex* hr_grid_mutex);
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x = false, float sr_red = 0.0f, const cs_coupled_dict* sr_dict = nullptr,
+    const std::string& sr_red_denoiser = "nlmeans", const std::string& sr_dncnn_model = "models/dncnn/dncnn_color.onnx",
+    const std::string& sr_fsrcnn_model = "");
 #endif

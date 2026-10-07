@@ -121,6 +121,7 @@
   <ItemGroup>
     <ClCompile Include="CS_encryption.cpp" />
     <ClCompile Include="crypto_utils.cpp" />
+    <ClCompile Include="cs_dict.cpp" />
     <ClCompile Include="cs_wavelet.cpp" />
     <ClCompile Include="helper_functions.cpp" />
     <ClCompile Include="image_decryption.cpp" />
@@ -136,6 +137,7 @@
     <ClInclude Include="avir_float4_sse.h" />
     <ClInclude Include="avir_float8_avx.h" />
     <ClInclude Include="crypto_utils.hpp" />
+    <ClInclude Include="cs_dict.hpp" />
     <ClInclude Include="CS_encryption.hpp" />
     <ClInclude Include="helper_functions.hpp" />
     <ClInclude Include="image_decryption.hpp" />

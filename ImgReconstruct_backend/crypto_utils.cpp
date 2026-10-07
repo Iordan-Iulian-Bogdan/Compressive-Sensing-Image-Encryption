@@ -511,8 +511,8 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
     // tile_size and (mode 1) samples_per_tile as 16-bit little-endian values.
     // Mode 2 stores lod byte count in the second slot as a sanity check.
     const uint8_t mode = buf[CS_OFF_PAD];
-    if (mode == CS_MODE_YCC420) {
-        // luma/chroma-split container. Pure-uniform mode 3 leaves the tile
+    if (mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422) {
+        // luma/chroma-split container. Pure-uniform modes 3/7 leave the tile
         // fields zero; the LOD-luma variant reuses the adaptive pad layout
         // (tile_size, lod byte count, weight_base). Accept the LOD variant
         // only when the lod count matches the geometry, otherwise fall back
@@ -528,7 +528,7 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
             out.adaptive_base = (base > 0) ? base : 256;
         }
     }
-    else if (mode == CS_MODE_YCC420_HF) {
+    else if (mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF) {
         out.sampling_mode = mode;
         out.periodic_tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
         const int lodc = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8);

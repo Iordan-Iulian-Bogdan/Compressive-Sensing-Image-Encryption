@@ -56,7 +56,8 @@ Header layout (v2, 32 pixels = 96 bytes at the start of the container):
 [65..80] HMAC-SHA256 tag, truncated to 16 bytes, over [0..64] + measurement body
 [81..95] sampling mode + geometry (authenticated):
           [81]     mode: 0 = random, 1 = periodic, 2 = adaptive,
-                   3 = YCC420, 5 = HF-focus, 6 = YCC420 + HF-focus
+                   3 = YCC420, 5 = HF-focus, 6 = YCC420 + HF-focus,
+                   7 = YCC422, 8 = YCC422 + HF-focus
          [82..83] tile_size (LE, modes 1 and 2)
          [84..85] mode 1: samples_per_tile; mode 2: lod byte count (sanity)
          [86..87] mode 2: weight_base (LE uint16; strength → base mapping below)
@@ -65,8 +66,8 @@ Header layout (v2, 32 pixels = 96 bytes at the start of the container):
 ### Adaptive sampling (`--adaptive`)
 
 Mode 2 splits the measurement budget across a tile grid by an 8-bit
-**level-of-detail** score per tile (mean |Laplacian|, min-max normalized,
-floored with `--adaptive-floor`, default 32). Each tile's share is weighted
+**level-of-detail** score per tile (mean |Laplacian| by default, min-max
+normalized, floored with `--adaptive-floor`, default 32). Each tile's share is weighted
 by `tile_pixels * (weight_base + lod)` — capacity keeps total allocation
 proportional to tile size, while `weight_base` controls how hard detail tiles
 are pushed over flat ones. `--adaptive-strength <s>` (default 0.5) sets that
@@ -86,6 +87,19 @@ the header). `--show-mask` (encrypt/roundtrip) writes `<output>.mask.png`
 after sampling. **Resolution:** by default encrypt downsamples the input 2×
 and decrypt 2×-upscales the solve (half-res pipeline). Pass `--full-res` on
 **both** encrypt and decrypt/roundtrip to keep native geometry end-to-end.
+
+**LOD scorers:** `--two-pass` replaces the Laplacian with a pilot uniform
+sample + cheap per-tile recon (residual scoring); `--spectral` replaces it
+with per-tile DCT band energy whitened by the image's global radial spectral
+decay (tiles pay for high-frequency energy the natural-image prior does not
+predict, so smooth gradients score low even when bright). `--two-pass` and
+`--spectral` are mutually exclusive; both imply the adaptive container and
+need no decrypt flags. `--regions` blends on top of any base scorer, and
+`--lod-smooth` blurs the shipped bytes. Measured on IMG_3690 at ratio 0.5:
+spectral ties Laplacian within ±0.1 dB at default and maximum strength
+(27.2/27.6 dB) — rank orders correlate on natural content; spectral is the
+cheaper deterministic alternative to the pilot solve, complementary where
+edge magnitude misleads (smooth high-contrast gradients).
 
 ### YCC 4:2:0 split sampling (`--ycc420`)
 
@@ -107,9 +121,24 @@ they drive the luma budget (LOD bytes ship in the container exactly like
 mode 2) while chroma stays uniform; `--periodic` is ignored with a warning.
 Chroma planes solve natively on their coarse grids. Joint solvers degrade to per-channel FISTA here.
 
+### YCC 4:2:2 split sampling (`--ycc422`)
+
+Mode 7 is the same luma/chroma-split construction with chroma downsampled
+horizontally only (full height, half width). The container holds ~2 bytes/px
+instead of 3, and chroma edges (text, colored boundaries) reconstruct
+sharper than 4:2:0 at a larger container. Same body layout (`[Y][Cr][Cb]`,
+counts re-derived from the luma budget), same absorbed adaptive flags, same
+decrypt pipeline with full-height chroma tiles; `--periodic` is ignored with
+a warning, `--ycc420` is mutually exclusive (error), and `--hf-focus`
+selects the mode-8 HF-weighted variant (thumbnail + edge-weighted luma,
+uniform 4:2:2 chroma). `--sample-bits`
+`L[,C]` applies to luma/chroma exactly like 4:2:0. Measured on the 480×360
+synthetic suite at ratio 0.5: 23.37 dB / 0.75 SSIM vs 22.68 dB for 4:2:0 at a
+1.33× container.
+
 ### HF-focus sampling (`--hf-focus`)
 
-Modes 5 and 6 store an authenticated, lossless PNG thumbnail (maximum dimension
+Modes 5, 6 and 8 store an authenticated, lossless PNG thumbnail (maximum dimension
 128px) in the container. Per-tile sample counts remain nearly uniform, but
 sample positions are drawn with probability weighted by the thumbnail's
 Laplacian magnitude. This concentrates measurements on edges while preserving
@@ -121,7 +150,9 @@ container.
 `--hf-focus` is an encrypt/roundtrip option and cannot be combined with
 `--periodic`, `--adaptive`, `--two-pass`, `--regions`, `--lod-smooth`,
 `--lod-full`, or a non-default adaptive strength. Combine it with `--ycc420`
-for mode 6: HF-weighted luma sampling plus uniform coarse-grid chroma.
+for mode 6 or `--ycc422` for mode 8: HF-weighted luma sampling plus uniform
+coarse-grid chroma (4:2:0 halves both chroma axes, 4:2:2 halves the width
+only, so mode 8 keeps full-height chroma detail).
 
 `--lod-full <n>` (encrypt/roundtrip only, default 0 = off) is the detail
 guarantee on top of adaptive sampling: tiles scoring LOD >= n (1–255) are
@@ -240,12 +271,77 @@ stays 0, independent flag so seam effects stay attributable). It measures
 bit-identical on tested content: unlike the discontinuous L1 threshold,
 which flips marginal coefficients into visibly different supports, the
 smooth TV perturbation lands below 8U output precision. Same verdict.
-`--photo-upscaler avir|waifu2x` selects the per-tile 2x upscaler backend (default
+`--photo-upscaler avir|cs-sr|fsrcnn|waifu2x` selects the per-tile 2x upscaler backend (default
 `avir`). Waifu2x batches tiles through the optional nunif Python package and
 falls back to AVIR if the command or any tile fails. Set `CS_WAIFU2X_CMD` if
 Python/nunif needs a custom launcher; `--waifu2x-cmd` and `--waifu2x-args`
 override it. To denoise while upscaling, use
 `--waifu2x-method noise_scale --waifu2x-noise 2` (noise range 0–3).
+
+`--photo-upscaler fsrcnn` runs FSRCNN 2x in-process via OpenCV dnn_superres
+(CPU, one session per worker thread, ~10–20 ms/tile). Needs the weights file
+(`--fsrcnn-model`, default `FSRCNN_x2.pb` resolved against the working
+directory); a missing model or a build without `opencv2/dnn_superres.hpp`
+falls back to AVIR per tile with one warning. Measured at ratio 0.5:
+IMG_3690 photo 26.79 dB / 0.772 SSIM vs. AVIR's 26.81 dB / 0.768 in ~26 s vs.
+~16 s — i.e. a tie, not a win: FSRCNN is trained on clean bicubic-downsampled
+images while decrypt feeds it FISTA-reconstructed tiles with solver noise
+(degradation mismatch, the BSRGAN-literature effect), so the learned prior
+cannot deploy. The CS-SR path, which refits the actual measurements
+(27.31 dB / 0.813 with `--red 0.75`), stays ahead here; fsrcnn remains the
+fast deterministic neural option (and the harness fits ESPCN/ECBSR/SPAN
+weights with the same 2x contract).
+
+`--photo-upscaler cs-sr` enables CPU 2× compressed-sensing super-resolution
+for BGR containers in the default half-resolution pipeline. Each reconstructed
+LR tile is first upscaled with AVIR; a reweighted-L1 FISTA solve then refines a
+sparse HR DCT correction of the **luma channel only** against the **original
+sampled LR luma** (BGR samples combined with the YCrCb weights) using a 2×2
+box-downsample forward model, a quadratic anchor to the AVIR image, and the
+optional `--tv` smoothness penalty. The anchor preserves HR detail that LR
+measurements alone cannot determine; chroma comes straight from the AVIR
+upscale, so one HR solve runs instead of three. It uses the existing tile
+overlap and feather blending; small/unsampled tiles and wavelet-basis solves
+use AVIR. `--ycc420`/`--ycc422` also use AVIR because split luma/chroma
+sampling needs a different SR operator; `--full-res` skips upscaling entirely.
+Example:
+`ImgReconstruct_backend roundtrip input.png output.png --ratio 0.5 --photo-upscaler cs-sr --no-preview`.
+Measured at ratio 0.5: IMG_3690 photo 27.17 dB / 0.784 SSIM vs. AVIR's
+26.81 dB / 0.768, taking 46 s vs. 16 s; 256px synthetic 19.36 dB / 0.624 vs.
+19.22 dB / 0.624 in 0.4 s (CPU; image dependent). An explicit iterative
+back-projection closure was trialed and removed — pulling toward the noisy LR
+solve hurt SSIM with no PSNR gain.
+
+`--red <f>` in [0, 1] (default 0 = off) adds a RED-lite natural-image prior
+to the cs-sr solve: after each outer FISTA pass the HR luma is blended
+toward its fastNlMeans-denoised self (`x ← x − red·(x − D(x))`, Romano et
+al.). Unlike DCT sparsity, the denoiser knows what natural texture looks
+like, so structure (SSIM) improves even where point-wise error (PSNR)
+barely moves. Same IMG_3690 setup: `--red 0.5` → 27.30 dB / 0.810,
+`--red 0.75` → 27.31 dB / 0.813 (measured best), `--red 1.0` → 27.27 dB /
+0.808 (over-smoothing starts); cost rises only ~4 s (NLM runs once per
+outer pass, not per iteration — a per-gradient-step denoiser is infeasible
+on CPU at these tile sizes, which is also why BM3D is left out: minutes per
+call). Synthetic 256px: SSIM 0.624 → 0.674 at `--red 0.5` with PSNR flat,
+the classic denoiser-prior signature.
+
+Single-stage HR-direct solving was trialed as an alternative to the
+two-stage (LR solve → HR refine) pipeline and rejected on measurement: a
+4×-budget cold solve reaches 36.05 dB vs 33.58 dB two-stage on small
+synthetic tiles (the 8-bit LR quantization does cost ~2.5 dB there), but on
+real photos warm-start economics dominate — integrated direct scores
+26.79 dB / 0.707 in 128 s and multi-tile direct collapses to 7.35 dB on
+tile-seam/garbage cascades, vs 27.31 dB / 0.813 in 50 s for two-stage+RED.
+The `cs_sr_direct_luma` experiment harness and its tests stay in the tree;
+no production flag ships.
+
+Cold-start follow-up (measured): a multiscale cascade warm start
+(coarse-to-fine binned FISTA chain, `cs_sr_cascade_init`) removes the
+iteration premium entirely — cascade + standard budget reaches 36.76 dB in
+0.016 s on the fixture, beating zeros + 4× budget (36.05 dB in 0.055 s)
+and two-stage (33.58 dB). The blocker was init quality, not iteration
+count; any future production retry should warm-start from the cascade
+(HF-focus thumbnails already ship this idea at image scale).
 
 `--device gpu` (decrypt, `--solver fista|joint`) offloads the batched tile solves to an AMD GPU over HIP: tile/channel solves queue up and flush as batched kernel groups (proximal-gradient + momentum over FFT-DCT transforms with sampled gradients; joint: row-coupled group threshold over stacked planes), while CDF97 and any device failure silently fall back to the CPU path (output differs from CPU only by float rounding). Set `CS_GPU_DEBUG=1` for per-batch timing lines. Building requires an AMD HIP SDK (7.2 tested) with the target GPU in `HipArch` (`hip_build.targets` compiles `cs_gpu.hip` through `hipcc` at link time).
 

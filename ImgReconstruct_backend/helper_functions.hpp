@@ -144,4 +144,69 @@ void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const floa
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     const int& iterations, cv::Mat refs[3], float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
 
+/** @brief true for the CS super-resolution upscaler backends ("cs", "cs-sr").
+Selected via --photo-upscaler; handled as a fused 2x path in the decrypt
+pipeline (like "avir", not a subprocess pipe). */
+bool cs_is_superres_backend(const std::string& backend);
+
+/** @brief CS super-resolution 2x refinement of one solved LR tile (CPU, DCT).
+Luminance-only: a sparse DCT correction around an AVIR warm start is solved
+so the 2x2-box downsample of the HR luma fits the original LR luma samples
+(BGR samples combined with the BGR2YCrCb weights), with a quadratic AVIR
+anchor and optional smoothed TV on the HR grid. (An explicit iterative
+back-projection closure was trialed and removed: pulling toward the noisy
+LR solve hurt SSIM with no PSNR gain; the anchor already provides dense
+consistency.) Chroma comes straight from the AVIR upscale, so one HR solve
+runs instead of three. red in [0,1] adds a RED-lite proximal step per
+outer pass (0 = off, bit-identical): "nlmeans" blends luma toward
+fastNlMeans, "dncnn" blends the BGR tile toward the DnCNN model output. Falls back to AVIR when the basis is
+not DCT, the sample set is empty, or the tile is degenerate. coef/tv/iterations/reweights/
+basis/wscale mirror the LR solve conventions. lr_tile is the solved CV_8UC3
+tile; hr_out is the 2x CV_8UC3 result. */
+// Default DnCNN color model (repo-vendored) for the dncnn RED denoiser.
+#define CS_DNCNN_DEFAULT_MODEL "models/dncnn/dncnn_color.onnx"
+
+void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
+    cv::Mat& hr_out, float red = 0.0f,
+    const std::string& red_denoiser = "nlmeans",
+    const std::string& dncnn_model = CS_DNCNN_DEFAULT_MODEL);
+
+/** @brief true when the DnCNN model loads and runs (cached per path).
+Thread-safe; loads lazily on first call. */
+bool cs_dncnn_available(const std::string& model_path);
+
+/** @brief denoise one BGR 8U image with the DnCNN color model (tiled
+internally so activation memory stays bounded). Input/output [0,255].
+Returns false when the model cannot be loaded or run (caller falls back).
+Thread-safe; deterministic on CPU. */
+bool cs_dncnn_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path);
+
+/** @brief single-stage HR solve for experiments (see .cpp): full
+HR-coefficient FISTA against the LR samples with no LR-solve warm start.
+b/rix/riy/m are the LR samples; hr_out holds Hr=2*Lr floats in [0,1]
+(w caller-allocated). init_mode 0 = zeros, 1 = AVIR demosaic (+anchor when
+anchor_w > 0). VERDICT (measured): a 4x-budget cold solve beats two-stage
++2.5 dB on small synthetic tiles but loses on real photos (warm-start
+economics dominate; a production --sr-direct path was built on this entry
+and removed after measuring worse on IMG_3690 in every configuration).
+The cascade init below answers it: cascade+1x matches the 4x-budget solve,
+so a production retry should warm-start from the cascade, not from zeros.
+Kept as the experiment harness. */
+void cs_sr_direct_luma(const float* b, const int* rix, const int* riy, int m,
+    int Lr, int Lc, float coef, float tv, int iterations, int reweights,
+    int fista_iters, float wscale, int init_mode, float anchor_w,
+    float* hr_out, const float* warm_px = nullptr);
+
+/** @brief multiscale cascade warm start for single-stage SR (see .cpp):
+bins the LR samples into progressively coarser cells, runs one short
+unweighted DCT-FISTA pass per level coarse-to-fine, and bilinearly
+upscales each solution to seed the next. hr_init holds Hr=2*Lr [0,1]
+pixels (caller-allocated). Pure function of the samples (deterministic);
+fista_iters overrides the fixed per-level budget (clamped [4,64]). */
+void cs_sr_cascade_init(const float* b, const int* rix, const int* riy, int m,
+    int Lr, int Lc, float coef, int fista_iters, float wscale, float* hr_init);
+
 #endif  // IMGRECONSTRUCT_BACKEND_HELPER_FUNCTIONS_HPP_

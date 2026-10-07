@@ -2,6 +2,7 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="CS_encryption.cpp" />
+    <ClCompile Include="cs_dict.cpp" />
     <ClCompile Include="cs_wavelet.cpp" />
     <ClCompile Include="helper_functions.cpp" />
     <ClCompile Include="image_decryption.cpp" />
@@ -13,6 +14,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CS_encryption.hpp" />
+    <ClInclude Include="cs_dict.hpp" />
     <ClInclude Include="cs_wavelet.hpp" />
     <ClInclude Include="helper_functions.hpp" />
     <ClInclude Include="image_decryption.hpp" />

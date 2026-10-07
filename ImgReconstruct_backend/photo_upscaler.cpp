@@ -268,6 +268,89 @@ void avir_fallback(std::vector<std::vector<cv::Mat>>& tiles) {
       if (!tile.empty() && tile.type() == CV_8UC3) UpscaleAvirInplace(tile);
 }
 
+#if __has_include(<opencv2/dnn_superres.hpp>)
+#include <opencv2/dnn_superres.hpp>
+#endif
+#include <mutex>
+#include <set>
+
+namespace {
+// Warn-once registry for FSRCNN model problems (a missing model would
+// otherwise spam one warning per tile across the whole grid).
+void cs_fsrcnn_warn_once(const std::string& model, const std::string& what) {
+  static std::mutex m;
+  static std::set<std::string> warned;
+  std::lock_guard<std::mutex> lk(m);
+  if (warned.insert(model).second) {
+    std::cerr << "Warning: --photo-upscaler fsrcnn: model '" << model
+              << "' unusable (" << what << "); falling back to AVIR" << std::endl;
+  }
+}
+}  // namespace
+
+bool cs_fsrcnn_upscale_2x(const cv::Mat& src, cv::Mat& dst,
+                          const std::string& model) {
+  dst.release();
+  if (src.empty() || src.type() != CV_8UC3) return false;
+#if !__has_include(<opencv2/dnn_superres.hpp>)
+  (void)model;
+  return false;
+#else
+  // Small-input guard: dnn_superres FSRCNN crashes (AV) on tiny tiles of
+  // this OpenCV build below ~32px (observed at 16x24, fine at 48x32).
+  // AVIR fallback preserves the contract; production tiles are larger
+  // except under extreme manual --tiles counts on small images.
+  if (src.rows < 32 || src.cols < 32) return false;
+  // One session per worker thread: dnn_superres instances are not documented
+  // thread-safe, while fused tile workers run concurrently. FSRCNN weights
+  // are ~40KB, so per-thread sessions are cheap; the model loads once per
+  // thread and is reused for all its tiles.
+  // NOTE: a DnnSuperResImpl that threw from readModel/upsample is NEVER
+  // reused: OpenCV's importer is not exception-safe to retry on the same
+  // instance (second load after a failed first load corrupts the heap and
+  // crashes later in unrelated code). Every (re)load allocates fresh.
+  struct Slot {
+    std::string path;
+    cv::Ptr<cv::dnn_superres::DnnSuperResImpl> net;
+    bool ready = false;
+  };
+  thread_local Slot slot;
+  if (!slot.ready || slot.path != model) {
+    slot.net.release();
+    slot.ready = false;
+    slot.path.clear();
+    try {
+      slot.net = cv::dnn_superres::DnnSuperResImpl::create();
+      slot.net->readModel(model);
+      slot.net->setModel("fsrcnn", 2);
+      slot.net->setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+      slot.net->setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    } catch (const cv::Exception& e) {
+      cs_fsrcnn_warn_once(model, e.what());
+      slot.net.release();
+      return false;
+    }
+    slot.path = model;
+    slot.ready = true;
+  }
+  try {
+    slot.net->upsample(src, dst);
+  } catch (const cv::Exception& e) {
+    cs_fsrcnn_warn_once(model, e.what());
+    slot.net.release();
+    slot.ready = false;
+    slot.path.clear();
+    return false;
+  }
+  if (dst.empty() || dst.type() != CV_8UC3 || dst.cols != src.cols * 2 ||
+      dst.rows != src.rows * 2) {
+    dst.release();
+    return false;
+  }
+  return true;
+#endif
+}
+
 // Single-tile variant of UpscaleSubprocessBatch: one temp dir, one input,
 // one 2x output. Same contract style (true = backend produced a valid 2x
 // tile, false = caller should AVIR-fallback).
@@ -340,6 +423,20 @@ bool UpscaleSubprocessSingle(const cv::Mat& src, cv::Mat& dst,
 
 void cs_upscale_tiles_2x(std::vector<std::vector<cv::Mat>>& tiles,
                          const CsPhotoUpscalerOptions& opt) {
+  if (opt.backend == "fsrcnn") {
+    // In-process neural upscale, one session per worker thread inside the
+    // helper; per-tile AVIR fallback keeps the 2x invariant on misses.
+    for (auto& row : tiles)
+      for (auto& tile : row) {
+        if (tile.empty() || tile.type() != CV_8UC3) continue;
+        cv::Mat up;
+        if (cs_fsrcnn_upscale_2x(tile, up, opt.fsrcnn_model))
+          tile = std::move(up);
+        else
+          UpscaleAvirInplace(tile);
+      }
+    return;
+  }
   if (opt.backend == "waifu2x") {
     if (UpscaleSubprocessBatch(tiles, opt.waifu2x_cmd,
                                cs_waifu2x_effective_args(opt), "waifu2x"))
@@ -376,6 +473,11 @@ bool cs_upscale_one_tile_2x(const cv::Mat& src_lr, cv::Mat& dst_hr,
   if (opt.backend == "avir") {
     cs_upscale_2x_avir(src_lr, dst_hr);
     return !dst_hr.empty();
+  }
+  if (opt.backend == "fsrcnn") {
+    if (cs_fsrcnn_upscale_2x(src_lr, dst_hr, opt.fsrcnn_model)) return true;
+    cs_upscale_2x_avir(src_lr, dst_hr);  // warning already printed
+    return false;
   }
   const char* tag = nullptr;
   std::string cmd, args;

@@ -14,6 +14,15 @@
 //
 // - "avir" (default): the vendored AVIR resampler (cs_upscale_2x_avir).
 //   Zero dependencies, millisecond-scale per tile, always available.
+// - "fsrcnn": FSRCNN 2x neural upscale via OpenCV dnn_superres
+//   (cs_fsrcnn_upscale_2x, in-process CPU, ~10-20 ms/tile). Needs the
+//   FSRCNN_x2.pb weights (opt.fsrcnn_model); missing model or a build
+//   without opencv2/dnn_superres.hpp falls back to AVIR per tile.
+// - "cs" / "cs-sr": CS super-resolution refinement
+//   (cs_sr_upscale_tile_2x in helper_functions.hpp): the HR tile's DCT
+//   coefficients are re-solved against the tile's original LR samples
+//   (DCT + TV, CPU). Handled as a fused 2x path in the decrypt pipeline,
+//   not through the batch helpers below; falls back to AVIR per tile.
 // - "waifu2x": one batched nunif subprocess over the whole tile grid:
 //   tiles are written to a temp dir, a single
 //     <waifu2x_cmd> -i <in_dir> -o <out_dir> <waifu2x_args>
@@ -60,6 +69,24 @@ inline std::string cs_env_or(const char* var, const std::string& fallback) {
 
 struct CsPhotoUpscalerOptions {
   std::string backend = "avir";
+  // RED-lite NLM strength for the cs-sr backend (0 = off): blends each
+  // outer FISTA pass toward its fastNlMeans-denoised self. Ignored by all
+  // other backends (including AVIR fallback tiles).
+  float sr_red = 0.0f;
+  // RED denoiser select for cs-sr ("nlmeans" luma fastNlMeans, "dncnn"
+  // color DnCNN model below). Ignored unless sr_red > 0.
+  std::string sr_red_denoiser = "nlmeans";
+  // DnCNN color model path (used only with sr_red_denoiser == "dncnn").
+  std::string sr_dncnn_model = "models/dncnn/dncnn_color.onnx";
+  // Coupled-dictionary SR model (CSD2) for --sr-dict: when non-empty, the
+  // fused 2x path refines tiles with patch-OMP synthesis (Dh) from LR
+  // gradient-feature codes (Dl) instead of the FISTA HR solve, in every
+  // container mode (it operates on solved tiles). --red is ignored there.
+  std::string sr_dict;
+  // FSRCNN 2x model for the "fsrcnn" backend (OpenCV dnn_superres,
+  // in-process CPU; default resolves against the working directory).
+  // A missing/unreadable model falls back to AVIR per tile.
+  std::string fsrcnn_model = "FSRCNN_x2.pb";
   std::string waifu2x_cmd = cs_waifu2x_cmd_default();
   // Full-arg override (explicit --waifu2x-args flag or CS_WAIFU2X_ARGS).
   // Empty (default) = compose from the fields below.
@@ -118,6 +145,13 @@ std::string cs_realcugan_model_dir(const CsPhotoUpscalerOptions& opt);
 // tile while solving continues, instead of one post-join batch.
 bool cs_upscale_one_tile_2x(const cv::Mat& src_lr, cv::Mat& dst_hr,
                             const CsPhotoUpscalerOptions& opt);
+
+// Upscale one LR tile exactly 2x with FSRCNN (OpenCV dnn_superres, CPU).
+// True on success; false when the model is missing/unreadable, the output
+// violates the 2x CV_8UC3 contract, or the build lacks
+// opencv2/dnn_superres.hpp (caller falls back to AVIR per tile).
+bool cs_fsrcnn_upscale_2x(const cv::Mat& src, cv::Mat& dst,
+                          const std::string& model);
 
 // Upscale every non-empty CV_8UC3 tile of the grid exactly 2x, in place.
 // The caller then scales the tile origins by 2 (all of them; empty tiles

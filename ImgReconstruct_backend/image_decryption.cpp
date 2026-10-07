@@ -1,7 +1,8 @@
-﻿#include "image_decryption.hpp"
+#include "image_decryption.hpp"
 #include "image_encryption.hpp"
 #include "image_preview.hpp"
 #include "cs_gpu.h"
+#include "cs_dict.hpp"
 #include "avir.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -279,8 +280,8 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     if (!cs_key_valid) {
         throw std::runtime_error("derived key not available: header must be parsed with the password first");
     }
-    if (sampling_mode != CS_MODE_YCC420 && sampling_mode != CS_MODE_YCC420_HF) {
-        throw std::runtime_error("ycc420 unpack requested on a non-YCC420 container");
+    if (!cs_is_ycc(sampling_mode)) {
+        throw std::runtime_error("ycc unpack requested on a non-YCC container");
     }
 
     // LOD-luma variant: lod bytes sit between header and measurements (same
@@ -288,7 +289,7 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     // chroma stays uniform. Pure-uniform mode 3 has no lod region.
     size_t body_off = 0;
     int mY_written = m;
-    if (sampling_mode == CS_MODE_YCC420_HF) {
+    if (cs_is_ycc_hf(sampling_mode)) {
         if (periodic_tile <= 0) throw std::runtime_error("ycc-hf container missing HF tile size");
         const uint32_t thumb_len =
             static_cast<uint32_t>(encrypted_img.data[CS_OFF_PAD + CS_OFF_HF_THUMBLEN]) |
@@ -329,12 +330,12 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         const int lod_pixels = cs_lod_pixels(rows, cols, periodic_tile);
         const size_t need_lod = (size_t)CS_HEADER_BYTES + (size_t)lod_bytes;
         if (encrypted_img.total() * 3 < need_lod) {
-            throw std::runtime_error("ycc420 container: body too short for lod region");
+            throw std::runtime_error("ycc container: body too short for lod region");
         }
         std::vector<uint8_t> lod(encrypted_img.data + CS_HEADER_BYTES,
             encrypted_img.data + CS_HEADER_BYTES + lod_bytes);
         if ((int)lod.size() != periodic_samples) {
-            throw std::runtime_error("ycc420 container: lod length mismatch");
+            throw std::runtime_error("ycc container: lod length mismatch");
         }
         returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, periodic_tile, adaptive_base, lod_full_threshold);
         mY_written = (int)ri_x.size();
@@ -345,12 +346,14 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         ri_y.resize((size_t)m);
         returnRandomIndices(ri_x, ri_y, rows, cols, m, cs_key);
     }
-    // chroma draws are uniform in both variants (tagged keys)
-    returnYcc420ChromaIndices(rows, cols, m, cs_key);
+    // chroma draws are uniform in every variant (tagged keys); dims and
+    // counts follow the container mode (4:2:0 halves both axes, 4:2:2
+    // halves the width only)
+    returnYcc420ChromaIndices(rows, cols, m, cs_key, sampling_mode);
     const int mC = m_chroma;
 
     int crows, ccols;
-    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    cs_chroma_dims(sampling_mode, rows, cols, crows, ccols);
 
     // Bit-packed (--sample-bits) bodies unpack first: three independent
     // sections (luma, Cr, Cb) after the raw thumbnail/lod prefix. The
@@ -365,7 +368,7 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
 
     const size_t need = (size_t)CS_HEADER_BYTES + body_off + (size_t)mY_written + (size_t)2 * mC;
     if (encrypted_img.total() * 3 < need) {
-        throw std::runtime_error("ycc420 container: body too short for luma/chroma payload");
+        throw std::runtime_error("ycc container: body too short for luma/chroma payload");
     }
     const uint8_t* body = encrypted_img.data + CS_HEADER_BYTES + body_off;
 
@@ -410,7 +413,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
     const std::vector<std::vector<cv::Mat>>& solved,
     const std::vector<std::vector<TileCoord>>& coordinates,
     int i, int j, bool ycrcb, bool chroma_sub, int basis,
-    const cv::Mat& thumbnail_seed = cv::Mat())
+    const cv::Mat& thumbnail_seed = cv::Mat(), bool chroma_sub_v = true)
 {
     // pixel plane -> solver-domain coefficients (/10 convention)
     auto to_basis = [&](cv::Mat& plane) {
@@ -473,14 +476,17 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
             thumbnail_planes[0](t_rect).convertTo(y_crop, CV_32F, 1.0 / 255.0);
             to_basis(y_crop);
             refs[0] = y_crop;
-            const cv::Rect chroma_rect(t_rect.x / 2, t_rect.y / 2,
+            // 4:2:2 halves the width only (chroma_sub_v == false keeps full
+            // height); 4:2:0 halves both axes.
+            const cv::Rect chroma_rect(t_rect.x / 2, chroma_sub_v ? t_rect.y / 2 : t_rect.y,
                 (t_rect.x + t_rect.width + 1) / 2 - t_rect.x / 2,
-                (t_rect.y + t_rect.height + 1) / 2 - t_rect.y / 2);
+                chroma_sub_v ? (t_rect.y + t_rect.height + 1) / 2 - t_rect.y / 2 : t_rect.height);
             for (int ch = 1; ch < 3; ++ch) {
                 cv::Mat coarse, seed;
                 cv::resize(thumbnail_planes[ch], coarse,
                     cv::Size((thumbnail_seed.cols + 1) / 2,
-                        (thumbnail_seed.rows + 1) / 2), 0, 0, cv::INTER_AREA);
+                        chroma_sub_v ? (thumbnail_seed.rows + 1) / 2 : thumbnail_seed.rows),
+                    0, 0, cv::INTER_AREA);
                 coarse(chroma_rect).convertTo(seed, CV_32F, 1.0 / 255.0);
                 to_basis(seed);
                 refs[ch] = seed;
@@ -525,8 +531,10 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
             // Y gets the generic image-like ref; chroma planes start from a
             // neutral flat-chroma solution (their statistics are very different)
             refs[0] = generic_to_basis(fit(generic_refs[0]));
+            // 4:2:0 halves both axes; 4:2:2 halves the width only
+            // (chroma_sub_v == false keeps full height).
             cv::Size chroma_size = chroma_sub
-                ? cv::Size((want.width + 1) / 2, (want.height + 1) / 2)
+                ? cv::Size((want.width + 1) / 2, chroma_sub_v ? (want.height + 1) / 2 : want.height)
                 : want;
             refs[1] = cv::Mat(chroma_size, CV_32F, cv::Scalar(0.5f));
             to_basis(refs[1]);
@@ -545,18 +553,21 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
     for (int ch = 0; ch < 3; ++ch) {
         cv::Mat plane = planes[ch];
         if (chroma_sub && ch > 0) {
-            // match the half-res chroma solves' unknown space (ycc420)
-            cv::resize(plane, plane, cv::Size((plane.cols + 1) / 2, (plane.rows + 1) / 2), 0, 0, cv::INTER_AREA);
+            // match the coarse chroma solves' unknown space (4:2:0 halves
+            // both axes, 4:2:2 halves the width only)
+            cv::resize(plane, plane, cv::Size((plane.cols + 1) / 2,
+                chroma_sub_v ? (plane.rows + 1) / 2 : plane.rows), 0, 0, cv::INTER_AREA);
         }
         to_basis(plane);
         refs[ch] = plane;
     }
 }
 
+
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe, std::mutex* hr_grid_mutex) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x, float sr_red, const cs_coupled_dict* sr_dict, const std::string& sr_red_denoiser, const std::string& sr_dncnn_model, const std::string& sr_fsrcnn_model) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -642,12 +653,36 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 if (pipe && !mats_out[i][j].empty()) {
                     pipe->enqueue(i, j);
                 }
-                // fused AVIR upscale: this tile is final the moment its solve
-                // finishes (same op as the post-join batch, so bit-identical).
+                // fused 2x upscale: this tile is final the moment its solve
+                // finishes (same op as the post-join batch, so bit-identical
+                // for AVIR). With the cs-sr backend the tile instead gets a
+                // CS super-resolution refinement: the HR DCT coefficients are
+                // re-solved against the tile's original LR samples
+                // (warm-started from AVIR); an empty SR result falls back to
+                // AVIR so no tile is ever lost.
                 // A separate grid keeps the live preview's LR reads safe.
                 else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
-                    cs_upscale_2x_avir(mats_out[i][j], hr);
+                    if (sr_dict) {
+                        // Coupled-dict SR refines the solved tile (no
+                        // measurements needed: patch-OMP synthesis +
+                        // back-projection operate post-solve).
+                        cs_sr_upscale_dict_2x(mats_out[i][j], sr_dict, hr);
+                    }
+                    else if (!sr_fsrcnn_model.empty()) {
+                        // FSRCNN neural upscale (in-process CPU session per
+                        // worker inside the helper); misses fall through to
+                        // AVIR below so no tile is ever lost.
+                        cs_fsrcnn_upscale_2x(mats_out[i][j], hr, sr_fsrcnn_model);
+                    }
+                    else if (superres_2x) {
+                        cs_sr_upscale_tile_2x(mats_out[i][j], mats_in[i][j],
+                            indices[i][j].ri_x_g, indices[i][j].ri_y_g,
+                            tile_coef, tile_tv, iterations, reweights, fista_iters,
+                            basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model);
+                    }
+                    if (hr.empty())
+                        cs_upscale_2x_avir(mats_out[i][j], hr);
                     // Cell header replacement races the preview's
                     // reconstructImage: serialize it under the grid mutex.
                     if (!hr.empty() && hr_grid_mutex) {
@@ -698,7 +733,8 @@ static void decrypt_tiles_ycc420(int num_threads,
     int solver, int fista_iters, int reweights, int basis, float wscale,
     const cv::Mat& thumbnail_seed, bool per_tile_coef = false, bool per_tile_tv = false,
     std::vector<std::vector<cv::Mat>>* hr_out = nullptr, bool fuse_upscale = false,
-    CsUpscalePipeline* pipe = nullptr, std::mutex* hr_grid_mutex = nullptr) {
+    CsUpscalePipeline* pipe = nullptr, std::mutex* hr_grid_mutex = nullptr, bool chroma_sub_v = true, const cs_coupled_dict* sr_dict = nullptr,
+    const std::string& sr_fsrcnn_model = "") {
 
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
     const int iters_off = iterations / 2;
@@ -751,14 +787,15 @@ static void decrypt_tiles_ycc420(int num_threads,
                 if (y_meas[i][j].empty()) continue;
 
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, basis, thumbnail_seed);
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, basis, thumbnail_seed, chroma_sub_v);
 
                 const int Th = mats_out[i][j].rows;
                 const int Tw = mats_out[i][j].cols;
                 // coarse tile from the same halving the prep used: exact cover
+                // (4:2:2 keeps full height, halves the width only)
                 const int xo = coordinates[i][j].x, yo = coordinates[i][j].y;
                 const int cTw = (xo + Tw + 1) / 2 - xo / 2;
-                const int cTh = (yo + Th + 1) / 2 - yo / 2;
+                const int cTh = chroma_sub_v ? (yo + Th + 1) / 2 - yo / 2 : Th;
                 const cv::Size coarse_want(cTw, cTh);
                 // neighbor-derived chroma refs are halved t_rect; parity on
                 // edge tiles can leave them 1px off the solved grid — refit
@@ -821,10 +858,19 @@ static void decrypt_tiles_ycc420(int num_threads,
                     pipe->enqueue(i, j);
                 }
                 // fused AVIR upscale: same op as the post-join batch, so
-                // bit-identical; separate grid keeps preview reads safe
+                // bit-identical; separate grid keeps preview reads safe.
+                // A coupled dict refines the merged BGR tile (post-solve, so
+                // split-grid sampling needs no special operator here).
                 else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
-                    cs_upscale_2x_avir(mats_out[i][j], hr);
+                    if (sr_dict) {
+                        cs_sr_upscale_dict_2x(mats_out[i][j], sr_dict, hr);
+                    }
+                    else if (!sr_fsrcnn_model.empty()) {
+                        cs_fsrcnn_upscale_2x(mats_out[i][j], hr, sr_fsrcnn_model);
+                    }
+                    if (hr.empty())
+                        cs_upscale_2x_avir(mats_out[i][j], hr);
                     // Serialize the cell write under the grid mutex (see
                     // the BGR path above).
                     if (!hr.empty() && hr_grid_mutex) {
@@ -982,7 +1028,9 @@ int decrypt_image::decrypt_image_tiled(
     // full resolution, chroma natively on the coarse grid. The mode travels
     // in the header so no decrypt-side flags are needed.
     if (dimgs.get_sampling_mode() == CS_MODE_YCC420 ||
-        dimgs.get_sampling_mode() == CS_MODE_YCC420_HF) {
+        dimgs.get_sampling_mode() == CS_MODE_YCC422 ||
+        dimgs.get_sampling_mode() == CS_MODE_YCC420_HF ||
+        dimgs.get_sampling_mode() == CS_MODE_YCC422_HF) {
         return decrypt_image_tiled_ycc420(dimgs, output_path, num_tiles, overlap,
             iterations, nun_threads, coef, show_preview, tv,
             full_res, solver, fista_iters, reweights, basis, wscale,
@@ -1064,8 +1112,38 @@ int decrypt_image::decrypt_image_tiled(
     // instead of running as one post-join batch.
     std::vector<std::vector<cv::Mat>> hr_tiles(
         num_tiles, std::vector<cv::Mat>(num_tiles));
+    const bool is_sr = cs_is_superres_backend(photo_up.backend);
+    // Coupled-dict SR (takes precedence over the FISTA cs-sr solve; works
+    // in every container mode since it refines solved tiles): warmed here
+    // so the fused workers only read the cache. Missing file = hard error
+    // (explicit user flag, fail fast rather than silent AVIR).
+    const cs_coupled_dict* sr_d = nullptr;
+    if (!photo_up.sr_dict.empty() && !full_res) {
+        if (photo_up.sr_red > 0.0f) {
+            std::cerr << "Note: --red is ignored with --sr-dict (dict path has no FISTA passes)" << std::endl;
+        }
+        sr_d = cs_sr_dict_cached(photo_up.sr_dict);
+        if (!sr_d) {
+            std::cerr << "Error: --sr-dict model failed to load" << std::endl;
+            return -3;
+        }
+    }
+    const bool use_dict = (sr_d != nullptr);
+    // FSRCNN neural upscale runs fused like AVIR (same post-join grid);
+    // a missing model degrades per tile inside the helper (warn-once).
+    const std::string fsrcnn_model =
+        (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "";
+    // DnCNN RED denoiser: warmed here (fail fast on an explicit flag) so
+    // the fused workers only read the session cache. NLM needs no warm-up.
+    const bool use_dncnn_red = is_sr && !full_res && !use_dict &&
+        photo_up.sr_red > 0.0f && photo_up.sr_red_denoiser == "dncnn";
+    if (use_dncnn_red && !cs_dncnn_available(photo_up.sr_dncnn_model)) {
+        std::cerr << "Error: DnCNN model failed to load" << std::endl;
+        return -3;
+    }
     const bool fuse_upscale =
-        !full_res && photo_up.backend == "avir";
+        !full_res && (photo_up.backend == "avir" || is_sr || use_dict ||
+            !fsrcnn_model.empty());
     const bool pipe_upscale =
         !full_res && !fuse_upscale &&
         (photo_up.backend == "waifu2x" || photo_up.backend == "waifu2x-ncnn" ||
@@ -1101,7 +1179,9 @@ int decrypt_image::decrypt_image_tiled(
                 tile_size, coef, tv, solver,
                 fista_iters, reweights, basis, wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
                 &hr_tiles, fuse_upscale, pipe_upscale ? &pipe : nullptr,
-                (fuse_upscale || pipe_upscale) ? &hr_grid_mutex : nullptr);
+                (fuse_upscale || pipe_upscale) ? &hr_grid_mutex : nullptr,
+                is_sr && !full_res, photo_up.sr_red, sr_d,
+                photo_up.sr_red_denoiser, photo_up.sr_dncnn_model, fsrcnn_model);
         });
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
@@ -1120,8 +1200,15 @@ int decrypt_image::decrypt_image_tiled(
         if (fuse_upscale || pipe_upscale) {
             for (int i = 0; i < num_tiles; ++i)
                 for (int j = 0; j < num_tiles; ++j) {
-                    if (hr_tiles[i][j].empty() && !decrypted_image_tiles[i][j].empty())
+                    if (hr_tiles[i][j].empty() && !decrypted_image_tiles[i][j].empty()) {
+                        // FSRCNN misses retry neural first (same warn-once),
+                        // then AVIR; other backends go straight to AVIR.
+                        if (!fsrcnn_model.empty() &&
+                            cs_fsrcnn_upscale_2x(decrypted_image_tiles[i][j],
+                                hr_tiles[i][j], fsrcnn_model))
+                            continue;
                         cs_upscale_2x_avir(decrypted_image_tiles[i][j], hr_tiles[i][j]);
+                    }
                 }
             decrypted_image_tiles = std::move(hr_tiles);
         }
@@ -1178,7 +1265,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
     int fista_iters, int reweights, int basis, float wscale,
     const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv) {
     if (solver == CS_SOLVER_FISTA_JOINT) {
-        std::cerr << "Warning: joint solver needs one shared RGB grid; --ycc420 degrades to per-channel FISTA" << std::endl;
+        std::cerr << "Warning: joint solver needs one shared RGB grid; ycc split sampling degrades to per-channel FISTA" << std::endl;
     }
 
     try {
@@ -1190,13 +1277,15 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         dimgs.get_sampled_ycc420(Y, Ym, Cr, Crm, Cb, Cbm);
         const int rows = Y.rows, cols = Y.cols;
 
-        // luma tiling reuses the standard splitter; chroma tiles halve the
-        // luma rects for exact coarse-grid coverage (see solver for the same
-        // formula — the two must agree)
+        // luma tiling reuses the standard splitter; chroma tiles cover the
+        // matching coarse rects (4:2:0 halves both axes, 4:2:2 halves the
+        // width only — see the solver for the same formula, the two must
+        // agree)
         std::vector<std::vector<cv::Mat>> y_tiles, y_mask_tiles;
         std::vector<std::vector<TileCoord>> coordinates, mask_coords;
         splitImageIntoTiles(Y, y_tiles, coordinates, num_tiles, overlap);
         splitImageIntoTiles(Ym, y_mask_tiles, mask_coords, num_tiles, overlap);
+        const bool chroma_sub_v = !cs_is_ycc422(dimgs.get_sampling_mode());
 
         std::vector<std::vector<cv::Mat>> cr_tiles(num_tiles, std::vector<cv::Mat>(num_tiles)),
             cr_mask_tiles(num_tiles, std::vector<cv::Mat>(num_tiles)),
@@ -1216,9 +1305,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 if (y_tiles[i][j].empty() || y_mask_tiles[i][j].empty()) continue;
                 const int x = coordinates[i][j].x, y0 = coordinates[i][j].y;
                 const int w = y_tiles[i][j].cols, h = y_tiles[i][j].rows;
-                const int cx = x / 2, cy = y0 / 2;
+                const int cx = x / 2, cy = chroma_sub_v ? y0 / 2 : y0;
                 const int cw = (x + w + 1) / 2 - x / 2;
-                const int ch = (y0 + h + 1) / 2 - y0 / 2;
+                const int ch = chroma_sub_v ? (y0 + h + 1) / 2 - y0 / 2 : h;
                 const cv::Rect crect(cx, cy, cw, ch);
                 cr_tiles[i][j] = Cr(crect).clone();
                 cr_mask_tiles[i][j] = Crm(crect).clone();
@@ -1276,7 +1365,29 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // stream through the background pipeline while solving continues.
         std::vector<std::vector<cv::Mat>> ycc_hr_tiles(
             num_tiles, std::vector<cv::Mat>(num_tiles));
-        const bool ycc_fuse = !full_res && photo_up.backend == "avir";
+        const bool ycc_is_sr = cs_is_superres_backend(photo_up.backend);
+        // CS-SR refines BGR tiles against full-grid random samples; ycc split
+        // sampling (luma/chroma on separate grids) keeps the AVIR fused path
+        // here (one note, no failure).
+        if (ycc_is_sr && !full_res)
+            std::cerr << "Note: cs-sr falls back to AVIR for ycc containers"
+                " (luma/chroma split sampling)" << std::endl;
+        // Coupled-dict SR needs no split-grid operator (post-solve tiles),
+        // so it stays available here; warmed before the workers start.
+        const cs_coupled_dict* ycc_sr_d = nullptr;
+        if (!photo_up.sr_dict.empty() && !full_res) {
+            if (photo_up.sr_red > 0.0f) {
+                std::cerr << "Note: --red is ignored with --sr-dict (dict path has no FISTA passes)" << std::endl;
+            }
+            ycc_sr_d = cs_sr_dict_cached(photo_up.sr_dict);
+            if (!ycc_sr_d) {
+                std::cerr << "Error: --sr-dict model failed to load" << std::endl;
+                return -3;
+            }
+        }
+        const bool ycc_fuse = !full_res && (photo_up.backend == "avir" || ycc_is_sr || ycc_sr_d ||
+            photo_up.backend == "fsrcnn");
+        // (the fsrcnn model path is threaded to the ycc tile solver below)
         const bool ycc_pipe =
             !full_res && !ycc_fuse &&
             (photo_up.backend == "waifu2x" ||
@@ -1311,7 +1422,8 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             solver, fista_iters, reweights, basis, wscale,
             std::cref(dimgs.thumb_seed), per_tile_coef, per_tile_tv,
             &ycc_hr_tiles, ycc_fuse, ycc_pipe ? &ycc_upipe : nullptr,
-            (ycc_fuse || ycc_pipe) ? &ycc_hr_grid_mutex : nullptr);
+            (ycc_fuse || ycc_pipe) ? &ycc_hr_grid_mutex : nullptr, chroma_sub_v, ycc_sr_d,
+            (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "");
         if (ycc_pipe) ycc_upipe.finish();
 
         if (show_preview) {
@@ -1324,10 +1436,14 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // Fused/pipelined tiles are adopted (AVIR fallback for misses).
         int ycc_blend_feather = overlap;
         if (ycc_fuse || ycc_pipe) {
+            const bool ycc_fsr = !full_res && photo_up.backend == "fsrcnn";
             for (int i = 0; i < num_tiles; ++i)
                 for (int j = 0; j < num_tiles; ++j) {
-                    if (ycc_hr_tiles[i][j].empty() && !decrypted[i][j].empty())
-                        cs_upscale_2x_avir(decrypted[i][j], ycc_hr_tiles[i][j]);
+                    if (ycc_hr_tiles[i][j].empty() && !decrypted[i][j].empty()) {
+                        if (!(ycc_fsr && cs_fsrcnn_upscale_2x(decrypted[i][j],
+                                ycc_hr_tiles[i][j], photo_up.fsrcnn_model)))
+                            cs_upscale_2x_avir(decrypted[i][j], ycc_hr_tiles[i][j]);
+                    }
                 }
             decrypted = std::move(ycc_hr_tiles);
         }
@@ -1360,7 +1476,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         cv::imwrite(output_path, reconstructed);
     }
     catch (const std::exception& e) {
-        std::cerr << "Error: ycc420 decryption pipeline failed: " << e.what() << std::endl;
+        std::cerr << "Error: ycc decryption pipeline failed: " << e.what() << std::endl;
         return -3;
     }
 

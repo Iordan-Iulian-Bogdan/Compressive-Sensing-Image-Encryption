@@ -22,25 +22,28 @@ public:
     void encrypt(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
     void encrypt(const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g);
 
-    // YCC 4:2:0 split encryption (mode 3): BGR -> YCrCb, chroma downsampled
-    // 2x, luma sampled at full resolution and each chroma plane sampled on
-    // its coarse grid. Body layout: [Y x m][Cr x m_chroma][Cb x m_chroma].
-    // pixel_p is the LUMA sampling ratio; total stored ~= 1.5x luma budget.
-    void encrypt_ycc420(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
+    // YCC 4:2:0 split encryption (mode 3; mode 7 = 4:2:2): BGR -> YCrCb,
+    // chroma downsampled to the mode's coarse grid, luma sampled at full
+    // resolution and each chroma plane sampled on its coarse grid. Body
+    // layout: [Y x m][Cr x m_chroma][Cb x m_chroma]. pixel_p is the LUMA
+    // sampling ratio; total stored ~= 1.5x luma budget (4:2:0) or ~= 2x
+    // (4:2:2, chroma full height).
+    void encrypt_ycc420(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420);
 
     void encrypt_hf_focus(const float& pixel_p, const std::string& password,
         int tile_size, int lod_min, int sample_bits = 8, int chroma_bits = 0);
     void encrypt_ycc420_hf(const float& pixel_p, const std::string& password,
-        int tile_size, int sample_bits = 8, int chroma_bits = 0);
+        int tile_size, int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_HF);
 
-    // YCC 4:2:0 with LOD-driven luma (mode 3 + shipped lod bytes): same LOD
-    // sources as encrypt_adaptive (Laplacian / two-pass / LLM regions +
-    // smoothing) drive the luma budget; chroma stays uniform coarse-grid.
+    // YCC 4:2:0 with LOD-driven luma (mode 3 + shipped lod bytes; mode 7 for
+    // 4:2:2): same LOD sources as encrypt_adaptive (Laplacian / two-pass /
+    // spectral-DCT / LLM regions + smoothing) drive the luma budget; chroma stays uniform
+    // coarse-grid.
     // Body layout: [lod x lod_bytes][Y x mY_written][Cr][Cb].
     void encrypt_ycc420_adaptive(const float& pixel_p, const std::string& password,
         int tile_size, int lod_min, int weight_base = 256, bool two_pass = false,
         float pilot_ratio = 0.05f, const std::string& regions_json = "",
-        float region_blend = 0.5f, float lod_smooth = 0.0f, int sample_bits = 8, int chroma_bits = 0, int lod_full = 0);    // Periodic tile-based encryption: generate random pattern within one tile,
+        float region_blend = 0.5f, float lod_smooth = 0.0f, int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, int mode = CS_MODE_YCC420, bool spectral_lod = false);    // Periodic tile-based encryption: generate random pattern within one tile,
     // then repeat across the image. tile_size should divide the image dimensions.
     void encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size, int sample_bits = 8, int chroma_bits = 0);
 
@@ -51,7 +54,7 @@ public:
     void encrypt_adaptive(const float& pixel_p, const std::string& password, int tile_size,
         int lod_min, int weight_base = 256, bool two_pass = false, float pilot_ratio = 0.05f,
         const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f,
-        int sample_bits = 8, int chroma_bits = 0, int lod_full = 0);
+        int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool spectral_lod = false);
 
     void writeEncryptedImageToDisk(const std::string& output_path);
 
@@ -79,7 +82,7 @@ public:
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
     */
-    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false, int sample_bits = 8, int chroma_bits = 0, int lod_full = 0);
+    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false);
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at
@@ -91,6 +94,12 @@ private:
     // standard adaptive path, so container format and decrypt are unchanged.
     std::vector<uint8_t> compute_twopass_lod(int tile_size, int lod_min, float pilot_ratio);
 };
+
+// Per-tile spectral LOD bytes (free function for test access): each tile's
+// gray DCT energy whitened by the image's global radial spectral decay,
+// min-max normalized with lod_min floor. Same grid layout as
+// compute_adaptive_lod, so counts/container/decrypt are unchanged.
+std::vector<uint8_t> compute_spectral_lod(const cv::Mat& img, int tile_size, int lod_min);
 
 /** @brief encrypts a given image and writes the result to disk
 @param input_path : path to input image

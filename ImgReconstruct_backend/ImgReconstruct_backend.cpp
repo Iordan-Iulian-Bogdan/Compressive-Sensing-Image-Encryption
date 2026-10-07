@@ -1,6 +1,7 @@
-﻿#include "image_decryption.hpp"
+#include "image_decryption.hpp"
 #include "image_encryption.hpp"
 #include "photo_upscaler.hpp"
+#include "cs_dict.hpp"
 #include "quality_utils.hpp"
 #include "cs_gpu.h"
 #include <opencv2/core/ocl.hpp>
@@ -26,6 +27,7 @@ void print_usage(const char* exe) {
         "  " << exe << " decrypt <input.png> <output.png> [options]\n"
         "  " << exe << " roundtrip <input.png> <output.png> [options]\n"
         "  " << exe << " compare <original.png> <decrypted.png> <out_prefix> [options]\n"
+  "  " << exe << " train-dict <out.csd2> <img1.png> [img2.png ...] [atoms=N] [iters=N] [pairs=N]\n"
         "\n"
 "Options:\n"
         "  --password <pw>       passphrase (else $CS_PASSWORD, else interactive prompt)\n"
@@ -50,13 +52,19 @@ void print_usage(const char* exe) {
         "                        derives tiles/overlap/iterations/coef from the image)\n"
         "  --no-preview          disable the live decryption preview window\n"
         "  --photo-upscaler <b>  per-tile 2x upscaler backend: avir (default,\n"
-        "                        vendored resampler), waifu2x (one batched\n"
+        "                        vendored resampler), fsrcnn (neural 2x, needs weights),\n"
+        "                        cs-sr (CS refinement: the\n"
+        "                        HR tile is re-solved against its LR samples),\n"
+        "                        waifu2x (one batched\n"
         "                        nunif subprocess), waifu2x-ncnn (native\n"
         "                        waifu2x-ncnn-vulkan binary) or realcugan\n"
         "                        (native realcugan-ncnn-vulkan binary); the\n"
         "                        ncnn binaries run on Vulkan (AMD included)\n"
         "                        with no Python, and fall back to AVIR when\n"
         "                        unavailable)\n"
+        "  --fsrcnn-model <f>    FSRCNN weights for --photo-upscaler fsrcnn\n"
+        "                        (default FSRCNN_x2.pb, resolved against the\n"
+        "                        working directory)\n"
         "  --waifu2x-cmd <s>     waifu2x command prefix (default\n"
         "                        \"python -m waifu2x.cli\" or $CS_WAIFU2X_CMD;\n"
         "                        e.g. \"py -m waifu2x.cli\" on Windows)\n"
@@ -70,6 +78,19 @@ void print_usage(const char* exe) {
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off)\n"
+  "  --red <f>             RED-lite NLM strength for --photo-upscaler cs-sr\n"
+  "                        in [0, 1] (0 = off): blends each outer FISTA pass\n"
+  "                        toward its fastNlMeans-denoised self; stronger\n"
+  "                        natural-image prior than TV, slower\n"
+  "  --red-denoiser <d>    RED denoiser for cs-sr: nlmeans (default, luma\n"
+  "                        fastNlMeans) or dncnn (repo-vendored color DnCNN\n"
+  "                        via ONNX Runtime, BGR tile per pass; slower)\n"
+  "  --dncnn-model <f>     DnCNN ONNX path (default models/dncnn/\n"
+  "                        dncnn_color.onnx)\n"
+  "  --sr-dict <f>         coupled-dictionary SR model (CSD2) for decrypt/\n"
+  "                        roundtrip: patch-OMP synthesis replaces the FISTA\n"
+  "                        HR solve in the fused 2x path (any container mode);\n"
+  "                        --red is ignored there; see train-dict\n"
   "  --solver <name>      tile solver: fista (default, reweighted-L1\n"
   "                        FISTA per channel), joint (SOMP-structured\n"
   "                        group-sparsity FISTA over R/G/B together +\n"
@@ -102,8 +123,17 @@ void print_usage(const char* exe) {
   "                        --lod-full) are absorbed: they drive the luma budget\n"
   "                        while chroma stays uniform. --periodic is ignored\n"
   "                        under --ycc420.\n"
+  "  --ycc422              encrypt with luma/chroma-split 4:2:2 sampling: Y\n"
+  "                        at full resolution, each chroma plane sampled on\n"
+  "                        a half-width, full-height grid (~2 bytes/px;\n"
+  "                        sharper chroma edges than 4:2:0 at a larger\n"
+  "                        container; decrypt auto-detects mode 7).\n"
+  "                        Same absorbed flags as --ycc420; mutually\n"
+  "                        exclusive with --ycc420; --hf-focus selects the\n"
+  "                        mode-8 HF-weighted variant.\n"
   "  --hf-focus            encrypt a stored LF thumbnail plus HF-weighted\n"
-  "                        samples (BGR mode 5; with --ycc420, mode 6)\n"
+  "                        samples (BGR mode 5; with --ycc420, mode 6;\n"
+  "                        with --ycc422, mode 8)\n"
   "  --sample-bits <L[,C]> bits for luma and optional chroma, each [1, 8]\n"
   "                        (one value applies to both; default 8; lower values shrink\n"
   "                        the container near-linearly at the cost of\n"
@@ -133,6 +163,10 @@ void print_usage(const char* exe) {
   "  --pilot-ratio <f>     pilot fraction of each tile's pixels for\n"
   "                        --two-pass scoring in [0.01, 0.25]\n"
   "                        (default 0.05; min 16 samples/tile)\n"
+  "  --spectral            adaptive scoring via per-tile DCT energy whitened\n"
+  "                        by the global spectral decay (band-energy\n"
+  "                        scoring) instead of the Laplacian; implies adaptive,\n"
+  "                        decrypt needs no new flags (encrypt/roundtrip only)\n"
   "  --regions <json>      inline LLM region spec, e.g.\n"
   "                        '{\"regions\": [{\"box\": [325,165,605,445],\n"
   "                        \"detail\": 1.0}]}' (boxes in 0-1000, origin\n"
@@ -254,10 +288,58 @@ int main(int argc, char* argv[])
     }
 
     const std::string mode = argv[1];
-    if (mode != "encrypt" && mode != "decrypt" && mode != "roundtrip" && mode != "compare") {
+    if (mode != "encrypt" && mode != "decrypt" && mode != "roundtrip" && mode != "compare" && mode != "train-dict") {
         std::cerr << "Error: unknown mode '" << mode << "'" << std::endl;
         print_usage(argv[0]);
         return 64;
+    }
+
+    if (mode == "train-dict") {
+        // train-dict <out.csd2> <img1.png> [img2.png ...] [atoms=N] [iters=N] [pairs=N] [plr=8]
+        if (argc < 4) {
+            std::cerr << "Error: train-dict needs <out.csd2> <img1.png> [img2.png ...]" << std::endl;
+            print_usage(argv[0]);
+            return 64;
+        }
+        const std::string out_path = argv[2];
+        int atoms = 256, iters = 10, max_pairs = 30000, plr = 8;
+        std::vector<cv::Mat> images;
+        for (int i = 3; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a.rfind("atoms=", 0) == 0) { atoms = std::atoi(a.c_str() + 6); continue; }
+            if (a.rfind("iters=", 0) == 0) { iters = std::atoi(a.c_str() + 6); continue; }
+            if (a.rfind("pairs=", 0) == 0) { max_pairs = std::atoi(a.c_str() + 6); continue; }
+            if (a.rfind("plr=", 0) == 0) { plr = std::atoi(a.c_str() + 4); continue; }
+            cv::Mat img = cv::imread(a, cv::IMREAD_COLOR);
+            if (img.empty()) {
+                std::cerr << "Error: cannot load training image '" << a << "'" << std::endl;
+                return 1;
+            }
+            std::cout << "using " << a << " (" << img.cols << "x" << img.rows << ")" << std::endl;
+            images.push_back(img);
+        }
+        if (images.empty()) {
+            std::cerr << "Error: train-dict needs at least one input image" << std::endl;
+            return 64;
+        }
+        if (atoms <= 0 || atoms > 4096 || iters <= 0 || max_pairs <= 0 || plr != 8) {
+            std::cerr << "Error: bad train-dict params (atoms 1..4096, iters >= 1, pairs >= 1, plr 8)" << std::endl;
+            return 64;
+        }
+        std::cout << "training coupled dictionary: atoms=" << atoms << " iters=" << iters
+            << " pairs=" << max_pairs << " plr=" << plr << std::endl;
+        cs_coupled_dict dict;
+        if (!cs_train_coupled_dictionary(images, atoms, iters, max_pairs, plr, dict)) {
+            std::cerr << "Error: coupled training failed (not enough patch data?)" << std::endl;
+            return 1;
+        }
+        if (!cs_save_coupled_dictionary(out_path, dict)) {
+            std::cerr << "Error: cannot write '" << out_path << "'" << std::endl;
+            return 1;
+        }
+        std::cout << "saved " << dict.atoms << " atoms (lr " << dict.plr << "x" << dict.plr
+            << " -> hr " << dict.phr << "x" << dict.phr << ") to " << out_path << std::endl;
+        return 0;
     }
 
     if (mode == "compare") {
@@ -305,10 +387,12 @@ int main(int argc, char* argv[])
     int tile_size = 64;
     bool adaptive = false;
     bool ycc420 = false;
+    bool ycc422 = false;
     bool hf_focus = false;
     int adaptive_floor = 32;    float adaptive_strength = 0.5f;
     int lod_full = 0;
     bool two_pass = false;
+    bool spectral = false;
     float pilot_ratio = 0.05f;
     std::string regions_json;
     float region_blend = 0.5f;
@@ -386,14 +470,20 @@ int main(int argc, char* argv[])
             show_preview = false;
         }
         else if (a == "--photo-upscaler") {
-            const char* v = next("avir, waifu2x, waifu2x-ncnn or realcugan");
+            const char* v = next("avir, cs-sr, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
             if (!v) return 64;
-            if (v != std::string("avir") && v != std::string("waifu2x") &&
+            if (v != std::string("avir") && v != std::string("cs-sr") && v != std::string("cs") &&
+                v != std::string("fsrcnn") && v != std::string("waifu2x") &&
                 v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
-                std::cerr << "Error: --photo-upscaler must be avir, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
+                std::cerr << "Error: --photo-upscaler must be avir, cs-sr, fsrcnn, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
                 return 64;
             }
             photo_up.backend = v;
+        }
+        else if (a == "--fsrcnn-model") {
+            const char* v = next("FSRCNN .pb path");
+            if (!v) return 64;
+            photo_up.fsrcnn_model = v;
         }
         else if (a == "--waifu2x-cmd") {
             const char* v = next("command");
@@ -458,6 +548,39 @@ int main(int argc, char* argv[])
             const char* v = next("floating point");
             if (!v || !parse_float(v, tv_lambda)) return 64;
         }
+        else if (a == "--red") {
+            // RED-lite NLM strength for --photo-upscaler cs-sr (0 = off):
+            // does NOT force manual mode, same as --tv
+            const char* v = next("floating point in [0, 1]");
+            float red = 0.0f;
+            if (!v || !parse_float(v, red)) return 64;
+            if (red < 0.0f || red > 1.0f) {
+                std::cerr << "Error: --red must be in [0, 1]" << std::endl;
+                return 64;
+            }
+            photo_up.sr_red = red;
+        }
+        else if (a == "--red-denoiser") {
+            const char* v = next("nlmeans or dncnn");
+            if (!v) return 64;
+            if (v != std::string("nlmeans") && v != std::string("dncnn")) {
+                std::cerr << "Error: --red-denoiser must be nlmeans or dncnn" << std::endl;
+                return 64;
+            }
+            photo_up.sr_red_denoiser = v;
+        }
+        else if (a == "--dncnn-model") {
+            const char* v = next("DnCNN ONNX model path");
+            if (!v) return 64;
+            photo_up.sr_dncnn_model = v;
+        }
+        else if (a == "--sr-dict") {
+            // coupled-dictionary SR model: decrypt-side only, takes
+            // precedence over the FISTA cs-sr solve in the fused 2x path
+            const char* v = next("CSD2 dictionary file");
+            if (!v) return 64;
+            photo_up.sr_dict = v;
+        }
         else if (a == "--periodic") {
             // encrypt-side only: decrypt auto-detects the mode from the
             // container header, so this must not flip decrypt into manual
@@ -474,12 +597,17 @@ int main(int argc, char* argv[])
             // sampling; decrypt auto-detects mode 3 from the container header
             ycc420 = true;
         }
+        else if (a == "--ycc422") {
+            // encrypt-side only: luma/chroma-split 4:2:2 sampling; decrypt
+            // auto-detects mode 7 from the container header
+            ycc422 = true;
+        }
         else if (a == "--hf-focus") {
             hf_focus = true;
         }
         else if (a == "--adaptive") {
             // encrypt-side only (same as --periodic): never forces manual
-            // decrypt parameters — mode travels in the authenticated header
+            // decrypt parameters â€” mode travels in the authenticated header
             adaptive = true;
         }
         else if (a == "--adaptive-floor") {
@@ -512,6 +640,11 @@ int main(int argc, char* argv[])
             // encrypt-side scoring variant: implies the adaptive container
             // (mode travels in the header, decrypt auto-detects)
             two_pass = true;
+        }
+        else if (a == "--spectral") {
+            // encrypt-side scoring variant (spectral-DCT LOD): implies the
+            // adaptive container, mutually exclusive with --two-pass
+            spectral = true;
         }
         else if (a == "--pilot-ratio") {
             const char* v = next("floating point in [0.01,0.25]");
@@ -655,12 +788,17 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --regions is encrypt-side only; ignoring for decrypt" << std::endl;
         regions_json.clear();
     }
-    if (ycc420 && mode != "encrypt" && mode != "roundtrip") {
-        std::cerr << "Warning: --ycc420 is encrypt-side only; ignoring for decrypt" << std::endl;
-        ycc420 = false;
+    if (ycc420 && ycc422) {
+        std::cerr << "Error: --ycc420 and --ycc422 are mutually exclusive" << std::endl;
+        return 64;
     }
-    if (ycc420 && periodic) {
-        std::cerr << "Warning: --periodic is meaningless with --ycc420; ignoring" << std::endl;
+    if ((ycc420 || ycc422) && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --ycc420/--ycc422 is encrypt-side only; ignoring for decrypt" << std::endl;
+        ycc420 = false;
+        ycc422 = false;
+    }
+    if ((ycc420 || ycc422) && periodic) {
+        std::cerr << "Warning: --periodic is meaningless with --ycc420/--ycc422; ignoring" << std::endl;
         periodic = false;
     }
     if (hf_focus && periodic) {
@@ -670,6 +808,10 @@ int main(int argc, char* argv[])
     if (hf_focus && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --hf-focus is encrypt-side only; ignoring for decrypt" << std::endl;
         hf_focus = false;
+    }
+    if (!photo_up.sr_dict.empty() && mode != "decrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --sr-dict is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.sr_dict.clear();
     }
 
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;
@@ -682,12 +824,12 @@ int main(int argc, char* argv[])
         // mode travels inside the authenticated container, so decrypt needs
         // no sampling flags. --adaptive/--two-pass win over --periodic when
         // combined (--two-pass implies the adaptive container), unless
-        // --ycc420 is set: then the adaptive-family flags are absorbed into
+        // --ycc420/--ycc422 is set: then the adaptive-family flags are absorbed into
         // the LOD-luma variant of the split container instead.
-        const bool use_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
+        const bool use_adaptive = adaptive || two_pass || spectral || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
@@ -695,7 +837,7 @@ int main(int argc, char* argv[])
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv);

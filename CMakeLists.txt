@@ -26,11 +26,21 @@ else()
     message(STATUS "OpenCV quality module not found: SSIM will report n/a")
 endif()
 
+# contrib dnn_superres module (FSRCNN backend) -- optional; photo_upscaler
+# falls back to AVIR per tile when opencv2/dnn_superres.hpp is missing
+if(TARGET opencv_dnn_superres)
+    list(APPEND OpenCV_LIBS opencv_dnn_superres)
+    message(STATUS "OpenCV dnn_superres module found: FSRCNN backend enabled")
+else()
+    message(STATUS "OpenCV dnn_superres module not found: FSRCNN falls back to AVIR")
+endif()
+
 # core library shared by the CLI and the test suite
 add_library(cs_core STATIC
     ImgReconstruct_backend/CS_encryption.cpp
     ImgReconstruct_backend/clip_scorer.cpp
     ImgReconstruct_backend/crypto_utils.cpp
+    ImgReconstruct_backend/cs_dict.cpp
     ImgReconstruct_backend/helper_functions.cpp
     ImgReconstruct_backend/image_decryption.cpp
     ImgReconstruct_backend/image_encryption.cpp

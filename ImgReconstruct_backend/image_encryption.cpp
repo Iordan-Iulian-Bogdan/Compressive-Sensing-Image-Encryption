@@ -10,6 +10,144 @@
 #include <algorithm>
 #include <iostream>
 
+// Global radial spectral decay of a gray image: thumbnail (max 128px),
+// orthonormal DCT, mean |F|^2 per radial bin, log-log least-squares slope.
+// Returns alpha in E(f) ~ f^-alpha (natural images ~2). Any degenerate fit
+// (flat image, too few bins, NaN) returns 2.0. Pure function of pixels.
+static double cs_fit_spectral_decay(const cv::Mat& gray) {
+    const int maxd = (std::max)(gray.rows, gray.cols);
+    if (maxd <= 0) return 2.0;
+    cv::Mat thumb = gray;
+    if (maxd > 128) {
+        cv::resize(gray, thumb, cv::Size(), 128.0 / maxd, 128.0 / maxd, cv::INTER_AREA);
+    }
+    cv::Mat f;
+    thumb.convertTo(f, CV_32F, 1.0 / 255.0);
+    cv::dct(f, f);
+    const int R = f.rows, C = f.cols;
+    if (R < 4 || C < 4) return 2.0;
+    const int fmax = (int)std::sqrt((double)(R - 1) * (R - 1) + (double)(C - 1) * (C - 1));
+    std::vector<double> sum((size_t)fmax + 1, 0.0), cnt((size_t)fmax + 1, 0.0);
+    for (int u = 0; u < R; ++u) {
+        const float* row = f.ptr<float>(u);
+        for (int v = 0; v < C; ++v) {
+            if (u == 0 && v == 0) continue; // DC carries brightness, not detail
+            int b = (int)std::lround(std::sqrt((double)u * u + (double)v * v));
+            if (b > fmax) b = fmax;
+            const double e = (double)row[v] * row[v];
+            sum[(size_t)b] += e;
+            cnt[(size_t)b] += 1.0;
+        }
+    }
+    double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+    int n = 0;
+    for (int b = 1; b <= fmax; ++b) {
+        if (cnt[(size_t)b] < 4.0 || sum[(size_t)b] <= 0.0) continue;
+        const double x = std::log((double)b);
+        const double y = std::log(sum[(size_t)b] / cnt[(size_t)b]);
+        sx += x; sy += y; sxx += x * x; sxy += x * y;
+        ++n;
+    }
+    if (n < 3) return 2.0;
+    const double denom = n * sxx - sx * sx;
+    if (!(denom > 1e-9)) return 2.0;
+    const double alpha = -((n * sxy - sx * sy) / denom);
+    if (!(alpha >= 0.5)) return 2.0; // NaN or rising spectrum: natural-image prior
+    return (std::min)(alpha, 4.0);
+}
+
+// Per-tile spectral level-of-detail bytes in [lod_min, 255]: each tile's
+// gray DCT energy whitened by the image's global radial decay, i.e. tiles
+// pay for high-frequency energy the natural-image prior does NOT predict.
+// Smooth gradients (steep local spectra, DCT-sparse) score low even when
+// bright; texture/noise (flat local spectra) score high. Same grid,
+// min-max + floor normalization, and row-major layout as the Laplacian
+// path, so counts/container/decrypt are unchanged. Pure function of pixels.
+std::vector<uint8_t> compute_spectral_lod(const cv::Mat& img, int tile_size, int lod_min) {
+    if (tile_size <= 0) {
+        throw std::runtime_error("adaptive sampling: tile size must be positive");
+    }
+    lod_min = (std::max)(0, (std::min)(255, lod_min));
+
+    cv::Mat gray;
+    if (img.channels() == 3) {
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    }
+    else {
+        gray = img;
+    }
+
+    // Expected-energy weights for a tile_size x tile_size DCT: (f+1)^alpha
+    // so each coefficient contributes surprise, not raw energy. DC weight 0
+    // (brightness must not buy budget).
+    const double alpha = cs_fit_spectral_decay(gray);
+    const int T = tile_size;
+    std::vector<float> w((size_t)T * T, 0.0f);
+    for (int u = 0; u < T; ++u) {
+        for (int v = 0; v < T; ++v) {
+            if (u == 0 && v == 0) continue;
+            const double f = std::sqrt((double)u * u + (double)v * v);
+            w[(size_t)u * T + v] = (float)std::pow(f + 1.0, alpha);
+        }
+    }
+
+    const int rows = img.rows;
+    const int cols = img.cols;
+    const int tiles_cols = (cols + tile_size - 1) / tile_size;
+    const int tiles_rows = (rows + tile_size - 1) / tile_size;
+    std::vector<uint8_t> lod((size_t)tiles_rows * tiles_cols, (uint8_t)lod_min);
+
+    std::vector<double> energy(lod.size(), 0.0);
+    double e_min = 0.0, e_max = 0.0;
+    bool first = true;
+    for (int tr = 0; tr < tiles_rows; ++tr) {
+        for (int tc = 0; tc < tiles_cols; ++tc) {
+            const int row0 = tr * tile_size;
+            const int col0 = tc * tile_size;
+            const int tile_w = (tile_size < cols - col0) ? tile_size : cols - col0;
+            const int tile_h = (tile_size < rows - row0) ? tile_size : rows - row0;
+            // Replicate-pad edge tiles to the common DCT grid so frequency
+            // bins (and the whitening) are comparable across all tiles.
+            cv::Mat buf(T, T, CV_32F);
+            for (int i = 0; i < T; ++i) {
+                const int sy = row0 + ((i < tile_h) ? i : tile_h - 1);
+                const uint8_t* srow = gray.ptr<uint8_t>(sy);
+                float* drow = buf.ptr<float>(i);
+                for (int j = 0; j < T; ++j) {
+                    const int sx = col0 + ((j < tile_w) ? j : tile_w - 1);
+                    drow[j] = srow[sx] * (1.0f / 255.0f);
+                }
+            }
+            cv::dct(buf, buf);
+            if (!buf.isContinuous()) buf = buf.clone();
+            const float* d = buf.ptr<float>(0);
+            double e = 0.0;
+            for (int i = 0; i < T * T; ++i) {
+                const double c = d[i];
+                e += (double)w[i] * c * c;
+            }
+            e /= (double)((long long)T * T);
+            const size_t k = (size_t)tr * tiles_cols + tc;
+            energy[k] = e;
+            if (first) { e_min = e_max = e; first = false; }
+            else {
+                e_min = (std::min)(e_min, e);
+                e_max = (std::max)(e_max, e);
+            }
+        }
+    }
+
+    const double range = e_max - e_min;
+    for (size_t i = 0; i < energy.size(); ++i) {
+        double n = 0.0;
+        if (range > 1e-9) {
+            n = (energy[i] - e_min) / range;
+        }
+        int v = lod_min + (int)std::lround(n * (255 - lod_min));
+        lod[i] = (uint8_t)(std::max)(0, (std::min)(255, v));
+    }
+    return lod;
+}
 namespace {
 // LLM region spec: box in 0-1000 normalized coords (origin top-left),
 // detail in [0,1]. Passed inline via --regions as
@@ -259,6 +397,7 @@ std::vector<uint8_t> compute_adaptive_lod(const cv::Mat& img, int tile_size, int
     }
     return lod;
 }
+
 
 void build_hf_thumb_png(const cv::Mat& input, std::vector<uint8_t>& encoded) {
     if (input.empty()) throw std::runtime_error("hf thumbnail: empty input image");
@@ -562,7 +701,7 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
  * container holds ~1.5 bytes per luma sample instead of 3 (BGR modes).
  * Metadata carries the luma budget m; chroma counts re-derive from it.
  */
-void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits) {
+void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits, int mode) {
     bm = pixel_p;
     m = rows * cols * bm;
 
@@ -575,7 +714,7 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     }
     cs_key_valid = true;
 
-    returnYcc420Indices(rows, cols, m, cs_key);
+    returnYcc420Indices(rows, cols, m, cs_key, mode);
     const int mC = m_chroma;
 
     cv::Mat ycc;
@@ -583,7 +722,7 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     std::vector<cv::Mat> planes;
     cv::split(ycc, planes); // 0:Y 1:Cr 2:Cb to match COLOR_YCrCb2BGR order
     int crows, ccols;
-    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    cs_chroma_dims(mode, rows, cols, crows, ccols);
     cv::Mat cr_small, cb_small;
     cv::resize(planes[1], cr_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
     cv::resize(planes[2], cb_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
@@ -599,8 +738,9 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
         throw std::runtime_error("failed to write authenticated header");
     }
 
-    // mode=3 in the authenticated pad region; decrypt restores it from here
-    buf[CS_OFF_PAD] = CS_MODE_YCC420;
+    // mode (3 or 7) in the authenticated pad region; decrypt restores it
+    // from here
+    buf[CS_OFF_PAD] = (uint8_t)mode;
 
     uint8_t* body = buf + CS_HEADER_BYTES;
     for (int k = 0; k < m; k++) {
@@ -636,7 +776,7 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
     encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
-    sampling_mode = CS_MODE_YCC420;
+    sampling_mode = mode;
 }
 
 // Forward declarations (defined alongside encrypt_adaptive below): LOD
@@ -657,7 +797,7 @@ std::vector<uint8_t> smooth_lod_grid(const std::vector<uint8_t>& lod,
  */
 void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::string& password,
     int tile_size, int lod_min, int weight_base, bool two_pass, float pilot_ratio,
-    const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full) {
+    const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full, int mode, bool spectral_lod) {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
     }
@@ -676,12 +816,13 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     cs_key_valid = true;
 
     // LOD source priority mirrors encrypt_adaptive: inline LLM regions >
-    // two-pass residual > Laplacian; smoothing applies to all three.
+    // two-pass residual / spectral DCT > Laplacian; smoothing applies to all.
     if (!regions_json.empty() && (region_blend < 0.0f || region_blend > 1.0f)) {
         throw std::runtime_error("regions: blend must be in [0, 1]");
     }
     const std::vector<uint8_t> base_lod = two_pass
         ? compute_twopass_lod(tile_size, lod_min, pilot_ratio)
+        : spectral_lod ? compute_spectral_lod(input_img, tile_size, lod_min)
         : compute_adaptive_lod(input_img, tile_size, lod_min);
     std::vector<uint8_t> lod = regions_json.empty()
         ? base_lod
@@ -695,7 +836,7 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     // chroma stays uniform on the coarse grids
     returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, tile_size, weight_base, lod_full);
     const int mY_written = (int)ri_x.size();
-    returnYcc420ChromaIndices(rows, cols, m, cs_key);
+    returnYcc420ChromaIndices(rows, cols, m, cs_key, mode);
     const int mC = m_chroma;
 
     cv::Mat ycc;
@@ -703,7 +844,7 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     std::vector<cv::Mat> planes;
     cv::split(ycc, planes); // 0:Y 1:Cr 2:Cb to match COLOR_YCrCb2BGR order
     int crows, ccols;
-    cs_ycc420_chroma_dims(rows, cols, crows, ccols);
+    cs_chroma_dims(mode, rows, cols, crows, ccols);
     cv::Mat cr_small, cb_small;
     cv::resize(planes[1], cr_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
     cv::resize(planes[2], cb_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
@@ -719,9 +860,9 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
         throw std::runtime_error("failed to write authenticated header");
     }
 
-    // mode=3 with the adaptive pad layout (tile_size, lod count, base) so
-    // decrypt restores the exact budgeting
-    buf[CS_OFF_PAD] = CS_MODE_YCC420;
+    // mode (3 or 7) with the adaptive pad layout (tile_size, lod count, base)
+    // so decrypt restores the exact budgeting
+    buf[CS_OFF_PAD] = (uint8_t)mode;
     buf[CS_OFF_PAD + 1] = (uint8_t)(tile_size & 0xFF);
     buf[CS_OFF_PAD + 2] = (uint8_t)((tile_size >> 8) & 0xFF);
     buf[CS_OFF_PAD + 3] = (uint8_t)(lod_bytes & 0xFF);
@@ -764,7 +905,7 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
     encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
-    sampling_mode = CS_MODE_YCC420;
+    sampling_mode = mode;
 }
 
 std::vector<uint8_t> encrypt_image::compute_twopass_lod(int tile_size, int lod_min, float pilot_ratio) {    if (tile_size <= 0) {
@@ -1115,7 +1256,7 @@ void encrypt_image::encrypt_hf_focus(const float& pixel_p,
 }
 
 void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
-    const std::string& password, int tile_size, int sample_bits, int chroma_bits) {
+    const std::string& password, int tile_size, int sample_bits, int chroma_bits, int mode) {
     if (tile_size <= 0) throw std::runtime_error("hf-focus tile size must be positive");
     bm = pixel_p;
     m = rows * cols * bm;
@@ -1137,14 +1278,14 @@ void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
     returnHfWeightedIndices(ri_x, ri_y, rows, cols, flat_lod, m, cs_key,
         tile_size, kWeightBase, weights, weight_cols, weight_rows);
     const int luma_count = static_cast<int>(ri_x.size());
-    returnYcc420ChromaIndices(rows, cols, m, cs_key);
+    returnYcc420ChromaIndices(rows, cols, m, cs_key, mode);
 
     cv::Mat ycc;
     cv::cvtColor(input_img, ycc, cv::COLOR_BGR2YCrCb);
     std::vector<cv::Mat> planes;
     cv::split(ycc, planes);
     int chroma_rows = 0, chroma_cols = 0;
-    cs_ycc420_chroma_dims(rows, cols, chroma_rows, chroma_cols);
+    cs_chroma_dims(mode, rows, cols, chroma_rows, chroma_cols);
     cv::Mat cr, cb;
     cv::resize(planes[1], cr, cv::Size(chroma_cols, chroma_rows), 0, 0, cv::INTER_AREA);
     cv::resize(planes[2], cb, cv::Size(chroma_cols, chroma_rows), 0, 0, cv::INTER_AREA);
@@ -1159,7 +1300,7 @@ void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
     uint8_t* buffer = encrypted_img.data;
     if (!cs_write_header(buffer, static_cast<size_t>(total) * 3, metadata, cs_key, salt))
         throw std::runtime_error("failed to write hf-focus header");
-    buffer[CS_OFF_PAD] = CS_MODE_YCC420_HF;
+    buffer[CS_OFF_PAD] = (uint8_t)mode;
     buffer[CS_OFF_PAD + 1] = static_cast<uint8_t>(tile_size & 0xff);
     buffer[CS_OFF_PAD + 2] = static_cast<uint8_t>((tile_size >> 8) & 0xff);
     buffer[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] = 0xff;
@@ -1196,7 +1337,7 @@ void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
         throw std::runtime_error("failed to authenticate hf-focus header");
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
-    sampling_mode = CS_MODE_YCC420_HF;
+    sampling_mode = mode;
     periodic_tile = tile_size;
     periodic_samples = 0;
     adaptive_base = kWeightBase;
@@ -1205,7 +1346,7 @@ void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
 
 void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& password, int tile_size,
     int lod_min, int weight_base, bool two_pass, float pilot_ratio,
-    const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full) {
+    const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full, bool spectral_lod) {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
     }
@@ -1224,13 +1365,14 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     cs_key_valid = true;
 
     // LOD source priority: inline LLM regions (blended over the base) >
-    // two-pass residual > Laplacian. All three reuse the identical lod
-    // container layout, so decrypt is unchanged either way.
+    // two-pass residual / spectral DCT > Laplacian. All reuse the identical
+    // lod container layout, so decrypt is unchanged either way.
     if (!regions_json.empty() && (region_blend < 0.0f || region_blend > 1.0f)) {
         throw std::runtime_error("regions: blend must be in [0, 1]");
     }
     const std::vector<uint8_t> base_lod = two_pass
         ? compute_twopass_lod(tile_size, lod_min, pilot_ratio)
+        : spectral_lod ? compute_spectral_lod(input_img, tile_size, lod_min)
         : compute_adaptive_lod(input_img, tile_size, lod_min);
     std::vector<uint8_t> lod = regions_json.empty()
         ? base_lod
@@ -1378,12 +1520,18 @@ int encrypt_image::encrypt_image_tiled(
     bool hf_focus,
     int sample_bits,
     int chroma_bits,
-    int lod_full
+    int lod_full,
+    bool ycc422,
+    bool spectral
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
         // derives its own coef/iterations from the container's actual ratio,
         // so auto mode has no reason to force full sampling
+
+        if (ycc420 && ycc422) {
+            throw std::runtime_error("--ycc420 and --ycc422 are mutually exclusive");
+        }
 
         if (compression_ratio < 0.001f || compression_ratio > 1.0f) {
             throw std::runtime_error("Compression ratio is outside the acceptable range of (0.001, 1.0]");
@@ -1400,8 +1548,11 @@ int encrypt_image::encrypt_image_tiled(
             throw std::runtime_error("--lod-full must be in [0, 255] (0 = off)");
         }
         if (hf_focus && (adaptive || two_pass || !regions_json.empty() ||
-            lod_smooth > 0.0f || adaptive_strength != 0.5f || lod_full > 0)) {
+            lod_smooth > 0.0f || adaptive_strength != 0.5f || lod_full > 0 || spectral)) {
             throw std::runtime_error("--hf-focus cannot be combined with adaptive sampling controls");
+        }
+        if (two_pass && spectral) {
+            throw std::runtime_error("--two-pass and --spectral are mutually exclusive LOD scorers");
         }
     }
     catch (const std::runtime_error& e) {
@@ -1428,34 +1579,38 @@ int encrypt_image::encrypt_image_tiled(
             const int hf_tile_size = tile_size > 0 ? tile_size : 32;
             if (ycc420) {
                 encrypt_img.encrypt_ycc420_hf(compression_ratio, password, hf_tile_size, sample_bits, chroma_bits);
+            } else if (ycc422) {
+                encrypt_img.encrypt_ycc420_hf(compression_ratio, password, hf_tile_size, sample_bits, chroma_bits, CS_MODE_YCC422_HF);
             } else {
                 encrypt_img.encrypt_hf_focus(compression_ratio, password, hf_tile_size, lod_min, sample_bits, chroma_bits);
             }
         }
-        else if (ycc420) {
-            // luma/chroma-split 4:2:0 sampling; the mode travels in the
-            // header so decrypt needs no new flags. Adaptive LOD flags
+        else if (ycc420 || ycc422) {
+            // luma/chroma-split sampling (mode travels in the header so
+            // decrypt needs no new flags). Adaptive LOD flags
             // (--adaptive/--two-pass/--regions/--lod-smooth/--lod-full) are
             // absorbed: they drive the luma budget while chroma stays uniform.
-            const bool ycc_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
+            const int split_mode = ycc422 ? CS_MODE_YCC422 : CS_MODE_YCC420;
+            const bool ycc_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0 || spectral;
             if (ycc_adaptive) {
                 const int ts = tile_size > 0 ? tile_size : 64;
                 const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
                 encrypt_img.encrypt_ycc420_adaptive(compression_ratio, password, ts, lod_min, wbase,
-                    two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full);
+                    two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full, split_mode, spectral);
             } else {
-                encrypt_img.encrypt_ycc420(compression_ratio, password, sample_bits, chroma_bits);
+                encrypt_img.encrypt_ycc420(compression_ratio, password, sample_bits, chroma_bits, split_mode);
             }
         }
-        else if (adaptive || lod_full > 0) {
+        else if (adaptive || lod_full > 0 || spectral) {
             // LOD-based per-tile sampling; default grid when tile_size unset.
-            // two_pass swaps the Laplacian scores for pilot-residual scores;
-            // container format is identical so decrypt needs no new flags.
+            // two_pass / spectral swap the Laplacian scores for pilot-residual
+            // / spectral-DCT scores; container format is identical so decrypt
+            // needs no new flags.
             // lod_full>0 alone selects this path (detail guarantee needs LOD).
             const int ts = tile_size > 0 ? tile_size : 64;
             const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
             encrypt_img.encrypt_adaptive(compression_ratio, password, ts, lod_min, wbase, two_pass, pilot_ratio,
-                regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full);
+                regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full, spectral);
         }
         else if (tile_size > 0) {
             // periodic tile-based sampling: one random per-tile pattern,
