@@ -149,6 +149,11 @@ Selected via --photo-upscaler; handled as a fused 2x path in the decrypt
 pipeline (like "avir", not a subprocess pipe). */
 bool cs_is_superres_backend(const std::string& backend);
 
+/** @brief true for the single-stage SR backend ("sr-direct").
+Selected via --photo-upscaler; handled as a fused 2x path in the decrypt
+pipeline (BGR containers; ycc split sampling falls back to AVIR). */
+bool cs_is_srdirect_backend(const std::string& backend);
+
 /** @brief CS super-resolution 2x refinement of one solved LR tile (CPU, DCT).
 Luminance-only: a sparse DCT correction around an AVIR warm start is solved
 so the 2x2-box downsample of the HR luma fits the original LR luma samples
@@ -171,7 +176,22 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
     cv::Mat& hr_out, float red = 0.0f,
     const std::string& red_denoiser = "nlmeans",
-    const std::string& dncnn_model = CS_DNCNN_DEFAULT_MODEL);
+    const std::string& dncnn_model = CS_DNCNN_DEFAULT_MODEL,
+    bool sr_cascade = false);
+
+/** @brief single-stage SR 2x refinement of one tile (CPU, DCT): the HR luma
+is solved directly against the tile's LR samples (cs_sr_direct_luma, no
+LR-solve warm start) and merged with the AVIR chroma, so one HR solve runs
+instead of three. sr_cascade selects the warm start: false = cold zeros
+with no anchor (init_mode 0), true = multiscale cascade chain
+(cs_sr_cascade_init, init_mode 2, anchored). Falls back to AVIR when the basis is
+not DCT, the sample set is empty, or the tile is degenerate.
+YCC split-sampling containers are not supported here (caller falls back);
+the BGR fused path is the production caller. */
+void cs_sr_direct_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
+    cv::Mat& hr_out, bool sr_cascade = false);
 
 /** @brief true when the DnCNN model loads and runs (cached per path).
 Thread-safe; loads lazily on first call. */

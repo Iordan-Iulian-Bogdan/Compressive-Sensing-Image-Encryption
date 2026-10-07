@@ -1346,7 +1346,12 @@ void test_photo_upscaler() {
     }
     {
         // Short model names map to model dirs; explicit paths pass through.
+        // Hermetic cmd: the resolver prefers model dirs shipped next to the
+        // binary (SearchPathA), so a machine with realcugan installed would
+        // otherwise return an install-qualified path here instead of the
+        // bare passthrough below.
         CsPhotoUpscalerOptions opt;
+        opt.realcugan_cmd = "cs-nonexistent-realcugan-cmd";
         opt.realcugan_model = "pro";
         check(cs_realcugan_model_dir(opt) == "models-pro",
             "photo-upscaler: pro maps to models-pro");
@@ -1368,6 +1373,9 @@ void test_photo_upscaler() {
 void test_cs_super_resolution() {
     check(cs_is_superres_backend("cs-sr") && !cs_is_superres_backend("avir"),
         "cs-sr: backend selection");
+    check(cs_is_srdirect_backend("sr-direct") && !cs_is_srdirect_backend("cs-sr") &&
+        !cs_is_superres_backend("sr-direct"),
+        "sr-direct: backend selection");
     // Simulate an imperfect LR reconstruction: measurements come from the
     // clean LR image, while the solved tile has a small brightness bias.
     const cv::Mat original = make_test_image(80, 80);
@@ -1422,6 +1430,38 @@ void test_cs_super_resolution() {
         const double n = cv::norm(red_lr, measured, cv::NORM_L2);
         check(std::isfinite(n), "cs-sr: red=0.5 residual is finite");
     }
+    // --sr-init cascade warm start: same contract, valid geometry.
+    cv::Mat casc;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, casc, 0.0f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, true);
+    check(casc.size() == original.size() && casc.type() == CV_8UC3,
+        "cs-sr: cascade init keeps 2x geometry and color type");
+    // sr-direct fused wrapper: single-stage solve from the same samples.
+    cv::Mat direct, direct_casc, direct_fb;
+    cs_sr_direct_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, direct);
+    check(direct.size() == original.size() && direct.type() == CV_8UC3,
+        "sr-direct: 2x geometry and color type");
+    if (!direct.empty()) {
+        // Fully sampled fixture: the single-stage solve must fit the
+        // samples at least as well as AVIR (catches dark/degenerate solves).
+        cv::Mat direct_lr;
+        cv::resize(direct, direct_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        cv::Mat base_lr;
+        cv::resize(baseline, base_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        check(cv::norm(direct_lr, measured, cv::NORM_L2) <
+              cv::norm(base_lr, measured, cv::NORM_L2),
+            "sr-direct: single-stage solve reduces LR measurement residual");
+    }
+    cs_sr_direct_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, direct_casc, true);
+    check(direct_casc.size() == original.size() && direct_casc.type() == CV_8UC3,
+        "sr-direct: cascade init keeps 2x geometry and color type");
+    cs_sr_direct_upscale_tile_2x(solved, packed, {}, {}, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, direct_fb);
+    check(cv::norm(direct_fb, baseline, cv::NORM_INF) == 0,
+        "sr-direct: missing measurements fall back to AVIR");
 }
 
 // Single-stage vs two-stage SR experiment: the same LR samples feed (a)

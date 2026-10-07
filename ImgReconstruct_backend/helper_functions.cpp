@@ -869,6 +869,16 @@ bool cs_is_superres_backend(const std::string& backend) {
     return s == "cs" || s == "cs-sr" || s == "cssr" || s == "cs_sr";
 }
 
+bool cs_is_srdirect_backend(const std::string& backend) {
+    std::string s;
+    s.reserve(backend.size());
+    for (char c : backend) {
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        s.push_back(c);
+    }
+    return s == "sr-direct" || s == "srdirect" || s == "sr_direct";
+}
+
 // 2x2-box downsample HR (Hr x Wc) -> LR (Lr x Lc), Hr = 2*Lr, Wc = 2*Lc.
 static void cs_sr_downsample(const float* hr, float* lr, int Lr, int Lc) {
     const int Wc = Lc * 2;
@@ -1006,11 +1016,40 @@ static std::mutex g_dncnn_mutex;
 static std::map<std::string, std::unique_ptr<CsDncnnEntry>> g_dncnn_cache;
 static std::map<std::string, bool> g_dncnn_failed;
 
+// The ORT DLL is delay-loaded and resolved from PATH: a stale system DLL
+// older than the vendored headers makes GetApi(ORT_API_VERSION) return null,
+// and constructing Ort::Env on it AV-crashes (not an Ort::Exception, so the
+// loader below cannot catch it). Probe the API table first so a
+// version-skewed runtime degrades to "model unavailable" instead of taking
+// the process down.
+static bool cs_ort_api_available() {
+    try {
+        const OrtApiBase* base = OrtGetApiBase();
+        if (!base || !base->GetApi) return false;
+        return base->GetApi(ORT_API_VERSION) != nullptr;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
 static CsDncnnEntry* cs_dncnn_entry(const std::string& path) {
     std::lock_guard<std::mutex> lk(g_dncnn_mutex);
     auto it = g_dncnn_cache.find(path);
     if (it != g_dncnn_cache.end()) return it->second.get();
     if (g_dncnn_failed.find(path) != g_dncnn_failed.end()) return nullptr;
+    if (!cs_ort_api_available()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                "Warning: onnxruntime.dll is older than the build headers "
+                "(API %d unavailable); DnCNN denoiser disabled\n",
+                ORT_API_VERSION);
+        }
+        g_dncnn_failed[path] = true;
+        return nullptr;
+    }
     try {
         auto e = std::make_unique<CsDncnnEntry>();
         Ort::SessionOptions opt;
@@ -1238,7 +1277,8 @@ static void cs_sr_core_single(float* x, const float* b, const float* anchor,
 void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
-    cv::Mat& hr_out, float red, const std::string& red_denoiser, const std::string& dncnn_model)
+    cv::Mat& hr_out, float red, const std::string& red_denoiser, const std::string& dncnn_model,
+    bool sr_cascade)
 {
     hr_out.release();
     if (lr_tile.empty() || lr_tile.type() != CV_8UC3) return;
@@ -1265,12 +1305,20 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     const int inner = cs_fista_inner_iters(iterations, fista_iters);
     const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, wscale);
 
-    // AVIR warm start: solved LR content carries the low frequencies, so
-    // the SR passes only need to fill in the sparse high frequencies.
-    // Luminance-only solve (benchmark convention: SR lives in Y, chroma is
-    // smooth enough to interpolate): the AVIR HR image below supplies both
-    // the Y warm start and the final Cr/Cb planes, so only one HR FISTA
-    // solve runs instead of three.
+    // Y measurements: OpenCV BGR2YCrCb luma weights over the sampled BGR
+    // triplets (same weights the Y plane below was built with).
+    std::vector<float> bB, bG, bR, b((size_t)m);
+    cs_extract_channel_measurements(pixel_measurements, 0, m, bB);
+    cs_extract_channel_measurements(pixel_measurements, 1, m, bG);
+    cs_extract_channel_measurements(pixel_measurements, 2, m, bR);
+    for (int k = 0; k < m; ++k) {
+        b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
+    }
+    // AVIR image: always needed for the final Cr/Cb planes (luminance-only
+    // solve: SR lives in Y, chroma is smooth enough to interpolate, so only
+    // one HR FISTA solve runs instead of three). It also supplies the
+    // default Y warm start; --sr-init cascade replaces the warm start below
+    // with the multiscale binned-FISTA chain (same anchor weight).
     cv::Mat init_hr;
     cs_upscale_2x_avir(lr_tile, init_hr);
     if (init_hr.empty() || init_hr.rows != Hr || init_hr.cols != Wc) {
@@ -1282,24 +1330,34 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     std::vector<cv::Mat> init_ycc_chs;
     cv::split(init_ycc, init_ycc_chs);
 
-    // Y measurements: OpenCV BGR2YCrCb luma weights over the sampled BGR
-    // triplets (same weights the Y plane below was built with).
-    std::vector<float> bB, bG, bR, b((size_t)m);
-    cs_extract_channel_measurements(pixel_measurements, 0, m, bB);
-    cs_extract_channel_measurements(pixel_measurements, 1, m, bG);
-    cs_extract_channel_measurements(pixel_measurements, 2, m, bR);
-    for (int k = 0; k < m; ++k) {
-        b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
-    }
-
     // Scratch for the single luma solve.
     std::vector<float> y((size_t)n_hr), x_prev((size_t)n_hr), grad((size_t)n_hr),
         pix_hr((size_t)n_hr), up_hr((size_t)n_hr);
     std::vector<float> lr_buf((size_t)n_lr), sc_lr((size_t)n_lr);
     std::vector<float> w((size_t)n_hr, 1.0f);
     cv::Mat xf;
-    init_ycc_chs[0].convertTo(xf, CV_32F, 1.0 / 255.0);
-    cv::dct(xf, xf, 0);
+    if (sr_cascade) {
+        // Multiscale warm start: binned coarse-to-fine FISTA chain lands HR
+        // pixels; a non-finite/degenerate cascade falls back to AVIR below.
+        std::vector<float> cas((size_t)n_hr, 0.0f);
+        cs_sr_cascade_init(b.data(), ri_x.data(), ri_y.data(), m,
+            Lr, Lc, coef, fista_iters, wscale, cas.data());
+        bool ok = false;
+        for (float v : cas) if (std::isfinite(v)) { ok = true; break; }
+        if (ok) {
+            cv::Mat casM(Hr, Wc, CV_32F, cas.data());
+            casM.convertTo(xf, CV_32F);
+            cv::dct(xf, xf, 0);
+        }
+        else {
+            init_ycc_chs[0].convertTo(xf, CV_32F, 1.0 / 255.0);
+            cv::dct(xf, xf, 0);
+        }
+    }
+    else {
+        init_ycc_chs[0].convertTo(xf, CV_32F, 1.0 / 255.0);
+        cv::dct(xf, xf, 0);
+    }
     // Full-scale warm start (no /10): the AVIR upscale of the solved tile
     // is already close to the truth, so FISTA refines in place. The /10
     // convention is only for generic gray references that must regrow.
@@ -1372,6 +1430,91 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     cv::Mat merged;
     cv::merge(out_ycc, merged);
     cv::cvtColor(merged, hr_out, cv::COLOR_YCrCb2BGR);
+}
+
+// Single-stage SR tile wrapper for the fused decrypt path: same I/O
+// contract as cs_sr_upscale_tile_2x (solved CV_8UC3 tile in, 2x CV_8UC3 out)
+// but the HR luma is solved directly from the LR samples (no LR-solve warm
+// start inside the coefficients). Chroma comes from the AVIR upscale, so one
+// HR solve runs instead of three. Degenerate inputs AVIR-fallback inline so
+// the caller never loses a tile.
+void cs_sr_direct_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
+    cv::Mat& hr_out, bool sr_cascade)
+{
+    hr_out.release();
+    if (lr_tile.empty() || lr_tile.type() != CV_8UC3) return;
+    const int Lr = lr_tile.rows, Lc = lr_tile.cols;
+    if (Lr < 8 || Lc < 8) { cs_upscale_2x_avir(lr_tile, hr_out); return; }
+    if (basis != CS_BASIS_DCT || ri_x.size() != ri_y.size() || ri_x.empty()) {
+        cs_upscale_2x_avir(lr_tile, hr_out);
+        return;
+    }
+    const int Hr = Lr * 2, Wc = Lc * 2;
+    const int n_hr = Hr * Wc;
+    const int m = (int)ri_x.size();
+    if (pixel_measurements.total() < (size_t)CS_HEADER_PIXELS + (size_t)m) {
+        cs_upscale_2x_avir(lr_tile, hr_out);
+        return;
+    }
+    // AVIR supplies the chroma planes (luma-only direct solve).
+    cv::Mat avir_hr;
+    cs_upscale_2x_avir(lr_tile, avir_hr);
+    if (avir_hr.empty() || avir_hr.rows != Hr || avir_hr.cols != Wc) {
+        cs_upscale_2x_avir(lr_tile, hr_out);
+        return;
+    }
+    cv::Mat avir_ycc;
+    cv::cvtColor(avir_hr, avir_ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> avir_chs;
+    cv::split(avir_ycc, avir_chs);
+    // Luma samples under the BGR2YCrCb weights (same as the two-stage path).
+    std::vector<float> bB, bG, bR;
+    std::vector<float> b((size_t)m);
+    cs_extract_channel_measurements(pixel_measurements, 0, m, bB);
+    cs_extract_channel_measurements(pixel_measurements, 1, m, bG);
+    cs_extract_channel_measurements(pixel_measurements, 2, m, bR);
+    for (int k = 0; k < m; ++k)
+        b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
+    std::vector<float> hr((size_t)n_hr, 0.0f);
+    if (sr_cascade) {
+        std::vector<float> cas((size_t)n_hr, 0.0f);
+        cs_sr_cascade_init(b.data(), ri_x.data(), ri_y.data(), m,
+            Lr, Lc, coef, fista_iters, wscale, cas.data());
+        bool ok = false;
+        for (float v : cas) if (std::isfinite(v)) { ok = true; break; }
+        if (ok)
+            cs_sr_direct_luma(b.data(), ri_x.data(), ri_y.data(), m,
+                Lr, Lc, coef, tv, iterations, reweights, fista_iters,
+                wscale, 2, 0.25f, hr.data(), cas.data());
+        else
+            cs_sr_direct_luma(b.data(), ri_x.data(), ri_y.data(), m,
+                Lr, Lc, coef, tv, iterations, reweights, fista_iters,
+                wscale, 0, 0.0f, hr.data());
+    }
+    else {
+        // Cold start from zeros with no anchor (measured: 25.27 dB fixture;
+        // the demosaic scatter + anchor converges dark: 15.98 dB there,
+        // worse in production since the anchor drags unobserved pixels).
+        cs_sr_direct_luma(b.data(), ri_x.data(), ri_y.data(), m,
+            Lr, Lc, coef, tv, iterations, reweights, fista_iters,
+            wscale, 0, 0.0f, hr.data());
+    }
+    bool finite = false;
+    for (float v : hr) if (std::isfinite(v)) { finite = true; break; }
+    if (!finite) { cs_upscale_2x_avir(lr_tile, hr_out); return; }
+    cv::Mat plane(Hr, Wc, CV_32F, hr.data());
+    cv::Mat y8 = plane * 255.0f;
+    y8.convertTo(y8, CV_8U);
+    std::vector<cv::Mat> out_ycc{ y8, avir_chs[1], avir_chs[2] };
+    cv::Mat merged, out;
+    cv::merge(out_ycc, merged);
+    cv::cvtColor(merged, out, cv::COLOR_YCrCb2BGR);
+    if (out.empty() || out.rows != Hr || out.cols != Wc)
+        cs_upscale_2x_avir(lr_tile, hr_out);
+    else
+        hr_out = std::move(out);
 }
 
 // ---------------------------------------------------------------------------

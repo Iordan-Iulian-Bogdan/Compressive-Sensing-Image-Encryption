@@ -271,7 +271,7 @@ stays 0, independent flag so seam effects stay attributable). It measures
 bit-identical on tested content: unlike the discontinuous L1 threshold,
 which flips marginal coefficients into visibly different supports, the
 smooth TV perturbation lands below 8U output precision. Same verdict.
-`--photo-upscaler avir|cs-sr|fsrcnn|waifu2x` selects the per-tile 2x upscaler backend (default
+`--photo-upscaler avir|cs-sr|sr-direct|fsrcnn|waifu2x` selects the per-tile 2x upscaler backend (default
 `avir`). Waifu2x batches tiles through the optional nunif Python package and
 falls back to AVIR if the command or any tile fails. Set `CS_WAIFU2X_CMD` if
 Python/nunif needs a custom launcher; `--waifu2x-cmd` and `--waifu2x-args`
@@ -325,22 +325,22 @@ on CPU at these tile sizes, which is also why BM3D is left out: minutes per
 call). Synthetic 256px: SSIM 0.624 → 0.674 at `--red 0.5` with PSNR flat,
 the classic denoiser-prior signature.
 
-Single-stage HR-direct solving was trialed as an alternative to the
-two-stage (LR solve → HR refine) pipeline and rejected on measurement: a
-4×-budget cold solve reaches 36.05 dB vs 33.58 dB two-stage on small
-synthetic tiles (the 8-bit LR quantization does cost ~2.5 dB there), but on
-real photos warm-start economics dominate — integrated direct scores
-26.79 dB / 0.707 in 128 s and multi-tile direct collapses to 7.35 dB on
-tile-seam/garbage cascades, vs 27.31 dB / 0.813 in 50 s for two-stage+RED.
-The `cs_sr_direct_luma` experiment harness and its tests stay in the tree;
-no production flag ships.
+`--photo-upscaler sr-direct` selects the single-stage variant: the HR luma
+is solved directly from the LR samples (`cs_sr_direct_luma`, no LR-solve
+warm start inside the coefficients) and merged with the AVIR chroma.
+Measured on the fixture it trails the two-stage path on real photos
+(warm-start economics dominate: integrated direct 26.79 dB / 0.707 in
+128 s vs 27.31 dB / 0.813 in 50 s for two-stage+RED), but it is available
+for BGR containers when the LR stage is best skipped; ycc containers fall
+back to AVIR and `--red` is ignored there (single-stage solve has no RED
+passes). `--sr-dict` takes precedence over both CS backends.
 
-Cold-start follow-up (measured): a multiscale cascade warm start
-(coarse-to-fine binned FISTA chain, `cs_sr_cascade_init`) removes the
-iteration premium entirely — cascade + standard budget reaches 36.76 dB in
-0.016 s on the fixture, beating zeros + 4× budget (36.05 dB in 0.055 s)
-and two-stage (33.58 dB). The blocker was init quality, not iteration
-count; any future production retry should warm-start from the cascade
+`--sr-init avir|cascade` (default `avir`, decrypt/roundtrip only) selects
+the warm start for `cs-sr` and `sr-direct`: `cascade` runs the multiscale
+coarse-to-fine binned-FISTA chain (`cs_sr_cascade_init`) instead of the
+AVIR upscale to seed the HR solve. On the fixture, cascade + standard
+budget reaches 36.76 dB in 0.016 s, beating zeros + 4× budget (36.05 dB
+in 0.055 s) — the blocker was init quality, not iteration count
 (HF-focus thumbnails already ship this idea at image scale).
 
 `--device gpu` (decrypt, `--solver fista|joint`) offloads the batched tile solves to an AMD GPU over HIP: tile/channel solves queue up and flush as batched kernel groups (proximal-gradient + momentum over FFT-DCT transforms with sampled gradients; joint: row-coupled group threshold over stacked planes), while CDF97 and any device failure silently fall back to the CPU path (output differs from CPU only by float rounding). Set `CS_GPU_DEBUG=1` for per-batch timing lines. Building requires an AMD HIP SDK (7.2 tested) with the target GPU in `HipArch` (`hip_build.targets` compiles `cs_gpu.hip` through `hipcc` at link time).

@@ -48,6 +48,12 @@
       <AdditionalLibraryDirectories>$(ProjectDir)..\ImgReconstruct_backend;$(ProjectDir)..\third_party\onnxruntime\lib;C:\Users\iorda\OneDrive\Documents\opencv\Release\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <DelayLoadDLLs>onnxruntime.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
+    <PostBuildEvent>
+      <!-- Delay-loaded ORT resolves from PATH: deploy the vendored DLL
+           matching the build headers, or a stale system onnxruntime.dll
+           (older API version) loads instead and disables the DnCNN path. -->
+      <Command>copy /y "$(ProjectDir)..\third_party\onnxruntime\lib\onnxruntime.dll" "$(TargetDir)"</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="test_main.cpp" />

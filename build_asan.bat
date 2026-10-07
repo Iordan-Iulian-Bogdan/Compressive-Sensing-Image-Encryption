@@ -23,7 +23,7 @@ if "%~1"=="linkonly" goto :link
 if "%~1"=="gpuobj" goto :gpu
 
 echo ============ main objects [ASAN] ============
-for %%f in (CS_encryption crypto_utils cs_wavelet helper_functions image_decryption image_encryption image_tiles image_preview photo_upscaler) do (
+for %%f in (CS_encryption crypto_utils cs_dict cs_wavelet helper_functions image_decryption image_encryption image_tiles image_preview photo_upscaler) do (
   clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\%%f.cpp" /Fo"%OBJ%\%%f.obj"
   if errorlevel 1 ( echo ERROR %%f & exit /b 1 )
 )
@@ -35,7 +35,7 @@ if not exist "%OBJ%\cs_gpu.obj" ( echo ERROR cs_gpu.obj missing from normal buil
 
 echo [link] ImgReconstruct_backend.exe [ASAN]
 :link
-link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:C:\opencv\build\x64\vc16\lib /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "/LIBPATH:%LLVM_ROOT%\lib\clang\23\lib\windows" /fsanitize=address "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" opencv_world490.lib clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_dynamic_runtime_thunk-x86_64.lib %SYSLIBS%
+link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:C:\opencv\build\x64\vc16\lib /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "/LIBPATH:%LLVM_ROOT%\lib\clang\23\lib\windows" /fsanitize=address "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_dict.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" opencv_world490.lib clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_dynamic_runtime_thunk-x86_64.lib %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking exe & exit /b 1 )
 
 copy "%LLVM_ROOT%\lib\clang\23\lib\windows\clang_rt.asan_dynamic-x86_64.dll" "%OUT%\" >nul
@@ -43,6 +43,7 @@ copy "%LLVM_ROOT%\bin\libomp.dll" "%OUT%\" >nul
 copy "C:\Program Files\AMD\ROCm\7.2\bin\amdhip64_7.dll" "%OUT%\" >nul
 copy "C:\Program Files\AMD\ROCm\7.2\bin\hipfft.dll" "%OUT%\" >nul
 copy "C:\Program Files\AMD\ROCm\7.2\bin\rocfft.dll" "%OUT%\" >nul
+copy "%ROOT%third_party\onnxruntime\lib\onnxruntime.dll" "%OUT%\" >nul
 echo BUILD OK: %OUT%
 goto :eof
 

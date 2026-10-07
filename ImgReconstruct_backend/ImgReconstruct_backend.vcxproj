@@ -150,6 +150,14 @@
     <ClInclude Include="quality_utils.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <!-- Delay-loaded ORT resolves from PATH: deploy the vendored DLL
+           matching the build headers, or a stale system onnxruntime.dll
+           (older API version) loads instead and disables the DnCNN path. -->
+      <Command>copy /y "$(ProjectDir)..\third_party\onnxruntime\lib\onnxruntime.dll" "$(TargetDir)"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <PropertyGroup>
     <CsHipDir>$(ProjectDir)</CsHipDir>
   </PropertyGroup>

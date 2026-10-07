@@ -55,6 +55,9 @@ void print_usage(const char* exe) {
         "                        vendored resampler), fsrcnn (neural 2x, needs weights),\n"
         "                        cs-sr (CS refinement: the\n"
         "                        HR tile is re-solved against its LR samples),\n"
+        "                        sr-direct (single-stage HR solve directly\n"
+        "                        from the LR samples, no LR-solve warm start;\n"
+        "                        BGR containers, ycc falls back to AVIR),\n"
         "                        waifu2x (one batched\n"
         "                        nunif subprocess), waifu2x-ncnn (native\n"
         "                        waifu2x-ncnn-vulkan binary) or realcugan\n"
@@ -91,6 +94,10 @@ void print_usage(const char* exe) {
   "                        roundtrip: patch-OMP synthesis replaces the FISTA\n"
   "                        HR solve in the fused 2x path (any container mode);\n"
   "                        --red is ignored there; see train-dict\n"
+  "  --sr-init <m>         CS SR warm start: avir (default, AVIR upscale of\n"
+  "                        the solved tile) or cascade (multiscale binned-\n"
+  "                        FISTA chain landing HR pixels); applies to cs-sr\n"
+  "                        and sr-direct, decrypt/roundtrip only\n"
   "  --solver <name>      tile solver: fista (default, reweighted-L1\n"
   "                        FISTA per channel), joint (SOMP-structured\n"
   "                        group-sparsity FISTA over R/G/B together +\n"
@@ -470,12 +477,12 @@ int main(int argc, char* argv[])
             show_preview = false;
         }
         else if (a == "--photo-upscaler") {
-            const char* v = next("avir, cs-sr, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
+            const char* v = next("avir, cs-sr, sr-direct, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
             if (!v) return 64;
             if (v != std::string("avir") && v != std::string("cs-sr") && v != std::string("cs") &&
-                v != std::string("fsrcnn") && v != std::string("waifu2x") &&
+                v != std::string("sr-direct") && v != std::string("fsrcnn") && v != std::string("waifu2x") &&
                 v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
-                std::cerr << "Error: --photo-upscaler must be avir, cs-sr, fsrcnn, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
+                std::cerr << "Error: --photo-upscaler must be avir, cs-sr, sr-direct, fsrcnn, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
                 return 64;
             }
             photo_up.backend = v;
@@ -580,6 +587,18 @@ int main(int argc, char* argv[])
             const char* v = next("CSD2 dictionary file");
             if (!v) return 64;
             photo_up.sr_dict = v;
+        }
+        else if (a == "--sr-init") {
+            // CS SR warm start: decrypt-side only (cs-sr / sr-direct)
+            const char* v = next("avir or cascade");
+            if (!v) return 64;
+            std::string s = v;
+            for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (s != "avir" && s != "cascade") {
+                std::cerr << "Error: --sr-init must be avir or cascade" << std::endl;
+                return 64;
+            }
+            photo_up.sr_init = s;
         }
         else if (a == "--periodic") {
             // encrypt-side only: decrypt auto-detects the mode from the
@@ -812,6 +831,10 @@ int main(int argc, char* argv[])
     if (!photo_up.sr_dict.empty() && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --sr-dict is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.sr_dict.clear();
+    }
+    if (photo_up.sr_init != "avir" && mode != "decrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --sr-init is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.sr_init = "avir";
     }
 
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;

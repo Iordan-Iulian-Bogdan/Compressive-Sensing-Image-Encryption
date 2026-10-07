@@ -567,7 +567,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 // decrypts tiles in wavefront (anti-diagonal) order
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
-    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x, float sr_red, const cs_coupled_dict* sr_dict, const std::string& sr_red_denoiser, const std::string& sr_dncnn_model, const std::string& sr_fsrcnn_model) {
+    int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x, float sr_red, const cs_coupled_dict* sr_dict, const std::string& sr_red_denoiser, const std::string& sr_dncnn_model, const std::string& sr_fsrcnn_model, bool sr_direct_2x, bool sr_cascade) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -675,11 +675,20 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                         // AVIR below so no tile is ever lost.
                         cs_fsrcnn_upscale_2x(mats_out[i][j], hr, sr_fsrcnn_model);
                     }
+                    else if (sr_direct_2x) {
+                        // Single-stage HR solve directly from the LR samples
+                        // (no LR-solve warm start in the coefficients).
+                        cs_sr_direct_upscale_tile_2x(mats_out[i][j], mats_in[i][j],
+                            indices[i][j].ri_x_g, indices[i][j].ri_y_g,
+                            tile_coef, tile_tv, iterations, reweights, fista_iters,
+                            basis, wscale, hr, sr_cascade);
+                    }
                     else if (superres_2x) {
                         cs_sr_upscale_tile_2x(mats_out[i][j], mats_in[i][j],
                             indices[i][j].ri_x_g, indices[i][j].ri_y_g,
                             tile_coef, tile_tv, iterations, reweights, fista_iters,
-                            basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model);
+                            basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
+                            sr_cascade);
                     }
                     if (hr.empty())
                         cs_upscale_2x_avir(mats_out[i][j], hr);
@@ -1113,6 +1122,8 @@ int decrypt_image::decrypt_image_tiled(
     std::vector<std::vector<cv::Mat>> hr_tiles(
         num_tiles, std::vector<cv::Mat>(num_tiles));
     const bool is_sr = cs_is_superres_backend(photo_up.backend);
+    const bool is_direct = cs_is_srdirect_backend(photo_up.backend);
+    const bool sr_cascade = (photo_up.sr_init == "cascade");
     // Coupled-dict SR (takes precedence over the FISTA cs-sr solve; works
     // in every container mode since it refines solved tiles): warmed here
     // so the fused workers only read the cache. Missing file = hard error
@@ -1122,6 +1133,9 @@ int decrypt_image::decrypt_image_tiled(
         if (photo_up.sr_red > 0.0f) {
             std::cerr << "Note: --red is ignored with --sr-dict (dict path has no FISTA passes)" << std::endl;
         }
+        if (is_direct) {
+            std::cerr << "Note: --sr-dict takes precedence over sr-direct (dict refines solved tiles)" << std::endl;
+        }
         sr_d = cs_sr_dict_cached(photo_up.sr_dict);
         if (!sr_d) {
             std::cerr << "Error: --sr-dict model failed to load" << std::endl;
@@ -1129,6 +1143,15 @@ int decrypt_image::decrypt_image_tiled(
         }
     }
     const bool use_dict = (sr_d != nullptr);
+    if (is_direct && !full_res && !use_dict && photo_up.sr_red > 0.0f) {
+        std::cerr << "Note: --red is ignored with sr-direct (single-stage solve has no RED passes)" << std::endl;
+    }
+    if (sr_cascade && full_res) {
+        std::cerr << "Warning: --sr-init is meaningless with --full-res; ignoring" << std::endl;
+    }
+    else if (sr_cascade && !is_sr && !is_direct && !use_dict) {
+        std::cerr << "Warning: --sr-init cascade needs a CS SR backend (--photo-upscaler cs-sr/sr-direct) or --sr-dict; ignoring" << std::endl;
+    }
     // FSRCNN neural upscale runs fused like AVIR (same post-join grid);
     // a missing model degrades per tile inside the helper (warn-once).
     const std::string fsrcnn_model =
@@ -1142,7 +1165,7 @@ int decrypt_image::decrypt_image_tiled(
         return -3;
     }
     const bool fuse_upscale =
-        !full_res && (photo_up.backend == "avir" || is_sr || use_dict ||
+        !full_res && (photo_up.backend == "avir" || is_sr || is_direct || use_dict ||
             !fsrcnn_model.empty());
     const bool pipe_upscale =
         !full_res && !fuse_upscale &&
@@ -1180,8 +1203,9 @@ int decrypt_image::decrypt_image_tiled(
                 fista_iters, reweights, basis, wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
                 &hr_tiles, fuse_upscale, pipe_upscale ? &pipe : nullptr,
                 (fuse_upscale || pipe_upscale) ? &hr_grid_mutex : nullptr,
-                is_sr && !full_res, photo_up.sr_red, sr_d,
-                photo_up.sr_red_denoiser, photo_up.sr_dncnn_model, fsrcnn_model);
+                is_sr && !full_res && !use_dict, photo_up.sr_red, sr_d,
+                photo_up.sr_red_denoiser, photo_up.sr_dncnn_model, fsrcnn_model,
+                is_direct && !full_res && !use_dict, sr_cascade);
         });
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
@@ -1366,11 +1390,12 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         std::vector<std::vector<cv::Mat>> ycc_hr_tiles(
             num_tiles, std::vector<cv::Mat>(num_tiles));
         const bool ycc_is_sr = cs_is_superres_backend(photo_up.backend);
-        // CS-SR refines BGR tiles against full-grid random samples; ycc split
-        // sampling (luma/chroma on separate grids) keeps the AVIR fused path
-        // here (one note, no failure).
-        if (ycc_is_sr && !full_res)
-            std::cerr << "Note: cs-sr falls back to AVIR for ycc containers"
+        const bool ycc_is_direct = cs_is_srdirect_backend(photo_up.backend);
+        // CS-SR / sr-direct refine BGR tiles against full-grid random samples;
+        // ycc split sampling (luma/chroma on separate grids) keeps the AVIR
+        // fused path here (one note, no failure).
+        if ((ycc_is_sr || ycc_is_direct) && !full_res)
+            std::cerr << "Note: cs-sr/sr-direct fall back to AVIR for ycc containers"
                 " (luma/chroma split sampling)" << std::endl;
         // Coupled-dict SR needs no split-grid operator (post-solve tiles),
         // so it stays available here; warmed before the workers start.
@@ -1385,7 +1410,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 return -3;
             }
         }
-        const bool ycc_fuse = !full_res && (photo_up.backend == "avir" || ycc_is_sr || ycc_sr_d ||
+        const bool ycc_fuse = !full_res && (photo_up.backend == "avir" || ycc_is_sr || ycc_is_direct || ycc_sr_d ||
             photo_up.backend == "fsrcnn");
         // (the fsrcnn model path is threaded to the ycc tile solver below)
         const bool ycc_pipe =

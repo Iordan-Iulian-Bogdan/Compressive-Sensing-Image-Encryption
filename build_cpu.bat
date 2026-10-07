@@ -41,6 +41,8 @@ clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\CS_enc
 if errorlevel 1 ( echo ERROR CS_encryption & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\crypto_utils.cpp" /Fo"%OBJ%\crypto_utils.obj"
 if errorlevel 1 ( echo ERROR crypto_utils & exit /b 1 )
+clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\cs_dict.cpp" /Fo"%OBJ%\cs_dict.obj"
+if errorlevel 1 ( echo ERROR cs_dict & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\cs_wavelet.cpp" /Fo"%OBJ%\cs_wavelet.obj"
 if errorlevel 1 ( echo ERROR cs_wavelet & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\helper_functions.cpp" /Fo"%OBJ%\helper_functions.obj"
@@ -66,6 +68,8 @@ clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\CS_enc
 if errorlevel 1 ( echo ERROR CS_encryption_t & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\crypto_utils.cpp" /Fo"%OBJT%\crypto_utils.obj"
 if errorlevel 1 ( echo ERROR crypto_utils_t & exit /b 1 )
+clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\cs_dict.cpp" /Fo"%OBJT%\cs_dict.obj"
+if errorlevel 1 ( echo ERROR cs_dict_t & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\cs_wavelet.cpp" /Fo"%OBJT%\cs_wavelet.obj"
 if errorlevel 1 ( echo ERROR cs_wavelet_t & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\helper_functions.cpp" /Fo"%OBJT%\helper_functions.obj"
@@ -89,16 +93,17 @@ if errorlevel 1 ( echo ERROR test_main & exit /b 1 )
 set "SYSLIBS=bcrypt.lib libomp.lib user32.lib gdi32.lib kernel32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib shell32.lib winspool.lib comdlg32.lib onnxruntime.lib delayimp.lib"
 
 echo [link] ImgReconstruct_backend.exe
-link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:%CV490_ROOT%\build\x64\vc16\lib /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:%LLVM_ROOT%\lib" "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" opencv_world490.lib %SYSLIBS%
+link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:%CV490_ROOT%\build\x64\vc16\lib /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:%LLVM_ROOT%\lib" "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_dict.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" opencv_world490.lib %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking exe & exit /b 1 )
 if "%~1"=="main" goto :finish
 
 echo [link] cs_tests.exe (static 4.13 set)
-set "STATIC413=opencv_core4130.lib opencv_imgproc4130.lib opencv_highgui4130.lib opencv_imgcodecs4130.lib opencv_dnn4130.lib opencv_photo4130.lib opencv_videoio4130.lib opencv_quality4130.lib ippicvmt.lib ippiw.lib ipphal.lib ittnotify.lib libprotobuf.lib libjpeg-turbo.lib libpng.lib libtiff.lib libopenjp2.lib IlmImf.lib zlib.lib ade.lib"
-link /OUT:"%OUT%\cs_tests.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll "/LIBPATH:C:\Users\iorda\OneDrive\Documents\opencv\Release\lib" /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:%LLVM_ROOT%\lib" "%OBJT%\test_main.obj" "%OBJT%\CS_encryption.obj" "%OBJT%\crypto_utils.obj" "%OBJT%\cs_wavelet.obj" "%OBJT%\helper_functions.obj" "%OBJT%\image_decryption.obj" "%OBJT%\image_encryption.obj" "%OBJT%\image_tiles.obj" "%OBJT%\image_preview.obj" "%OBJT%\photo_upscaler.obj" "%OBJT%\cs_gpu.obj" %STATIC413% %SYSLIBS%
+set "STATIC413=opencv_core4130.lib opencv_imgproc4130.lib opencv_highgui4130.lib opencv_imgcodecs4130.lib opencv_dnn4130.lib opencv_dnn_superres4130.lib opencv_photo4130.lib opencv_videoio4130.lib opencv_quality4130.lib ippicvmt.lib ippiw.lib ipphal.lib ittnotify.lib libprotobuf.lib libjpeg-turbo.lib libpng.lib libtiff.lib libopenjp2.lib IlmImf.lib zlib.lib ade.lib"
+link /OUT:"%OUT%\cs_tests.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll "/LIBPATH:C:\Users\iorda\OneDrive\Documents\opencv\Release\lib" /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:%LLVM_ROOT%\lib" "%OBJT%\test_main.obj" "%OBJT%\CS_encryption.obj" "%OBJT%\crypto_utils.obj" "%OBJT%\cs_dict.obj" "%OBJT%\cs_wavelet.obj" "%OBJT%\helper_functions.obj" "%OBJT%\image_decryption.obj" "%OBJT%\image_encryption.obj" "%OBJT%\image_tiles.obj" "%OBJT%\image_preview.obj" "%OBJT%\photo_upscaler.obj" "%OBJT%\cs_gpu.obj" %STATIC413% %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking tests & exit /b 1 )
 
 :finish
 copy "%LLVM_ROOT%\bin\libomp.dll" "%OUT%\" >nul
 copy "%CV490_ROOT%\build\x64\vc16\bin\opencv_world490.dll" "%OUT%\" >nul
+copy "%ROOT%third_party\onnxruntime\lib\onnxruntime.dll" "%OUT%\" >nul
 echo BUILD OK: %OUT%

@@ -213,5 +213,5 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
     int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x = false, float sr_red = 0.0f, const cs_coupled_dict* sr_dict = nullptr,
     const std::string& sr_red_denoiser = "nlmeans", const std::string& sr_dncnn_model = "models/dncnn/dncnn_color.onnx",
-    const std::string& sr_fsrcnn_model = "");
+    const std::string& sr_fsrcnn_model = "", bool sr_direct_2x = false, bool sr_cascade = false);
 #endif

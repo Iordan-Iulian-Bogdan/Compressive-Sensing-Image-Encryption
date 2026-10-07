@@ -23,6 +23,11 @@
 //   coefficients are re-solved against the tile's original LR samples
 //   (DCT + TV, CPU). Handled as a fused 2x path in the decrypt pipeline,
 //   not through the batch helpers below; falls back to AVIR per tile.
+// - "sr-direct": single-stage CS super-resolution
+//   (cs_sr_direct_upscale_tile_2x): the HR luma is solved directly from
+//   the LR samples with no LR-solve warm start inside the coefficients.
+//   Same fused path as cs-sr (BGR containers; ycc falls back to AVIR).
+// Both CS backends honor --sr-init avir|cascade for the warm start.
 // - "waifu2x": one batched nunif subprocess over the whole tile grid:
 //   tiles are written to a temp dir, a single
 //     <waifu2x_cmd> -i <in_dir> -o <out_dir> <waifu2x_args>
@@ -83,6 +88,11 @@ struct CsPhotoUpscalerOptions {
   // gradient-feature codes (Dl) instead of the FISTA HR solve, in every
   // container mode (it operates on solved tiles). --red is ignored there.
   std::string sr_dict;
+  // Warm start for the CS SR solves (--sr-init avir|cascade, default avir):
+  // "cascade" runs the multiscale binned-FISTA chain (cs_sr_cascade_init)
+  // instead of the AVIR upscale to seed the HR solve (cs-sr) / single-stage
+  // solve (sr-direct). Ignored by all other backends.
+  std::string sr_init = "avir";
   // FSRCNN 2x model for the "fsrcnn" backend (OpenCV dnn_superres,
   // in-process CPU; default resolves against the working directory).
   // A missing/unreadable model falls back to AVIR per tile.
