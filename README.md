@@ -82,7 +82,10 @@ pixel); measurements follow. Decryption regenerates identical indices from
 `(key, lod, m, geometry, weight_base)` via `cs_compute_tile_sample_counts`
 (deterministic largest-remainder split with capacity clamp/redistribute) plus
 a per-tile Fisher–Yates draw — no decrypt-side flag needed (mode travels in
-the header). `--show-mask` (encrypt/roundtrip) writes `<output>.mask.png`
+the header). Tile grids are capped at 65535 tiles (16-bit lod-count header
+field): finer grids are refused at encrypt with the minimum viable
+`--tile-size`, and count-mismatched containers are rejected at decrypt
+instead of decoding to silent garbage. `--show-mask` (encrypt/roundtrip) writes `<output>.mask.png`
 (source | binary mask | cyan overlay) and opens the same view in a window
 after sampling. **Resolution:** by default encrypt downsamples the input 2×
 and decrypt 2×-upscales the solve (half-res pipeline). Pass `--full-res` on

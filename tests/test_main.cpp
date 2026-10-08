@@ -1880,6 +1880,62 @@ void test_hf_weighted_spread() {
         "hf-spread: hot cell still favored");
 }
 
+void test_adaptive_tile_grid_limit() {
+    // The lod byte count travels in a 16-bit header field: tile grids over
+    // 65535 tiles truncate it and decrypt silently regenerates wrong
+    // positions (6 dB garbage, exit 0). Encrypt must refuse up front.
+    const std::string input_path = ".cs_test_t1_input.png";
+    const std::string output_path = ".cs_test_t1_output.png";
+    const std::string password = "tile-grid-limit-password";
+    // NB: encrypt downsamples 2x by default, so size for 76,800 post-
+    // downscale tiles (over the 65535 limit): 640x480 -> 320x240.
+    cv::Mat original = make_test_image(640, 480); // tile-size 1 = 76,800 tiles
+    check(cv::imwrite(input_path, original), "tile-grid-limit: write source image");
+
+    int rc = encrypt_image::encrypt_image_tiled(
+        input_path, "", password, 0.5f, 1, nullptr, true, 32, 0.5f,
+        false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+        8, 0, 0, false, false);
+    check(rc != 0, "tile-grid-limit: BGR adaptive tile-size 1 rejected");
+    rc = encrypt_image::encrypt_image_tiled(
+        input_path, "", password, 0.5f, 1, nullptr, true, 32, 0.5f,
+        false, false, false, 0.05f, "", 0.5f, 0.0f, true, false,
+        8, 0, 0, false, false);
+    check(rc != 0, "tile-grid-limit: ycc420 adaptive tile-size 1 rejected");
+
+    // Positive control: 64x48 at tile-size 1 = 3072 tiles fits the field, so
+    // the 1px-tile machinery must roundtrip sane end to end.
+    const std::string small_in = ".cs_test_t1_small.png";
+    const std::string small_out = ".cs_test_t1_small_out.png";
+    cv::Mat small = make_test_image(64, 48);
+    check(cv::imwrite(small_in, small), "tile-grid-limit: write small image");
+    cv::Mat encrypted;
+    rc = encrypt_image::encrypt_image_tiled(
+        small_in, "", password, 0.5f, 1, &encrypted, true, 32, 0.5f,
+        false, true, false, 0.05f, "", 0.5f, 0.0f, false, false,
+        8, 0, 0, false, false);
+    check(rc == 0, "tile-grid-limit: small tile-size 1 encrypts");
+    if (rc == 0) {
+        CSencryption::params = AUTO_PARAM;
+        const int decrypt_rc = decrypt_image::decrypt_image_tiled(
+            encrypted, small_out, password, 1, 24, 5, 4, 0.01f, false);
+        check(decrypt_rc == 0, "tile-grid-limit: small tile-size 1 decrypts");
+        const cv::Mat decoded = cv::imread(small_out, cv::IMREAD_COLOR);
+        check(!decoded.empty(), "tile-grid-limit: output readable");
+        if (!decoded.empty()) {
+            cv::Mat sized;
+            cv::resize(decoded, sized, small.size());
+            const double p = cs_quality::psnr(small, sized);
+            std::printf("       tile-size 1 64x48 PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 12.0, "tile-grid-limit: small tile-size 1 PSNR sane");
+        }
+        std::remove(small_out.c_str());
+    }
+    std::remove(small_in.c_str());
+    std::remove(input_path.c_str());
+    std::remove(output_path.c_str());
+}
+
 void test_sample_bits() {
     // helper unit checks: identity at 8, bounded error below
     check(cs_quantize_sample(0, 4) == 0 && cs_quantize_sample(255, 4) == 15,
@@ -2213,6 +2269,7 @@ int main() {
     test_dncnn_red();
     test_hf_focus_roundtrip();
     test_hf_weighted_spread();
+    test_adaptive_tile_grid_limit();
     test_sample_bits();
     test_per_tile_coef();
     test_gpu_fista_agreement();

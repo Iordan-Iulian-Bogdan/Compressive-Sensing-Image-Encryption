@@ -801,6 +801,20 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
     }
+    // 16-bit lod-count header field: grids over 65535 tiles truncate it and
+    // decrypt silently regenerates wrong positions. Fail fast (see
+    // encrypt_adaptive for the full rationale).
+    {
+        const int ntiles = cs_lod_tile_count(input_img.rows, input_img.cols, tile_size);
+        if (ntiles > 65535) {
+            const int min_ts = (std::max)(1, (int)std::ceil(std::sqrt(
+                (double)input_img.rows * (double)input_img.cols / 65535.0)));
+            throw std::runtime_error("adaptive sampling: --tile-size " +
+                std::to_string(tile_size) + " gives " + std::to_string(ntiles) +
+                " tiles, but the container stores at most 65535 lod bytes; use --tile-size >= " +
+                std::to_string(min_ts));
+        }
+    }
     if (weight_base < 1) weight_base = 1;
     if (weight_base > 65535) weight_base = 65535;
     bm = pixel_p;
@@ -1184,6 +1198,20 @@ std::vector<uint8_t> smooth_lod_grid(const std::vector<uint8_t>& lod,
 void encrypt_image::encrypt_hf_focus(const float& pixel_p,
     const std::string& password, int tile_size, int lod_min, int sample_bits, int chroma_bits) {
     if (tile_size <= 0) throw std::runtime_error("hf-focus tile size must be positive");
+    // 16-bit lod-count header field: grids over 65535 tiles truncate it and
+    // decrypt silently regenerates wrong positions. Fail fast (see
+    // encrypt_adaptive for the full rationale).
+    {
+        const int ntiles = cs_lod_tile_count(input_img.rows, input_img.cols, tile_size);
+        if (ntiles > 65535) {
+            const int min_ts = (std::max)(1, (int)std::ceil(std::sqrt(
+                (double)input_img.rows * (double)input_img.cols / 65535.0)));
+            throw std::runtime_error("hf-focus: --tile-size " +
+                std::to_string(tile_size) + " gives " + std::to_string(ntiles) +
+                " tiles, but the container stores at most 65535 lod bytes; use --tile-size >= " +
+                std::to_string(min_ts));
+        }
+    }
     bm = pixel_p;
     m = rows * cols * bm;
     uint8_t salt[CS_SALT_BYTES];
@@ -1349,6 +1377,21 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     const std::string& regions_json, float region_blend, float lod_smooth, int sample_bits, int chroma_bits, int lod_full, bool spectral_lod) {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
+    }
+    // The lod byte count travels in a 16-bit header field: grids over 65535
+    // tiles would truncate it and decrypt would silently regenerate wrong
+    // positions (6 dB garbage, exit 0). Fail fast with the minimum viable
+    // tile size instead.
+    {
+        const int ntiles = cs_lod_tile_count(input_img.rows, input_img.cols, tile_size);
+        if (ntiles > 65535) {
+            const int min_ts = (std::max)(1, (int)std::ceil(std::sqrt(
+                (double)input_img.rows * (double)input_img.cols / 65535.0)));
+            throw std::runtime_error("adaptive sampling: --tile-size " +
+                std::to_string(tile_size) + " gives " + std::to_string(ntiles) +
+                " tiles, but the container stores at most 65535 lod bytes; use --tile-size >= " +
+                std::to_string(min_ts));
+        }
     }
     if (weight_base < 1) weight_base = 1;
     if (weight_base > 65535) weight_base = 65535;

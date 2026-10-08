@@ -527,6 +527,17 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
                 (buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
             out.adaptive_base = (base > 0) ? base : 256;
         }
+        else if (tile > 0) {
+            // Tile grid present but the lod count disagrees with the
+            // geometry: the 16-bit count field truncated (grids over 65535
+            // tiles, only writable by the pre-guard writer). Falling back
+            // to uniform would silently scatter every sample (6 dB
+            // garbage, exit 0), so reject for re-encryption instead. The
+            // header MAC already passed, ruling out tampering. tile == 0
+            // still means a pre-LOD uniform container (tolerant read).
+            out.legacy = true;
+            return false;
+        }
     }
     else if (mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF) {
         out.sampling_mode = mode;
@@ -553,10 +564,23 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
                 (buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE + 1] << 8);
             out.adaptive_base = (base > 0) ? base : 256; // 0 = pre-strength default
         }
+        const bool lod_ok = (mode != CS_MODE_ADAPTIVE && mode != CS_MODE_HF_FOCUS) ||
+            (out.periodic_tile > 0 &&
+                out.periodic_samples == cs_lod_bytes(out.rows, out.cols, out.periodic_tile));
         if (out.periodic_tile <= 0 ||
             (mode == CS_MODE_PERIODIC && out.periodic_samples <= 0) ||
-            ((mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) &&
-                out.periodic_samples != cs_lod_bytes(out.rows, out.cols, out.periodic_tile))) {
+            !lod_ok) {
+            if ((mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) &&
+                out.periodic_tile > 0) {
+                // Lod count disagrees with geometry: the 16-bit count field
+                // truncated (grids over 65535 tiles, only writable by the
+                // pre-guard writer). Falling back to RANDOM would silently
+                // scatter every sample (6 dB garbage, exit 0), so reject
+                // for re-encryption instead. The header MAC already passed,
+                // ruling out tampering.
+                out.legacy = true;
+                return false;
+            }
             out.sampling_mode = CS_MODE_RANDOM;
             out.periodic_tile = 0;
             out.periodic_samples = 0;
