@@ -743,7 +743,12 @@ static void decrypt_tiles_ycc420(int num_threads,
     const cv::Mat& thumbnail_seed, bool per_tile_coef = false, bool per_tile_tv = false,
     std::vector<std::vector<cv::Mat>>* hr_out = nullptr, bool fuse_upscale = false,
     CsUpscalePipeline* pipe = nullptr, std::mutex* hr_grid_mutex = nullptr, bool chroma_sub_v = true, const cs_coupled_dict* sr_dict = nullptr,
-    const std::string& sr_fsrcnn_model = "") {
+    const std::string& sr_fsrcnn_model = "", float y_confidence = 0.0f,
+    float y_dual_tv = 0.0f,
+    std::vector<std::vector<cv::Mat>>* low_tv_tiles = nullptr) {
+
+    if (y_confidence > 0.0f && basis != CS_BASIS_DCT)
+        std::cerr << "Note: --y-confidence requires --basis dct; ignoring for wavelet" << std::endl;
 
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
     const int iters_off = iterations / 2;
@@ -844,9 +849,23 @@ static void decrypt_tiles_ycc420(int num_threads,
                     int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t) {
                     reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, reweights, fista_iters, basis, wscale);
                 };
+                // Solve high-TV first as the base, then low-TV from the same
+                // neighbour warm start (independent, not a continuation).
+                const bool mixed = low_tv_tiles && y_dual_tv > 0.0f &&
+                    cs_y_mixed_density(y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, Th, Tw);
+                cv::Mat y_low = mixed ? x0[0].clone() : cv::Mat();
+                if (!y_low.empty())
+                    solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
+                        y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations,
+                        x0[0], false, dummy, y_dual_tv);
+                cv::Mat& low = y_low.empty() ? x0[0] : y_low;
                 solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                    y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations, x0[0],
+                    y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations, low,
                     false, dummy, tile_tv_y);
+                if (y_confidence > 0.0f)
+                    cs_refine_y_confidence(y_meas[i][j], y_idx[i][j].ri_x_g,
+                        y_idx[i][j].ri_y_g, low, y_confidence, tile_coef_y,
+                        tile_tv_y, iterations, fista_iters, basis, wscale);
                 solve_plane(cr_meas[i][j], coef_c, cTh, cTw,
                     cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, iters_c, x0[1],
                     true, x0[2], 0.0f);
@@ -862,6 +881,17 @@ static void decrypt_tiles_ycc420(int num_threads,
                 cv::merge(chs, 3, ycc_tile);
                 ycc_tile.convertTo(ycc_tile, CV_8UC3);
                 cv::cvtColor(ycc_tile, mats_out[i][j], cv::COLOR_YCrCb2BGR);
+                if (low_tv_tiles) {
+                    if (mixed) {
+                        cv::Mat low_ycc;
+                        cv::Mat low_chs[3] = { y_low, cr_full, cb_full };
+                        cv::merge(low_chs, 3, low_ycc);
+                        low_ycc.convertTo(low_ycc, CV_8UC3);
+                        cv::cvtColor(low_ycc, (*low_tv_tiles)[i][j], cv::COLOR_YCrCb2BGR);
+                    } else {
+                        (*low_tv_tiles)[i][j] = mats_out[i][j];
+                    }
+                }
                 // streaming pipeline: same handoff as decrypt_tiles above
                 if (pipe && !mats_out[i][j].empty()) {
                     pipe->enqueue(i, j);
@@ -1045,6 +1075,8 @@ int decrypt_image::decrypt_image_tiled(
             full_res, solver, fista_iters, reweights, basis, wscale,
             photo_up, per_tile_coef, per_tile_tv);
     }
+    if (photo_up.y_dual_tv > 0.0f || photo_up.y_confidence > 0.0f)
+        std::cerr << "Note: --y-dual-tv/--y-confidence require a YCC container; ignoring for BGR" << std::endl;
 
     //int N_reconfigured = tiles;
     std::string windowName = output_path.empty() ? "decrypted tiles" : output_path;
@@ -1322,6 +1354,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             cr_eph(num_tiles, std::vector<cv::Mat>(num_tiles)),
             cb_eph(num_tiles, std::vector<cv::Mat>(num_tiles));
         std::vector<std::vector<cv::Mat>> decrypted(num_tiles, std::vector<cv::Mat>(num_tiles));
+        std::vector<std::vector<cv::Mat>> low_tv_tiles;
+        const bool dual_tv = photo_up.y_dual_tv > 0.0f;
+        if (dual_tv) low_tv_tiles.resize(num_tiles, std::vector<cv::Mat>(num_tiles));
 
         cv::Size tile_size(0, 0);
         for (int i = 0; i < num_tiles; i++) {
@@ -1410,11 +1445,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 return -3;
             }
         }
-        const bool ycc_fuse = !full_res && (photo_up.backend == "avir" || ycc_is_sr || ycc_is_direct || ycc_sr_d ||
+        const bool ycc_fuse = !dual_tv && !full_res && (photo_up.backend == "avir" || ycc_is_sr || ycc_is_direct || ycc_sr_d ||
             photo_up.backend == "fsrcnn");
         // (the fsrcnn model path is threaded to the ycc tile solver below)
         const bool ycc_pipe =
-            !full_res && !ycc_fuse &&
+            !dual_tv && !full_res && !ycc_fuse &&
             (photo_up.backend == "waifu2x" ||
              photo_up.backend == "waifu2x-ncnn" ||
              photo_up.backend == "realcugan");
@@ -1442,13 +1477,17 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         if (ycc_pipe)
             ycc_upipe.start(photo_up, decrypted, ycc_hr_tiles,
                             &ycc_hr_grid_mutex);
+        if (dual_tv && photo_up.backend != "avir")
+            std::cerr << "Note: --y-dual-tv uses AVIR for both candidate grids" << std::endl;
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
             decrypted, coordinates, num_tiles, overlap, iterations, tile_size, coef, tv,
             solver, fista_iters, reweights, basis, wscale,
             std::cref(dimgs.thumb_seed), per_tile_coef, per_tile_tv,
             &ycc_hr_tiles, ycc_fuse, ycc_pipe ? &ycc_upipe : nullptr,
             (ycc_fuse || ycc_pipe) ? &ycc_hr_grid_mutex : nullptr, chroma_sub_v, ycc_sr_d,
-            (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "");
+            (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "",
+            photo_up.y_confidence, photo_up.y_dual_tv,
+            dual_tv ? &low_tv_tiles : nullptr);
         if (ycc_pipe) ycc_upipe.finish();
 
         if (show_preview) {
@@ -1473,7 +1512,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             decrypted = std::move(ycc_hr_tiles);
         }
         if (!full_res && !ycc_fuse && !ycc_pipe) {
-            cs_upscale_tiles_2x(decrypted, photo_up);
+            if (dual_tv) {
+                CsPhotoUpscalerOptions avir_up;
+                cs_upscale_tiles_2x(decrypted, avir_up);
+                cs_upscale_tiles_2x(low_tv_tiles, avir_up);
+            } else cs_upscale_tiles_2x(decrypted, photo_up);
         }
         if (!full_res) {
             for (int i = 0; i < num_tiles; ++i)
@@ -1490,11 +1533,30 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // geometry, resize to 2x the recorded size
         reconstructed = blendTilesWithImage(decrypted, coordinates, reconstructed, 0.5f, ycc_blend_feather);
 
-        {
-            const cv::Size final_size(full_res ? org_size.width : org_size.width * 2,
-                full_res ? org_size.height : org_size.height * 2);
-            if (final_size.width > 0 && final_size.height > 0 && reconstructed.size() != final_size) {
-                cv::resize(reconstructed, reconstructed, final_size);
+        const cv::Size final_size(full_res ? org_size.width : org_size.width * 2,
+            full_res ? org_size.height : org_size.height * 2);
+        if (final_size.width > 0 && final_size.height > 0 && reconstructed.size() != final_size)
+            cv::resize(reconstructed, reconstructed, final_size);
+
+        if (dual_tv) {
+            cv::Mat low_composite = reconstructImage(low_tv_tiles, coordinates);
+            low_composite = blendTilesWithImage(low_tv_tiles, coordinates,
+                low_composite, 0.5f, ycc_blend_feather);
+            if (low_composite.size() != reconstructed.size())
+                cv::resize(low_composite, low_composite, reconstructed.size());
+            cv::Mat edge_blended, dual_weight;
+            cs_blend_y_dual_tv(low_composite, reconstructed, Ym, edge_blended,
+                photo_up.y_dual_tv_mask.empty() ? nullptr : &dual_weight);
+            if (!edge_blended.empty()) reconstructed = std::move(edge_blended);
+            if (!dual_weight.empty() && !photo_up.y_dual_tv_mask.empty()) {
+                cv::Mat mask_view;
+                dual_weight.convertTo(mask_view, CV_8U, 255.0);
+                if (cv::imwrite(photo_up.y_dual_tv_mask, mask_view))
+                    std::cout << "Dual-TV blend mask written to "
+                              << photo_up.y_dual_tv_mask << std::endl;
+                else
+                    std::cerr << "Warning: --y-dual-tv-mask: failed to write "
+                              << photo_up.y_dual_tv_mask << "\n";
             }
         }
 

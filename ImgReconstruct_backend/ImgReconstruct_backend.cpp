@@ -45,9 +45,18 @@ void print_usage(const char* exe) {
         "                        sample count (starved tiles regularized more,\n"
         "                        rich tiles relaxed; tv stays global unless\n"
         "                        --per-tile-tv is also given)\n"
-        "  --per-tile-tv         scale the TV weight per tile the same way\n"
-        "                        (smooth/starved tiles smoothed more; watch\n"
-        "                        for seams on flat gradients)\n"
+  "  --per-tile-tv         scale the TV weight per tile the same way\n"
+  "                        (smooth/starved tiles smoothed more; watch\n"
+  "                        for seams on flat gradients)\n"
+  "  --y-confidence <f>   YCC luma confidence prior [0,1] on decrypt:\n"
+  "                        smooth locally sparse unsampled areas (default 0;\n"
+  "                        adds a CPU FISTA refinement pass)\n"
+  "  --y-dual-tv <f>      YCC luma: solve again with this high TV weight,\n"
+  "                        blend into sparse regions via a soft sample mask\n"
+  "                        (0 = off; uses --tv for the low-TV solve)\n"
+  "  --y-dual-tv-mask <p>  write the binary dual-TV selection mask to PNG\n"
+  "                        (black = high-TV, white = low-TV composite;\n"
+  "                        needs --y-dual-tv)\n"
         "  --manual              force manual parameter mode (auto is the default and\n"
         "                        derives tiles/overlap/iterations/coef from the image)\n"
         "  --no-preview          disable the live decryption preview window\n"
@@ -470,6 +479,41 @@ int main(int argc, char* argv[])
             // failure mode to watch, keep it separable from coef)
             per_tile_tv = true;
         }
+        else if (a == "--y-confidence") {
+            const char* v = next("strength in [0,1]");
+            // /fp:fast may optimize away isfinite(NaN); reject non-decimal
+            // tokens before conversion (including nan/inf spellings).
+            bool decimal = v && *v;
+            bool digit = false;
+            if (v) for (const char* p = v; *p; ++p) {
+                if (*p >= '0' && *p <= '9') digit = true;
+                else if (*p != '.' && *p != '+' && *p != '-' && *p != 'e' && *p != 'E') decimal = false;
+            }
+            if (!decimal || !digit || !parse_float(v, photo_up.y_confidence) ||
+                photo_up.y_confidence < 0.0f || photo_up.y_confidence > 1.0f) {
+                std::cerr << "Error: --y-confidence must be in [0,1]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--y-dual-tv") {
+            const char* v = next("TV weight in (0,1]");
+            bool decimal = v && *v;
+            bool digit = false;
+            if (v) for (const char* p = v; *p; ++p) {
+                if (*p >= '0' && *p <= '9') digit = true;
+                else if (*p != '.' && *p != '+' && *p != '-' && *p != 'e' && *p != 'E') decimal = false;
+            }
+            if (!decimal || !digit || !parse_float(v, photo_up.y_dual_tv) ||
+                photo_up.y_dual_tv < 0.0f || photo_up.y_dual_tv > 1.0f) {
+                std::cerr << "Error: --y-dual-tv must be in [0,1]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--y-dual-tv-mask") {
+            const char* v = next("output PNG path");
+            if (!v) return 64;
+            photo_up.y_dual_tv_mask = v;
+        }
         else if (a == "--manual") {
             manual = true;
         }
@@ -835,6 +879,25 @@ int main(int argc, char* argv[])
     if (photo_up.sr_init != "avir" && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --sr-init is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.sr_init = "avir";
+    }
+    if (photo_up.y_confidence > 0.0f && mode == "encrypt") {
+        std::cerr << "Warning: --y-confidence is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.y_confidence = 0.0f;
+    }
+    if (photo_up.y_dual_tv > 0.0f && mode == "encrypt") {
+        std::cerr << "Warning: --y-dual-tv is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.y_dual_tv = 0.0f;
+    }
+    if (photo_up.y_dual_tv > 0.0f && photo_up.y_dual_tv <= tv_lambda && mode != "encrypt") {
+        std::cerr << "Error: --y-dual-tv must exceed --tv (the low-TV solve)" << std::endl;
+        return 64;
+    }
+    if (!photo_up.y_dual_tv_mask.empty() && mode == "encrypt") {
+        std::cerr << "Warning: --y-dual-tv-mask is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.y_dual_tv_mask.clear();
+    }
+    if (!photo_up.y_dual_tv_mask.empty() && photo_up.y_dual_tv <= 0.0f && mode != "encrypt") {
+        std::cerr << "Warning: --y-dual-tv-mask needs --y-dual-tv; no mask will be written" << std::endl;
     }
 
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;

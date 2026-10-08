@@ -93,6 +93,14 @@ struct CsPhotoUpscalerOptions {
   // instead of the AVIR upscale to seed the HR solve (cs-sr) / single-stage
   // solve (sr-direct). Ignored by all other backends.
   std::string sr_init = "avir";
+  // Decrypt-side YCC luma confidence prior (0 disables the extra CPU pass).
+  float y_confidence = 0.0f;
+  // Second independent Y solve with this TV weight; soft sample-density mask
+  // blends its pixels into poorly covered regions (0 disables dual solve).
+  float y_dual_tv = 0.0f;
+  // Where to write the exact binary dual-TV selection mask (grayscale PNG,
+  // 0 = high-TV composite, 255 = low-TV composite). Empty disables the dump.
+  std::string y_dual_tv_mask;
   // FSRCNN 2x model for the "fsrcnn" backend (OpenCV dnn_superres,
   // in-process CPU; default resolves against the working directory).
   // A missing/unreadable model falls back to AVIR per tile.

@@ -696,6 +696,295 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     }
 }
 
+void cs_refine_y_confidence(const cv::Mat& measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    cv::Mat& plane, float strength, float coef, float tv,
+    int iterations, int fista_iters, int basis, float wscale)
+{
+    if (!(strength > 0.0f) || basis != CS_BASIS_DCT ||
+        plane.empty() || plane.type() != CV_32F ||
+        ri_x.size() != ri_y.size() || ri_x.empty()) return;
+    const int rows = plane.rows, cols = plane.cols, n = rows * cols;
+    const int m = (int)ri_x.size();
+    if (!plane.isContinuous() || rows < 8 || cols < 8 ||
+        measurements.total() < (size_t)CS_HEADER_PIXELS + m) return;
+
+    cv::Mat observed = cv::Mat::zeros(rows, cols, CV_32F);
+    for (int k = 0; k < m; ++k) {
+        if ((unsigned)ri_x[k] >= (unsigned)rows || (unsigned)ri_y[k] >= (unsigned)cols) return;
+        observed.at<float>(ri_x[k], ri_y[k]) = 1.0f;
+    }
+    // Blur the binary sample mask on the solve grid. Normalize by the tile's
+    // mean density, so a uniform draw has little/no extra prior. The clamp
+    // prevents sparsely sampled tiles from getting an excessively strong pull.
+    cv::Mat density, guide, target, weight(rows, cols, CV_32F);
+    cv::GaussianBlur(observed, density, cv::Size(), 5.0, 5.0, cv::BORDER_REPLICATE);
+    cv::GaussianBlur(plane, guide, cv::Size(), 1.2, 1.2, cv::BORDER_REPLICATE);
+    guide.convertTo(target, CV_32F, 1.0 / 255.0);
+    const float mean_density = (float)m / n;
+    const float scale = (std::min)(strength, 1.0f) * 0.25f;
+    for (int r = 0; r < rows; ++r) {
+        const float* d = density.ptr<float>(r);
+        const float* obs = observed.ptr<float>(r);
+        float* dst = weight.ptr<float>(r);
+        for (int c = 0; c < cols; ++c) {
+            const float low = (std::max)(0.0f, 1.0f - d[c] / (mean_density + 1e-6f));
+            dst[c] = obs[c] > 0.0f ? 0.0f : scale * low;
+        }
+    }
+    if (cv::countNonZero(weight) == 0) return;
+
+    // The first-pass Y solve is a full-scale warm start. Penalize only sparse
+    // coefficient *corrections* from it; measured pixels keep their original
+    // quadratic data term. The target is a lightly smoothed first-pass image,
+    // not a potentially misleading neighbour tile or a zero/flat reference.
+    cv::Mat initial;
+    plane.convertTo(initial, CV_32F, 1.0 / 255.0);
+    const cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+    std::vector<float> x((size_t)n), y((size_t)n), prev((size_t)n), z((size_t)n),
+        grad((size_t)n), pix((size_t)n), scratch((size_t)n), anchor((size_t)n), b;
+    cs_extract_channel_measurements(measurements, 0, m, b);
+    std::memcpy(x.data(), initial.ptr<float>(), sizeof(float) * (size_t)n);
+    cs_synth_adj(x.data(), rows, cols, bx);
+    anchor = x;
+    y = x;
+    prev = x;
+    const float lambda = coef * 0.1f;
+    float L = bx.lip + 2.0f * scale + 8.0f * tv;
+    const bool bt = tv > 0.0f;
+    const int iters = (std::min)(24, cs_fista_inner_iters(iterations, fista_iters));
+    std::vector<float> tvgrad(tv > 0.0f ? (size_t)n : 0);
+    auto smooth = [&](const float* coeff, float* gradient) -> double {
+        std::memcpy(pix.data(), coeff, sizeof(float) * (size_t)n);
+        cs_synth(pix.data(), rows, cols, bx);
+        if (gradient) std::fill(scratch.begin(), scratch.end(), 0.0f);
+        double fx = 0.0;
+        for (int k = 0; k < m; ++k) {
+            const int i = ri_x[k] * cols + ri_y[k];
+            const float diff = pix[(size_t)i] - b[(size_t)k];
+            fx += (double)diff * diff;
+            if (gradient) scratch[(size_t)i] = 2.0f * diff;
+        }
+        const float* w = weight.ptr<float>();
+        const float* t = target.ptr<float>();
+        for (int i = 0; i < n; ++i) {
+            const float diff = pix[(size_t)i] - t[i];
+            fx += (double)w[i] * diff * diff;
+            if (gradient) scratch[(size_t)i] += 2.0f * w[i] * diff;
+        }
+        if (tv > 0.0f) {
+            fx += tv * cs_tv_grad_phi(pix.data(), tvgrad.data(), rows, cols);
+            if (gradient)
+                for (int i = 0; i < n; ++i) scratch[(size_t)i] += tv * tvgrad[(size_t)i];
+        }
+        if (gradient) {
+            cs_synth_adj(scratch.data(), rows, cols, bx);
+            std::memcpy(gradient, scratch.data(), sizeof(float) * (size_t)n);
+        }
+        return fx;
+    };
+    float momentum = 1.0f;
+    for (int k = 0; k < iters; ++k) {
+        const double fy = smooth(y.data(), grad.data());
+        for (int trial = 0; ; ++trial) {
+            const float step = 1.0f / L;
+            for (int i = 0; i < n; ++i) {
+                const float v = y[(size_t)i] - step * grad[(size_t)i] - anchor[(size_t)i];
+                const float thr = lambda * step * bx.wscale[(size_t)i];
+                z[(size_t)i] = anchor[(size_t)i] + (std::fabs(v) > thr ?
+                    std::copysign(std::fabs(v) - thr, v) : 0.0f);
+            }
+            if (!bt) break;
+            const double fz = smooth(z.data(), nullptr);
+            double dot = 0.0, dz2 = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const double dz = (double)z[(size_t)i] - y[(size_t)i];
+                dot += (double)grad[(size_t)i] * dz;
+                dz2 += dz * dz;
+            }
+            if (fz <= fy + dot + 0.5 * L * dz2 + 1e-7 * (1.0 + std::fabs(fy)) || trial >= 24) break;
+            L *= 2.0f;
+        }
+        const float new_momentum = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * momentum * momentum));
+        const float factor = (momentum - 1.0f) / new_momentum;
+        for (int i = 0; i < n; ++i)
+            y[(size_t)i] = z[(size_t)i] + factor * (z[(size_t)i] - prev[(size_t)i]);
+        prev.swap(z);
+        momentum = new_momentum;
+    }
+    cs_synth(prev.data(), rows, cols, bx);
+    for (int i = 0; i < n; ++i) plane.ptr<float>()[i] = prev[(size_t)i] * 255.0f;
+}
+
+bool cs_y_mixed_density(const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    int rows, int cols)
+{
+    if (rows < 16 || cols < 16 || ri_x.size() != ri_y.size() || ri_x.empty()) return false;
+    cv::Mat mask = cv::Mat::zeros(rows, cols, CV_32F);
+    for (size_t k = 0; k < ri_x.size(); ++k) {
+        if ((unsigned)ri_x[k] >= (unsigned)rows || (unsigned)ri_y[k] >= (unsigned)cols) return false;
+        mask.at<float>(ri_x[k], ri_y[k]) = 1.0f;
+    }
+    cv::Mat density;
+    cv::GaussianBlur(mask, density, cv::Size(), 5.0, 5.0, cv::BORDER_REPLICATE);
+    const double avg = cv::mean(mask)[0];
+    double low = 1.0, high = 0.0;
+    for (int r = 0; r < rows; r += 4)
+        for (int c = 0; c < cols; c += 4) {
+            const double v = density.at<float>(r, c);
+            low = (std::min)(low, v);
+            high = (std::max)(high, v);
+        }
+    return low < 0.7 * avg && high > 1.3 * avg;
+}
+
+void cs_blend_y_dual_tv(const cv::Mat& low_bgr, const cv::Mat& high_bgr,
+    const cv::Mat& sample_mask, cv::Mat& blended, cv::Mat* weight_out)
+{
+    blended.release();
+    if (low_bgr.empty() || high_bgr.empty() || low_bgr.type() != CV_8UC3 ||
+        high_bgr.type() != CV_8UC3 || low_bgr.size() != high_bgr.size() ||
+        sample_mask.empty() || sample_mask.type() != CV_8U) return;
+
+    // Edge detection uses the stable high-TV solution, so low-TV noise
+    // cannot vote itself in. Selection below copies all three channels from
+    // the chosen composite, which matches the saved binary mask exactly.
+    cv::Mat high_ycc;
+    cv::cvtColor(high_bgr, high_ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> hch;
+    cv::split(high_ycc, hch);
+    cv::Mat high_y;
+    hch[0].convertTo(high_y, CV_32F);
+    cv::Mat edge_source, gx, gy, magnitude;
+    cv::GaussianBlur(high_y, edge_source, cv::Size(), 1.0, 1.0);
+    cv::Sobel(edge_source, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(edge_source, gy, CV_32F, 0, 1, 3);
+    cv::magnitude(gx, gy, magnitude);
+
+    cv::Mat mask;
+    if (sample_mask.size() != high_bgr.size())
+        cv::resize(sample_mask, mask, high_bgr.size(), 0, 0, cv::INTER_NEAREST);
+    else mask = sample_mask;
+    cv::Mat sampled, density;
+    mask.convertTo(sampled, CV_32F);
+    cv::GaussianBlur(sampled, density, cv::Size(), 5.0, 5.0, cv::BORDER_REPLICATE);
+    const float mean = (float)cv::mean(sampled)[0];
+
+    // Build solid detail segments: close strong edges and fill enclosed
+    // interiors. The flood must start outside the image: (0,0) can itself
+    // be an edge, in which case flooding 255 into it is a no-op and
+    // bitwise_not(flood) makes the entire image a detail segment.
+    cv::Mat mag_smooth, edge_bin;
+    cv::GaussianBlur(magnitude, mag_smooth, cv::Size(), 1.5, 1.5,
+        cv::BORDER_REPLICATE);
+    cv::threshold(mag_smooth, edge_bin, 35.0, 255.0, cv::THRESH_BINARY);
+    edge_bin.convertTo(edge_bin, CV_8U);
+    const int kclose =
+        (std::max)(7, (std::min)(25, (std::min)(high_bgr.rows, high_bgr.cols) / 200)) | 1;
+    const cv::Mat kernel =
+        cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kclose, kclose));
+    cv::Mat closed;
+    cv::morphologyEx(edge_bin, closed, cv::MORPH_CLOSE, kernel);
+    cv::Mat flood;
+    cv::copyMakeBorder(closed, flood, 1, 1, 1, 1,
+        cv::BORDER_CONSTANT, cv::Scalar(0));
+    cv::floodFill(flood, cv::Point(0, 0), cv::Scalar(255));
+    cv::Mat holes, segments;
+    cv::bitwise_not(flood(cv::Rect(1, 1, closed.cols, closed.rows)), holes);
+    cv::bitwise_or(closed, holes, segments);
+    // Keep only substantiated segments: real area AND enough strong-edge
+    // pixels inside to justify low-TV detail. A closed loop around smooth
+    // sky has a tiny edge fraction and stays high-TV. Cap component area so
+    // merged reconstruction texture cannot turn the whole image white.
+    cv::Mat labels, stats, centroids;
+    const int ncomp =
+        cv::connectedComponentsWithStats(segments, labels, stats, centroids, 8);
+    const int min_area = (std::max)(32, high_bgr.rows * high_bgr.cols / 100000);
+    // A single filled component occupying almost the whole image cannot
+    // identify a meaningful detail boundary. Do not let it select low-TV
+    // everywhere, even if an edge-rich background passes the edge fraction.
+    const int max_area = (int)(0.80 * (double)segments.total());
+    constexpr double kEdgeSubstantiation = 0.03;
+    std::vector<int> edge_px((size_t)(std::max)(ncomp, 1), 0);
+    for (int r = 0; r < labels.rows; ++r) {
+        const int* L = labels.ptr<int>(r);
+        const uchar* E = edge_bin.ptr<uchar>(r);
+        for (int c = 0; c < labels.cols; ++c) {
+            if (E[c]) edge_px[(size_t)L[c]]++;
+        }
+    }
+    cv::Mat kept = cv::Mat::zeros(segments.size(), CV_8U);
+    for (int i = 1; i < ncomp; ++i) {
+        const int area = stats.at<int>(i, cv::CC_STAT_AREA);
+        if (area >= min_area && area <= max_area &&
+            edge_px[(size_t)i] >= kEdgeSubstantiation * area)
+            kept.setTo(255, labels == i);
+    }
+    // Coverage veto: segments without samples keep the high-TV base.
+    cv::Mat coverage, selected;
+    cv::threshold(density, coverage, 0.2f * mean, 255.0, cv::THRESH_BINARY);
+    coverage.convertTo(coverage, CV_8U);
+    cv::bitwise_and(kept, coverage, selected);
+    // Closed contours miss flat portions of a colorful object such as the
+    // crown of a bird. At half resolution, connect colorful regions of
+    // similar hue and accept only components substantially supported by the
+    // existing detail segments. Unsaturated cage bars and distant background
+    // colors do not bridge into the object.
+    if (cv::countNonZero(selected) > 0) {
+        const cv::Size small_size((selected.cols + 1) / 2, (selected.rows + 1) / 2);
+        cv::Mat small_seed, small_color, hsv;
+        cv::resize(selected, small_seed, small_size, 0, 0, cv::INTER_AREA);
+        cv::threshold(small_seed, small_seed, 128, 255, cv::THRESH_BINARY);
+        cv::resize(high_bgr, small_color, small_size, 0, 0, cv::INTER_AREA);
+        cv::GaussianBlur(small_color, small_color, cv::Size(), 1.5, 1.5);
+        cv::cvtColor(small_color, hsv, cv::COLOR_BGR2HSV);
+        cv::Mat grown = cv::Mat::zeros(small_size, CV_8U);
+        // Hue bins keep adjacent shades of one object connected without
+        // connecting unrelated saturated regions (blue sky vs green bird).
+        for (int h0 = 0; h0 < 180; h0 += 15) {
+            cv::Mat hue_bin;
+            cv::inRange(hsv, cv::Scalar(h0, 90, 25),
+                cv::Scalar(h0 + 14, 255, 255), hue_bin);
+            cv::morphologyEx(hue_bin, hue_bin, cv::MORPH_CLOSE,
+                cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
+            cv::Mat color_labels, color_stats, color_centers;
+            const int count = cv::connectedComponentsWithStats(hue_bin,
+                color_labels, color_stats, color_centers, 8);
+            std::vector<int> seed_count((size_t)count, 0);
+            for (int r = 0; r < small_seed.rows; ++r) {
+                const uchar* s = small_seed.ptr<uchar>(r);
+                const int* l = color_labels.ptr<int>(r);
+                for (int c = 0; c < small_seed.cols; ++c)
+                    if (s[c] && l[c]) ++seed_count[(size_t)l[c]];
+            }
+            std::vector<uchar> accept((size_t)count, 0);
+            for (int i = 1; i < count; ++i) {
+                const int area = color_stats.at<int>(i, cv::CC_STAT_AREA);
+                if (area >= 64 && area <= (int)(0.30 * hue_bin.total()) &&
+                    seed_count[(size_t)i] >= (std::max)(16, area / 40))
+                    accept[(size_t)i] = 255;
+            }
+            for (int r = 0; r < grown.rows; ++r) {
+                const int* l = color_labels.ptr<int>(r);
+                uchar* g = grown.ptr<uchar>(r);
+                for (int c = 0; c < grown.cols; ++c)
+                    if (l[c]) g[c] |= accept[(size_t)l[c]];
+            }
+        }
+        cv::resize(grown, grown, selected.size(), 0, 0, cv::INTER_NEAREST);
+        cv::bitwise_or(selected, grown, selected);
+        cv::bitwise_and(selected, coverage, selected);
+    }
+    // The saved segmentation is the actual hard compositing decision: white
+    // takes the low-TV (well-sampled detail) tile composite, black keeps the
+    // high-TV (sparse-region) composite. No second per-pixel edge weighting,
+    // chroma substitution, or feathering can make the dump disagree with the
+    // pixels used. Both candidates were overlap-feathered before this step.
+    if (weight_out) selected.convertTo(*weight_out, CV_32F, 1.0 / 255.0);
+    blended = high_bgr.clone();
+    low_bgr.copyTo(blended, selected);
+}
+
 void fista_channel_begin(fista_channel_task& t, const cv::Mat& pixel_measurements,
     const int& channel, const float& param_c, const int& rows, const int& cols,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations,

@@ -2073,6 +2073,169 @@ void test_sample_bits() {
 // Per-tile coef (--per-tile-coef): scaling math + an adaptive end-to-end
 // where tile counts differ (uniform containers would scale by exactly 1).
 // ---------------------------------------------------------------------------
+void test_y_confidence_prior() {
+    const int rows = 48, cols = 64;
+    cv::Mat first(rows, cols, CV_32F);
+    std::vector<int> rx, ry;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            const bool sparse = c >= cols / 2;
+            const bool observed = sparse ? ((r % 8 == 0) && (c % 8 == 0))
+                                         : ((r + c) % 4 != 0);
+            first.at<float>(r, c) = 128.0f +
+                (sparse && !observed ? ((r + c) % 2 ? 30.0f : -30.0f) : 0.0f);
+            if (observed) { rx.push_back(r); ry.push_back(c); }
+        }
+    cv::Mat measurements(1, CS_HEADER_PIXELS + (int)rx.size(), CV_8UC3, cv::Scalar(0));
+    for (size_t k = 0; k < rx.size(); ++k)
+        measurements.at<cv::Vec3b>(CS_HEADER_PIXELS + (int)k) = cv::Vec3b(128, 128, 128);
+    cv::Mat off = first.clone(), on = first.clone();
+    cs_refine_y_confidence(measurements, rx, ry, off, 0.0f, 0.01f, 0.0f,
+        6, 0, CS_BASIS_DCT, 2.0f);
+    check(cv::norm(off, first, cv::NORM_INF) == 0.0,
+        "y-confidence: zero strength leaves pixels unchanged");
+    cs_refine_y_confidence(measurements, rx, ry, on, 1.0f, 0.01f, 0.0f,
+        6, 0, CS_BASIS_DCT, 2.0f);
+    double sparse_error = 0, dense_change = 0, sample_error = 0;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            if (c >= cols / 2) sparse_error += std::fabs(on.at<float>(r, c) - 128.0f);
+            else dense_change += std::fabs(on.at<float>(r, c) - first.at<float>(r, c));
+        }
+    for (size_t k = 0; k < rx.size(); ++k)
+        sample_error += std::fabs(on.at<float>(rx[k], ry[k]) - 128.0f);
+    std::printf("       y-confidence sparse MAE %.2f, dense change %.2f, measured MAE %.2f\n",
+        sparse_error / (rows * cols / 2), dense_change / (rows * cols / 2), sample_error / rx.size());
+    check(sparse_error < rows * cols / 2 * 20.0,
+        "y-confidence: reduces unsampled sparse-area noise");
+    check(dense_change / (rows * cols / 2) < 2.0,
+        "y-confidence: preserves densely measured region");
+    check(sample_error / rx.size() < 2.0,
+        "y-confidence: measured data remains constrained");
+}
+
+void test_y_dual_tv_blend() {
+    const int rows = 64, cols = 128;
+    cv::Mat low(rows, cols, CV_8UC3, cv::Scalar(120, 120, 120));
+    cv::Mat high(rows, cols, CV_8UC3, cv::Scalar(120, 120, 120));
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            if (c < cols / 2) {
+                const bool inside = r >= 12 && r < 52 && c >= 24 && c < 40;
+                const uchar v = inside ? 200 : 40;
+                low.at<cv::Vec3b>(r, c) = cv::Vec3b(v, v, v);
+                const uchar h = inside ? 175 : 65;
+                high.at<cv::Vec3b>(r, c) = cv::Vec3b(h, h, h);
+            } else {
+                const uchar v = (r + c) % 2 ? 80 : 160;
+                low.at<cv::Vec3b>(r, c) = cv::Vec3b(v, v, v);
+            }
+        }
+    std::vector<int> rx, ry;
+    cv::Mat mask = cv::Mat::zeros(rows, cols, CV_8U);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            const bool dense = c < cols / 2;
+            if (dense ? ((r + c) % 4 != 0) : (r % 8 == 0 && c % 8 == 0)) {
+                rx.push_back(r); ry.push_back(c);
+                mask.at<uchar>(r, c) = 1;
+            }
+        }
+    cv::Mat merged, weight;
+    check(cs_y_mixed_density(rx, ry, rows, cols), "y-dual-tv: mixed tile detected");
+    cs_blend_y_dual_tv(low, high, mask, merged, &weight);
+    check(!merged.empty() && merged.size() == low.size(),
+        "y-dual-tv: blend geometry");
+    check(!weight.empty() && weight.size() == low.size() && weight.type() == CV_32F,
+        "y-dual-tv: mask geometry/type");
+    if (!weight.empty()) {
+        double wmin, wmax;
+        cv::minMaxLoc(weight, &wmin, &wmax);
+        check(wmin >= 0.0 && wmax <= 1.0,
+            "y-dual-tv: binary mask range");
+        bool exact_source = true;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                const float w = weight.at<float>(r, c);
+                const cv::Vec3b expected = w == 1.0f
+                    ? low.at<cv::Vec3b>(r, c) : high.at<cv::Vec3b>(r, c);
+                if ((w != 0.0f && w != 1.0f) ||
+                    merged.at<cv::Vec3b>(r, c) != expected) exact_source = false;
+            }
+        check(exact_source, "y-dual-tv: each output BGR pixel matches mask-selected candidate");
+        check(weight.at<float>(32, 8) < 1e-6,
+            "y-dual-tv: flat dense region has zero weight");
+        check(weight.at<float>(32, 24) > 0.0,
+            "y-dual-tv: edge region has positive weight");
+        check(weight.at<float>(32, 32) > 0.9,
+            "y-dual-tv: segment interior is filled, not just edges");
+    }
+    if (!merged.empty()) {
+        check(weight.at<float>(32, 24) == 1.0f &&
+            merged.at<cv::Vec3b>(32, 24) == low.at<cv::Vec3b>(32, 24),
+            "y-dual-tv: image-wide segment copies low-TV detail");
+        double wmax2 = 0; int argmax_r = 0, argmax_c = 0;
+        for (int r = 0; r < rows; ++r) for (int c = 0; c < cols; ++c) {
+            const float w = weight.at<float>(r, c);
+            if (w > wmax2) { wmax2 = w; argmax_r = r; argmax_c = c; }
+        }
+        check(wmax2 > 0.9 &&
+            merged.at<cv::Vec3b>(argmax_r, argmax_c)[0] ==
+                low.at<cv::Vec3b>(argmax_r, argmax_c)[0],
+            "y-dual-tv: full-weight pixels come from exactly one solve");
+        check(weight.at<float>(32, 18) == 0.0f &&
+            merged.at<cv::Vec3b>(32, 18) == high.at<cv::Vec3b>(32, 18),
+            "y-dual-tv: exterior copies high-TV composite");
+        cv::Mat sparse = merged(cv::Rect(85, 10, 32, 40));
+        cv::Mat sparse_high = high(cv::Rect(85, 10, 32, 40));
+        check(cv::norm(sparse, sparse_high, cv::NORM_L1) < 50,
+            "y-dual-tv: sparse checkerboard noise remains suppressed");
+        check(merged.at<cv::Vec3b>(32, 8)[0] == high.at<cv::Vec3b>(32, 8)[0],
+            "y-dual-tv: flat dense region keeps high-TV base");
+
+        // A strong edge on the top/left border used to make floodFill(0,0)
+        // a no-op, and bitwise_not then selected the whole image. The
+        // outside padding must leave unsupported areas black.
+        cv::Mat corner = high.clone(), corner_weight;
+        corner(cv::Rect(0, 0, 12, 12)).setTo(cv::Scalar(0, 0, 0));
+        cs_blend_y_dual_tv(low, corner, mask, merged, &corner_weight);
+        check(!corner_weight.empty() &&
+            corner_weight.at<float>(32, 100) < 1e-6f,
+            "y-dual-tv: border edge cannot fill unsupported image");
+
+        // Dense, connected texture must never turn the entire image into
+        // one low-TV segment, even when its component contains many edges.
+        cv::Mat textured = high.clone(), textured_weight;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                const uchar v = (c / 3) % 2 ? 210 : 30;
+                textured.at<cv::Vec3b>(r, c) = cv::Vec3b(v, v, v);
+            }
+        cs_blend_y_dual_tv(low, textured, mask, merged, &textured_weight);
+        check(!textured_weight.empty() && cv::mean(textured_weight)[0] < 0.8,
+            "y-dual-tv: near-full-image component rejected");
+    }
+}
+
+void test_y_dual_tv_color_segment() {
+    const int rows = 160, cols = 192;
+    cv::Mat high(rows, cols, CV_8UC3, cv::Scalar(180, 80, 25)); // blue background
+    const cv::Scalar green(45, 150, 65), crown(55, 158, 70);
+    cv::rectangle(high, cv::Rect(60, 68, 72, 75), green, cv::FILLED);
+    cv::rectangle(high, cv::Rect(70, 27, 52, 54), crown, cv::FILLED);
+    cv::Mat low = high.clone();
+    cv::Mat sampled(rows, cols, CV_8U, cv::Scalar(0));
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c)
+            if ((r + c) % 3 != 0) sampled.at<uchar>(r, c) = 1;
+    cv::Mat result, weight;
+    cs_blend_y_dual_tv(low, high, sampled, result, &weight);
+    check(!weight.empty() && weight.at<float>(38, 96) > 0.9f,
+        "y-dual-tv: color segment fills crown beyond closed-edge seed");
+    check(!weight.empty() && weight.at<float>(38, 25) < 1e-6f,
+        "y-dual-tv: colorful background stays outside object segment");
+}
+
 void test_per_tile_coef() {
     // exact math: sqrt scaling with [0.25x, 4x] clamps and degenerate guards
     check(cs_per_tile_coef(0.01f, 100, 400.0) == 0.02f, "per-tile-coef: sqrt upscale");
@@ -2242,10 +2405,16 @@ void test_gpu_fista_agreement() {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     // Large photos trip CL_MEM_OBJECT_ALLOCATION_FAILURE on this host's
     // OpenCL runtime during heavy GEMM; CPU path is deterministic for tests.
     cv::ocl::setUseOpenCL(false);
+    if (argc == 2 && std::string(argv[1]) == "--y-confidence-only") {
+        test_y_confidence_prior();
+        test_y_dual_tv_blend();
+        test_y_dual_tv_color_segment();
+        return g_failures ? 1 : 0;
+    }
 
     test_crypto();
     test_shuffle();
@@ -2271,6 +2440,9 @@ int main() {
     test_hf_weighted_spread();
     test_adaptive_tile_grid_limit();
     test_sample_bits();
+    test_y_confidence_prior();
+    test_y_dual_tv_blend();
+    test_y_dual_tv_color_segment();
     test_per_tile_coef();
     test_gpu_fista_agreement();
 

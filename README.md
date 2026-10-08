@@ -106,6 +106,50 @@ edge magnitude misleads (smooth high-contrast gradients).
 
 ### YCC 4:2:0 split sampling (`--ycc420`)
 
+On decrypt, `--y-confidence 0.3` enables an optional second CPU FISTA pass
+for luma in YCC420/422 containers. It blurs the binary sample mask (5-pixel
+sigma), compares local coverage with the tile's mean, and uses a soft
+quadratic anchor only in locally under-sampled **unmeasured** pixels. The
+anchor is a lightly smoothed first-pass Y reconstruction (1.2-pixel sigma);
+the original measurements retain their data term. Strength is in [0,1];
+0 (default) does not change the current decode. DCT basis only; chroma uses
+the existing reconstruction. This is a decrypt option: existing containers
+need no re-encryption. Try 0.2–0.5 and compare against 0 on the same image;
+it adds one Y solve and can soften real texture where samples are scarce.
+
+For tiles that contain both dense and sparse sampling, `--y-dual-tv 0.02`
+detects mixed-density reconstruction tiles and performs **two independent Y
+solves** from the same warm start: high-TV first as the base, then low-TV
+(`--tv`, default 0). The two tile grids are composited separately, including
+overlap feathering and AVIR upscaling. **After all tiles are solved**, Sobel
+edges of the stable high-TV composite define where to copy low-TV detail;
+the blurred sample mask gates edges with inadequate coverage. The mask has
+soft boundaries and spans reconstruction-tile seams. Uniform-density tiles
+use the normal single solve. Dual-TV uses AVIR for both candidates (other
+photo upscalers are ignored when dual-TV is active).
+Try `--y-dual-tv 0.01`, `0.02`, `0.05` against the same container; the
+high-TV value must exceed `--tv`. This adds another full Y solve and may
+smooth actual detail in sparse areas. It can also be combined with
+`--y-confidence`, which refines the low-TV candidate before blending. On
+IMG_3690's existing YCC container: baseline 27.63 dB (~9 s), confidence
+0.3 alone 28.46 dB (~15 s), post-composite filled-segment mask + confidence
+0.3 + dual-TV 0.02 reached 28.73 dB (~68 s) with binary color-segment selection.
+High-TV backtracking makes dual solves costly. `--y-dual-tv-mask out.png`
+writes the exact binary selection mask alongside the decode: black pixels
+come from the high-TV composite, white pixels from the low-TV composite. It
+copies whole BGR pixels (the two candidates use the same chroma solve), so
+the mask exactly describes which candidate supplies every output pixel. The
+edge/coverage decision can be
+inspected directly. The map holds solid detail segments (strong high-TV edges,
+closed morphologically and flood-filled from a padded outside border, gated
+by sample coverage and a maximum component size). Hue-connected saturated
+regions supported by those segments can expand into smooth parts of the same
+object (e.g. a bird's crown), without selecting similarly smooth blue sky;
+this is a color heuristic, not semantic object segmentation. This is a hard
+cut at segment borders (only the earlier reconstruction-tile overlaps are
+feathered). These
+decrypt-side options require a YCC container; BGR modes ignore them.
+
 Mode 3 applies the JPEG insight directly: encrypt converts to YCrCb,
 downsamples chroma 2×, samples luma at the full `--ratio` budget and each
 chroma plane on its own coarse grid (domain-separated key streams), and packs

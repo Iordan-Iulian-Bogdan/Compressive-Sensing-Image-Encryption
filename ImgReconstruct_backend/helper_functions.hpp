@@ -114,6 +114,25 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cs_null_mat(),
     float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
 
+// Second Y-only CPU FISTA pass with a smoothed sample-density confidence map.
+// plane is CV_32F [0,255] in and out; measured pixels retain their data term.
+void cs_refine_y_confidence(const cv::Mat& measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    cv::Mat& plane, float strength, float coef, float tv,
+    int iterations, int fista_iters, int basis, float wscale);
+
+// Detect mixed-density reconstruction tiles; uniform tiles need one solve.
+bool cs_y_mixed_density(const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    int rows, int cols);
+
+// Post-composite segment mask: strong Sobel edges from the stable high-TV
+// image are closed/flood-filled and hue-connected where supported by samples.
+// Hard BGR selection: white takes the low-TV composite, black the high-TV
+// composite. When weight_out is non-null it receives this exact binary mask
+// as CV_32F (0 or 1), for saving to PNG.
+void cs_blend_y_dual_tv(const cv::Mat& low_bgr, const cv::Mat& high_bgr,
+    const cv::Mat& sample_mask, cv::Mat& blended, cv::Mat* weight_out = nullptr);
+
 /** @brief two-phase per-channel FISTA: submit all channels of a tile (or
 wave) before waiting for any of them, so the GPU worker's batch queue stays
 full and its pipelined kernels overlap. Begin prepares the problem and
