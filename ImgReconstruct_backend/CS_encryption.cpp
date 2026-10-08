@@ -433,7 +433,10 @@ void CSencryption::returnHfWeightedIndices(
 
     std::uniform_real_distribution<double> uniform(0.0, 1.0);
     std::vector<double> keys;
+    std::vector<double> ukeys;
     std::vector<int> order;
+    std::vector<int> rest;
+    std::vector<char> taken;
     for (int tile_row = 0; tile_row < tile_rows; ++tile_row) {
         for (int tile_col = 0; tile_col < tile_cols; ++tile_col) {
             const int tile_index = tile_row * tile_cols + tile_col;
@@ -453,6 +456,7 @@ void CSencryption::returnHfWeightedIndices(
                 continue;
             }
             keys.resize(static_cast<size_t>(pixel_count));
+            ukeys.resize(static_cast<size_t>(pixel_count));
             for (int i = 0; i < pixel_count; ++i) {
                 const int local_row = i / tile_width;
                 const int local_col = i % tile_width;
@@ -460,20 +464,61 @@ void CSencryption::returnHfWeightedIndices(
                     (row0 + local_row) * weight_rows / image_rows);
                 const int thumb_col = (std::min)(weight_cols - 1,
                     (col0 + local_col) * weight_cols / image_cols);
-                const double weight = pixel_floor + weights[
+                // HF weight compression: raw thumbnail-|Laplacian| weights
+                // are heavy-tailed (a strong edge can outweigh flat pixels
+                // 100:1), so a plain weighted top-k piles the tile's whole
+                // budget onto the feature and starves the rest. log1p bounds
+                // the effective boost: with floor F and gain K,
+                //   edge:flat = (F + K*log1p(200)) / (F + K*log1p(0.5))
+                //           ~ (8 + 4*5.3) / (8 + 4*0.41) ~ 3x  (F=8, K=4).
+                constexpr double kHfWeightGain = 4.0;
+                const double raw = (double)weights[
                     static_cast<size_t>(thumb_row) * weight_cols + thumb_col];
-                keys[static_cast<size_t>(i)] = std::pow(uniform(generator), 1.0 / weight);
+                const double cw = (double)pixel_floor +
+                    kHfWeightGain * std::log1p(raw > 0.0 ? raw : 0.0);
+                keys[static_cast<size_t>(i)] = std::pow(uniform(generator), 1.0 / cw);
+                ukeys[static_cast<size_t>(i)] = uniform(generator);
             }
+            // Uniform base split: half of every tile's budget is drawn
+            // uniformly (independent stream) so no region can starve however
+            // spiky the weights are; the other half follows the compressed
+            // HF weights. Deterministic given (key, geometry, lod,
+            // thumbnail): decrypt regenerates identical positions through
+            // this same routine.
+            // COMPAT: positions differ from pre-change containers (modes
+            // 5/6/8); old containers must be re-encrypted. No spare
+            // authenticated header byte exists to version-gate the draw.
+            const int n_uni = sample_count / 2;
+            const int n_w = sample_count - n_uni;
             order.resize(static_cast<size_t>(pixel_count));
             std::iota(order.begin(), order.end(), 0);
-            std::nth_element(order.begin(), order.begin() + sample_count, order.end(),
-                [&](int a, int b) {
-                    return keys[static_cast<size_t>(a)] > keys[static_cast<size_t>(b)];
-                });
-            for (int i = 0; i < sample_count; ++i) {
-                const int local = order[static_cast<size_t>(i)];
-                out_rows.push_back(row0 + local / tile_width);
-                out_cols.push_back(col0 + local % tile_width);
+            taken.assign(static_cast<size_t>(pixel_count), 0);
+            if (n_uni > 0) {
+                std::nth_element(order.begin(), order.begin() + n_uni, order.end(),
+                    [&](int a, int b) {
+                        return ukeys[static_cast<size_t>(a)] > ukeys[static_cast<size_t>(b)];
+                    });
+                for (int i = 0; i < n_uni; ++i) {
+                    const int local = order[static_cast<size_t>(i)];
+                    taken[static_cast<size_t>(local)] = 1;
+                    out_rows.push_back(row0 + local / tile_width);
+                    out_cols.push_back(col0 + local % tile_width);
+                }
+            }
+            if (n_w > 0) {
+                rest.clear();
+                rest.reserve(static_cast<size_t>(pixel_count) - (size_t)n_uni);
+                for (int i = 0; i < pixel_count; ++i)
+                    if (!taken[static_cast<size_t>(i)]) rest.push_back(i);
+                std::nth_element(rest.begin(), rest.begin() + n_w, rest.end(),
+                    [&](int a, int b) {
+                        return keys[static_cast<size_t>(a)] > keys[static_cast<size_t>(b)];
+                    });
+                for (int i = 0; i < n_w; ++i) {
+                    const int local = rest[static_cast<size_t>(i)];
+                    out_rows.push_back(row0 + local / tile_width);
+                    out_cols.push_back(col0 + local % tile_width);
+                }
             }
         }
     }

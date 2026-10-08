@@ -139,13 +139,18 @@ synthetic suite at ratio 0.5: 23.37 dB / 0.75 SSIM vs 22.68 dB for 4:2:0 at a
 ### HF-focus sampling (`--hf-focus`)
 
 Modes 5, 6 and 8 store an authenticated, lossless PNG thumbnail (maximum dimension
-128px) in the container. Per-tile sample counts remain nearly uniform, but
-sample positions are drawn with probability weighted by the thumbnail's
-Laplacian magnitude. This concentrates measurements on edges while preserving
-coverage in smooth tiles. The thumbnail is encrypted with AES-CTR using a
+128px) in the container. Per-tile sample counts remain nearly uniform, and
+within each tile the budget splits 50/50: half drawn uniformly (so no region
+can starve), half drawn with probability weighted by the log-compressed
+thumbnail Laplacian (`log1p`, ~3x edge-vs-flat boost instead of the raw
+100:1 spikes that used to pile whole tiles onto single features). This
+concentrates measurements on edges while preserving coverage in smooth tiles.
+The thumbnail is encrypted with AES-CTR using a
 domain-separated counter and is also used as a first-wave solver warm start.
 Use `--tile-size 32` for a fine HF grid; decrypt detects the mode from the
-container.
+container. Note: the within-tile draw changed under the same mode numbers,
+so mode 5/6/8 containers written by older binaries must be re-encrypted;
+decrypting them with a new binary misplaces samples.
 
 `--hf-focus` is an encrypt/roundtrip option and cannot be combined with
 `--periodic`, `--adaptive`, `--two-pass`, `--regions`, `--lod-smooth`,

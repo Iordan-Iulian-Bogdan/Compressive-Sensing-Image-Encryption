@@ -1820,6 +1820,66 @@ void test_hf_focus_roundtrip() {
 // packed roundtrip. Plumbing breakage (wrong offsets, misaligned sections)
 // collapses to garbage, so loose relative PSNR bounds suffice.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// HF-weighted spread: log-compressed weights + 50% uniform base.
+// A spiky weight map must neither starve flat regions (uniform base) nor
+// lose its HF bias (compressed weighted half still favors the hot cell).
+// Goes straight at the sampler (protected member via probe subclass) with
+// a fixed key, so the same call also pins encrypt/decrypt determinism.
+// ---------------------------------------------------------------------------
+struct HfSamplerProbe : CSencryption {
+    using CSencryption::returnHfWeightedIndices;
+};
+
+void test_hf_weighted_spread() {
+    const int rows = 128, cols = 128, tile = 64;
+    const int m_total = rows * cols / 4; // 4096 over 2x2 tiles
+    const std::vector<uint8_t> lod(4, 128); // flat LOD: budgets ~equal
+    const int wc = 8, wr = 8;
+    std::vector<float> weights((size_t)wc * wr, 0.5f);
+    weights[(size_t)2 * wc + 5] = 400.0f; // hot cell -> rows [32,48), cols [80,96)
+    uint8_t key[32];
+    for (int i = 0; i < 32; ++i) key[i] = (uint8_t)(i * 7 + 1);
+
+    HfSamplerProbe a, b;
+    std::vector<int> ax, ay, bx, by;
+    a.returnHfWeightedIndices(ax, ay, rows, cols, lod, m_total, key,
+        tile, 65535, weights, wc, wr);
+    b.returnHfWeightedIndices(bx, by, rows, cols, lod, m_total, key,
+        tile, 65535, weights, wc, wr);
+    check(ax.size() == (size_t)m_total && ay.size() == (size_t)m_total,
+        "hf-spread: total sample count preserved");
+    check(ax == bx && ay == by, "hf-spread: deterministic (decrypt regenerates)");
+
+    // uniqueness: uniform and weighted halves must be disjoint
+    std::vector<char> seen((size_t)rows * cols, 0);
+    bool dup = false;
+    for (size_t k = 0; k < ax.size(); ++k) {
+        const size_t idx = (size_t)ax[k] * cols + (size_t)ay[k];
+        if (seen[idx]) { dup = true; break; }
+        seen[idx] = 1;
+    }
+    check(!dup, "hf-spread: no duplicate positions");
+
+    // coverage over 16x16 cells: uniform base forbids starved regions
+    int cells[8][8] = {};
+    for (size_t k = 0; k < ax.size(); ++k) cells[ax[k] / 16][ay[k] / 16]++;
+    int cmin = m_total;
+    long long rest_sum = 0;
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 8; ++j) {
+            cmin = (std::min)(cmin, cells[i][j]);
+            if (i != 2 || j != 5) rest_sum += cells[i][j];
+        }
+    std::printf("       hf-spread min 16x16 cell: %d, hot cell: %d\n",
+        cmin, cells[2][5]);
+    check(cmin >= 4, "hf-spread: no starved 16x16 cell");
+    // HF bias preserved: hot cell well above the flat-cell mean
+    const double flat_mean = (double)rest_sum / 63.0;
+    check((double)cells[2][5] > 1.5 * flat_mean,
+        "hf-spread: hot cell still favored");
+}
+
 void test_sample_bits() {
     // helper unit checks: identity at 8, bounded error below
     check(cs_quantize_sample(0, 4) == 0 && cs_quantize_sample(255, 4) == 15,
@@ -2152,6 +2212,7 @@ int main() {
     test_coupled_dict();
     test_dncnn_red();
     test_hf_focus_roundtrip();
+    test_hf_weighted_spread();
     test_sample_bits();
     test_per_tile_coef();
     test_gpu_fista_agreement();
