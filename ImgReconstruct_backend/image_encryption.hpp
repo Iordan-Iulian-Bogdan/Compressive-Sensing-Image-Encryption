@@ -64,6 +64,12 @@ public:
     // last encrypt_* call. Returns false when no indices are available.
     bool build_sampling_mask_view(cv::Mat& out) const;
 
+    // Build under/over-sampled tile canvases from the indices used by the
+    // last encrypt_* call (see cs_build_sample_class_views). Writes
+    // <prefix>_under.png / <prefix>_over.png; no-ops with a warning when
+    // there is nothing to classify. No GUI (headless-safe).
+    void present_sample_classes(const std::string& prefix, int tile_size) const;
+
     // --show-mask: write <output>.mask.png and open a window until a key is
     // pressed (skipped when headless/no window support). output_path may be
     // empty (in-memory encrypt); then only the window is used.
@@ -82,7 +88,7 @@ public:
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
     */
-    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false);
+    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const std::string& sample_split = "");
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at
@@ -100,6 +106,17 @@ private:
 // min-max normalized with lod_min floor. Same grid layout as
 // compute_adaptive_lod, so counts/container/decrypt are unchanged.
 std::vector<uint8_t> compute_spectral_lod(const cv::Mat& img, int tile_size, int lod_min);
+
+// Classify tiles by sample density: bins (rix, riy) into a tile_size grid
+// over rows x cols and splits tile counts against their mean (under: count
+// < mean, over: count > mean; ties go in neither canvas). Renders two
+// full-geometry BGR canvases: source tile pixels at original positions for
+// the class, black elsewhere, each labeled with its tile count. Pure
+// function of inputs (deterministic); returns false on degenerate input
+// (empty image/indices, tile_size < 1, no grid cells).
+bool cs_build_sample_class_views(const cv::Mat& input,
+    const std::vector<int>& rix, const std::vector<int>& riy,
+    int tile_size, cv::Mat& under, cv::Mat& over);
 
 /** @brief encrypts a given image and writes the result to disk
 @param input_path : path to input image

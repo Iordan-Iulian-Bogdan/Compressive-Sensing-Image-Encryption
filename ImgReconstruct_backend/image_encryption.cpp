@@ -555,6 +555,91 @@ void encrypt_image::present_sampling_mask(const std::string& output_path) const 
     }
 }
 
+bool cs_build_sample_class_views(const cv::Mat& input,
+    const std::vector<int>& rix, const std::vector<int>& riy,
+    int tile_size, cv::Mat& under, cv::Mat& over)
+{
+    under.release();
+    over.release();
+    if (input.empty() || input.type() != CV_8UC3) return false;
+    if (rix.size() != riy.size() || rix.empty() || tile_size < 1) return false;
+    const int rows = input.rows, cols = input.cols;
+    const int ntr = (rows + tile_size - 1) / tile_size;
+    const int ntc = (cols + tile_size - 1) / tile_size;
+    if (ntr < 1 || ntc < 1) return false;
+    // per-tile sample counts (ri_x = row, ri_y = col, same convention as
+    // the container writers); out-of-range samples are ignored.
+    std::vector<long long> counts((size_t)ntr * ntc, 0);
+    for (size_t k = 0; k < rix.size(); ++k) {
+        const int r = rix[k], c = riy[k];
+        if (r < 0 || r >= rows || c < 0 || c >= cols) continue;
+        counts[(size_t)(r / tile_size) * ntc + (c / tile_size)] += 1;
+    }
+    long long total = 0;
+    for (long long v : counts) total += v;
+    if (total <= 0) return false;
+    const double mean = (double)total / (double)counts.size();
+    under = cv::Mat::zeros(rows, cols, CV_8UC3);
+    over = cv::Mat::zeros(rows, cols, CV_8UC3);
+    long long n_under = 0, n_over = 0;
+    for (int tr = 0; tr < ntr; ++tr) {
+        for (int tc = 0; tc < ntc; ++tc) {
+            const long long cnt = counts[(size_t)tr * ntc + tc];
+            cv::Mat* dst = nullptr;
+            if ((double)cnt < mean) { dst = &under; ++n_under; }
+            else if ((double)cnt > mean) { dst = &over; ++n_over; }
+            else continue;  // ties go in neither canvas
+            const int y0 = tr * tile_size, x0 = tc * tile_size;
+            const int h = (std::min)(tile_size, rows - y0);
+            const int w = (std::min)(tile_size, cols - x0);
+            if (h <= 0 || w <= 0) continue;
+            input(cv::Rect(x0, y0, w, h)).copyTo((*dst)(cv::Rect(x0, y0, w, h)));
+        }
+    }
+    if (n_under == 0 && n_over == 0) {
+        // exact-uniform grid (e.g. periodic): nothing to split
+        under.release();
+        over.release();
+        return false;
+    }
+    auto label = [](cv::Mat& panel, const char* t) {
+        cv::putText(panel, t, cv::Point(8, 22), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+            cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+        cv::putText(panel, t, cv::Point(8, 22), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+            cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    };
+    char info[96];
+    std::snprintf(info, sizeof(info), "under-sampled tiles: %lld", n_under);
+    label(under, info);
+    std::snprintf(info, sizeof(info), "over-sampled tiles: %lld", n_over);
+    label(over, info);
+    return true;
+}
+
+void encrypt_image::present_sample_classes(const std::string& prefix, int tile_size) const {
+    cv::Mat under, over;
+    if (!cs_build_sample_class_views(input_img, ri_x, ri_y, tile_size, under, over)) {
+        std::cerr << "Warning: --sample-split: no samplable tile grid "
+                     "(uniform counts or missing indices); nothing written\n";
+        return;
+    }
+    const std::string under_path = prefix + "_under.png";
+    const std::string over_path = prefix + "_over.png";
+    bool ok = true;
+    if (!cv::imwrite(under_path, under)) {
+        std::cerr << "Warning: --sample-split: failed to write " << under_path << "\n";
+        ok = false;
+    }
+    if (!cv::imwrite(over_path, over)) {
+        std::cerr << "Warning: --sample-split: failed to write " << over_path << "\n";
+        ok = false;
+    }
+    if (ok) {
+        std::cout << "Sample-class tiles written to " << under_path
+                  << " and " << over_path << std::endl;
+    }
+}
+
 /** @brief top-level encryption: v2 authenticated header.
  * The passphrase is stretched with PBKDF2-HMAC-SHA256 using a random 16-byte
  * salt stored in the header; the resulting 256-bit key seeds the index RNG
@@ -1565,7 +1650,8 @@ int encrypt_image::encrypt_image_tiled(
     int chroma_bits,
     int lod_full,
     bool ycc422,
-    bool spectral
+    bool spectral,
+    const std::string& sample_split
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -1680,6 +1766,15 @@ int encrypt_image::encrypt_image_tiled(
         // compression stage just finished: render the mask that was used
         if (show_mask) {
             encrypt_img.present_sampling_mask(output_path);
+        }
+
+        // under/over-sampled tile dump, on the same LOD grid the sampling
+        // used (hf defaults to 32, adaptive paths to 64, periodic passes
+        // its tile size through; exact-uniform grids warn and skip).
+        if (!sample_split.empty()) {
+            int grid = tile_size > 0 ? tile_size : 64;
+            if (hf_focus && tile_size <= 0) grid = 32;
+            encrypt_img.present_sample_classes(sample_split, grid);
         }
     }
     catch (const std::runtime_error& e) {

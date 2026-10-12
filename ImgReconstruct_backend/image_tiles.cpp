@@ -180,12 +180,32 @@ cv::Mat blendTilesWithImage(
 
         const cv::Mat tile_roi =
             tiles[i][j](cv::Rect(0, 0, clipped_width, clipped_height));
+        // Cosine taper applies only at interior tile borders. Where a tile
+        // edge touches the image border there is no neighbor to blend with,
+        // so that side carries full weight (same convention as
+        // cs_onnx_denoise_tiled). Without this, border pixels get weight
+        // 0.5*(1-cos(0)) = 0 with no contributor, and the max(weight,1e-6)
+        // normalization below turns the whole outer pixel ring black.
+        const bool touch_l = x <= 0;
+        const bool touch_t = y <= 0;
+        const bool touch_r = x + tile_width >= max_x;
+        const bool touch_b = y + tile_height >= max_y;
+        const int ox = clipped_x - x;
+        const int oy = clipped_y - y;
         cv::Mat weights(clipped_height, clipped_width, CV_32FC1);
         for (int r = 0; r < clipped_height; ++r) {
-          const int dy = (std::min)(r, tile_height - 1 - r);
+          const int rr = r + oy;
+          const int dt = touch_t ? feather : rr;
+          const int db = touch_b ? feather : tile_height - 1 - rr;
+          const int dy = (std::min)(dt, db);
           for (int c = 0; c < clipped_width; ++c) {
-            const int dx = (std::min)(c, tile_width - 1 - c);
-            const int distance = (std::min)((std::min)(dx, dy), feather);
+            const int cc = c + ox;
+            const int dl = touch_l ? feather : cc;
+            const int dr = touch_r ? feather : tile_width - 1 - cc;
+            int distance = (std::min)(dl, dr);
+            distance = (std::min)(distance, dy);
+            distance = (std::min)(distance, feather);
+            distance = (std::max)(distance, 0);
             weights.at<float>(r, c) = static_cast<float>(
                 0.5 * (1.0 - std::cos(CV_PI * distance / feather)));
           }

@@ -36,6 +36,29 @@ inline float cs_per_tile_coef(float coef, int m_tile, double m_mean) {
     return (float)(coef * f);
 }
 
+// Grain-adaptive TV strength (--grain-tv): ROF lambda from measured tile
+// noise over the reference (2x excess; 0 at/below reference). Calibrated:
+// +1dB-class gain on sigma-25 synthetic noise (higher lambdas plateau
+// there), clean content untouched.
+inline float cs_grain_tv_lambda(double sigma, float ref) {
+    if (!(ref > 0.0f) || !(sigma > (double)ref)) return 0.0f;
+    return (float)(2.0 * (sigma - (double)ref));
+}
+
+// Noise sigma estimate of a BGR tile in gray levels: Immerkaer Laplacian
+// (sigma = sqrt(pi/2) * mean|Lo| / 6) per 32px block, MEDIAN over blocks.
+// The median separates grain from texture — texture raises some blocks
+// while flat blocks stay at the noise floor, so textured-but-clean tiles
+// read low and uniformly grainy tiles read high. Single block for small
+// tiles. Returns 0 on degenerate input. Pure function (deterministic).
+double cs_estimate_noise_sigma(const cv::Mat& bgr);
+
+// ROF TV denoise of one BGR tile, luma-only (chroma passes through):
+// Chambolle projection, lambda in pixel units, fixed iteration budget.
+// Deterministic; no-op on degenerate input. Used by --grain-tv to smooth
+// only tiles whose measured grain exceeds the reference.
+void cs_tv_denoise_tile(cv::Mat& bgr, float lambda, int iters = 100);
+
 // Container section packing for --sample-bits (bit format in
 // crypto_utils.hpp): sections record raw offset/count and their plane depth
 // (or interleaved BGR luma/chroma depths) in ascending order; everything
@@ -112,7 +135,18 @@ inline cv::Mat& cs_null_mat() { static cv::Mat m; return m; }
 void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cs_null_mat(),
-    float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
+    float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f,
+    bool use_onsager = false);
+
+// Block-aware 2D DCT on a CV_32F plane: dct_block <= 0 is the legacy
+// whole-plane transform (bit-identical); >0 applies an independent
+// orthonormal DCT per BxB block (edge blocks clipped to the plane).
+// Forward and inverse stay exact adjoints either way, so every FISTA
+// fixed point only moves via the sparser block prior. All solver-domain
+// conversions (warm starts, tails, RED round trips) must use these —
+// never raw cv::dct — so analysis and synthesis agree on the basis.
+void cs_dct_forward(cv::Mat& plane, int dct_block);
+void cs_dct_inverse(cv::Mat& plane, int dct_block);
 
 // Second Y-only CPU FISTA pass with a smoothed sample-density confidence map.
 // plane is CV_32F [0,255] in and out; measured pixels retain their data term.
@@ -133,6 +167,27 @@ bool cs_y_mixed_density(const std::vector<int>& ri_x, const std::vector<int>& ri
 void cs_blend_y_dual_tv(const cv::Mat& low_bgr, const cv::Mat& high_bgr,
     const cv::Mat& sample_mask, cv::Mat& blended, cv::Mat* weight_out = nullptr);
 
+// Classify solved tiles by dual-TV blend weight: per-tile white fraction of
+// the binary weight mask (white = low-TV solve chosen) split against the
+// mean tile fraction (above -> lowtv canvas, below -> hightv, ties in
+// neither). Renders two full-geometry BGR canvases from the composite at
+// the tiles' rects, black elsewhere, each labeled with its tile count. Pure
+// function of inputs (deterministic); returns false on degenerate input
+// (geometry/type mismatch, empty grids, nothing to split).
+bool cs_build_dual_tv_class_views(const cv::Mat& composite, const cv::Mat& weight,
+    const std::vector<std::vector<cv::Mat>>& tiles,
+    const std::vector<std::vector<TileCoord>>& coordinates,
+    cv::Mat& lowtv, cv::Mat& hightv);
+
+// Pixel-exact cutouts of a dual-TV blend: lowcut keeps the low-candidate
+// pixels where the binary weight is 1, highcut keeps the blended pixels
+// where it is 0 (== the high candidate there, by the blend contract);
+// black elsewhere. Accepts CV_32F 0/1 or CV_8U 0/255 weights. Pure function
+// of inputs (deterministic); returns false on degenerate input (geometry/
+// type mismatch, empty mats).
+bool cs_build_dual_tv_cutouts(const cv::Mat& blended, const cv::Mat& low,
+    const cv::Mat& weight, cv::Mat& lowcut, cv::Mat& highcut);
+
 /** @brief two-phase per-channel FISTA: submit all channels of a tile (or
 wave) before waiting for any of them, so the GPU worker's batch queue stays
 full and its pipelined kernels overlap. Begin prepares the problem and
@@ -152,7 +207,7 @@ void fista_channel_begin(fista_channel_task& t, const cv::Mat& pixel_measurement
     const int& channel, const float& param_c, const int& rows, const int& cols,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations,
     cv::Mat& ref, float tv = 0.0f, int reweights = 2, int fista_iters = 0,
-    int basis = CS_BASIS_DCT, float wscale = 2.0f);
+    int basis = CS_BASIS_DCT, float wscale = 2.0f, bool use_onsager = false);
 void fista_channel_end(fista_channel_task& t, cv::Mat& ref);
 
 /** @brief SOMP-structured joint RGB solve: stacked group-L2,1 FISTA with
@@ -170,8 +225,12 @@ bool cs_is_superres_backend(const std::string& backend);
 
 /** @brief true for the single-stage SR backend ("sr-direct").
 Selected via --photo-upscaler; handled as a fused 2x path in the decrypt
-pipeline (BGR containers; ycc split sampling falls back to AVIR). */
+pipeline (like "avir", not a subprocess pipe). */
 bool cs_is_srdirect_backend(const std::string& backend);
+
+/** @brief true for the untrained-prior SR backend ("dip").
+Same fused 2x handling as cs-sr (BGR containers; ycc falls back). */
+bool cs_is_dip_backend(const std::string& backend);
 
 /** @brief CS super-resolution 2x refinement of one solved LR tile (CPU, DCT).
 Luminance-only: a sparse DCT correction around an AVIR warm start is solved
@@ -183,12 +242,52 @@ LR solve hurt SSIM with no PSNR gain; the anchor already provides dense
 consistency.) Chroma comes straight from the AVIR upscale, so one HR solve
 runs instead of three. red in [0,1] adds a RED-lite proximal step per
 outer pass (0 = off, bit-identical): "nlmeans" blends luma toward
-fastNlMeans, "dncnn" blends the BGR tile toward the DnCNN model output. Falls back to AVIR when the basis is
+fastNlMeans, "dncnn"/"scunet"/"restormer" blend the BGR tile toward the
+ONNX model output (red_model overrides the per-denoiser default path).
+red_decay in [0,1] schedules the blend per pass (HQS-style: 1.0 keeps all
+passes identical, <1 decays geometrically). Falls back to AVIR when the basis is
 not DCT, the sample set is empty, or the tile is degenerate. coef/tv/iterations/reweights/
 basis/wscale mirror the LR solve conventions. lr_tile is the solved CV_8UC3
 tile; hr_out is the 2x CV_8UC3 result. */
 // Default DnCNN color model (repo-vendored) for the dncnn RED denoiser.
 #define CS_DNCNN_DEFAULT_MODEL "models/dncnn/dncnn_color.onnx"
+// Default blind color models for the scunet/restormer RED denoisers (not
+// vendored: models/ is gitignored; see README for download sources).
+#define CS_SCUNET_DEFAULT_MODEL "models/scunet/scunet_color_real_psnr.onnx"
+#define CS_RESTORMER_DEFAULT_MODEL "models/restormer/restormer_color.onnx"
+
+// Blind ONNX image-denoiser kinds sharing one RGB-NCHW clean-output
+// contract (BGR in/out at the API boundary): dncnn (tiny, 512px runner
+// tiles) vs scunet/restormer (large, 256px runner tiles).
+enum cs_onnx_kind {
+    CS_ONNX_DNCNN = 0,
+    CS_ONNX_SCUNET = 1,
+    CS_ONNX_RESTORMER = 2
+};
+
+// Map a --red-denoiser name to its kind (-1 when not an ONNX denoiser).
+inline int cs_onnx_kind_for(const std::string& denoiser) {
+    std::string s = denoiser;
+    for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (s == "dncnn") return CS_ONNX_DNCNN;
+    if (s == "scunet") return CS_ONNX_SCUNET;
+    if (s == "restormer") return CS_ONNX_RESTORMER;
+    return -1;
+}
+
+// Resolve the model file for a RED denoiser: explicit --red-model wins,
+// else the dncnn path for dncnn (back-compat with --dncnn-model), else the
+// per-kind default. Empty when the denoiser needs no model (nlmeans).
+inline std::string cs_red_model_for(const std::string& denoiser,
+    const std::string& dncnn_model, const std::string& red_model) {
+    if (!red_model.empty()) return red_model;
+    const int kind = cs_onnx_kind_for(denoiser);
+    if (kind == CS_ONNX_DNCNN)
+        return dncnn_model.empty() ? std::string(CS_DNCNN_DEFAULT_MODEL) : dncnn_model;
+    if (kind == CS_ONNX_SCUNET) return std::string(CS_SCUNET_DEFAULT_MODEL);
+    if (kind == CS_ONNX_RESTORMER) return std::string(CS_RESTORMER_DEFAULT_MODEL);
+    return std::string();
+}
 
 void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y,
@@ -196,7 +295,8 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     cv::Mat& hr_out, float red = 0.0f,
     const std::string& red_denoiser = "nlmeans",
     const std::string& dncnn_model = CS_DNCNN_DEFAULT_MODEL,
-    bool sr_cascade = false);
+    bool sr_cascade = false, const std::string& red_model = "",
+    float red_decay = 1.0f);
 
 /** @brief single-stage SR 2x refinement of one tile (CPU, DCT): the HR luma
 is solved directly against the tile's LR samples (cs_sr_direct_luma, no
@@ -212,6 +312,21 @@ void cs_sr_direct_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_m
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
     cv::Mat& hr_out, bool sr_cascade = false);
 
+/** @brief untrained-prior (Deep Decoder style) 2x refinement of one solved
+LR tile (CPU): a tiny randomly-initialized generator (nearest-upsample +
+per-pixel channel mixes + leaky ReLU, final sigmoid; underparameterized vs
+the HR pixels) is fit by Adam against the tile's LR luma samples (2x2-box
+forward model) plus an AVIR anchor, starting from a fixed seed, with early
+stopping on the data-loss plateau (the DIP regularizer: structure fits
+before noise, so grainy tiles stop before fitting speckles; iters is the
+max budget). No
+training data, no weights, no basis involved. Luma-only solve merged with
+the AVIR chroma (same contract as the cs-sr path). Falls back to AVIR on
+degenerate input or a non-finite result. Deterministic. */
+void cs_dip_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
+    const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    cv::Mat& hr_out, float anchor_w = 0.05f, int iters = 400, float step = 0.04f);
+
 /** @brief true when the DnCNN model loads and runs (cached per path).
 Thread-safe; loads lazily on first call. */
 bool cs_dncnn_available(const std::string& model_path);
@@ -222,6 +337,13 @@ Returns false when the model cannot be loaded or run (caller falls back).
 Thread-safe; deterministic on CPU. */
 bool cs_dncnn_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     const std::string& model_path);
+
+/** @brief same RGB-NCHW clean-output contract for any blind ONNX color
+denoiser (scunet/restormer share the DnCNN runner with smaller tiles).
+kind selects messages and tile geometry (see cs_onnx_kind). */
+bool cs_onnx_available(const std::string& model_path, int kind);
+bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path, int kind);
 
 /** @brief single-stage HR solve for experiments (see .cpp): full
 HR-coefficient FISTA against the LR samples with no LR-solve warm start.

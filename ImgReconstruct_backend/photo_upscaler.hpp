@@ -28,6 +28,9 @@
 //   the LR samples with no LR-solve warm start inside the coefficients.
 //   Same fused path as cs-sr (BGR containers; ycc falls back to AVIR).
 // Both CS backends honor --sr-init avir|cascade for the warm start.
+// - "dip": untrained Deep Decoder prior (cs_dip_upscale_tile_2x): a tiny
+//   generator is fit per tile to its own LR samples (no weights, no
+//   basis). Same fused path (BGR; ycc falls back to AVIR).
 // - "waifu2x": one batched nunif subprocess over the whole tile grid:
 //   tiles are written to a temp dir, a single
 //     <waifu2x_cmd> -i <in_dir> -o <out_dir> <waifu2x_args>
@@ -78,11 +81,19 @@ struct CsPhotoUpscalerOptions {
   // outer FISTA pass toward its fastNlMeans-denoised self. Ignored by all
   // other backends (including AVIR fallback tiles).
   float sr_red = 0.0f;
-  // RED denoiser select for cs-sr ("nlmeans" luma fastNlMeans, "dncnn"
-  // color DnCNN model below). Ignored unless sr_red > 0.
+  // RED denoiser select for cs-sr ("nlmeans" luma fastNlMeans, "dncnn" /
+  // "scunet" / "restormer" blind color ONNX models). Ignored unless
+  // sr_red > 0.
   std::string sr_red_denoiser = "nlmeans";
   // DnCNN color model path (used only with sr_red_denoiser == "dncnn").
   std::string sr_dncnn_model = "models/dncnn/dncnn_color.onnx";
+  // Explicit model file for the ONNX RED denoisers (dncnn/scunet/
+  // restormer); empty selects the per-denoiser default.
+  std::string sr_red_model;
+  // HQS-style schedule on the RED blend per outer pass: 1.0 keeps every
+  // pass identical (legacy), <1 decays geometrically (strong early,
+  // gentle late).
+  float sr_red_decay = 1.0f;
   // Coupled-dictionary SR model (CSD2) for --sr-dict: when non-empty, the
   // fused 2x path refines tiles with patch-OMP synthesis (Dh) from LR
   // gradient-feature codes (Dl) instead of the FISTA HR solve, in every
@@ -101,6 +112,17 @@ struct CsPhotoUpscalerOptions {
   // Where to write the exact binary dual-TV selection mask (grayscale PNG,
   // 0 = high-TV composite, 255 = low-TV composite). Empty disables the dump.
   std::string y_dual_tv_mask;
+  // Prefix for solved-tile class canvases (<prefix>_lowtv.png /
+  // <prefix>_hightv.png): tiles taken mostly from the low/high-TV solve
+  // (split by mean tile white-fraction of the blend mask) at original
+  // positions, rest black. Empty disables the dump. Needs --y-dual-tv
+  // (YCC containers only).
+  std::string dual_tv_split;
+  // Prefix for pixel-exact blend cutouts (<prefix>_low.png /
+  // <prefix>_high.png): low-candidate pixels where the binary mask is
+  // white, blended (= high-candidate) pixels where it is black, black
+  // elsewhere. Empty disables the dump. Needs --y-dual-tv (YCC only).
+  std::string dual_tv_cutouts;
   // FSRCNN 2x model for the "fsrcnn" backend (OpenCV dnn_superres,
   // in-process CPU; default resolves against the working directory).
   // A missing/unreadable model falls back to AVIR per tile.
@@ -125,6 +147,14 @@ struct CsPhotoUpscalerOptions {
   std::string realcugan_cmd = cs_env_or("CS_REALCUGAN_CMD", "realcugan-ncnn-vulkan");
   std::string realcugan_args = cs_env_or("CS_REALCUGAN_ARGS", "");
   std::string realcugan_model = cs_env_or("CS_REALCUGAN_MODEL", "models-se");
+  // Final polish pass (--final-polish, empty = off): after the decrypt
+  // pipeline composites the final image, upscale it 2x with the selected
+  // subprocess backend (waifu2x | waifu2x-ncnn | realcugan, configured by
+  // the --waifu2x-*/--realcugan-* options above) and downsample back to its
+  // size (INTER_AREA). The up-then-down roundtrip acts as a high-quality
+  // artifact smoother on top of everything else. Any backend failure skips
+  // the pass with a warning, leaving the image untouched.
+  std::string final_polish;
 };
 
 // Effective args for the subprocess: the explicit override when set,
@@ -177,5 +207,12 @@ bool cs_fsrcnn_upscale_2x(const cv::Mat& src, cv::Mat& dst,
 // Postcondition: every non-empty CV_8UC3 tile is 2x its input size.
 void cs_upscale_tiles_2x(std::vector<std::vector<cv::Mat>>& tiles,
                          const CsPhotoUpscalerOptions& opt);
+
+// Final polish up-then-down pass for a finished composite image (see
+// final_polish above): 2x upscale via the selected subprocess backend,
+// then INTER_AREA downsample back to the input size, in place. No-op
+// (returns false, image untouched) when final_polish is empty/unknown or
+// the backend fails. True when the pass was applied.
+bool cs_final_polish_updown(cv::Mat& img, const CsPhotoUpscalerOptions& opt);
 
 #endif  // IMGRECONSTRUCT_BACKEND_PHOTO_UPSCALER_HPP_

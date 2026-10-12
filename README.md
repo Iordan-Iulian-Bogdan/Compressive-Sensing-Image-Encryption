@@ -87,7 +87,14 @@ field): finer grids are refused at encrypt with the minimum viable
 `--tile-size`, and count-mismatched containers are rejected at decrypt
 instead of decoding to silent garbage. `--show-mask` (encrypt/roundtrip) writes `<output>.mask.png`
 (source | binary mask | cyan overlay) and opens the same view in a window
-after sampling. **Resolution:** by default encrypt downsamples the input 2×
+after sampling. `--sample-split <prefix>` (encrypt/roundtrip) writes
+`<prefix>_under.png` / `<prefix>_over.png`: source tiles from
+under/over-sampled regions (split by mean tile count) at original positions,
+rest black — no window, headless-safe. `--grain-tv <f>` (decrypt/roundtrip)
+smooths only grainy tiles: post-solve Laplacian noise estimate per tile in
+gray levels; tiles above `<f>` get a luma ROF smooth proportional to the
+excess, clean tiles pass through untouched (any container, works with
+`--tv 0`). **Resolution:** by default encrypt downsamples the input 2×
 and decrypt 2×-upscales the solve (half-res pipeline). Pass `--full-res` on
 **both** encrypt and decrypt/roundtrip to keep native geometry end-to-end.
 
@@ -140,7 +147,12 @@ come from the high-TV composite, white pixels from the low-TV composite. It
 copies whole BGR pixels (the two candidates use the same chroma solve), so
 the mask exactly describes which candidate supplies every output pixel. The
 edge/coverage decision can be
-inspected directly. The map holds solid detail segments (strong high-TV edges,
+inspected directly. `--dual-tv-split <prefix>` (needs `--y-dual-tv`, YCC
+only) writes `<prefix>_lowtv.png` / `<prefix>_hightv.png`: solved tiles taken
+mostly from the low/high-TV solve (split by mean tile mask weight) at
+original positions, rest black. `--dual-tv-cutouts <prefix>` writes
+`<prefix>_low.png` / `<prefix>_high.png`: pixel-exact cutouts (low-candidate
+pixels where the mask is white, blended pixels where black, else black). The map holds solid detail segments (strong high-TV edges,
 closed morphologically and flood-filled from a padded outside border, gated
 by sample coverage and a maximum component size). Hue-connected saturated
 regions supported by those segments can expand into smooth parts of the same
@@ -323,6 +335,29 @@ stays 0, independent flag so seam effects stay attributable). It measures
 bit-identical on tested content: unlike the discontinuous L1 threshold,
 which flips marginal coefficients into visibly different supports, the
 smooth TV perturbation lands below 8U output precision. Same verdict.
+`--final-polish waifu2x|waifu2x-ncnn|realcugan` (unset by default) runs one
+whole-image pass after everything else: the finished composite is upscaled
+2x with the neural backend (configured by the `--waifu2x-*`/`--realcugan-*`
+options above) and downsampled back with `INTER_AREA`, which smooths solver
+and tiling artifacts that survive the per-tile stages. Applies to BGR and
+ycc decrypts alike; a backend failure skips the pass with a warning, leaving
+the image untouched.
+
+`--basis dct|wavelet` selects the sparsifying basis (default `dct`,
+whole-tile). `--dct-block N` (0 = whole-tile default, else N x N,
+decrypt/roundtrip only, CPU only) switches DCT to independent per-block
+transforms. Measured on a 1000x744 photo crop, full-res, ratio 0.5: whole-tile
+20.7 dB, B=64 16.3 dB, B=8 14.0 dB — smaller blocks lose monotonically because
+pixel-domain random sampling is maximally incoherent with the global DCT while
+per-block coefficient groups starve (each block's coefficients see only local
+samples). The wavelet basis (+12 dB over global DCT here) wins through
+multiscale structure, not locality. `--wscale F` (default 2) is the threshold
+ramp: coarsest x1, finest xF for wavelet, and a DC(x1)-to-peak(xF) frequency
+ramp for DCT (1 = legacy uniform). The DCT ramp is the high-leverage prior:
+ratio 0.5 full-res goes 20.7 dB (w=1) to 27.4 dB (w=2) to 34.3 dB (w=4),
+past wavelet's 33.0 dB; w=8 saturates (34.5 dB). Auto (half-res + upscale)
+pipelines are upscale-bound and gain ~0.1 dB.
+
 `--photo-upscaler avir|cs-sr|sr-direct|fsrcnn|waifu2x` selects the per-tile 2x upscaler backend (default
 `avir`). Waifu2x batches tiles through the optional nunif Python package and
 falls back to AVIR if the command or any tile fails. Set `CS_WAIFU2X_CMD` if
@@ -377,6 +412,20 @@ on CPU at these tile sizes, which is also why BM3D is left out: minutes per
 call). Synthetic 256px: SSIM 0.624 → 0.674 at `--red 0.5` with PSNR flat,
 the classic denoiser-prior signature.
 
+`--red-denoiser scunet` swaps NLM for the blind SCUNet-real color model
+(same RED plumbing, 256px runner tiles; weights gitignored at
+`models/scunet/scunet_color_real_psnr.onnx` — fetch `scunet_color_real_psnr.onnx`
+plus its `.onnx.data` from `Heliosoph/scunet-onnx`). `--red-denoiser restormer`
+is the same interface awaiting weights at `models/restormer/restormer_color.onnx`;
+`--red-model <f>` overrides either default. `--red-decay <f>` in [0,1]
+schedules the blend per outer pass HQS-style (1.0 = legacy identical passes,
+<1 decays geometrically: strong early, gentle late).
+
+`--onsager` adds the LDAMP-style Onsager correction to the per-channel FISTA
+tile solver: residuals are debiased by the previous residual scaled by the
+soft-threshold support fraction (CPU only; the joint solver and the HIP kernel
+are unchanged). Off by default; output is bit-identical with it off.
+
 `--photo-upscaler sr-direct` selects the single-stage variant: the HR luma
 is solved directly from the LR samples (`cs_sr_direct_luma`, no LR-solve
 warm start inside the coefficients) and merged with the AVIR chroma.
@@ -394,6 +443,21 @@ AVIR upscale to seed the HR solve. On the fixture, cascade + standard
 budget reaches 36.76 dB in 0.016 s, beating zeros + 4× budget (36.05 dB
 in 0.055 s) — the blocker was init quality, not iteration count
 (HF-focus thumbnails already ship this idea at image scale).
+
+`--photo-upscaler dip` selects the untrained-prior variant: per tile, a
+tiny Deep Decoder generator (nearest-upsample + channel mixes + ReLU,
+final sigmoid; underparameterized vs the HR pixels) is fit by Adam from a
+fixed seed against the tile's own LR luma samples (2x2-box forward model)
+plus the usual AVIR anchor — no training data, no weights, no basis, CPU
+only, luma-only with AVIR chroma. BGR containers (ycc falls back to AVIR).
+The generator is a residual head over the AVIR luma (zero-initialised output
+weights, so it starts exactly at AVIR). Every fifth measured sample is held
+out; Adam fits the rest, and the weights from the best held-out step are
+kept (early stop after 100 steps without improvement). On a 1000x750 crop of
+IMG_3690 at ratio 0.5, one tile: AVIR 23.21 dB, DIP 23.15 dB at about 140 s
+(about 280x slower). The previous non-residual version scored 22.92 dB on the
+same crop. The earlier 19.59 dB synthetic result did not transfer to photos
+and should be disregarded. DIP is kept as an experiment, not a quality path.
 
 `--device gpu` (decrypt, `--solver fista|joint`) offloads the batched tile solves to an AMD GPU over HIP: tile/channel solves queue up and flush as batched kernel groups (proximal-gradient + momentum over FFT-DCT transforms with sampled gradients; joint: row-coupled group threshold over stacked planes), while CDF97 and any device failure silently fall back to the CPU path (output differs from CPU only by float rounding). Set `CS_GPU_DEBUG=1` for per-batch timing lines. Building requires an AMD HIP SDK (7.2 tested) with the target GPU in `HipArch` (`hip_build.targets` compiles `cs_gpu.hip` through `hipcc` at link time).
 

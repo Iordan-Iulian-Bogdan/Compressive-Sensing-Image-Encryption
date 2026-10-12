@@ -196,6 +196,44 @@ void test_tile_helpers() {
     cv::Mat out = blendTilesWithImage(t2, c2, base, 0.5f);
     const cv::Vec3b px = out.at<cv::Vec3b>(0, 0);
     check(std::abs((int)px[0] - 60) <= 1, "blend: alpha=0.5 averages overlapping tiles");
+
+    // feather blend: a tile edge touching the image border has no neighbor,
+    // so it carries full weight. A single solid tile + feather must come
+    // back bit-exact; before the fix the outer pixel ring came out black
+    // (cosine weight 0 with no contributor, 0/1e-6 after normalization).
+    {
+        const int W = 80, H = 64;
+        cv::Mat solid(H, W, CV_8UC3, cv::Scalar(128, 64, 200));
+        std::vector<std::vector<cv::Mat>> ft(1, std::vector<cv::Mat>(1, solid.clone()));
+        std::vector<std::vector<TileCoord>> fc(1, std::vector<TileCoord>(1, { 0, 0 }));
+        cv::Mat pasted = reconstructImage(ft, fc);
+        cv::Mat fbl = blendTilesWithImage(ft, fc, pasted, 0.5f, 24);
+        double mx = 0.0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const cv::Vec3b a = solid.at<cv::Vec3b>(y, x), b = fbl.at<cv::Vec3b>(y, x);
+                for (int c = 0; c < 3; ++c) mx = (std::max)(mx, (double)std::abs((int)a[c] - (int)b[c]));
+            }
+        check(mx == 0.0, "blend feather: single tile keeps border pixels (no black frame)");
+    }
+    // feather blend: 2x2 overlapping tiles from a solid image agree
+    // everywhere (borders full weight, seams partition of unity).
+    {
+        const int W = 64, H = 64, ov = 16;
+        cv::Mat solid(H, W, CV_8UC3, cv::Scalar(90, 160, 40));
+        std::vector<std::vector<cv::Mat>> gt;
+        std::vector<std::vector<TileCoord>> gc;
+        splitImageIntoTiles(solid, gt, gc, 2, ov);
+        cv::Mat pasted = reconstructImage(gt, gc);
+        cv::Mat fbl = blendTilesWithImage(gt, gc, pasted, 0.5f, ov);
+        double mx = 0.0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const cv::Vec3b a = solid.at<cv::Vec3b>(y, x), b = fbl.at<cv::Vec3b>(y, x);
+                for (int c = 0; c < 3; ++c) mx = (std::max)(mx, (double)std::abs((int)a[c] - (int)b[c]));
+            }
+        check(mx <= 1.0, "blend feather: overlapping tiles agree on solid image");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +403,95 @@ void test_fista_solvers() {
 // ---------------------------------------------------------------------------
 // 4c. CDF 9/7 wavelet basis (lifting DWT roundtrip + FISTA solves)
 // ---------------------------------------------------------------------------
+void test_dct_adjoint() {
+    // The FISTA gradient assumes S^T = forward DCT for S = inverse DCT.
+    // If cv::dct is not orthonormal, the solve fixed point drifts off the
+    // data even at full sampling. Check S^T S = I and <S a, b> = <a, S^T b>.
+    // Same operations as cs_synth (cv::dct inverse) and cs_synth_adj (cv::dct forward).
+    std::mt19937 rng(42);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    cv::Mat a(16, 24, CV_32F), bvec(16, 24, CV_32F);
+    for (int i = 0; i < 16; ++i)
+        for (int j = 0; j < 24; ++j) { a.at<float>(i, j) = gauss(rng); bvec.at<float>(i, j) = gauss(rng); }
+    cv::Mat sa, sadj_b, rtv;
+    cv::dct(a, sa, cv::DCT_INVERSE);
+    cv::dct(bvec, sadj_b, 0);
+    double lhs = 0.0, rhs = 0.0, rt = 0.0;
+    for (int i = 0; i < 16; ++i)
+        for (int j = 0; j < 24; ++j) {
+            lhs += (double)sa.at<float>(i, j) * bvec.at<float>(i, j);
+            rhs += (double)a.at<float>(i, j) * sadj_b.at<float>(i, j);
+        }
+    cv::Mat s1, s2;
+    cv::dct(a, s1, cv::DCT_INVERSE);
+    cv::dct(s1, s2, 0);
+    for (int i = 0; i < 16; ++i)
+        for (int j = 0; j < 24; ++j) rt = std::max(rt, (double)std::fabs(s2.at<float>(i, j) - a.at<float>(i, j)));
+    std::printf("       dct adjoint: <Sa,b>=%.6f <a,S^Tb>=%.6f roundtrip max err=%.2e\n", lhs, rhs, rt);
+    check(std::fabs(lhs - rhs) < 1e-3 * (1.0 + std::fabs(lhs)), "dct: forward DCT is adjoint of inverse");
+    check(rt < 1e-3, "dct: adjoint of synthesis inverts synthesis (S^T S = I)");
+}
+
+void test_block_dct() {
+    // Block-DCT (--dct-block) must stay orthogonal per block, including
+    // edge remainder blocks when dims are not multiples of B. Odd sizes
+    // (70x66) exercise 6-wide and 2-wide remainders at B=16.
+    std::mt19937 rng(7);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    for (int B : {8, 16, 32}) {
+        cv::Mat a(70, 66, CV_32F), bvec(70, 66, CV_32F);
+        for (int i = 0; i < 70; ++i)
+            for (int j = 0; j < 66; ++j) { a.at<float>(i, j) = gauss(rng); bvec.at<float>(i, j) = gauss(rng); }
+        cv::Mat sa = a.clone(), sb = bvec.clone();
+        cs_dct_inverse(sa, B);
+        cs_dct_forward(sb, B);
+        double lhs = 0.0, rhs = 0.0;
+        for (int i = 0; i < 70; ++i)
+            for (int j = 0; j < 66; ++j) {
+                lhs += (double)sa.at<float>(i, j) * bvec.at<float>(i, j);
+                rhs += (double)a.at<float>(i, j) * sb.at<float>(i, j);
+            }
+        cv::Mat rtv = a.clone();
+        cs_dct_inverse(rtv, B);
+        cs_dct_forward(rtv, B);
+        double rt = 0.0;
+        for (int i = 0; i < 70; ++i)
+            for (int j = 0; j < 66; ++j) rt = std::max(rt, (double)std::fabs(rtv.at<float>(i, j) - a.at<float>(i, j)));
+        std::printf("       block-dct B=%d: adjoint err=%.2e roundtrip max err=%.2e\n",
+            B, std::fabs(lhs - rhs) / (1.0 + std::fabs(lhs)), rt);
+        check(std::fabs(lhs - rhs) < 1e-3 * (1.0 + std::fabs(lhs)), "block-dct: adjoint identity holds per block");
+        check(rt < 1e-3, "block-dct: roundtrip inverts (incl. remainder blocks)");
+    }
+    // basis plumbing: block travels via cs_make_basis, wavelet unaffected
+    cs_fista_basis bx = cs_make_basis(64, 64, CS_BASIS_DCT, 2.0f, 8);
+    check(bx.dct_block == 8, "block-dct: explicit size stored in basis");
+    cs_set_default_dct_block(16);
+    check(cs_default_dct_block() == 16, "block-dct: global default settable");
+    cs_fista_basis bx2 = cs_make_basis(64, 64, CS_BASIS_DCT, 2.0f);
+    check(bx2.dct_block == 16, "block-dct: default picked up by make_basis");
+    cs_fista_basis bxw = cs_make_basis(64, 64, CS_BASIS_CDF97, 2.0f);
+    check(bxw.dct_block == 0, "block-dct: wavelet basis ignores block");
+    cs_set_default_dct_block(0);
+    check(cs_default_dct_block() == 0, "block-dct: default restored to whole-plane");
+    // frequency ramp: DC x1, peak AC x wscale, uniform at wscale <= 1
+    {
+        cs_fista_basis bu = cs_make_basis(64, 48, CS_BASIS_DCT, 1.0f);
+        bool ones = true;
+        for (float v : bu.wscale) ones = ones && (v == 1.0f);
+        check(ones, "dct-ramp: wscale=1 keeps uniform weights");
+        cs_fista_basis bw = cs_make_basis(64, 48, CS_BASIS_DCT, 2.0f);
+        check(bw.wscale[0] == 1.0f, "dct-ramp: DC protected (x1)");
+        const float peak = bw.wscale[(size_t)63 * 48 + 47];
+        check(std::fabs(peak - 2.0f) < 1e-5f, "dct-ramp: peak AC carries x wscale");
+        bool mono = true;
+        for (int i = 1; i < 64; ++i) mono = mono && (bw.wscale[(size_t)i * 48] >= bw.wscale[(size_t)(i - 1) * 48]);
+        check(mono, "dct-ramp: weights rise monotonically with frequency");
+    }
+}
+
 void test_wavelet_basis() {
+    test_dct_adjoint();
+    test_block_dct();
     int b = -1;
     check(cs_basis_from_name("dct", b) == 0 && b == CS_BASIS_DCT, "wavelet: dct parses to 0");
     check(cs_basis_from_name("wavelet", b) == 0 && b == CS_BASIS_CDF97, "wavelet: wavelet parses to 1");
@@ -437,8 +563,9 @@ void test_wavelet_basis() {
     }
 
     // per-scale threshold ramp (cs_make_basis wscale vector): LL and the
-    // coarsest detail band stay x1, the finest band gets x wscale, DCT
-    // stays all-ones (bit-identical legacy behavior)
+    // coarsest detail band stay x1, the finest band gets x wscale; DCT
+    // maps the knob to a DC(x1)-to-peak(x wscale) frequency ramp
+    // (uniform only at wscale <= 1, the legacy behavior)
     {
         bool ok = true;
         // 64x64 -> 3 levels, LL is 8x8
@@ -457,10 +584,13 @@ void test_wavelet_basis() {
         // wscale 1.0 disables the ramp
         cs_fista_basis bx1 = cs_make_basis(64, 64, CS_BASIS_CDF97, 1.0f);
         for (float v : bx1.wscale) ok = ok && (std::fabs(v - 1.0f) < 1e-6f);
-        // DCT is always uniform regardless of the knob
+        // DCT maps the knob to a frequency ramp (DC x1, peak x wscale)
         cs_fista_basis bd = cs_make_basis(64, 64, CS_BASIS_DCT, 3.0f);
-        for (float v : bd.wscale) ok = ok && (std::fabs(v - 1.0f) < 1e-6f);
-        check(ok, "wavelet: per-scale ramp LL=1, finest=wscale, DCT uniform");
+        ok = ok && (std::fabs(bd.wscale[0] - 1.0f) < 1e-6f);
+        ok = ok && (std::fabs(bd.wscale[(size_t)63 * 64 + 63] - 3.0f) < 1e-4f);
+        cs_fista_basis bd1 = cs_make_basis(64, 64, CS_BASIS_DCT, 1.0f);
+        for (float v : bd1.wscale) ok = ok && (std::fabs(v - 1.0f) < 1e-6f);
+        check(ok, "wavelet: per-scale ramp LL=1, finest=wscale, DCT frequency ramp");
     }
 
     // end-to-end: wavelet-basis FISTA solves decrypt sanely
@@ -600,6 +730,157 @@ void test_adaptive_counts() {
     long long hsum = 0;
     for (int v : h) hsum += v;
     check(hsum == 500, "lod-full: tiny budget total still equals m");
+}
+
+void test_sample_split() {
+    // Hand-made density: 64x64 image, 32px grid -> 2x2 tiles with
+    // 100/300/200/200 samples (mean 200): under={(0,0)}, over={(0,1)}.
+    const cv::Mat src = make_test_image(64, 64);
+    const int per_tile[4] = { 100, 300, 200, 200 };
+    std::vector<int> rx, ry;
+    for (int t = 0; t < 4; ++t) {
+        const int tr = t / 2, tc = t % 2, n = per_tile[t];
+        for (int k = 0; k < n; ++k) {
+            rx.push_back(tr * 32 + (k * 7) % 32);
+            ry.push_back(tc * 32 + (k * 13) % 32);
+        }
+    }
+    cv::Mat under, over;
+    check(cs_build_sample_class_views(src, rx, ry, 32, under, over),
+        "sample-split: builds on valid input");
+    check(under.size() == src.size() && under.type() == CV_8UC3 &&
+        over.size() == src.size() && over.type() == CV_8UC3,
+        "sample-split: full geometry and color type");
+    auto tile_nonblack = [](const cv::Mat& m, int tr, int tc, int ts) {
+        const int h = (std::min)(ts, m.rows - tr * ts);
+        const int w = (std::min)(ts, m.cols - tc * ts);
+        long long nz = 0;
+        for (int r = 0; r < h; ++r) {
+            const cv::Vec3b* p = m.ptr<cv::Vec3b>(tr * ts + r) + tc * ts;
+            for (int k = 0; k < w; ++k)
+                if (p[k] != cv::Vec3b(0, 0, 0)) ++nz;
+        }
+        return nz;
+    };
+    // sparse tile lives in under only, dense tile in over only, ties black.
+    // Both canvases carry a text label in the top band of tile (0,0), so
+    // row-0 membership is probed on a strip below the text (y 26..31).
+    auto strip_nonblack = [](const cv::Mat& m, int tr, int tc, int ts) {
+        const int w = (std::min)(ts, m.cols - tc * ts);
+        long long nz = 0;
+        for (int r = 26; r < 32; ++r) {
+            const cv::Vec3b* p = m.ptr<cv::Vec3b>(tr * ts + r) + tc * ts;
+            for (int k = 0; k < w; ++k)
+                if (p[k] != cv::Vec3b(0, 0, 0)) ++nz;
+        }
+        return nz;
+    };
+    check(strip_nonblack(under, 0, 0, 32) > 0 && strip_nonblack(over, 0, 0, 32) == 0,
+        "sample-split: sparse tile lands in under canvas only");
+    check(strip_nonblack(over, 0, 1, 32) > 0 && strip_nonblack(under, 0, 1, 32) == 0,
+        "sample-split: dense tile lands in over canvas only");
+    check(tile_nonblack(under, 1, 0, 32) == 0 && tile_nonblack(over, 1, 0, 32) == 0 &&
+        tile_nonblack(under, 1, 1, 32) == 0 && tile_nonblack(over, 1, 1, 32) == 0,
+        "sample-split: mean-tied tiles stay black in both");
+    // canvases reproduce source pixels where they are non-black (same strip)
+    {
+        cv::Mat diff;
+        cv::absdiff(src(cv::Rect(0, 26, 32, 6)), under(cv::Rect(0, 26, 32, 6)), diff);
+        cv::Mat gray;
+        cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
+        check(cv::countNonZero(gray) == 0, "sample-split: under tile pixels match source");
+    }
+    // degenerate inputs rejected
+    cv::Mat u2, o2;
+    check(!cs_build_sample_class_views(src, {}, {}, 32, u2, o2),
+        "sample-split: empty indices rejected");
+    check(!cs_build_sample_class_views(src, rx, ry, 0, u2, o2),
+        "sample-split: tile_size<1 rejected");
+    check(!cs_build_sample_class_views(cv::Mat(), rx, ry, 32, u2, o2),
+        "sample-split: empty image rejected");
+    // exact-uniform grid: nothing to split
+    {
+        std::vector<int> ux, uy;
+        for (int r = 0; r < 64; ++r)
+            for (int c = 0; c < 64; ++c) { ux.push_back(r); uy.push_back(c); }
+        check(!cs_build_sample_class_views(src, ux, uy, 32, u2, o2),
+            "sample-split: uniform grid reports nothing to split");
+    }
+}
+
+void test_grain_tv() {
+    cv::Mat clean = make_test_image(128, 128);
+    cv::Mat noisy;
+    {
+        cv::Mat nse;
+        clean.convertTo(nse, CV_32F);
+        cv::Mat gauss(nse.size(), CV_32FC3);
+        cv::randn(gauss, 0.0, 25.0);
+        cv::Mat noisyf = nse + gauss;
+        noisyf.convertTo(noisy, CV_8U);
+    }
+    const double sig_clean = cs_estimate_noise_sigma(clean);
+    const double sig_noisy = cs_estimate_noise_sigma(noisy);
+    std::printf("       grain-tv sigma clean %.2f, noisy %.2f\n", sig_clean, sig_noisy);
+    check(std::isfinite(sig_clean) && std::isfinite(sig_noisy),
+        "grain-tv: estimator finite");
+    check(sig_clean > 0.0 && sig_clean < 30.0,
+        "grain-tv: clean content reads sane");
+    check(sig_noisy > 2.0 * sig_clean,
+        "grain-tv: noise reads well above content");
+    check(cs_estimate_noise_sigma(cv::Mat()) == 0.0,
+        "grain-tv: empty input rejected");
+    {
+        cv::Mat gray;
+        cv::cvtColor(clean, gray, cv::COLOR_BGR2GRAY);
+        check(cs_estimate_noise_sigma(gray) == 0.0,
+            "grain-tv: non-BGR input rejected");
+        check(cs_estimate_noise_sigma(cv::Mat(2, 2, CV_8UC3,
+            cv::Scalar(9, 9, 9))) == 0.0,
+            "grain-tv: tiny input rejected");
+    }
+    // ROF mapping used by the worker (lambda = excess over reference):
+    // noisy improves clearly, clean barely moves, runs are deterministic.
+    const double ref = 8.0;
+    check(cs_grain_tv_lambda(sig_noisy, (float)ref) > 0.0f &&
+        cs_grain_tv_lambda(sig_clean, (float)ref) == 0.0f &&
+        cs_grain_tv_lambda(sig_noisy, 0.0f) == 0.0f,
+        "grain-tv: strength mapping fires only above reference");
+    const double p_noisy = cs_quality::psnr(clean, noisy);
+    cv::Mat dn = noisy.clone();
+    cs_tv_denoise_tile(dn, cs_grain_tv_lambda(sig_noisy, (float)ref));
+    const double p_dn = cs_quality::psnr(clean, dn);
+    std::printf("       grain-tv noisy %.2f dB -> denoised %.2f dB\n", p_noisy, p_dn);
+    check(p_dn > p_noisy + 1.0,
+        "grain-tv: excess-mapped ROF improves noisy input >= 1 dB");
+    cv::Mat dn2 = noisy.clone();
+    cs_tv_denoise_tile(dn2, cs_grain_tv_lambda(sig_noisy, (float)ref));
+    {
+        // absdiff-based (cv::norm INF flaked on identical mats in this
+        // static OpenCV build; the transparent reduction never does).
+        cv::Mat d;
+        cv::absdiff(dn, dn2, d);
+        double mn, mx;
+        cv::minMaxLoc(d.reshape(1), &mn, &mx);
+        check(mx == 0.0, "grain-tv: ROF deterministic");
+    }
+    {
+        cv::Mat dc = clean.clone();
+        cs_tv_denoise_tile(dc, 2.0f);
+        check(cs_quality::psnr(clean, dc) > 35.0,
+            "grain-tv: small lambda barely moves clean input");
+        cv::Mat empty;
+        cs_tv_denoise_tile(empty, 5.0f);
+        check(empty.empty(), "grain-tv: empty tile no-op");
+        cv::Mat gray;
+        cv::cvtColor(clean, gray, cv::COLOR_BGR2GRAY);
+        cs_tv_denoise_tile(gray, 5.0f);
+        check(gray.type() == CV_8UC1, "grain-tv: non-BGR tile untouched");
+        cv::Mat neg = noisy.clone();
+        cs_tv_denoise_tile(neg, 0.0f);
+        check(cv::norm(neg, noisy, cv::NORM_INF) == 0,
+            "grain-tv: zero lambda no-op");
+    }
 }
 
 void test_adaptive_roundtrip() {
@@ -1292,6 +1573,31 @@ void test_photo_upscaler() {
         check(all_2x(grid), "photo-upscaler: waifu2x failure falls back to AVIR");
     }
     {
+        // Final polish up-then-down: empty/unknown selection is a no-op
+        // (image untouched); a failing backend also leaves it untouched.
+        CsPhotoUpscalerOptions opt;
+        cv::Mat img = make_test_image(48, 32);
+        cv::Mat before = img.clone();
+        check(!cs_final_polish_updown(img, opt),
+            "final-polish: empty selection is a no-op");
+        check(cv::norm(img, before, cv::NORM_INF) == 0,
+            "final-polish: empty selection leaves pixels untouched");
+        opt.final_polish = "bogus-polish";
+        check(!cs_final_polish_updown(img, opt),
+            "final-polish: unknown backend is a no-op");
+        check(cv::norm(img, before, cv::NORM_INF) == 0,
+            "final-polish: unknown backend leaves pixels untouched");
+        opt.final_polish = "waifu2x";
+        opt.waifu2x_cmd = "cs-nonexistent-waifu2x-cmd";
+        check(!cs_final_polish_updown(img, opt),
+            "final-polish: backend failure leaves pixels untouched");
+        check(cv::norm(img, before, cv::NORM_INF) == 0,
+            "final-polish: failed run keeps geometry and content");
+        cv::Mat empty;
+        check(!cs_final_polish_updown(empty, opt),
+            "final-polish: empty input rejected");
+    }
+    {
         // Denoising control composes into the waifu2x args.
         CsPhotoUpscalerOptions opt;
         check(cs_waifu2x_effective_args(opt) ==
@@ -1430,6 +1736,19 @@ void test_cs_super_resolution() {
         const double n = cv::norm(red_lr, measured, cv::NORM_L2);
         check(std::isfinite(n), "cs-sr: red=0.5 residual is finite");
     }
+    // HQS schedule: decay=1.0 is bit-identical to the default call;
+    // decay=0 keeps the first pass and drops the second, staying sane.
+    cv::Mat red10, red00;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, red10, 0.5f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f);
+    check(cv::norm(red10, red05, cv::NORM_INF) == 0,
+        "cs-sr: red-decay=1 is bit-identical to default");
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, red00, 0.5f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, false, "", 0.0f);
+    check(red00.size() == original.size() && red00.type() == CV_8UC3,
+        "cs-sr: red-decay=0 keeps 2x geometry and color type");
     // --sr-init cascade warm start: same contract, valid geometry.
     cv::Mat casc;
     cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
@@ -1462,6 +1781,36 @@ void test_cs_super_resolution() {
         8, 2, 0, CS_BASIS_DCT, 2.0f, direct_fb);
     check(cv::norm(direct_fb, baseline, cv::NORM_INF) == 0,
         "sr-direct: missing measurements fall back to AVIR");
+    check(cs_is_dip_backend("dip") && !cs_is_dip_backend("cs-sr") &&
+        !cs_is_superres_backend("dip"),
+        "dip: backend selection");
+    // Untrained-prior wrapper on the same fully sampled fixture: valid
+    // geometry, fits samples at least as well as AVIR (catches broken
+    // adjoints: a wrong transpose cannot reduce the residual), and
+    // deterministic across runs (fixed seed, serial math).
+    cv::Mat dip, dip2, dip_fb;
+    cs_dip_upscale_tile_2x(solved, packed, rx, ry, dip);
+    check(dip.size() == original.size() && dip.type() == CV_8UC3,
+        "dip: 2x geometry and color type");
+    if (!dip.empty()) {
+        cv::Mat dip_lr, dip_base_lr;
+        cv::resize(dip, dip_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        cv::resize(baseline, dip_base_lr, measured.size(), 0, 0, cv::INTER_AREA);
+        check(cv::norm(dip_lr, measured, cv::NORM_L2) <
+              cv::norm(dip_base_lr, measured, cv::NORM_L2),
+            "dip: generator fit reduces LR measurement residual");
+    }
+    cs_dip_upscale_tile_2x(solved, packed, rx, ry, dip2);
+    if (!dip.empty() && !dip2.empty()) {
+        cv::Mat d;
+        cv::absdiff(dip, dip2, d);
+        double mn, mx;
+        cv::minMaxLoc(d.reshape(1), &mn, &mx);
+        check(mx == 0.0, "dip: deterministic");
+    }
+    cs_dip_upscale_tile_2x(solved, packed, {}, {}, dip_fb);
+    check(cv::norm(dip_fb, baseline, cv::NORM_INF) == 0,
+        "dip: missing measurements fall back to AVIR");
 }
 
 // Single-stage vs two-stage SR experiment: the same LR samples feed (a)
@@ -1702,6 +2051,17 @@ static std::string cs_test_dncnn_model() {
     return "";
 }
 
+static std::string cs_test_scunet_model() {
+    if (const char* env = std::getenv("CS_TEST_SCUNET")) return env;
+    const char* cands[] = { "scunet_color_real_psnr.onnx",
+        "models/scunet/scunet_color_real_psnr.onnx" };
+    for (auto c : cands) {
+        std::ifstream f(c, std::ios::binary);
+        if (f.good()) return c;
+    }
+    return "";
+}
+
 void test_dncnn_red() {
     check(!cs_dncnn_available(".cs_test_nope.onnx"), "dncnn: missing model rejected");
     cv::Mat probe, out;
@@ -1767,6 +2127,163 @@ void test_dncnn_red() {
             cv::resize(refined, rl, measured.size(), 0, 0, cv::INTER_AREA);
             check(std::isfinite(cv::norm(rl, measured, cv::NORM_L2)), "dncnn red: residual finite");
         }
+    }
+}
+
+void test_onnx_denoisers() {
+    // kind mapping + model resolution are pure and unconditional
+    check(cs_onnx_kind_for("dncnn") == CS_ONNX_DNCNN &&
+        cs_onnx_kind_for("SCUNet") == CS_ONNX_SCUNET &&
+        cs_onnx_kind_for("restormer") == CS_ONNX_RESTORMER &&
+        cs_onnx_kind_for("nlmeans") < 0 && cs_onnx_kind_for("bogus") < 0,
+        "onnx: kind mapping");
+    check(cs_red_model_for("nlmeans", "d.onnx", "") == "" &&
+        cs_red_model_for("dncnn", "d.onnx", "") == "d.onnx" &&
+        cs_red_model_for("dncnn", "", "") == CS_DNCNN_DEFAULT_MODEL &&
+        cs_red_model_for("scunet", "d.onnx", "") == CS_SCUNET_DEFAULT_MODEL &&
+        cs_red_model_for("restormer", "d.onnx", "") == CS_RESTORMER_DEFAULT_MODEL &&
+        cs_red_model_for("scunet", "d.onnx", "r.onnx") == "r.onnx",
+        "onnx: model path resolution");
+    // missing models fail gracefully per kind (restormer has no weights here)
+    check(!cs_onnx_available(".cs_test_nope.onnx", CS_ONNX_SCUNET),
+        "onnx: missing scunet model rejected");
+    check(!cs_onnx_available(".cs_test_nope.onnx", CS_ONNX_RESTORMER),
+        "onnx: missing restormer model rejected");
+    cv::Mat probe, out;
+    check(!cs_onnx_denoise_bgr(probe, out, ".cs_test_nope.onnx", CS_ONNX_SCUNET),
+        "onnx: missing model run fails");
+    check(!cs_onnx_denoise_bgr(cv::Mat(), out, "whatever", CS_ONNX_RESTORMER),
+        "onnx: empty input rejected");
+    // SCUNet-real weights (opt-in asset, gitignored): clean pass-through,
+    // noisy improvement, determinism — same contract as the dncnn test.
+    const std::string model = cs_test_scunet_model();
+    if (model.empty()) {
+        std::printf("[SKIP] scunet: no model found (set CS_TEST_SCUNET=<path>)\n");
+        return;
+    }
+    check(cs_onnx_available(model, CS_ONNX_SCUNET), "scunet: model loads");
+    cv::Mat clean = make_test_image(128, 128);
+    cv::Mat dn;
+    check(cs_onnx_denoise_bgr(clean, dn, model, CS_ONNX_SCUNET), "scunet: denoise runs");
+    if (dn.empty()) {
+        check(false, "scunet: output readable");
+        return;
+    }
+    check(dn.size() == clean.size() && dn.type() == CV_8UC3, "scunet: geometry preserved");
+    const double stay = cs_quality::psnr(clean, dn);
+    std::printf("       scunet clean-in PSNR: %.2f dB\n", stay);
+    check(stay > 28.0, "scunet: near-identity on clean input");
+    cv::Mat cleanf, nse, noisyf, noisy, dn_noisy;
+    clean.convertTo(cleanf, CV_32F);
+    nse.create(clean.size(), CV_32FC3);
+    cv::randn(nse, 0.0, 25.0);
+    noisyf = cleanf + nse;
+    noisyf.convertTo(noisy, CV_8U);
+    const double p_noisy = cs_quality::psnr(clean, noisy);
+    check(cs_onnx_denoise_bgr(noisy, dn_noisy, model, CS_ONNX_SCUNET), "scunet: noisy denoise runs");
+    const double p_dn = cs_quality::psnr(clean, dn_noisy);
+    std::printf("       scunet noisy %.2f dB -> denoised %.2f dB\n", p_noisy, p_dn);
+    check(p_dn > p_noisy + 2.0, "scunet: noisy input improves >= 2 dB");
+    cv::Mat dn2;
+    cs_onnx_denoise_bgr(clean, dn2, model, CS_ONNX_SCUNET);
+    {
+        // absdiff-based (cv::norm INF flaked on identical mats in this
+        // static OpenCV build; the transparent reduction never does).
+        cv::Mat d;
+        cv::absdiff(dn, dn2, d);
+        double mn, mx;
+        cv::minMaxLoc(d.reshape(1), &mn, &mx);
+        check(mx == 0.0, "scunet: deterministic");
+    }
+    // RED integration: scunet branch of the cs-sr tile solve completes
+    {
+        cv::Mat original = make_test_image(80, 80);
+        cv::Mat measured, solved;
+        cv::resize(original, measured, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+        cv::add(measured, cv::Scalar(8, 8, 8), solved);
+        const int m = measured.rows * measured.cols;
+        cv::Mat packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+        std::vector<int> rx, ry;
+        for (int row = 0; row < measured.rows; ++row)
+            for (int col = 0; col < measured.cols; ++col) {
+                rx.push_back(row); ry.push_back(col);
+                packed.at<cv::Vec3b>(CS_HEADER_PIXELS + row * measured.cols + col) =
+                    measured.at<cv::Vec3b>(row, col);
+            }
+        cv::Mat refined;
+        cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+            8, 2, 0, CS_BASIS_DCT, 2.0f, refined, 0.5f, "scunet", "", false, model);
+        check(refined.size() == original.size() && refined.type() == CV_8UC3,
+            "scunet red: 2x geometry and color type");
+    }
+}
+
+void test_onsager() {
+    // 50%-sampled 40x40 fixture through one channel solve, correction
+    // on vs off: both finite/sane/deterministic, and the correction
+    // engages (outputs differ) on content with partial support.
+    cv::Mat truth_bgr = make_test_image(80, 80);
+    cv::Mat truth_gray;
+    cv::cvtColor(truth_bgr, truth_gray, cv::COLOR_BGR2GRAY);
+    cv::Mat truth_lr;
+    cv::resize(truth_gray, truth_lr, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+    cv::Mat lr;
+    cv::resize(truth_bgr, lr, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+    std::mt19937 rng(99);
+    std::vector<int> rx, ry;
+    cv::Mat lr8;
+    lr.convertTo(lr8, CV_8U);
+    for (int r = 0; r < 40; ++r)
+        for (int c = 0; c < 40; ++c)
+            if ((rng() % 100) < 50) { rx.push_back(r); ry.push_back(c); }
+    const int m = (int)rx.size();
+    check(m > 400, "onsager: fixture holds enough samples");
+    cv::Mat packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+    for (int k = 0; k < m; ++k)
+        packed.at<cv::Vec3b>(CS_HEADER_PIXELS + k) = lr8.at<cv::Vec3b>(rx[k], ry[k]);
+    auto solve_once = [&](bool oc) {
+        cv::Mat ref = cv::Mat::zeros(40, 40, CV_32F);
+        cv::dct(ref, ref, 0);
+        ref /= 10.0f;
+        cv::Mat dummy;
+        reconstruct_color_channel_fista(packed, 0, 0.0375f, 40, 40, rx, ry,
+            2, ref, false, dummy, 0.0f, 1, 8, CS_BASIS_DCT, 2.0f, oc);
+        cv::Mat out;
+        ref.convertTo(out, CV_8U);
+        return out;
+    };
+    cv::Mat p8 = solve_once(false), c8 = solve_once(true);
+    // finite pixels (8U saturate rules out inf/nan; guard anyway)
+    bool fin = true;
+    {
+        cv::Mat pf, cf;
+        p8.convertTo(pf, CV_32F);
+        c8.convertTo(cf, CV_32F);
+        for (int r = 0; r < 40 && fin; ++r)
+            for (int c = 0; c < 40; ++c)
+                if (!std::isfinite(pf.at<float>(r, c)) ||
+                    !std::isfinite(cf.at<float>(r, c))) { fin = false; break; }
+    }
+    check(fin, "onsager: both paths finite");
+    const double p_plain = cs_quality::psnr(truth_lr, p8);
+    const double p_corr = cs_quality::psnr(truth_lr, c8);
+    std::printf("       onsager off %.2f dB vs on %.2f dB\n", p_plain, p_corr);
+    check(std::isfinite(p_plain) && std::isfinite(p_corr) &&
+        p_plain > 8.0 && p_corr > 8.0, "onsager: both paths sane");
+    {
+        cv::Mat d;
+        cv::absdiff(p8, c8, d);
+        double mn, mx;
+        cv::minMaxLoc(d.reshape(1), &mn, &mx);
+        check(mx > 0.0, "onsager: correction engages (outputs differ)");
+    }
+    cv::Mat corr2 = solve_once(true);
+    {
+        cv::Mat d;
+        cv::absdiff(c8, corr2, d);
+        double mn, mx;
+        cv::minMaxLoc(d.reshape(1), &mn, &mx);
+        check(mx == 0.0, "onsager: deterministic");
     }
 }
 
@@ -2236,6 +2753,118 @@ void test_y_dual_tv_color_segment() {
         "y-dual-tv: colorful background stays outside object segment");
 }
 
+void test_dual_tv_split() {
+    // Checkerboard weight over a 2x2 solve-tile grid: white tiles (0,1) and
+    // (1,0) go to lowtv, black tiles (0,0) and (1,1) to hightv (mean 0.5).
+    // Row 1 carries the membership probes: both canvases are labeled inside
+    // tile (0,0), so row 0 is label-polluted by design.
+    const cv::Mat comp = make_test_image(64, 64);
+    cv::Mat weight(64, 64, CV_32F, cv::Scalar(0.0f));
+    weight(cv::Rect(32, 0, 32, 32)).setTo(1.0f);
+    weight(cv::Rect(0, 32, 32, 32)).setTo(1.0f);
+    std::vector<std::vector<cv::Mat>> tiles(2, std::vector<cv::Mat>(2));
+    std::vector<std::vector<TileCoord>> coords(2, std::vector<TileCoord>(2));
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            tiles[i][j] = cv::Mat(32, 32, CV_8UC3, cv::Scalar(1, 2, 3));
+            coords[i][j] = TileCoord{ j * 32, i * 32 };
+        }
+    cv::Mat lowtv, hightv;
+    check(cs_build_dual_tv_class_views(comp, weight, tiles, coords, lowtv, hightv),
+        "dual-tv-split: builds on valid input");
+    check(lowtv.size() == comp.size() && lowtv.type() == CV_8UC3 &&
+        hightv.size() == comp.size() && hightv.type() == CV_8UC3,
+        "dual-tv-split: full geometry and color type");
+    auto tile_nonblack = [](const cv::Mat& m, int tr, int tc) {
+        long long nz = 0;
+        for (int r = 0; r < 32; ++r) {
+            const cv::Vec3b* p = m.ptr<cv::Vec3b>(tr * 32 + r) + tc * 32;
+            for (int k = 0; k < 32; ++k)
+                if (p[k] != cv::Vec3b(0, 0, 0)) ++nz;
+        }
+        return nz;
+    };
+    check(tile_nonblack(lowtv, 1, 0) > 0 && tile_nonblack(hightv, 1, 0) == 0,
+        "dual-tv-split: white tile lands in lowtv canvas only");
+    check(tile_nonblack(hightv, 1, 1) > 0 && tile_nonblack(lowtv, 1, 1) == 0,
+        "dual-tv-split: black tile lands in hightv canvas only");
+    {
+        cv::Mat diff;
+        cv::absdiff(comp(cv::Rect(0, 32, 32, 32)), lowtv(cv::Rect(0, 32, 32, 32)), diff);
+        cv::Mat gray;
+        cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
+        check(cv::countNonZero(gray) == 0, "dual-tv-split: lowtv pixels match composite");
+    }
+    // pixel-exact cutouts: low keeps the low candidate on white weight,
+    // high keeps the blend on black weight, black elsewhere (no labels).
+    {
+        cv::Mat low = comp.clone();
+        cv::Mat blended = comp.clone();
+        blended(cv::Rect(32, 0, 32, 64)).setTo(cv::Scalar(7, 8, 9));
+        cv::Mat lowcut, highcut;
+        check(cs_build_dual_tv_cutouts(blended, low, weight, lowcut, highcut),
+            "dual-tv-cutouts: builds on valid input");
+        check(lowcut.size() == comp.size() && lowcut.type() == CV_8UC3 &&
+            highcut.size() == comp.size() && highcut.type() == CV_8UC3,
+            "dual-tv-cutouts: full geometry and color type");
+        auto rect_eq = [](const cv::Mat& a, const cv::Mat& b, const cv::Rect& r) {
+            cv::Mat diff;
+            cv::absdiff(a(r), b(r), diff);
+            cv::Mat gray;
+            cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
+            return cv::countNonZero(gray) == 0;
+        };
+        auto rect_black = [](const cv::Mat& a, const cv::Rect& r) {
+            cv::Mat gray;
+            cv::cvtColor(a(r), gray, cv::COLOR_BGR2GRAY);
+            return cv::countNonZero(gray) == 0;
+        };
+        // weight white on (0,1)+(1,0): lowcut keeps low there, black elsewhere
+        check(rect_eq(lowcut, low, cv::Rect(32, 0, 32, 32)) &&
+            rect_eq(lowcut, low, cv::Rect(0, 32, 32, 32)),
+            "dual-tv-cutouts: low keeps low-candidate on white weight");
+        check(rect_black(lowcut, cv::Rect(0, 0, 32, 32)) &&
+            rect_black(lowcut, cv::Rect(32, 32, 32, 32)),
+            "dual-tv-cutouts: low black on black weight");
+        // weight black on (0,0)+(1,1): highcut keeps blended there
+        check(rect_eq(highcut, blended, cv::Rect(0, 0, 32, 32)) &&
+            rect_eq(highcut, blended, cv::Rect(32, 32, 32, 32)),
+            "dual-tv-cutouts: high keeps blended on black weight");
+        check(rect_black(highcut, cv::Rect(32, 0, 32, 32)) &&
+            rect_black(highcut, cv::Rect(0, 32, 32, 32)),
+            "dual-tv-cutouts: high black on white weight");
+        // 8U 0/255 weights accepted with identical result
+        cv::Mat w8;
+        weight.convertTo(w8, CV_8U, 255.0);
+        cv::Mat lowcut8, highcut8;
+        check(cs_build_dual_tv_cutouts(blended, low, w8, lowcut8, highcut8),
+            "dual-tv-cutouts: 8U weights accepted");
+        check(cv::norm(lowcut, lowcut8, cv::NORM_INF) == 0 &&
+            cv::norm(highcut, highcut8, cv::NORM_INF) == 0,
+            "dual-tv-cutouts: 8U weights match float weights");
+        cv::Mat lc2, hc2;
+        check(!cs_build_dual_tv_cutouts(cv::Mat(), low, weight, lc2, hc2),
+            "dual-tv-cutouts: empty blend rejected");
+        check(!cs_build_dual_tv_cutouts(blended, low, cv::Mat(), lc2, hc2),
+            "dual-tv-cutouts: empty weight rejected");
+    }
+    // degenerate inputs rejected
+    cv::Mat l2, h2;
+    check(!cs_build_dual_tv_class_views(cv::Mat(), weight, tiles, coords, l2, h2),
+        "dual-tv-split: empty composite rejected");
+    check(!cs_build_dual_tv_class_views(comp, cv::Mat(), tiles, coords, l2, h2),
+        "dual-tv-split: empty weight rejected");
+    check(!cs_build_dual_tv_class_views(comp, weight,
+        std::vector<std::vector<cv::Mat>>(), coords, l2, h2),
+        "dual-tv-split: empty tile grid rejected");
+    // all-tied fractions (uniform 0.5 weight): nothing to split
+    {
+        cv::Mat half(64, 64, CV_32F, cv::Scalar(0.5f));
+        check(!cs_build_dual_tv_class_views(comp, half, tiles, coords, l2, h2),
+            "dual-tv-split: tied fractions report nothing to split");
+    }
+}
+
 void test_per_tile_coef() {
     // exact math: sqrt scaling with [0.25x, 4x] clamps and degenerate guards
     check(cs_per_tile_coef(0.01f, 100, 400.0) == 0.02f, "per-tile-coef: sqrt upscale");
@@ -2413,6 +3042,11 @@ int main(int argc, char* argv[]) {
         test_y_confidence_prior();
         test_y_dual_tv_blend();
         test_y_dual_tv_color_segment();
+        test_dual_tv_split();
+        return g_failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--grain-only") {
+        test_grain_tv();
         return g_failures ? 1 : 0;
     }
 
@@ -2423,6 +3057,8 @@ int main(int argc, char* argv[]) {
     test_fista_solvers();
     test_wavelet_basis();
     test_adaptive_counts();
+    test_sample_split();
+    test_grain_tv();
     test_adaptive_roundtrip();
     test_spectral_lod();
     test_lod_full_roundtrip();
@@ -2436,6 +3072,8 @@ int main(int argc, char* argv[]) {
     test_sr_direct();
     test_coupled_dict();
     test_dncnn_red();
+    test_onnx_denoisers();
+    test_onsager();
     test_hf_focus_roundtrip();
     test_hf_weighted_spread();
     test_adaptive_tile_grid_limit();
@@ -2443,6 +3081,7 @@ int main(int argc, char* argv[]) {
     test_y_confidence_prior();
     test_y_dual_tv_blend();
     test_y_dual_tv_color_segment();
+    test_dual_tv_split();
     test_per_tile_coef();
     test_gpu_fista_agreement();
 

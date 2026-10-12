@@ -3,6 +3,7 @@
 #include "image_tiles.hpp"
 
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <atomic>
 #include <cstdio>
@@ -356,7 +357,7 @@ bool cs_fsrcnn_upscale_2x(const cv::Mat& src, cv::Mat& dst,
 // tile, false = caller should AVIR-fallback).
 bool UpscaleSubprocessSingle(const cv::Mat& src, cv::Mat& dst,
                              const std::string& cmd, const std::string& args,
-                             const char* tag) {
+                             const char* tag, const char* filename = "tile.png") {
   dst.release();
   if (src.empty() || src.type() != CV_8UC3) return false;
 
@@ -385,7 +386,7 @@ bool UpscaleSubprocessSingle(const cv::Mat& src, cv::Mat& dst,
   } guard{root};
 
   try {
-    if (!cv::imwrite((root / "in" / "tile.png").string(), src)) {
+    if (!cv::imwrite((root / "in" / filename).string(), src)) {
       std::cerr << "Warning: --photo-upscaler " << tag
                 << ": tile write failed; falling back to AVIR" << std::endl;
       return false;
@@ -408,7 +409,7 @@ bool UpscaleSubprocessSingle(const cv::Mat& src, cv::Mat& dst,
 
   cv::Mat up;
   try {
-    up = cv::imread((root / "out" / "tile.png").string(), cv::IMREAD_COLOR);
+    up = cv::imread((root / "out" / filename).string(), cv::IMREAD_COLOR);
   } catch (...) {
   }
   if (up.empty() || up.type() != CV_8UC3 || up.cols != src.cols * 2 ||
@@ -502,4 +503,41 @@ bool cs_upscale_one_tile_2x(const cv::Mat& src_lr, cv::Mat& dst_hr,
   if (UpscaleSubprocessSingle(src_lr, dst_hr, cmd, args, tag)) return true;
   cs_upscale_2x_avir(src_lr, dst_hr);  // warning already printed
   return false;
+}
+
+bool cs_final_polish_updown(cv::Mat& img,
+                            const CsPhotoUpscalerOptions& opt) {
+  if (img.empty() || img.type() != CV_8UC3) return false;
+  const char* tag = nullptr;
+  std::string cmd, args;
+  if (opt.final_polish == "waifu2x") {
+    tag = "waifu2x";
+    cmd = opt.waifu2x_cmd;
+    args = cs_waifu2x_effective_args(opt);
+  } else if (opt.final_polish == "waifu2x-ncnn") {
+    tag = "waifu2x-ncnn";
+    cmd = opt.waifu2x_ncnn_cmd;
+    args = cs_waifu2x_ncnn_effective_args(opt);
+  } else if (opt.final_polish == "realcugan") {
+    tag = "realcugan";
+    cmd = opt.realcugan_cmd;
+    args = cs_realcugan_effective_args(opt);
+  } else {
+    if (!opt.final_polish.empty()) {
+      std::cerr << "Warning: unknown --final-polish '" << opt.final_polish
+                << "'; skipping final upscale/downsample pass" << std::endl;
+    }
+    return false;
+  }
+  cv::Mat up;
+  // Same -i/-o dir contract as the tile path, one file per run; a backend
+  // miss keeps the caller's image (warnings already printed).
+  if (!UpscaleSubprocessSingle(img, up, cmd, args, tag, "final.png"))
+    return false;
+  cv::Mat down;
+  cv::resize(up, down, img.size(), 0, 0, cv::INTER_AREA);
+  if (down.empty() || down.size() != img.size() || down.type() != CV_8UC3)
+    return false;
+  img = std::move(down);
+  return true;
 }

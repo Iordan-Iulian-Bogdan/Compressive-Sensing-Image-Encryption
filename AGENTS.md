@@ -21,6 +21,7 @@ C++ image encryption via compressive sensing with FISTA reconstruction (per-chan
 
 ## Conventions
 - For large logs or file analysis, use sandboxed processing (ctx tools) and only return derived summaries.
+- Test commands for the user: write ALL output files (decrypts, comparisons, error maps) to the repo root `C:\Users\iorda\OneDrive\Documents\Compressive-Sensing-Image-Encryption-CPU_Limited_memory_BFGS` using relative paths (e.g. `wavelet.dec.png`, never `$env:TEMP` or absolute temp paths).
 
 # context-mode - MANDATORY routing rules
 

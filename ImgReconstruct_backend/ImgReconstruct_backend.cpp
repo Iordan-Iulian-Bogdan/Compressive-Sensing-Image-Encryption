@@ -1,4 +1,5 @@
 #include "image_decryption.hpp"
+#include "cs_wavelet.hpp"
 #include "image_encryption.hpp"
 #include "photo_upscaler.hpp"
 #include "cs_dict.hpp"
@@ -48,6 +49,10 @@ void print_usage(const char* exe) {
   "  --per-tile-tv         scale the TV weight per tile the same way\n"
   "                        (smooth/starved tiles smoothed more; watch\n"
   "                        for seams on flat gradients)\n"
+  "  --grain-tv <f>        smooth only grainy tiles: post-solve Laplacian\n"
+  "                        noise estimate per tile (gray levels); tiles above\n"
+  "                        <f> get a luma ROF smooth proportional to the\n"
+  "                        excess, clean tiles pass through (any container)\n"
   "  --y-confidence <f>   YCC luma confidence prior [0,1] on decrypt:\n"
   "                        smooth locally sparse unsampled areas (default 0;\n"
   "                        adds a CPU FISTA refinement pass)\n"
@@ -57,6 +62,15 @@ void print_usage(const char* exe) {
   "  --y-dual-tv-mask <p>  write the binary dual-TV selection mask to PNG\n"
   "                        (black = high-TV, white = low-TV composite;\n"
   "                        needs --y-dual-tv)\n"
+  "  --dual-tv-split <p>  write <p>_lowtv.png / <p>_hightv.png: solved\n"
+  "                        tiles taken mostly from the low/high-TV solve\n"
+  "                        (split by mean tile mask weight) at original\n"
+  "                        positions, rest black; needs --y-dual-tv\n"
+  "                        (YCC containers only)\n"
+  "  --dual-tv-cutouts <p> write <p>_low.png / <p>_high.png: pixel-exact\n"
+  "                        cutouts (low-candidate pixels where the mask is\n"
+  "                        white, blended pixels where black, else black);\n"
+  "                        needs --y-dual-tv (YCC containers only)\n"
         "  --manual              force manual parameter mode (auto is the default and\n"
         "                        derives tiles/overlap/iterations/coef from the image)\n"
         "  --no-preview          disable the live decryption preview window\n"
@@ -67,6 +81,9 @@ void print_usage(const char* exe) {
         "                        sr-direct (single-stage HR solve directly\n"
         "                        from the LR samples, no LR-solve warm start;\n"
         "                        BGR containers, ycc falls back to AVIR),\n"
+        "                        dip (untrained Deep Decoder prior fit to the\n"
+        "                        tile's own samples, no weights; BGR, ycc\n"
+        "                        falls back to AVIR),\n"
         "                        waifu2x (one batched\n"
         "                        nunif subprocess), waifu2x-ncnn (native\n"
         "                        waifu2x-ncnn-vulkan binary) or realcugan\n"
@@ -85,8 +102,14 @@ void print_usage(const char* exe) {
         "                        <method> -n <noise> -g -1)\n"
         "  --waifu2x-method <m>  waifu2x denoising: scale (pure 2x upscale,\n"
         "                        default) or noise_scale (denoise + 2x)\n"
-        "  --waifu2x-noise <n>   waifu2x denoise strength in [0, 3]\n"
-        "                        (default 0; used with noise_scale)\n"
+  "  --waifu2x-noise <n>   waifu2x denoise strength in [0, 3]\n"
+  "                        (default 0; used with noise_scale)\n"
+  "  --final-polish <b>    after everything else, upscale the final image\n"
+  "                        2x with a neural backend and downsample back\n"
+  "                        (artifact smoother): waifu2x, waifu2x-ncnn or\n"
+  "                        realcugan (configured by the --waifu2x-*/--realcugan-*\n"
+  "                        options above); unset by default; a backend\n"
+  "                        failure skips the pass with a warning\n"
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off)\n"
@@ -95,10 +118,21 @@ void print_usage(const char* exe) {
   "                        toward its fastNlMeans-denoised self; stronger\n"
   "                        natural-image prior than TV, slower\n"
   "  --red-denoiser <d>    RED denoiser for cs-sr: nlmeans (default, luma\n"
-  "                        fastNlMeans) or dncnn (repo-vendored color DnCNN\n"
-  "                        via ONNX Runtime, BGR tile per pass; slower)\n"
+  "                        fastNlMeans), dncnn (repo-vendored color DnCNN),\n"
+  "                        scunet (blind real-camera color model) or\n"
+  "                        restormer (blind color transformer); ONNX models\n"
+  "                        run in-process via ONNX Runtime, BGR tile/pass\n"
   "  --dncnn-model <f>     DnCNN ONNX path (default models/dncnn/\n"
   "                        dncnn_color.onnx)\n"
+  "  --red-model <f>       model file for the scunet/restormer RED denoiser\n"
+  "                        (default models/scunet/scunet_color_real_psnr.onnx\n"
+  "                        resp. models/restormer/restormer_color.onnx)\n"
+  "  --red-decay <f>       HQS schedule on the RED blend per outer pass in\n"
+  "                        [0, 1] (default 1 = every pass identical; <1\n"
+  "                        decays geometrically: strong early, gentle late)\n"
+  "  --onsager             LDAMP-style Onsager correction in the per-channel\n"
+  "                        FISTA tile solver (debiases residuals by the shrink\n"
+  "                        support fraction; CPU only, joint solver unchanged)\n"
   "  --sr-dict <f>         coupled-dictionary SR model (CSD2) for decrypt/\n"
   "                        roundtrip: patch-OMP synthesis replaces the FISTA\n"
   "                        HR solve in the fused 2x path (any container mode);\n"
@@ -115,13 +149,16 @@ void print_usage(const char* exe) {
   "                        --iterations as N*4 clamped to [16,40]; max 500)\n"
   "  --reweights <n>      outer reweight passes (1-5, default 2;\n"
   "                        1 = plain unweighted solve)\n"
-  "  --basis <name>       sparsifying basis: dct (default, block-DCT)\n"
-  "                        or wavelet (multilevel CDF 9/7, sparser on\n"
-  "                        natural images)\n"
-  "  --wscale <f>         wavelet per-scale threshold ramp\n"
-  "                        (in (0,16], default 2: coarsest band x1, finest\n"
-  "                        band x wscale, LL protected; 1 = uniform;\n"
-  "                        DCT ignores it)\n"
+  "  --basis <name>       sparsifying basis: dct (default, whole-tile;\n"
+  "                        add --dct-block for block-DCT) or wavelet\n"
+  "                        (multilevel CDF 9/7, sparser on natural images)\n"
+  "  --dct-block <n>      DCT block size: 0 = whole-tile (default),\n"
+  "                        else independent DCT per n x n block (try 8,\n"
+  "                        16, 32; decrypt/roundtrip only, CPU only)\n"
+  "  --wscale <f>         per-scale threshold ramp (in (0,16], default\n"
+  "                        2: coarsest band x1, finest band x wscale, LL\n"
+  "                        protected; 1 = uniform; DCT maps it to a\n"
+  "                        DC-to-peak frequency ramp)\n"
         "  --device <name>      solve device: cpu (default) or gpu\n"
         "                        (HIP offload; dct basis, any tv; other\n"
         "                        combinations fall back to cpu per call)\n"
@@ -200,6 +237,10 @@ void print_usage(const char* exe) {
         "  --show-mask           after encrypt/roundtrip sampling, write\n"
         "                        <output>.mask.png and open a preview window\n"
         "                        (source | binary mask | cyan overlay)\n"
+        "  --sample-split <p>   after encrypt/roundtrip sampling, write\n"
+        "                        <p>_under.png and <p>_over.png: source tiles\n"
+        "                        from under/over-sampled regions (split by mean\n"
+        "                        tile count) at original positions, rest black\n"
         "  --full-res            keep native resolution end-to-end (skip the\n"
         "                        default encrypt 2x downscale and decrypt\n"
         "                        2x upscale); use on encrypt AND decrypt/roundtrip\n"
@@ -395,6 +436,8 @@ int main(int argc, char* argv[])
     float coef = 0.01f;
     bool per_tile_coef = false;
     bool per_tile_tv = false;
+    float grain_tv = 0.0f;
+    bool use_onsager = false;
     float tv_lambda = 0.0f;
     bool manual = false;
     bool show_preview = true;
@@ -414,6 +457,7 @@ int main(int argc, char* argv[])
     float region_blend = 0.5f;
     float lod_smooth = 0.0f;
     bool show_mask = false;
+    std::string sample_split;
     bool full_res = false;
     int sample_bits = 8;
     int chroma_sample_bits = 8;
@@ -424,6 +468,7 @@ int main(int argc, char* argv[])
     std::string basis_name = "dct";
     int basis = CS_BASIS_DCT;
     float wscale = 2.0f;
+    int dct_block = 0;
 
     for (int i = 4; i < argc; i++) {
         const std::string a = argv[i];
@@ -479,6 +524,17 @@ int main(int argc, char* argv[])
             // failure mode to watch, keep it separable from coef)
             per_tile_tv = true;
         }
+        else if (a == "--grain-tv") {
+            // decrypt-side only: reference noise sigma in gray levels;
+            // per-tile counts travel in the container, so like the other
+            // per-tile flags this must not flip decrypt into manual mode
+            const char* v = next("floating point in (0, 64]");
+            if (!v || !parse_float(v, grain_tv)) return 64;
+            if (grain_tv <= 0.0f || grain_tv > 64.0f) {
+                std::cerr << "Error: --grain-tv must be in (0, 64]" << std::endl;
+                return 64;
+            }
+        }
         else if (a == "--y-confidence") {
             const char* v = next("strength in [0,1]");
             // /fp:fast may optimize away isfinite(NaN); reject non-decimal
@@ -514,6 +570,16 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             photo_up.y_dual_tv_mask = v;
         }
+        else if (a == "--dual-tv-split") {
+            const char* v = next("output prefix");
+            if (!v) return 64;
+            photo_up.dual_tv_split = v;
+        }
+        else if (a == "--dual-tv-cutouts") {
+            const char* v = next("output prefix");
+            if (!v) return 64;
+            photo_up.dual_tv_cutouts = v;
+        }
         else if (a == "--manual") {
             manual = true;
         }
@@ -521,12 +587,13 @@ int main(int argc, char* argv[])
             show_preview = false;
         }
         else if (a == "--photo-upscaler") {
-            const char* v = next("avir, cs-sr, sr-direct, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
+            const char* v = next("avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
             if (!v) return 64;
             if (v != std::string("avir") && v != std::string("cs-sr") && v != std::string("cs") &&
-                v != std::string("sr-direct") && v != std::string("fsrcnn") && v != std::string("waifu2x") &&
+                v != std::string("sr-direct") && v != std::string("dip") &&
+                v != std::string("fsrcnn") && v != std::string("waifu2x") &&
                 v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
-                std::cerr << "Error: --photo-upscaler must be avir, cs-sr, sr-direct, fsrcnn, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
+                std::cerr << "Error: --photo-upscaler must be avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
                 return 64;
             }
             photo_up.backend = v;
@@ -593,6 +660,18 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             photo_up.realcugan_model = v;
         }
+        else if (a == "--final-polish") {
+            // post-pipeline whole-image up-then-down pass (decrypt-side
+            // only; subprocess neural backends, same CLIs as per-tile)
+            const char* v = next("waifu2x, waifu2x-ncnn or realcugan");
+            if (!v) return 64;
+            if (v != std::string("waifu2x") &&
+                v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
+                std::cerr << "Error: --final-polish must be waifu2x, waifu2x-ncnn or realcugan" << std::endl;
+                return 64;
+            }
+            photo_up.final_polish = v;
+        }
         else if (a == "--tv") {
             // does NOT force manual mode: AUTO still derives coef/iterations
             // from the container ratio; only the TV weight is overridden
@@ -612,10 +691,11 @@ int main(int argc, char* argv[])
             photo_up.sr_red = red;
         }
         else if (a == "--red-denoiser") {
-            const char* v = next("nlmeans or dncnn");
+            const char* v = next("nlmeans, dncnn, scunet or restormer");
             if (!v) return 64;
-            if (v != std::string("nlmeans") && v != std::string("dncnn")) {
-                std::cerr << "Error: --red-denoiser must be nlmeans or dncnn" << std::endl;
+            if (v != std::string("nlmeans") && v != std::string("dncnn") &&
+                v != std::string("scunet") && v != std::string("restormer")) {
+                std::cerr << "Error: --red-denoiser must be nlmeans, dncnn, scunet or restormer" << std::endl;
                 return 64;
             }
             photo_up.sr_red_denoiser = v;
@@ -624,6 +704,29 @@ int main(int argc, char* argv[])
             const char* v = next("DnCNN ONNX model path");
             if (!v) return 64;
             photo_up.sr_dncnn_model = v;
+        }
+        else if (a == "--red-model") {
+            // explicit model file for scunet/restormer (or dncnn override):
+            // decrypt-side only, does not force manual mode
+            const char* v = next("ONNX model file");
+            if (!v) return 64;
+            photo_up.sr_red_model = v;
+        }
+        else if (a == "--red-decay") {
+            // HQS strength schedule: does NOT force manual mode, same as --tv
+            const char* v = next("floating point in [0, 1]");
+            float decay = 1.0f;
+            if (!v || !parse_float(v, decay)) return 64;
+            if (decay < 0.0f || decay > 1.0f) {
+                std::cerr << "Error: --red-decay must be in [0, 1]" << std::endl;
+                return 64;
+            }
+            photo_up.sr_red_decay = decay;
+        }
+        else if (a == "--onsager") {
+            // decrypt-side only; per-tile counts travel in the container,
+            // so this must not flip decrypt into manual parameter mode
+            use_onsager = true;
         }
         else if (a == "--sr-dict") {
             // coupled-dictionary SR model: decrypt-side only, takes
@@ -742,6 +845,12 @@ int main(int argc, char* argv[])
             // encrypt/roundtrip only: after sampling, save + open the mask
             show_mask = true;
         }
+        else if (a == "--sample-split") {
+            // encrypt/roundtrip only: dump under/over-sampled tile canvases
+            const char* v = next("output prefix");
+            if (!v) return 64;
+            sample_split = v;
+        }
         else if (a == "--sample-bits") {
             // encrypt-side only (container size lever); decrypt auto-detects
             // from the header, so this must not flip decrypt into manual
@@ -811,6 +920,15 @@ int main(int argc, char* argv[])
                 return 64;
             }
         }
+        else if (a == "--dct-block") {
+            const char* v = next("integer");
+            if (!v || !parse_int(v, dct_block)) return 64;
+            if (dct_block != 0 && (dct_block < 2 || dct_block > 1024)) {
+                std::cerr << "Error: --dct-block must be 0 (whole-plane) or in [2, 1024]" << std::endl;
+                return 64;
+            }
+            cs_set_default_dct_block(dct_block);
+        }
         else if (a == "--device") {
             const char* v = next("cpu|gpu");
             if (!v) return 64;
@@ -876,6 +994,10 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --sr-dict is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.sr_dict.clear();
     }
+    if (!photo_up.final_polish.empty() && mode != "decrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --final-polish is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.final_polish.clear();
+    }
     if (photo_up.sr_init != "avir" && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --sr-init is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.sr_init = "avir";
@@ -899,6 +1021,42 @@ int main(int argc, char* argv[])
     if (!photo_up.y_dual_tv_mask.empty() && photo_up.y_dual_tv <= 0.0f && mode != "encrypt") {
         std::cerr << "Warning: --y-dual-tv-mask needs --y-dual-tv; no mask will be written" << std::endl;
     }
+    if (!photo_up.dual_tv_split.empty() && mode == "encrypt") {
+        std::cerr << "Warning: --dual-tv-split is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.dual_tv_split.clear();
+    }
+    if (!photo_up.dual_tv_split.empty() && photo_up.y_dual_tv <= 0.0f && mode != "encrypt") {
+        std::cerr << "Warning: --dual-tv-split needs --y-dual-tv (YCC containers only); nothing will be written" << std::endl;
+    }
+    if (!photo_up.dual_tv_cutouts.empty() && mode == "encrypt") {
+        std::cerr << "Warning: --dual-tv-cutouts is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.dual_tv_cutouts.clear();
+    }
+    if (!photo_up.dual_tv_cutouts.empty() && photo_up.y_dual_tv <= 0.0f && mode != "encrypt") {
+        std::cerr << "Warning: --dual-tv-cutouts needs --y-dual-tv (YCC containers only); nothing will be written" << std::endl;
+    }
+    if (!sample_split.empty() && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --sample-split is encrypt-side only; ignoring for decrypt" << std::endl;
+        sample_split.clear();
+    }
+    if (grain_tv > 0.0f && mode == "encrypt") {
+        std::cerr << "Warning: --grain-tv is decrypt-side only; ignoring for encrypt" << std::endl;
+        grain_tv = 0.0f;
+    }
+    if (!photo_up.sr_red_model.empty() && cs_onnx_kind_for(photo_up.sr_red_denoiser) < 0 && mode != "encrypt") {
+        std::cerr << "Warning: --red-model needs an ONNX --red-denoiser (dncnn/scunet/restormer); ignoring" << std::endl;
+        photo_up.sr_red_model.clear();
+    }
+    if ((photo_up.sr_red_decay < 1.0f || !photo_up.sr_red_model.empty()) && mode == "encrypt") {
+        if (photo_up.sr_red_decay < 1.0f) {
+            std::cerr << "Warning: --red-decay is decrypt-side only; ignoring for encrypt" << std::endl;
+            photo_up.sr_red_decay = 1.0f;
+        }
+        if (!photo_up.sr_red_model.empty()) {
+            std::cerr << "Warning: --red-model is decrypt-side only; ignoring for encrypt" << std::endl;
+            photo_up.sr_red_model.clear();
+        }
+    }
 
     CSencryption::params = manual ? MANUAL_PARAM : AUTO_PARAM;
 
@@ -915,18 +1073,18 @@ int main(int argc, char* argv[])
         const bool use_adaptive = adaptive || two_pass || spectral || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv);
+                tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                        tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv);
+                        tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);
             }
         }
     }

@@ -141,6 +141,48 @@ void FillWaveletWeights(std::vector<float>& weights, int rows, int cols,
   }
 }
 
+// DCT frequency ramp (the DCT analog of the wavelet per-scale ramp):
+// weight = highest^f with f in [0,1] the normalized 2D frequency inside
+// each transform block (DC -> 1, highest AC -> highest). Whole-plane mode
+// (block <= 0) normalizes by the plane dims; block mode normalizes per
+// block by its actual size (edge remainder blocks included). wscale <= 1
+// keeps the legacy uniform weights.
+void FillDctWeights(std::vector<float>& weights, int rows, int cols,
+                    int block, float highest_weight) {
+  weights.assign(static_cast<size_t>(rows) * cols, 1.0f);
+  if (highest_weight <= 1.0f) {
+    return;
+  }
+  const double logw = std::log(static_cast<double>(highest_weight));
+  for (int r = 0; r < rows; ++r) {
+    int bh, fu;
+    if (block > 0) {
+      const int y0 = (r / block) * block;
+      bh = (std::min)(block, rows - y0);
+      fu = r - y0;
+    } else {
+      bh = rows;
+      fu = r;
+    }
+    const double fn_r = bh > 1 ? (double)fu / (bh - 1) : 0.0;
+    for (int c = 0; c < cols; ++c) {
+      int bw, fv;
+      if (block > 0) {
+        const int x0 = (c / block) * block;
+        bw = (std::min)(block, cols - x0);
+        fv = c - x0;
+      } else {
+        bw = cols;
+        fv = c;
+      }
+      const double fn_c = bw > 1 ? (double)fv / (bw - 1) : 0.0;
+      const double f = 0.5 * (fn_r + fn_c);
+      weights[(size_t)r * cols + c] =
+          static_cast<float>(std::exp(logw * f));
+    }
+  }
+}
+
 }  // namespace
 
 int cs_basis_from_name(const std::string& name, int& out) {
@@ -172,15 +214,28 @@ int cs_dwt_levels(int rows, int cols) {
   return (std::max)(1, levels);
 }
 
-cs_fista_basis cs_make_basis(int rows, int cols, int basis_id, float wscale) {
+namespace {
+int g_dct_block_default = 0;
+}  // namespace
+
+int cs_default_dct_block() { return g_dct_block_default; }
+void cs_set_default_dct_block(int block) { g_dct_block_default = block; }
+
+cs_fista_basis cs_make_basis(int rows, int cols, int basis_id, float wscale,
+                             int dct_block) {
   cs_fista_basis basis;
   basis.basis = basis_id == CS_BASIS_CDF97 ? CS_BASIS_CDF97 : CS_BASIS_DCT;
   basis.levels = basis.basis == CS_BASIS_CDF97 ? cs_dwt_levels(rows, cols) : 0;
   basis.lip = 2.0f;
+  basis.dct_block =
+      (basis.basis == CS_BASIS_DCT) ? (dct_block < 0 ? g_dct_block_default : dct_block) : 0;
   if (basis.basis == CS_BASIS_CDF97) {
     FillWaveletWeights(basis.wscale, rows, cols, basis.levels, wscale);
   } else {
-    basis.wscale.assign(static_cast<size_t>(rows) * cols, 1.0f);
+    // DCT honors --wscale as a highest-frequency multiplier (DC x1),
+    // the DCT analog of the wavelet per-scale ramp; wscale <= 1 keeps
+    // the legacy uniform weights bit-identically.
+    FillDctWeights(basis.wscale, rows, cols, basis.dct_block, wscale);
   }
   return basis;
 }
