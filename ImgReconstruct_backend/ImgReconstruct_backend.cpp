@@ -272,6 +272,11 @@ void print_usage(const char* exe) {
   "                        --ratio scales every rate globally. With --ycc420\n"
   "                        or --ycc422 the rates drive the luma budget while\n"
   "                        chroma stays uniform (modes 11/12).\n"
+  "  --seg-solve <f>       decrypt/roundtrip only: solve each segment of the\n"
+  "                        label/color mask <f> in isolation (only its own\n"
+  "                        samples, rest zeroed) and hard-combine by label.\n"
+  "                        BGR containers only; costs one full solve per\n"
+  "                        class and disables the live preview.\n"
         "  --show-mask           after encrypt/roundtrip sampling, write\n"
         "                        <output>.mask.png and open a preview window\n"
         "                        (source | binary mask | cyan overlay)\n"
@@ -505,6 +510,7 @@ int main(int argc, char* argv[])
     float lod_smooth = 0.0f;
     std::string seg_mask;
     std::string seg_rates;
+    std::string seg_solve;
     bool show_mask = false;
     std::string sample_split;
     bool full_res = false;
@@ -943,6 +949,11 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             seg_rates = v;
         }
+        else if (a == "--seg-solve") {
+            const char* v = next("label/color mask PNG path");
+            if (!v) return 64;
+            seg_solve = v;
+        }
         else if (a == "--show-mask") {
             // encrypt/roundtrip only: after sampling, save + open the mask
             show_mask = true;
@@ -1084,6 +1095,10 @@ int main(int argc, char* argv[])
         seg_mask.clear();
         seg_rates.clear();
     }
+    if (!seg_solve.empty() && mode != "decrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --seg-solve is decrypt-side only; ignoring for encrypt" << std::endl;
+        seg_solve.clear();
+    }
     if (ycc420 && ycc422) {
         std::cerr << "Error: --ycc420 and --ycc422 are mutually exclusive" << std::endl;
         return 64;
@@ -1204,14 +1219,14 @@ int main(int argc, char* argv[])
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
-                tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);
+                tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, seg_solve);
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
             rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask, seg_rates);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
-                        tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);
+                        tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve);
             }
         }
     }

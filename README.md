@@ -144,6 +144,15 @@ flags except `--ycc420`/`--ycc422`, which absorb it like the adaptive LOD
 path: the rates drive the luma budget (modes 11/12) while chroma stays
 uniform. `--show-mask`/`--sample-split` work unchanged.
 
+**Per-segment solve:** `--seg-solve <f>` (decrypt/roundtrip, BGR containers
+only) solves each class of the label/color mask `<f>` in isolation — only
+that class's samples, everything else zeroed — and hard-combines the class
+canvases by label. Expect boundary ringing/seams: a hard-zeroed edge is not
+DCT/wavelet-sparse, so each solve extrapolates blind across its borders.
+Costs one full solve per class and disables the live preview. Measured on
+the IMG_3690 thumbnail: 16.2 dB isolated vs 17.4 dB joint from the same
+seg container.
+
 ### YCC 4:2:0 split sampling (`--ycc420`)
 
 On decrypt, `--y-confidence 0.3` enables an optional second CPU FISTA pass

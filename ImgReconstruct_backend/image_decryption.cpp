@@ -1111,10 +1111,11 @@ int decrypt_image::decrypt_image_tiled(
     bool per_tile_coef,
     bool per_tile_tv,
     float grain_tv,
-    bool use_onsager
+    bool use_onsager,
+    const std::string& seg_solve_mask
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve_mask);
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -1139,7 +1140,8 @@ int decrypt_image::decrypt_image_tiled(
     bool per_tile_tv,
     float grain_tv,
     bool use_onsager,
-    size_t* hr_applied_out
+    size_t* hr_applied_out,
+    const std::string& seg_solve_mask
 ) {
     PhaseLog prof;
     if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT) {
@@ -1259,11 +1261,17 @@ int decrypt_image::decrypt_image_tiled(
         // extracting all the sampled pixels (sampled_mat) and thier coordinates (masked_mat)
         dimgs.get_sampled_mat(sampled_mat, masked_mat);
 
+        // Tile-split + per-tile solve + composite as one reusable unit: the
+        // standard path runs it once on all samples; --seg-solve runs it per
+        // class on class-restricted samples and hard-combines by label.
+        // (Body kept at its original indentation; sm/mm are the inputs.)
+        auto solve_grid = [&](const cv::Mat& sm, const cv::Mat& mm, bool use_preview,
+                cv::Mat& grid_out) -> int {
         // we split the sampled image into tiles
         // every tile overlaps with other neighboring tiles  
         // this is done because otherwise the titles wont quite match with eachother along the borders
         // this becomes more obvious as the numer of samples goes down, aka more compression 
-        splitImageIntoTiles(sampled_mat, encrypted_image_tiles, coordinates, num_tiles, overlap);
+        splitImageIntoTiles(sm, encrypted_image_tiles, coordinates, num_tiles, overlap);
 
         cv::Size tile_size;
         int estimated_number_of_samples = 0;
@@ -1285,7 +1293,7 @@ int decrypt_image::decrypt_image_tiled(
 
                 for (int q = 0; q < encrypted_image_tiles[i][j].rows; q++) {
                     for (int k = 0; k < encrypted_image_tiles[i][j].cols; k++) {
-                        if (masked_mat.at<cv::Vec3b>(base_row + q, base_col + k) == cv::Vec3b(1, 1, 1)) {
+                        if (mm.at<cv::Vec3b>(base_row + q, base_col + k) == cv::Vec3b(1, 1, 1)) {
                             ri_x_g.push_back(q);
                             ri_y_g.push_back(k);
                         }
@@ -1307,7 +1315,7 @@ int decrypt_image::decrypt_image_tiled(
         }
         prof.mark("prep");
 
-        cv::Mat reconstructed = cv::Mat::zeros(sampled_mat.rows, sampled_mat.cols, CV_8UC3);
+        cv::Mat reconstructed = cv::Mat::zeros(sm.rows, sm.cols, CV_8UC3);
 
     std::thread decrypt_tiles_thread;
     // Fused AVIR upscale (default backend, non-full-res): each worker
@@ -1386,7 +1394,7 @@ int decrypt_image::decrypt_image_tiled(
     ImagePreview preview;
     std::mutex hr_grid_mutex;
     std::vector<std::vector<TileCoord>> hr_coordinates;
-    if ((fuse_upscale || pipe_upscale) && show_preview) {
+    if ((fuse_upscale || pipe_upscale) && use_preview) {
         hr_coordinates = coordinates;
         for (int i = 0; i < num_tiles; ++i)
             for (int j = 0; j < num_tiles; ++j) {
@@ -1396,7 +1404,7 @@ int decrypt_image::decrypt_image_tiled(
         preview.Start(windowName, reconstructed, hr_coordinates, hr_tiles,
                       &hr_grid_mutex);
     }
-    else if (show_preview) {
+    else if (use_preview) {
         preview.Start(windowName, reconstructed, coordinates, decrypted_image_tiles);
     }
 
@@ -1410,7 +1418,7 @@ int decrypt_image::decrypt_image_tiled(
         (photo_up.sr_hr_weight > 0.0f ||
             (photo_up.sr_hr_red_radius > 0.0f && photo_up.sr_red > 0.0f))) {
         hr_sr_ctx.anchors = &dimgs.hr_samples;
-        hr_sr_ctx.stride = sampled_mat.cols * 2;
+            hr_sr_ctx.stride = sm.cols * 2;
         hr_sr_ctx.weight = photo_up.sr_hr_weight;
         hr_sr_ctx.red_radius = photo_up.sr_hr_red_radius;
     }
@@ -1434,7 +1442,7 @@ int decrypt_image::decrypt_image_tiled(
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
 
-    if (show_preview) {
+    if (use_preview) {
         preview.Stop();
     }
     prof.mark("solve");
@@ -1479,6 +1487,67 @@ int decrypt_image::decrypt_image_tiled(
         // full weight and the overlap zones sum to a smooth transition
         // (fewer visible seams than the legacy 0.5 alpha blend)
         reconstructed = blendTilesWithImage(decrypted_image_tiles, coordinates, reconstructed, 0.5f, blend_feather);
+            grid_out = reconstructed;
+            return 0;
+        }; // solve_grid
+
+        cv::Mat reconstructed;
+        if (!seg_solve_mask.empty()) {
+            // Isolated per-class solves: each class is solved only from its
+            // own samples (everything else zeroed out), then hard-combined
+            // by label. YCC containers solve luma/chroma jointly and are
+            // rejected here (BGR modes only).
+            if (cs_is_ycc(dimgs.get_sampling_mode())) {
+                throw std::runtime_error("--seg-solve needs a BGR container; YCC-seg containers solve luma/chroma jointly");
+            }
+            if (show_preview) {
+                std::cout << "Note: --seg-solve disables the live preview (one solve per class); nothing will be shown" << std::endl;
+            }
+            cv::Mat mask_raw = cv::imread(seg_solve_mask, cv::IMREAD_UNCHANGED);
+            if (mask_raw.empty()) {
+                throw std::runtime_error("--seg-solve: cannot load '" + seg_solve_mask + "'");
+            }
+            cv::Mat seg_ids = cs_segmask_resolve_ids(mask_raw, sampled_mat.rows, sampled_mat.cols);
+            bool seen[256] = { false };
+            for (int y = 0; y < seg_ids.rows; ++y) {
+                const uint8_t* row = seg_ids.ptr<uint8_t>(y);
+                for (int x = 0; x < seg_ids.cols; ++x) seen[row[x]] = true;
+            }
+            std::vector<int> classes;
+            for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
+            if (classes.empty()) {
+                throw std::runtime_error("--seg-solve: mask holds no classes");
+            }
+            std::cout << "seg-solve: " << classes.size() << " isolated class solves (hard combine)" << std::endl;
+            // Class canvases return at solve geometry (2x after the fused
+            // upscale unless --full-res): combine at canvas geometry with a
+            // nearest-neighbor labels map, then the shared tail below brings
+            // the composite to final size exactly like the standard path.
+            cv::Mat comb_ids = seg_ids;
+            reconstructed = cv::Mat::zeros(sampled_mat.size(), CV_8UC3);
+            cv::Mat class_canvas;
+            for (int c : classes) {
+                const cv::Mat in_class_full = (seg_ids == c);
+                const double share = 100.0 * cv::countNonZero(in_class_full) / (double)seg_ids.total();
+                cv::Mat sm_c, mm_c;
+                sampled_mat.copyTo(sm_c);
+                masked_mat.copyTo(mm_c);
+                sm_c.setTo(cv::Scalar(0, 0, 0), ~in_class_full);
+                mm_c.setTo(cv::Scalar(0, 0, 0), ~in_class_full);
+                std::cout << "seg-solve: class " << c << " (" << share << "% of pixels) ..." << std::endl;
+                const int class_rc = solve_grid(sm_c, mm_c, false, class_canvas);
+                if (class_rc != 0) return class_rc;
+                if (class_canvas.size() != comb_ids.size()) {
+                    cv::resize(seg_ids, comb_ids, class_canvas.size(), 0, 0, cv::INTER_NEAREST);
+                    reconstructed = cv::Mat::zeros(class_canvas.size(), CV_8UC3);
+                }
+                class_canvas.copyTo(reconstructed, comb_ids == c);
+            }
+        }
+        else {
+            const int grid_rc = solve_grid(sampled_mat, masked_mat, show_preview, reconstructed);
+            if (grid_rc != 0) return grid_rc;
+        }
 
         // Solve geometry may differ from org_size by container padding;
         // the standard output is 2x org_size (org_size itself under
