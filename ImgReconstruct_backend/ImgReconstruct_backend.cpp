@@ -80,10 +80,10 @@ void print_usage(const char* exe) {
         "                        HR tile is re-solved against its LR samples),\n"
         "                        sr-direct (single-stage HR solve directly\n"
         "                        from the LR samples, no LR-solve warm start;\n"
-        "                        BGR containers, ycc falls back to AVIR),\n"
+        "                        luma path in ycc containers),\n"
         "                        dip (untrained Deep Decoder prior fit to the\n"
-        "                        tile's own samples, no weights; BGR, ycc\n"
-        "                        falls back to AVIR),\n"
+        "                        tile's own samples, no weights; luma path\n"
+        "                        in ycc containers),\n"
         "                        waifu2x (one batched\n"
         "                        nunif subprocess), waifu2x-ncnn (native\n"
         "                        waifu2x-ncnn-vulkan binary) or realcugan\n"
@@ -127,9 +127,18 @@ void print_usage(const char* exe) {
   "  --red-model <f>       model file for the scunet/restormer RED denoiser\n"
   "                        (default models/scunet/scunet_color_real_psnr.onnx\n"
   "                        resp. models/restormer/restormer_color.onnx)\n"
-  "  --red-decay <f>       HQS schedule on the RED blend per outer pass in\n"
-  "                        [0, 1] (default 1 = every pass identical; <1\n"
-  "                        decays geometrically: strong early, gentle late)\n"
+        "  --red-decay <f>       HQS schedule on the RED blend per outer pass in\n"
+        "                        [0, 1] (default 1 = every pass identical; <1\n"
+        "                        decays geometrically: strong early, gentle late)\n"
+        "  --hr-weight <f>       HR-anchor data-term weight for cs-sr in\n"
+        "                        [0, 16] (default 1: each anchor pulls its HR\n"
+        "                        pixel at full weight beside the LR samples;\n"
+        "                        0 = post-hoc replacement only)\n"
+        "  --hr-red-radius <f>   anchor-proximity RED radius in HR pixels in\n"
+        "                        [0, 64] (default 0 = legacy uniform RED): the\n"
+        "                        RED blend scales per pixel from 0 at anchor\n"
+        "                        pixels to full beyond a few radii; needs\n"
+        "                        --hr-detail anchors and --red > 0\n"
   "  --onsager             LDAMP-style Onsager correction in the per-channel\n"
   "                        FISTA tile solver (debiases residuals by the shrink\n"
   "                        support fraction; CPU only, joint solver unchanged)\n"
@@ -184,9 +193,13 @@ void print_usage(const char* exe) {
   "                        Same absorbed flags as --ycc420; mutually\n"
   "                        exclusive with --ycc420; --hf-focus selects the\n"
   "                        mode-8 HF-weighted variant.\n"
-  "  --hf-focus            encrypt a stored LF thumbnail plus HF-weighted\n"
-  "                        samples (BGR mode 5; with --ycc420, mode 6;\n"
-  "                        with --ycc422, mode 8)\n"
+        "  --hf-focus            encrypt a stored LF thumbnail plus HF-weighted\n"
+        "                        samples (BGR mode 5; with --ycc420, mode 6;\n"
+        "                        with --ycc422, mode 8)\n"
+        "  --hr-detail <n>       encrypt K native-luma edge anchors as a\n"
+        "                        trailing payload (BGR mode 4, ycc420 mode 9;\n"
+        "                        uniform sampling + 8-bit samples only; decrypt\n"
+        "                        applies them as exact luma replacements)\n"
   "  --sample-bits <L[,C]> bits for luma and optional chroma, each [1, 8]\n"
   "                        (one value applies to both; default 8; lower values shrink\n"
   "                        the container near-linearly at the cost of\n"
@@ -206,9 +219,21 @@ void print_usage(const char* exe) {
   "                        tiles win when the budget cannot fit them all;\n"
   "                        encrypt/roundtrip only, decrypt auto-detects)\n"
   "  --adaptive-strength <s>  how aggressively detail tiles are over-sampled\n"
-  "                        and flat tiles under-sampled, s in [0, 1]\n"
-  "                        (default 0.5; 0 = uniform like random sampling,\n"
-  "                        1 = maximum LOD bias)\n"
+        "                        and flat tiles under-sampled, s in [0, 1]\n"
+        "                        (default 0.5; 0 = uniform like random sampling,\n"
+        "                        1 = maximum LOD bias)\n"
+        "  --adaptive-gamma <g>  LOD contrast exponent in [0.1, 4] (default\n"
+        "                        1 = off): reshapes shipped detail scores as\n"
+        "                        floor + ((v-floor)/(255-floor))^g; >1 pushes\n"
+        "                        mid-detail down for stronger edge focus\n"
+        "                        past strength 1.0, <1 flattens toward uniform\n"
+        "                        (adaptive paths only, decrypt auto-detects)\n"
+        "  --adaptive-cutoff <n> hard LOD floor in [0, 255] (default 0 =\n"
+        "                        off): tiles scoring below n get zero samples\n"
+        "                        (background blackout); survivors absorb the\n"
+        "                        budget up to capacity, unplaceable remainder\n"
+        "                        is dropped (smaller container). Needs an\n"
+        "                        adaptive path; decrypt auto-detects\n"
   "  --two-pass            adaptive scoring via a pilot uniform sample +\n"
   "                        cheap per-tile recon (residual scoring) instead\n"
   "                        of the Laplacian; implies adaptive, decrypt\n"
@@ -234,6 +259,19 @@ void print_usage(const char* exe) {
   "                        field before budget allocation in [0, 8]\n"
   "                        (default 0 = off; 1-2 removes the abrupt\n"
   "                        per-tile density rectangles)\n"
+  "  --seg-mask <f>        encrypt with per-segment sampling: <f> is an 8-bit\n"
+  "                        label map (pixel value = class id) or a BGR color\n"
+  "                        mask matched to the scene palette; --seg-rates\n"
+  "                        gives the per-class sampling rate in [0,1]\n"
+  "                        (class order = id order). Each segment is sampled\n"
+  "                        at its own rate; decrypt auto-detects (mode 10).\n"
+  "                        Exclusive with all other sampling flags except\n"
+  "                        --ycc420/--ycc422 (seg-luma split, modes 11/12).\n"
+  "  --seg-rates <l>       comma list, e.g. 0.02,0.6,0.02,0.02,0.05,0.08,0.05,0.05\n"
+  "                        (digits and commas only, PowerShell-safe).\n"
+  "                        --ratio scales every rate globally. With --ycc420\n"
+  "                        or --ycc422 the rates drive the luma budget while\n"
+  "                        chroma stays uniform (modes 11/12).\n"
         "  --show-mask           after encrypt/roundtrip sampling, write\n"
         "                        <output>.mask.png and open a preview window\n"
         "                        (source | binary mask | cyan overlay)\n"
@@ -284,12 +322,18 @@ int run_compare(const std::string& original_path, const std::string& decoded_pat
     const double s = cs_quality::ssim(original, decoded);
     const double mae = cs_quality::mean_abs_error(original, decoded);
     const double mx = cs_quality::max_abs_error(original, decoded);
+    double edge_p = -1.0, edge_mae = -1.0, edge_share = 0.0;
+    cs_quality::edge_scores(original, decoded, edge_p, edge_mae, edge_share);
 
     std::printf("PSNR: %.2f dB\n", p);
     if (s >= 0.0) std::printf("SSIM: %.4f\n", s);
     else          std::printf("SSIM: n/a (OpenCV quality module not available)\n");
     std::printf("MAE:  %.3f\n", mae);
     std::printf("MAX:  %.1f\n", mx);
+    if (edge_p >= 0.0)
+        std::printf("Edge-PSNR (top-10%% gradient, share %.3f): %.2f dB\n", edge_share, edge_p);
+    if (edge_mae >= 0.0)
+        std::printf("Edge-MAE: %.3f\n", edge_mae);
 
     const cv::Mat err = cs_quality::error_map(original, decoded, amplification);
     const cv::Mat strip = cs_quality::side_by_side(original, decoded, amplification);
@@ -448,7 +492,10 @@ int main(int argc, char* argv[])
     bool ycc420 = false;
     bool ycc422 = false;
     bool hf_focus = false;
+    int hr_detail = 0;
     int adaptive_floor = 32;    float adaptive_strength = 0.5f;
+    float adaptive_gamma = 1.0f;
+    int adaptive_cutoff = 0;
     int lod_full = 0;
     bool two_pass = false;
     bool spectral = false;
@@ -456,6 +503,8 @@ int main(int argc, char* argv[])
     std::string regions_json;
     float region_blend = 0.5f;
     float lod_smooth = 0.0f;
+    std::string seg_mask;
+    std::string seg_rates;
     bool show_mask = false;
     std::string sample_split;
     bool full_res = false;
@@ -723,6 +772,29 @@ int main(int argc, char* argv[])
             }
             photo_up.sr_red_decay = decay;
         }
+        else if (a == "--hr-weight") {
+            // HR-anchor data-term weight for cs-sr: does NOT force manual
+            // mode, same as --tv
+            const char* v = next("floating point in [0, 16]");
+            float hrw = 1.0f;
+            if (!v || !parse_float(v, hrw)) return 64;
+            if (hrw < 0.0f || hrw > 16.0f) {
+                std::cerr << "Error: --hr-weight must be in [0, 16]" << std::endl;
+                return 64;
+            }
+            photo_up.sr_hr_weight = hrw;
+        }
+        else if (a == "--hr-red-radius") {
+            // Anchor-proximity RED radius: does NOT force manual mode
+            const char* v = next("floating point in [0, 64]");
+            float hrr = 0.0f;
+            if (!v || !parse_float(v, hrr)) return 64;
+            if (hrr < 0.0f || hrr > 64.0f) {
+                std::cerr << "Error: --hr-red-radius must be in [0, 64]" << std::endl;
+                return 64;
+            }
+            photo_up.sr_hr_red_radius = hrr;
+        }
         else if (a == "--onsager") {
             // decrypt-side only; per-tile counts travel in the container,
             // so this must not flip decrypt into manual parameter mode
@@ -771,6 +843,10 @@ int main(int argc, char* argv[])
         else if (a == "--hf-focus") {
             hf_focus = true;
         }
+        else if (a == "--hr-detail") {
+            const char* v = next("integer");
+            if (!v || !parse_int(v, hr_detail)) return 64;
+        }
         else if (a == "--adaptive") {
             // encrypt-side only (same as --periodic): never forces manual
             // decrypt parameters â€” mode travels in the authenticated header
@@ -794,11 +870,27 @@ int main(int argc, char* argv[])
                 return 64;
             }
         }
-        else if (a == "--adaptive-strength") {
+                else if (a == "--adaptive-strength") {
             const char* v = next("floating point in [0,1]");
             if (!v || !parse_float(v, adaptive_strength)) return 64;
             if (adaptive_strength < 0.0f || adaptive_strength > 1.0f) {
                 std::cerr << "Error: --adaptive-strength must be in [0, 1]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--adaptive-gamma") {
+            const char* v = next("floating point in [0.1, 4]");
+            if (!v || !parse_float(v, adaptive_gamma)) return 64;
+            if (adaptive_gamma < 0.1f || adaptive_gamma > 4.0f) {
+                std::cerr << "Error: --adaptive-gamma must be in [0.1, 4]" << std::endl;
+                return 64;
+            }
+        }
+        else if (a == "--adaptive-cutoff") {
+            const char* v = next("integer in [0, 255]");
+            if (!v || !parse_int(v, adaptive_cutoff)) return 64;
+            if (adaptive_cutoff < 0 || adaptive_cutoff > 255) {
+                std::cerr << "Error: --adaptive-cutoff must be in [0, 255]" << std::endl;
                 return 64;
             }
         }
@@ -840,6 +932,16 @@ int main(int argc, char* argv[])
                 std::cerr << "Error: --lod-smooth must be in [0, 8]" << std::endl;
                 return 64;
             }
+        }
+        else if (a == "--seg-mask") {
+            const char* v = next("label/color mask PNG path");
+            if (!v) return 64;
+            seg_mask = v;
+        }
+        else if (a == "--seg-rates") {
+            const char* v = next("comma-separated per-class rates");
+            if (!v) return 64;
+            seg_rates = v;
         }
         else if (a == "--show-mask") {
             // encrypt/roundtrip only: after sampling, save + open the mask
@@ -965,9 +1067,22 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --lod-full is encrypt-side only; ignoring for decrypt" << std::endl;
         lod_full = 0;
     }
+    if (adaptive_gamma != 1.0f && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --adaptive-gamma is encrypt-side only; ignoring for decrypt" << std::endl;
+        adaptive_gamma = 1.0f;
+    }
+    if (adaptive_cutoff != 0 && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --adaptive-cutoff is encrypt-side only; ignoring for decrypt" << std::endl;
+        adaptive_cutoff = 0;
+    }
     if (!regions_json.empty() && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --regions is encrypt-side only; ignoring for decrypt" << std::endl;
         regions_json.clear();
+    }
+    if ((!seg_mask.empty() || !seg_rates.empty()) && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --seg-mask/--seg-rates is encrypt-side only; ignoring for decrypt" << std::endl;
+        seg_mask.clear();
+        seg_rates.clear();
     }
     if (ycc420 && ycc422) {
         std::cerr << "Error: --ycc420 and --ycc422 are mutually exclusive" << std::endl;
@@ -989,6 +1104,10 @@ int main(int argc, char* argv[])
     if (hf_focus && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --hf-focus is encrypt-side only; ignoring for decrypt" << std::endl;
         hf_focus = false;
+    }
+    if (hr_detail != 0 && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --hr-detail is encrypt-side only; ignoring for decrypt" << std::endl;
+        hr_detail = 0;
     }
     if (!photo_up.sr_dict.empty() && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --sr-dict is decrypt-side only; ignoring for encrypt" << std::endl;
@@ -1043,6 +1162,14 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --grain-tv is decrypt-side only; ignoring for encrypt" << std::endl;
         grain_tv = 0.0f;
     }
+    if (photo_up.sr_hr_weight != 1.0f && mode == "encrypt") {
+        std::cerr << "Warning: --hr-weight is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.sr_hr_weight = 1.0f;
+    }
+    if (photo_up.sr_hr_red_radius != 0.0f && mode == "encrypt") {
+        std::cerr << "Warning: --hr-red-radius is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.sr_hr_red_radius = 0.0f;
+    }
     if (!photo_up.sr_red_model.empty() && cs_onnx_kind_for(photo_up.sr_red_denoiser) < 0 && mode != "encrypt") {
         std::cerr << "Warning: --red-model needs an ONNX --red-denoiser (dncnn/scunet/restormer); ignoring" << std::endl;
         photo_up.sr_red_model.clear();
@@ -1073,7 +1200,7 @@ int main(int argc, char* argv[])
         const bool use_adaptive = adaptive || two_pass || spectral || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask, seg_rates);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
@@ -1081,7 +1208,7 @@ int main(int argc, char* argv[])
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split);
+            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask, seg_rates);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);

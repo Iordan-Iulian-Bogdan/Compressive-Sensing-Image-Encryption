@@ -1,6 +1,7 @@
 #include "CS_encryption.hpp"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -9,7 +10,7 @@
 int CSencryption::params = AUTO_PARAM;
 
 std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, int m_total,
-    int rows, int cols, int tile_size, int weight_base, int full_threshold)
+    int rows, int cols, int tile_size, int weight_base, int full_threshold, int cutoff)
 {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
@@ -47,15 +48,17 @@ std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, 
 
     std::vector<int> counts(nt, 0);
     std::vector<char> is_full(nt, 0);
+    const auto cut = [&](int i) { return cutoff > 0 && lod[i] < cutoff; };
     long long pool_budget = m_total;
     if (full_threshold > 0 && m_total > 0) {
         // --lod-full: qualifying tiles (lod >= threshold) take their whole
         // pixel capacity first, greedy fit in (lod desc, index asc) order
-        // against the budget; the pool below splits whatever remains
+        // against the budget; the pool below splits whatever remains.
+        // --adaptive-cutoff wins on overlap: cut tiles are never claimed.
         std::vector<int> order;
         order.reserve((size_t)nt);
         for (int i = 0; i < nt; ++i)
-            if (lod[i] >= full_threshold) order.push_back(i);
+            if (lod[i] >= full_threshold && !cut(i)) order.push_back(i);
         std::sort(order.begin(), order.end(), [&](int a, int b) {
             if (lod[a] != lod[b]) return lod[a] > lod[b];
             return a < b;
@@ -72,12 +75,13 @@ std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, 
     }
 
     // pool = tiles still splitting the (remaining) budget via the standard
-    // largest-remainder machinery; with threshold 0 this is every tile and
-    // the allocation below is bit-identical to the legacy path
+    // largest-remainder machinery; with threshold 0 and cutoff 0 this is
+    // every tile and the allocation below is bit-identical to the legacy
+    // path. Cutoff tiles stay at count 0 (background blackout).
     std::vector<int> pool;
     pool.reserve((size_t)nt);
     for (int i = 0; i < nt; ++i)
-        if (!is_full[i]) pool.push_back(i);
+        if (!is_full[i] && !cut(i)) pool.push_back(i);
     const int np = (int)pool.size();
     if (np == 0 || pool_budget <= 0) {
         return counts;
@@ -294,7 +298,7 @@ void CSencryption::returnPeriodicIndices(std::vector<int>& ri_x, std::vector<int
 // weight_base).
 void CSencryption::returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
     const std::vector<uint8_t>& lod, int m_total, const uint8_t key[32], int tile_size,
-    int weight_base, int full_threshold)
+    int weight_base, int full_threshold, int cutoff)
 {
     if (tile_size <= 0) {
         throw std::runtime_error("adaptive sampling: tile size must be positive");
@@ -306,7 +310,7 @@ void CSencryption::returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int
     unsigned int shuffle_seed;
     std::memcpy(&shuffle_seed, key, sizeof(shuffle_seed));
 
-    const std::vector<int> counts = cs_compute_tile_sample_counts(lod, m_total, xm, ym, tile_size, weight_base, full_threshold);
+    const std::vector<int> counts = cs_compute_tile_sample_counts(lod, m_total, xm, ym, tile_size, weight_base, full_threshold, cutoff);
     // same grid as cs_compute_tile_sample_counts: tiles_cols across ym (cols),
     // tiles_rows across xm (rows), lod index = tr * tiles_cols + tc
     const int tiles_cols = (ym + tile_size - 1) / tile_size;
@@ -346,6 +350,57 @@ void CSencryption::returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int
                 ri_x.push_back(row0 + local / tile_w);
                 ri_y.push_back(col0 + local % tile_w);
             }
+        }
+    }
+
+    shuffle(ri_x, shuffle_seed);
+    shuffle(ri_y, shuffle_seed);
+}
+
+// Per-segment sampling (mode 10): each class id draws its own budgeted
+// share of its pixels (count_c = round(pix_c * q_c / 255)) via partial
+// Fisher-Yates over that class's pixel pool, classes in ascending id order
+// from one shared RNG stream, then one global shuffle fixes the measurement
+// order. Deterministic from (key, labels, rates): encryption draws it,
+// decryption regenerates it from the shipped body prefix.
+void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
+    const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32])
+{
+    if (labels.empty() || labels.rows != xm || labels.cols != ym || labels.type() != CV_8U) {
+        throw std::runtime_error("seg-mask sampling: label map geometry mismatch");
+    }
+
+    std::seed_seq seq(key, key + 32);
+    std::mt19937 generator(seq);
+
+    unsigned int shuffle_seed;
+    std::memcpy(&shuffle_seed, key, sizeof(shuffle_seed));
+
+    ri_x.clear();
+    ri_y.clear();
+
+    std::vector<int> pool;
+    pool.reserve(1024);
+    for (size_t c = 0; c < rates_q.size(); ++c) {
+        if (rates_q[c] == 0) continue;
+        pool.clear();
+        for (int r = 0; r < xm; ++r) {
+            const uint8_t* row = labels.ptr<uint8_t>(r);
+            for (int col = 0; col < ym; ++col) {
+                if (row[col] == (uint8_t)c) pool.push_back(r * ym + col);
+            }
+        }
+        const size_t pix = pool.size();
+        if (pix == 0) continue;
+        size_t want = (size_t)std::llround((double)pix * (double)rates_q[c] / 255.0);
+        if (want > pix) want = pix;
+        for (size_t k = 0; k < want; ++k) {
+            std::uniform_int_distribution<size_t> pick(k, pix - 1);
+            const size_t j = pick(generator);
+            std::swap(pool[k], pool[j]);
+            const int lin = pool[(size_t)k];
+            ri_x.push_back(lin / ym);
+            ri_y.push_back(lin % ym);
         }
     }
 

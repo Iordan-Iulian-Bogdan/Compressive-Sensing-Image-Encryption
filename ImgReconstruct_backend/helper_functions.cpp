@@ -1351,7 +1351,8 @@ static void cs_sr_downsample(const float* hr, float* lr, int Lr, int Lc) {
 // smooth-objective value f(y) = ||Ax-b||^2 (+ tv*TV) for backtracking.
 static float cs_sr_fista_grad(const float* y, float* pix_hr, float* lr_buf, float* sc_lr,
     float* up_hr, float* g, const float* b, const float* anchor, float anchor_weight,
-    const int* rix, const int* riy, int m, int Hr, int Wc, int Lr, int Lc, float tv_lambda)
+    const int* rix, const int* riy, int m, int Hr, int Wc, int Lr, int Lc, float tv_lambda,
+    const int* hr_idx, const float* hr_val, int n_hr_anchors, float hr_weight)
 {
     const int n_hr = Hr * Wc;
     const int n_lr = Lr * Lc;
@@ -1382,6 +1383,25 @@ static float cs_sr_fista_grad(const float* y, float* pix_hr, float* lr_buf, floa
     cs_dct_forward(G, cs_default_dct_block());
     for (int i = 0; i < n_hr; ++i) g[i] = 2.0f * up_hr[i];
 
+    // Exact-HR data term: sum hr_w*(pix[a]-v_a)^2 over anchor pixels.
+    // Point sampling is orthonormal, so each anchor pulls its own pixel at
+    // full weight; the sparse residual is DCT'd exactly like the LR term.
+    // (up_hr is free scratch here: the data grad is already folded into g,
+    // and the TV branch below only reads pix_hr.)
+    if (n_hr_anchors > 0 && hr_weight > 0.0f && hr_idx && hr_val) {
+        std::memset(up_hr, 0, sizeof(float) * (size_t)n_hr);
+        for (int k = 0; k < n_hr_anchors; ++k) {
+            const int idx = hr_idx[k];
+            if ((unsigned)idx >= (unsigned)n_hr) continue;
+            const float diff = pix_hr[idx] - hr_val[k];
+            up_hr[idx] += diff;
+            fx += hr_weight * diff * diff;
+        }
+        cv::Mat S(Hr, Wc, CV_32F, up_hr);
+        cs_dct_forward(S, cs_default_dct_block());
+        for (int i = 0; i < n_hr; ++i) g[i] += 2.0f * hr_weight * up_hr[i];
+    }
+
     if (tv_lambda > 0.0f) {
         float* tvgrad = up_hr; // data grad already folded into g
         const float phi = cs_tv_grad_phi(pix_hr, tvgrad, Hr, Wc);
@@ -1402,7 +1422,8 @@ static float cs_sr_fista_grad(const float* y, float* pix_hr, float* lr_buf, floa
 static float cs_sr_smooth_fx(const float* xc, float* pix_hr, float* lr_buf,
     const float* b, const float* anchor, float anchor_weight,
     const int* rix, const int* riy, int m,
-    int Hr, int Wc, int Lr, int Lc, float tv_lambda, float* tv_scratch)
+    int Hr, int Wc, int Lr, int Lc, float tv_lambda, float* tv_scratch,
+    const int* hr_idx, const float* hr_val, int n_hr_anchors, float hr_weight)
 {
     const int n_hr = Hr * Wc;
     const int n_lr = Lr * Lc;
@@ -1420,11 +1441,49 @@ static float cs_sr_smooth_fx(const float* xc, float* pix_hr, float* lr_buf,
     if (tv_lambda > 0.0f) {
         fx += tv_lambda * cs_tv_grad_phi(pix_hr, tv_scratch, Hr, Wc);
     }
+    if (n_hr_anchors > 0 && hr_weight > 0.0f && hr_idx && hr_val) {
+        for (int k = 0; k < n_hr_anchors; ++k) {
+            const int idx = hr_idx[k];
+            if ((unsigned)idx >= (unsigned)n_hr) continue;
+            const float diff = pix_hr[idx] - hr_val[k];
+            fx += hr_weight * diff * diff;
+        }
+    }
     for (int i = 0; i < n_hr; ++i) {
         const float diff = xc[i] - anchor[i];
         fx += anchor_weight * diff * diff;
     }
     return fx;
+}
+
+// Anchor-proximity RED map (see hpp): exact distance to the nearest anchor
+// via distanceTransform (anchors = zero pixels), mapped to a [0,1] blend
+// factor. Empty when there is nothing to modulate (legacy uniform RED).
+cv::Mat cs_hr_red_map(int Hr, int Wc, const std::vector<int>& anchor_idx, float radius)
+{
+    cv::Mat empty;
+    if (Hr <= 0 || Wc <= 0 || anchor_idx.empty() || !(radius > 0.0f)) return empty;
+    cv::Mat mask(Hr, Wc, CV_8U, cv::Scalar(255));
+    bool any = false;
+    for (int idx : anchor_idx) {
+        if (idx < 0 || idx >= Hr * Wc) continue;
+        mask.at<uint8_t>(idx / Wc, idx % Wc) = 0;
+        any = true;
+    }
+    if (!any) return empty;
+    cv::Mat dist;
+    cv::distanceTransform(mask, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE, CV_32F);
+    cv::Mat factor(Hr, Wc, CV_32F);
+    const float inv2s2 = 1.0f / (2.0f * radius * radius);
+    for (int y = 0; y < Hr; ++y) {
+        const float* dp = dist.ptr<float>(y);
+        float* fp = factor.ptr<float>(y);
+        for (int x = 0; x < Wc; ++x) {
+            const float d = dp[x];
+            fp[x] = 1.0f - std::exp(-d * d * inv2s2);
+        }
+    }
+    return factor;
 }
 
 // RED-lite proximal step (Romano et al., "Regularization by Denoising"):
@@ -1454,9 +1513,32 @@ static void cs_sr_red_proximal(float* x, int Hr, int Wc, float red)
     cs_dct_forward(pix, cs_default_dct_block());
 }
 
-double cs_estimate_noise_sigma(const cv::Mat& bgr)
+// Anchor-weighted RED-lite proximal: same NLM pull, but the blend strength
+// varies per pixel (wmap in [0,1], e.g. from cs_hr_red_map): exact anchors
+// take no denoising pull while poorly-anchored pixels take the full one.
+// Empty wmap (or wrong geometry) degrades to the uniform path exactly.
+static void cs_sr_red_proximal_weighted(float* x, int Hr, int Wc, float red,
+    const cv::Mat& wmap)
 {
-    if (bgr.empty() || bgr.type() != CV_8UC3) return 0.0;
+    if (!(red > 0.0f)) return;
+    if (red > 1.0f) red = 1.0f;
+    if (wmap.empty() || wmap.rows != Hr || wmap.cols != Wc || wmap.type() != CV_32F) {
+        cs_sr_red_proximal(x, Hr, Wc, red);
+        return;
+    }
+    cv::Mat pix(Hr, Wc, CV_32F, x);
+    cs_dct_inverse(pix, cs_default_dct_block());
+    cv::Mat u8, dn, dnf;
+    pix.convertTo(u8, CV_8U, 255.0);
+    cv::fastNlMeansDenoising(u8, dn, 5.0f, 7, 15);
+    dn.convertTo(dnf, CV_32F, 1.0 / 255.0);
+    cv::Mat step = (pix - dnf).mul(wmap);
+    pix -= red * step;
+    cs_dct_forward(pix, cs_default_dct_block());
+}
+
+double cs_estimate_noise_sigma(const cv::Mat& bgr)
+{    if (bgr.empty() || bgr.type() != CV_8UC3) return 0.0;
     if (bgr.rows < 4 || bgr.cols < 4) return 0.0;
     cv::Mat ycc;
     cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
@@ -1845,17 +1927,20 @@ static void cs_sr_core_single(float* x, const float* b, const float* anchor,
     const cs_fista_basis& bx,
     std::vector<float>& y, std::vector<float>& x_prev,
     std::vector<float>& grad, std::vector<float>& pix_hr,
-    std::vector<float>& lr_buf, std::vector<float>& sc_lr, std::vector<float>& up_hr)
+    std::vector<float>& lr_buf, std::vector<float>& sc_lr, std::vector<float>& up_hr,
+    const int* hr_idx, const float* hr_val, int n_hr_anchors, float hr_weight)
 {
     const int n_hr = Hr * Wc;
     const bool bt = (tv_lambda > 0.0f);
     // Data-term Lipschitz for P*D*IDCT: 2*||A||^2 <= 0.25*lip. TV keeps the
     // same 8*tv curvature fold + backtracking policy as the LR core.
+    // Exact-HR anchors add 2*hr_w (orthonormal point sampling).
     // (Always-on backtracking was trialed here after a white-output scare
     // that turned out to be a white-input test fixture, not instability:
     // biased samples solve fine at 32.47 dB. Kept off: the fixed step is
     // exact-safe and ~40% cheaper per iteration.)
-    float L = 0.25f * bx.lip + 2.0f * anchor_weight + 8.0f * tv_lambda;
+    const float hr_lip = (n_hr_anchors > 0 && hr_weight > 0.0f) ? 2.0f * hr_weight : 0.0f;
+    float L = 0.25f * bx.lip + 2.0f * anchor_weight + 8.0f * tv_lambda + hr_lip;
     std::memcpy(y.data(), x, sizeof(float) * (size_t)n_hr);
     std::memcpy(x_prev.data(), x, sizeof(float) * (size_t)n_hr);
     std::vector<float> z((size_t)n_hr);
@@ -1864,7 +1949,8 @@ static void cs_sr_core_single(float* x, const float* b, const float* anchor,
     for (int k = 0; k < iters; ++k) {
         const float fy = cs_sr_fista_grad(yy, pix_hr.data(), lr_buf.data(), sc_lr.data(),
             up_hr.data(), grad.data(), b, anchor, anchor_weight,
-            rix, riy, m, Hr, Wc, Lr, Lc, tv_lambda);
+            rix, riy, m, Hr, Wc, Lr, Lc, tv_lambda,
+            hr_idx, hr_val, n_hr_anchors, hr_weight);
         float step = 1.0f / L;
         if (bt) {
             for (int trial = 0; ; ++trial) {
@@ -1878,7 +1964,8 @@ static void cs_sr_core_single(float* x, const float* b, const float* anchor,
                     z[(size_t)i] = anchor[i] + ((av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f);
                 }
                 const float fz = cs_sr_smooth_fx(z.data(), pix_hr.data(), lr_buf.data(),
-                    b, anchor, anchor_weight, rix, riy, m, Hr, Wc, Lr, Lc, tv_lambda, up_hr.data());
+                    b, anchor, anchor_weight, rix, riy, m, Hr, Wc, Lr, Lc, tv_lambda, up_hr.data(),
+                    hr_idx, hr_val, n_hr_anchors, hr_weight);
                 double dot = 0.0, dz2 = 0.0;
                 for (int i = 0; i < n_hr; ++i) {
                     const double dz = (double)z[(size_t)i] - yy[i];
@@ -1913,7 +2000,8 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
     cv::Mat& hr_out, float red, const std::string& red_denoiser, const std::string& dncnn_model,
-    bool sr_cascade, const std::string& red_model, float red_decay)
+    bool sr_cascade, const std::string& red_model, float red_decay,
+    const CsHrSrCtx& hr_sr)
 {
     hr_out.release();
     if (lr_tile.empty() || lr_tile.type() != CV_8UC3) return;
@@ -2011,11 +2099,38 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     constexpr float anchor_weight = 0.25f;
     const float correction_coef = coef * 0.1f;
     std::fill(w.begin(), w.end(), 1.0f);
+    // HR-detail anchors as in-solve data terms: global output-geometry
+    // indices map to tile-local HR pixels via the tile origin; anchors
+    // outside this tile are skipped (neighbor tiles own them). The list is
+    // also the RED-modulation support (see hr_red_map below), so it fills
+    // whenever anchors are present; the core guards the data-term weight
+    // and the map builder guards the RED radius independently.
+    std::vector<int> tile_hr_idx;
+    std::vector<float> tile_hr_val;
+    if (hr_sr.anchors && !hr_sr.anchors->empty() && hr_sr.stride > 0) {
+        tile_hr_idx.reserve(hr_sr.anchors->size());
+        tile_hr_val.reserve(hr_sr.anchors->size());
+        for (const CsHrSample& s : *hr_sr.anchors) {
+            const int gx = (int)(s.idx % (uint32_t)hr_sr.stride);
+            const int gy = (int)(s.idx / (uint32_t)hr_sr.stride);
+            const int lx = gx - hr_sr.ox, ly = gy - hr_sr.oy;
+            if (lx < 0 || ly < 0 || lx >= Wc || ly >= Hr) continue;
+            tile_hr_idx.push_back(ly * Wc + lx);
+            tile_hr_val.push_back(s.y * (1.0f / 255.0f));
+        }
+    }
+    // Anchor-weighted RED: per-pixel blend map from the same tile-local
+    // anchors (empty = legacy uniform RED). Built once; the per-pass
+    // decayed strength multiplies it at each application.
+    const cv::Mat hr_red_map = (red > 0.0f) ?
+        cs_hr_red_map(Hr, Wc, tile_hr_idx, hr_sr.red_radius) : cv::Mat();
     for (int r = 0; r < reweights; ++r) {
         cs_sr_core_single(x, b.data(), anchor.data(), anchor_weight,
             ri_x.data(), ri_y.data(), m, Hr, Wc, Lr, Lc,
             w.data(), correction_coef, tv, inner, bx,
-            y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr);
+            y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr,
+            tile_hr_idx.data(), tile_hr_val.data(), (int)tile_hr_idx.size(),
+            hr_sr.weight);
         // RED-lite: pull the pass solution toward the denoiser manifold
         // before reweighting, so the reweights protect denoised structure.
         // red = 0 skips exactly (bit-identical to the unregularized path).
@@ -2046,12 +2161,20 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
                 cv::split(dn_ycc, dn_chs);
                 cv::Mat dnf;
                 dn_chs[0].convertTo(dnf, CV_32F, 1.0 / 255.0);
-                px -= rl * (px - dnf);
+                if (hr_red_map.empty()) {
+                    px -= rl * (px - dnf);
+                } else {
+                    px -= rl * (px - dnf).mul(hr_red_map);
+                }
             }
             cs_dct_forward(px, cs_default_dct_block());
         }
         else {
-            cs_sr_red_proximal(x, Hr, Wc, red_r);
+            if (hr_red_map.empty()) {
+                cs_sr_red_proximal(x, Hr, Wc, red_r);
+            } else {
+                cs_sr_red_proximal_weighted(x, Hr, Wc, red_r, hr_red_map);
+            }
         }
         if (r + 1 < reweights) {
             float mx = 0.0f;
@@ -2584,7 +2707,8 @@ void cs_sr_direct_luma(const float* b, const int* rix, const int* riy, int m,
     for (int r = 0; r < reweights; ++r) {
         cs_sr_core_single(x.data(), b, anchor.data(), anchor_w,
             rix, riy, m, Hr, Wc, Lr, Lc, w.data(), lambda, tv, inner, bx,
-            y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr);
+            y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr,
+            nullptr, nullptr, 0, 0.0f);
         if (r + 1 < reweights) {
             float mx = 0.0f;
             for (int i = 0; i < n_hr; ++i) {
@@ -2817,6 +2941,167 @@ static const struct CsGpuFallbackRegFista {
 
 // (OWL-QN subsampled-chroma solve evaluate_coarse +
 // reconstruct_color_channel_subchroma removed with the solver.)
+
+std::vector<CsHrSample> cs_select_hr_detail(const cv::Mat& native_bgr,
+    int out_w, int out_h, int count) {
+    std::vector<CsHrSample> out;
+    if (count <= 0 || native_bgr.empty() || native_bgr.type() != CV_8UC3)
+        return out;
+    if (out_w <= 0 || out_h <= 0) return out;
+    if (count > CS_HRDETAIL_MAX_SAMPLES) count = CS_HRDETAIL_MAX_SAMPLES;
+    cv::Mat ref = native_bgr;
+    cv::Mat resized;
+    if (native_bgr.cols != out_w || native_bgr.rows != out_h) {
+        cv::resize(native_bgr, resized, cv::Size(out_w, out_h), 0, 0, cv::INTER_LINEAR);
+        ref = resized;
+    }
+    cv::Mat gray, gx, gy, mag;
+    cv::cvtColor(ref, gray, cv::COLOR_BGR2GRAY);
+    cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
+    cv::addWeighted(cv::abs(gx), 1.0, cv::abs(gy), 1.0, 0.0, mag);
+    // Per-cell top-2 bucketing (16x16) spreads anchors along edges instead
+    // of clustering them on the single strongest contour.
+    constexpr int CELL = 16, PER_CELL = 2;
+    struct Cand { float g; int idx; };
+    std::vector<Cand> pool;
+    pool.reserve((size_t)out_w * out_h / 32);
+    for (int cy0 = 0; cy0 < out_h; cy0 += CELL) {
+        for (int cx0 = 0; cx0 < out_w; cx0 += CELL) {
+            Cand best[PER_CELL] = { {-1.0f, -1}, {-1.0f, -1} };
+            const int cy1 = (std::min)(cy0 + CELL, out_h);
+            const int cx1 = (std::min)(cx0 + CELL, out_w);
+            for (int y = cy0; y < cy1; ++y) {
+                const float* mp = mag.ptr<float>(y);
+                for (int x = cx0; x < cx1; ++x) {
+                    const float g = mp[x];
+                    if (g > best[0].g) {
+                        best[1] = best[0];
+                        best[0] = { g, y * out_w + x };
+                    }
+                    else if (g > best[1].g) {
+                        best[1] = { g, y * out_w + x };
+                    }
+                }
+            }
+            for (int k = 0; k < PER_CELL; ++k)
+                if (best[k].idx >= 0 && best[k].g > 0.0f) pool.push_back(best[k]);
+        }
+    }
+    if (pool.empty()) return out;
+    if ((int)pool.size() > count) {
+        std::nth_element(pool.begin(), pool.begin() + count, pool.end(),
+            [](const Cand& a, const Cand& b) { return a.g > b.g; });
+        pool.resize((size_t)count);
+    }
+    // Deterministic order: strength descending, index ascending on ties.
+    std::sort(pool.begin(), pool.end(), [](const Cand& a, const Cand& b) {
+        if (a.g != b.g) return a.g > b.g;
+        return a.idx < b.idx;
+    });
+    out.reserve(pool.size());
+    for (const Cand& c : pool) {
+        CsHrSample s;
+        s.idx = (uint32_t)c.idx;
+        s.y = gray.at<uint8_t>(c.idx / out_w, c.idx % out_w);
+        out.push_back(s);
+    }
+    return out;
+}
+
+void cs_write_hr_payload(uint8_t* dst, const std::vector<CsHrSample>& s,
+    const uint8_t key[32], const uint8_t iv[16]) {
+    uint8_t* p = dst;
+    for (const CsHrSample& sm : s) {
+        p[0] = (uint8_t)(sm.idx & 0xff);
+        p[1] = (uint8_t)((sm.idx >> 8) & 0xff);
+        p[2] = (uint8_t)((sm.idx >> 16) & 0xff);
+        p[3] = (uint8_t)((sm.idx >> 24) & 0xff);
+        p[4] = sm.y;
+        p[5] = 0;
+        p += CS_HRDETAIL_SAMPLE_BYTES;
+    }
+    const size_t len = s.size() * CS_HRDETAIL_SAMPLE_BYTES;
+    if (len == 0) return;
+    uint8_t counter[CS_IV_BYTES];
+    std::memcpy(counter, iv, CS_IV_BYTES);
+    counter[0] ^= CS_HRDETAIL_TAG;
+    if (!cs_aes256_ctr_xor(dst, len, key, counter)) {
+        cs_wipe(counter, sizeof(counter));
+        throw std::runtime_error("hr-detail payload encryption failed");
+    }
+    cs_wipe(counter, sizeof(counter));
+}
+
+bool cs_read_hr_payload(const uint8_t* src, size_t len, const uint8_t key[32],
+    const uint8_t iv[16], std::vector<CsHrSample>& out) {
+    out.clear();
+    if (len == 0 || len % CS_HRDETAIL_SAMPLE_BYTES != 0) return false;
+    const size_t n = len / CS_HRDETAIL_SAMPLE_BYTES;
+    if (n > CS_HRDETAIL_MAX_SAMPLES) return false;
+    std::vector<uint8_t> buf(src, src + len);
+    uint8_t counter[CS_IV_BYTES];
+    std::memcpy(counter, iv, CS_IV_BYTES);
+    counter[0] ^= CS_HRDETAIL_TAG;
+    if (!cs_aes256_ctr_xor(buf.data(), buf.size(), key, counter)) {
+        cs_wipe(counter, sizeof(counter));
+        return false;
+    }
+    cs_wipe(counter, sizeof(counter));
+    out.reserve(n);
+    for (size_t k = 0; k < n; ++k) {
+        const uint8_t* p = buf.data() + k * CS_HRDETAIL_SAMPLE_BYTES;
+        CsHrSample s;
+        s.idx = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        s.y = p[4];
+        out.push_back(s);
+    }
+    cs_wipe(buf.data(), buf.size());
+    return true;
+}
+
+size_t cs_apply_hr_detail(cv::Mat& bgr, const std::vector<CsHrSample>& s) {
+    if (bgr.empty() || bgr.type() != CV_8UC3 || s.empty()) return 0;
+    const int W = bgr.cols, H = bgr.rows;
+    const size_t total = (size_t)W * H;
+    cv::Mat ycc;
+    cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> chs;
+    cv::split(ycc, chs);
+    const cv::Mat orig_y = chs[0].clone();
+    size_t in_range = 0;
+    for (const CsHrSample& sm : s) {
+        if ((size_t)sm.idx >= total) continue;
+        chs[0].at<uint8_t>((int)(sm.idx / (uint32_t)W), (int)(sm.idx % (uint32_t)W)) = sm.y;
+        ++in_range;
+    }
+    if (in_range == 0) return 0;
+    cv::merge(chs, ycc);
+    cv::cvtColor(ycc, bgr, cv::COLOR_YCrCb2BGR);
+    // Gamut guard: exact Y plus solver chroma can fall outside BGR gamut
+    // (clipped on the way back, Y drifts). Revert anchors that did not
+    // survive the roundtrip instead of injecting clip artifacts.
+    cv::Mat chk;
+    cv::cvtColor(bgr, chk, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> chk_chs;
+    cv::split(chk, chk_chs);
+    size_t applied = 0;
+    for (const CsHrSample& sm : s) {
+        if ((size_t)sm.idx >= total) continue;
+        const int y = (int)(sm.idx / (uint32_t)W), x = (int)(sm.idx % (uint32_t)W);
+        if (std::abs((int)chk_chs[0].at<uint8_t>(y, x) - (int)sm.y) <= 1) {
+            ++applied;
+        } else {
+            chs[0].at<uint8_t>(y, x) = orig_y.at<uint8_t>(y, x);
+        }
+    }
+    if (applied < in_range) {
+        cv::merge(chs, ycc);
+        cv::cvtColor(ycc, bgr, cv::COLOR_YCrCb2BGR);
+    }
+    return applied;
+}
 
 
 

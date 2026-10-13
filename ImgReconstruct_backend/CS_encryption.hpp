@@ -14,9 +14,15 @@
  * full_threshold > 0 (--lod-full) additionally guarantees whole tiles: tiles
  * with lod >= threshold take their full pixel capacity first (greedy fit in
  * lod-desc/index-asc order against m_total), the rest split the remainder.
+ * cutoff > 0 (--adaptive-cutoff) hard-excludes tiles with lod < cutoff
+ * (count 0, surviving tiles absorb the budget up to their capacity; the
+ * total may come in under m_total when survivors saturate). Cutoff wins
+ * over full_threshold on overlap. Decrypt recomputes identical counts, so
+ * the cutoff travels in the authenticated header with the other parameters.
  */
 std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, int m_total,
-    int rows, int cols, int tile_size, int weight_base = 256, int full_threshold = 0);
+    int rows, int cols, int tile_size, int weight_base = 256, int full_threshold = 0,
+    int cutoff = 0);
 
 void cs_hf_thumb_weights(const cv::Mat& thumbnail, std::vector<float>& weights,
     int& weight_cols, int& weight_rows);
@@ -45,10 +51,19 @@ protected:
     // Adaptive periodic sampling: per-tile counts from LOD bytes (see
     // cs_compute_tile_sample_counts), then a distinct in-tile draw per tile
     // in row-major order. Fully deterministic from (key, lod, m, geometry,
-    // weight_base, full_threshold).
+    // weight_base, full_threshold, cutoff).
     void returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
         const std::vector<uint8_t>& lod, int m_total, const uint8_t key[32], int tile_size,
-        int weight_base = 256, int full_threshold = 0);
+        int weight_base = 256, int full_threshold = 0, int cutoff = 0);
+
+    // Per-segment sampling (mode 10): class ids from an 8-bit label map
+    // (xm x ym), per-class sample counts from quantized rates
+    // (count_c = round(pix_c * q_c / 255), ids >= rates_q.size() score 0).
+    // One shared RNG stream draws classes in ascending id order, then one
+    // global shuffle fixes the measurement order — fully deterministic from
+    // (key, labels, rates) so encryption and decryption agree.
+    void returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
+        const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32]);
     void returnHfWeightedIndices(std::vector<int>& ri_x, std::vector<int>& ri_y,
         int rows, int cols, const std::vector<uint8_t>& lod, int m_total,
         const uint8_t key[32], int tile_size, int weight_base,
@@ -62,7 +77,16 @@ protected:
     int periodic_samples = 0;
     int adaptive_base = 256;         // mode 2: LOD weight_base from header
     int lod_full_threshold = 0;      // --lod-full detail guarantee from header (0 = off)
+    int adaptive_cutoff = 0;         // --adaptive-cutoff hard floor from header (0 = off)
     cv::Mat thumb_seed;
+
+    // Mode 4/9 (CS_MODE_*_HRDETAIL): exact native-luma anchors carried as
+    // a trailing CTR-encrypted body section. Filled by the decrypt-side
+    // payload parse; applied as post-composite luma replacements.
+    std::vector<CsHrSample> hr_samples;
+    bool hr_detail = false;
+    uint32_t hr_count = 0;
+    size_t hr_applied = 0;
 
     // Mode 3/7 (CS_MODE_YCC420/CS_MODE_YCC422): coarse chroma sampling
     // positions on the mode's chroma grid + per-plane chroma sample count.

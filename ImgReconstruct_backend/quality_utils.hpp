@@ -67,6 +67,49 @@ inline double max_abs_error(const cv::Mat& a, const cv::Mat& b) {
     return maxv;
 }
 
+// Edge-region scores: Sobel gradient magnitude on the ORIGINAL gray plane,
+// mask = pixels at/above the 90th percentile (top-10% edges, truth-defined
+// so runs stay comparable). Reports PSNR and MAE over masked pixels across
+// all channels, plus the actual mask share. Deterministic; -1 on
+// incompatible inputs. Built for SR/HR-detail work, where global metrics
+// saturate but edge neighborhoods move.
+inline void edge_scores(const cv::Mat& original, const cv::Mat& decoded,
+    double& edge_psnr, double& edge_mae, double& masked_fraction) {
+    edge_psnr = -1.0; edge_mae = -1.0; masked_fraction = 0.0;
+    if (original.empty() || original.size() != decoded.size() ||
+        original.type() != decoded.type() || original.type() != CV_8UC3)
+        return;
+    cv::Mat gray, gx, gy, mag;
+    cv::cvtColor(original, gray, cv::COLOR_BGR2GRAY);
+    cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
+    cv::magnitude(gx, gy, mag);
+    cv::Mat flat = mag.reshape(1, 1);
+    std::vector<float> vals;
+    flat.copyTo(vals);
+    if (vals.empty()) return;
+    const size_t k = vals.size() * 9 / 10;
+    std::nth_element(vals.begin(), vals.begin() + k, vals.end());
+    const float thr = vals[k];
+    cv::Mat mask;
+    cv::compare(mag, thr, mask, cv::CMP_GE);
+    const double cnt = (double)cv::countNonZero(mask);
+    if (cnt < 1.0) return;
+    masked_fraction = cnt / (double)original.total();
+    cv::Mat diff;
+    cv::absdiff(original, decoded, diff);
+    diff.convertTo(diff, CV_32F);
+    cv::Mat sq = diff.mul(diff);
+    cv::Mat sqm, dm;
+    sq.copyTo(sqm, mask);
+    diff.copyTo(dm, mask);
+    const cv::Scalar ss = cv::sum(sqm);
+    const cv::Scalar as = cv::sum(dm);
+    const double mse = (ss[0] + ss[1] + ss[2]) / (cnt * 3.0);
+    edge_mae = (as[0] + as[1] + as[2]) / (cnt * 3.0);
+    edge_psnr = (mse < 1e-9) ? 99.0 : 10.0 * std::log10((255.0 * 255.0) / mse);
+}
+
 // Amplified false-color error map (JET).
 // amplification <= 0 auto-scales so the peak error fills 0..255;
 // amplification > 0 multiplies the mean-abs-difference grayscale by that factor

@@ -26,11 +26,11 @@
 // - "sr-direct": single-stage CS super-resolution
 //   (cs_sr_direct_upscale_tile_2x): the HR luma is solved directly from
 //   the LR samples with no LR-solve warm start inside the coefficients.
-//   Same fused path as cs-sr (BGR containers; ycc falls back to AVIR).
+//   Same fused path as cs-sr (ycc containers refine luma-only).
 // Both CS backends honor --sr-init avir|cascade for the warm start.
 // - "dip": untrained Deep Decoder prior (cs_dip_upscale_tile_2x): a tiny
 //   generator is fit per tile to its own LR samples (no weights, no
-//   basis). Same fused path (BGR; ycc falls back to AVIR).
+//   basis). Same fused path (ycc containers refine luma-only).
 // - "waifu2x": one batched nunif subprocess over the whole tile grid:
 //   tiles are written to a temp dir, a single
 //     <waifu2x_cmd> -i <in_dir> -o <out_dir> <waifu2x_args>
@@ -94,6 +94,16 @@ struct CsPhotoUpscalerOptions {
   // pass identical (legacy), <1 decays geometrically (strong early,
   // gentle late).
   float sr_red_decay = 1.0f;
+  // HR-anchor data-term weight for the cs-sr solve (0 = off: post-hoc
+  // replacement only). Anchors are exact native luma, so 1.0 pulls each
+  // anchor pixel at full weight beside the LR samples.
+  float sr_hr_weight = 1.0f;
+  // Anchor-proximity RED radius in HR pixels (0 = legacy uniform RED):
+  // the RED-lite blend scales per pixel by 1-exp(-d^2/2r^2) from the
+  // nearest in-tile anchor, so exact anchors take (almost) no denoising
+  // pull while poorly-anchored pixels take the full one. Needs --hr-detail
+  // anchors and --red > 0 to have any effect.
+  float sr_hr_red_radius = 0.0f;
   // Coupled-dictionary SR model (CSD2) for --sr-dict: when non-empty, the
   // fused 2x path refines tiles with patch-OMP synthesis (Dh) from LR
   // gradient-feature codes (Dl) instead of the FISTA HR solve, in every

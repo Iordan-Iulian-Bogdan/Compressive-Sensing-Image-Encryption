@@ -156,6 +156,9 @@ public:
     cv::Size get_org_size();
 
     int get_sampling_mode() const { return sampling_mode; }
+    bool has_hr_detail() const { return hr_detail; }
+    const std::vector<CsHrSample>& get_hr_samples() const { return hr_samples; }
+    size_t get_hr_applied() const { return hr_applied; }
     int get_sample_bits() const { return sample_bits; }
     int get_sample_bits_chroma() const { return sample_bits_chroma; }
     int get_lod_full_threshold() const { return lod_full_threshold; }
@@ -189,7 +192,7 @@ public:
     /** @brief decrypts tiles from an already-loaded encrypted image (in-memory, no PNG roundtrip).
     Shared implementation for both overloads. Note: the Mat is const but the impl needs a copy.
     */
-    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false);
+    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr);
 
     static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false);
 
@@ -200,7 +203,7 @@ public:
     each chroma plane natively on its half-resolution grid, then merges
     YCrCb -> BGR per tile. FISTA_JOINT degrades to per-channel FISTA.
     */
-    static int decrypt_image_tiled_ycc420(decrypt_image& dimgs, const std::string& output_path, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false);
+    static int decrypt_image_tiled_ycc420(decrypt_image& dimgs, const std::string& output_path, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr);
 
 };
 
@@ -214,5 +217,6 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x = false, float sr_red = 0.0f, const cs_coupled_dict* sr_dict = nullptr,
     const std::string& sr_red_denoiser = "nlmeans", const std::string& sr_dncnn_model = "models/dncnn/dncnn_color.onnx",
     const std::string& sr_fsrcnn_model = "", bool sr_direct_2x = false, bool sr_cascade = false, float grain_tv = 0.0f, bool use_onsager = false,
-    const std::string& red_model = "", float red_decay = 1.0f, bool sr_dip_2x = false);
+    const std::string& red_model = "", float red_decay = 1.0f, bool sr_dip_2x = false,
+    const CsHrSrCtx& hr_sr = CsHrSrCtx());
 #endif

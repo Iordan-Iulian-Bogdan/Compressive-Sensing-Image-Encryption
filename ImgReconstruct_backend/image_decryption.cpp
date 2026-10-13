@@ -98,8 +98,12 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     periodic_samples = info.periodic_samples;
     adaptive_base = info.adaptive_base;
     lod_full_threshold = info.full_threshold;
+    adaptive_cutoff = info.adaptive_cutoff;
     sample_bits = info.sample_bits;
     sample_bits_chroma = info.sample_bits_chroma;
+    hr_detail = info.hr_detail;
+    hr_count = info.hr_count;
+    hr_samples.clear();
 
     if (info.key_valid) {
         std::memcpy(cs_key, info.key, sizeof(cs_key));
@@ -175,6 +179,9 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
     if (!cs_key_valid) {
         throw std::runtime_error("derived key not available: header must be parsed with the password first");
     }
+    if (hr_detail && (sample_bits != 8 || sample_bits_chroma != 8)) {
+        throw std::runtime_error("hr-detail container has packed samples (corrupt body)");
+    }
 
     sampled_mat = cv::Mat(rows, cols, CV_8UC3, cv::Scalar(0, 0, 0));
     masked_mat = cv::Mat(rows, cols, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -184,7 +191,33 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
     int meas0 = CS_HEADER_PIXELS;
     std::vector<uint8_t> lod;
 
-    if (sampling_mode == CS_MODE_ADAPTIVE) {
+    if (sampling_mode == CS_MODE_SEGMASK) {
+        // Per-segment container: the body prefix [nclasses][rates][seglen]
+        // [label PNG] carries everything the sampler needs; measurements
+        // follow at the first whole pixel after the prefix.
+        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        CsSegPrefix pre;
+        if (total_bytes <= CS_HEADER_BYTES ||
+            !cs_segmask_parse_prefix(encrypted_img.data + CS_HEADER_BYTES,
+                total_bytes - CS_HEADER_BYTES, pre)) {
+            throw std::runtime_error("seg-mask container: corrupt prefix");
+        }
+        meas0 = CS_HEADER_PIXELS + (int)((pre.total + 2) / 3);
+        const uint8_t* png0 = encrypted_img.data + CS_HEADER_BYTES + (pre.total - pre.seglen);
+        std::vector<uint8_t> png(png0, png0 + pre.seglen);
+        cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
+        if (labels.empty()) {
+            throw std::runtime_error("seg-mask container: label decode failed");
+        }
+        if (labels.rows != rows || labels.cols != cols) {
+            cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
+        }
+        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key);
+        if ((int)ri_x.size() != m) {
+            throw std::runtime_error("seg-mask container: count mismatch");
+        }
+    }
+    else if (sampling_mode == CS_MODE_ADAPTIVE) {
         if (periodic_tile <= 0) {
             throw std::runtime_error("adaptive container: missing tile size in header");
         }
@@ -200,7 +233,7 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
             // header pad sanity field disagrees with geometry — reject
             throw std::runtime_error("adaptive container: lod length mismatch");
         }
-        returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, periodic_tile, adaptive_base, lod_full_threshold);
+        returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, periodic_tile, adaptive_base, lod_full_threshold, adaptive_cutoff);
     }
     else if (sampling_mode == CS_MODE_PERIODIC && periodic_tile > 0 && periodic_samples > 0) {
         // the container was encrypted with periodic tile sampling: regenerate
@@ -274,6 +307,21 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
             masked_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = cv::Vec3b(1, 1, 1);
         }
     }
+
+    // Trailing HR-detail payload (mode 4): CTR-decrypt the exact stored
+    // bytes after the measurement section into native-luma anchors.
+    if (hr_detail) {
+        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        const size_t pay_off = (size_t)CS_HEADER_BYTES + (size_t)3 * (size_t)m_count;
+        const size_t pay_len = (size_t)hr_count * CS_HRDETAIL_SAMPLE_BYTES;
+        if (hr_count == 0 || pay_off + pay_len > total_bytes) {
+            throw std::runtime_error("hr-detail container: corrupt payload");
+        }
+        if (!cs_read_hr_payload(encrypted_img.data + pay_off, pay_len,
+                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples)) {
+            throw std::runtime_error("hr-detail container: corrupt payload");
+        }
+    }
 }
 
 void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
@@ -284,13 +332,45 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     if (!cs_is_ycc(sampling_mode)) {
         throw std::runtime_error("ycc unpack requested on a non-YCC container");
     }
+    if (hr_detail && (sample_bits != 8 || sample_bits_chroma != 8)) {
+        throw std::runtime_error("hr-detail container has packed samples (corrupt body)");
+    }
 
     // LOD-luma variant: lod bytes sit between header and measurements (same
     // padded layout as mode 2); the luma draw regenerates from them while
     // chroma stays uniform. Pure-uniform mode 3 has no lod region.
     size_t body_off = 0;
     int mY_written = m;
-    if (cs_is_ycc_hf(sampling_mode)) {
+    int chroma_mode = sampling_mode;
+    if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG) {
+        // Seg-luma variant: the body prefix [nclasses][rates][seglen][label
+        // PNG] regenerates the luma draw; chroma stays uniform on the base
+        // split geometry (4:2:0 vs 4:2:2).
+        chroma_mode = (sampling_mode == CS_MODE_YCC422_SEG) ? CS_MODE_YCC422 : CS_MODE_YCC420;
+        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        CsSegPrefix pre;
+        if (total_bytes <= CS_HEADER_BYTES ||
+            !cs_segmask_parse_prefix(encrypted_img.data + CS_HEADER_BYTES,
+                total_bytes - CS_HEADER_BYTES, pre)) {
+            throw std::runtime_error("seg-mask container: corrupt prefix");
+        }
+        body_off = pre.total;
+        const uint8_t* png0 = encrypted_img.data + CS_HEADER_BYTES + (pre.total - pre.seglen);
+        std::vector<uint8_t> png(png0, png0 + pre.seglen);
+        cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
+        if (labels.empty()) {
+            throw std::runtime_error("seg-mask container: label decode failed");
+        }
+        if (labels.rows != rows || labels.cols != cols) {
+            cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
+        }
+        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key);
+        if ((int)ri_x.size() != m) {
+            throw std::runtime_error("seg-mask container: count mismatch");
+        }
+        mY_written = m;
+    }
+    else if (cs_is_ycc_hf(sampling_mode)) {
         if (periodic_tile <= 0) throw std::runtime_error("ycc-hf container missing HF tile size");
         const uint32_t thumb_len =
             static_cast<uint32_t>(encrypted_img.data[CS_OFF_PAD + CS_OFF_HF_THUMBLEN]) |
@@ -338,7 +418,7 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         if ((int)lod.size() != periodic_samples) {
             throw std::runtime_error("ycc container: lod length mismatch");
         }
-        returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, periodic_tile, adaptive_base, lod_full_threshold);
+        returnAdaptiveIndices(ri_x, ri_y, rows, cols, lod, m, cs_key, periodic_tile, adaptive_base, lod_full_threshold, adaptive_cutoff);
         mY_written = (int)ri_x.size();
         body_off = (size_t)lod_pixels * 3;
     } else {
@@ -348,13 +428,13 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         returnRandomIndices(ri_x, ri_y, rows, cols, m, cs_key);
     }
     // chroma draws are uniform in every variant (tagged keys); dims and
-    // counts follow the container mode (4:2:0 halves both axes, 4:2:2
+    // counts follow the base split mode (4:2:0 halves both axes, 4:2:2
     // halves the width only)
-    returnYcc420ChromaIndices(rows, cols, m, cs_key, sampling_mode);
+    returnYcc420ChromaIndices(rows, cols, m, cs_key, chroma_mode);
     const int mC = m_chroma;
 
     int crows, ccols;
-    cs_chroma_dims(sampling_mode, rows, cols, crows, ccols);
+    cs_chroma_dims(chroma_mode, rows, cols, crows, ccols);
 
     // Bit-packed (--sample-bits) bodies unpack first: three independent
     // sections (luma, Cr, Cb) after the raw thumbnail/lod prefix. The
@@ -372,6 +452,22 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         throw std::runtime_error("ycc container: body too short for luma/chroma payload");
     }
     const uint8_t* body = encrypted_img.data + CS_HEADER_BYTES + body_off;
+
+    // Trailing HR-detail payload (mode 9): CTR-decrypt the exact stored
+    // bytes after the luma/chroma sections into native-luma anchors.
+    if (hr_detail) {
+        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        const size_t pay_off = (size_t)CS_HEADER_BYTES + body_off +
+            (size_t)mY_written + (size_t)2 * (size_t)mC;
+        const size_t pay_len = (size_t)hr_count * CS_HRDETAIL_SAMPLE_BYTES;
+        if (hr_count == 0 || pay_off + pay_len > total_bytes) {
+            throw std::runtime_error("hr-detail container: corrupt payload");
+        }
+        if (!cs_read_hr_payload(encrypted_img.data + pay_off, pay_len,
+                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples)) {
+            throw std::runtime_error("hr-detail container: corrupt payload");
+        }
+    }
 
     y = cv::Mat::zeros(rows, cols, CV_8U);
     y_mask = cv::Mat::zeros(rows, cols, CV_8U);
@@ -569,7 +665,7 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
     int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x, float sr_red, const cs_coupled_dict* sr_dict, const std::string& sr_red_denoiser, const std::string& sr_dncnn_model,     const std::string& sr_fsrcnn_model, bool sr_direct_2x, bool sr_cascade, float grain_tv, bool use_onsager,
-    const std::string& red_model, float red_decay, bool sr_dip_2x) {
+    const std::string& red_model, float red_decay, bool sr_dip_2x, const CsHrSrCtx& hr_sr) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -696,11 +792,17 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                             basis, wscale, hr, sr_cascade);
                     }
                     else if (superres_2x) {
+                        // Tile-mapped HR anchors join the solve (neighborhood
+                        // improvement); post-hoc replacement still pins the
+                        // anchor pixels exactly afterwards.
+                        CsHrSrCtx tile_hr = hr_sr;
+                        tile_hr.ox = coordinates[i][j].x * 2;
+                        tile_hr.oy = coordinates[i][j].y * 2;
                         cs_sr_upscale_tile_2x(mats_out[i][j], mats_in[i][j],
                             indices[i][j].ri_x_g, indices[i][j].ri_y_g,
                             tile_coef, tile_tv, iterations, reweights, fista_iters,
                             basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
-                            sr_cascade, red_model, red_decay);
+                            sr_cascade, red_model, red_decay, tile_hr);
                     }
                     else if (sr_dip_2x) {
                         // Untrained-prior refinement: tiny generator fit to
@@ -764,7 +866,12 @@ static void decrypt_tiles_ycc420(int num_threads,
     const std::string& sr_fsrcnn_model = "", float y_confidence = 0.0f,
     float y_dual_tv = 0.0f,
     std::vector<std::vector<cv::Mat>>* low_tv_tiles = nullptr, float grain_tv = 0.0f,
-    bool use_onsager = false) {
+    bool use_onsager = false, bool superres_2x = false, float sr_red = 0.0f,
+    const std::string& sr_red_denoiser = "nlmeans",
+    const std::string& sr_dncnn_model = CS_DNCNN_DEFAULT_MODEL,
+    bool sr_direct_2x = false, bool sr_cascade = false,
+    const std::string& red_model = "", float red_decay = 1.0f,
+    bool sr_dip_2x = false, const CsHrSrCtx& hr_sr = CsHrSrCtx()) {
 
     if (y_confidence > 0.0f && basis != CS_BASIS_DCT)
         std::cerr << "Note: --y-confidence requires --basis dct; ignoring for wavelet" << std::endl;
@@ -923,10 +1030,15 @@ static void decrypt_tiles_ycc420(int num_threads,
                 if (pipe && !mats_out[i][j].empty()) {
                     pipe->enqueue(i, j);
                 }
-                // fused AVIR upscale: same op as the post-join batch, so
+                // fused upscale: same op as the post-join batch, so
                 // bit-identical; separate grid keeps preview reads safe.
                 // A coupled dict refines the merged BGR tile (post-solve, so
-                // split-grid sampling needs no special operator here).
+                // split-grid sampling needs no special operator here). The
+                // CS SR backends refine luma-only against the tile's own LR
+                // luma samples: y_meas channel 0 carries luma, and the
+                // helpers' BGR2Y weights collapse to 1.0 on the gray-as-BGR
+                // container, so no separate chroma operator is needed
+                // (chroma comes from the AVIR upscale inside the helper).
                 else if (fuse_upscale && hr_out && !mats_out[i][j].empty()) {
                     cv::Mat hr;
                     if (sr_dict) {
@@ -934,6 +1046,26 @@ static void decrypt_tiles_ycc420(int num_threads,
                     }
                     else if (!sr_fsrcnn_model.empty()) {
                         cs_fsrcnn_upscale_2x(mats_out[i][j], hr, sr_fsrcnn_model);
+                    }
+                    else if (sr_direct_2x) {
+                        cs_sr_direct_upscale_tile_2x(mats_out[i][j], y_meas[i][j],
+                            y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g,
+                            tile_coef_y, tile_tv_y, iterations, reweights, fista_iters,
+                            basis, wscale, hr, sr_cascade);
+                    }
+                    else if (superres_2x) {
+                        CsHrSrCtx tile_hr = hr_sr;
+                        tile_hr.ox = coordinates[i][j].x * 2;
+                        tile_hr.oy = coordinates[i][j].y * 2;
+                        cs_sr_upscale_tile_2x(mats_out[i][j], y_meas[i][j],
+                            y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g,
+                            tile_coef_y, tile_tv_y, iterations, reweights, fista_iters,
+                            basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
+                            sr_cascade, red_model, red_decay, tile_hr);
+                    }
+                    else if (sr_dip_2x) {
+                        cs_dip_upscale_tile_2x(mats_out[i][j], y_meas[i][j],
+                            y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, hr);
                     }
                     if (hr.empty())
                         cs_upscale_2x_avir(mats_out[i][j], hr);
@@ -1006,7 +1138,8 @@ int decrypt_image::decrypt_image_tiled(
     bool per_tile_coef,
     bool per_tile_tv,
     float grain_tv,
-    bool use_onsager
+    bool use_onsager,
+    size_t* hr_applied_out
 ) {
     PhaseLog prof;
     if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT) {
@@ -1094,17 +1227,15 @@ int decrypt_image::decrypt_image_tiled(
         nun_threads = omp_get_max_threads();
     }
 
-    // mode-3 (YCC 4:2:0) containers take a dedicated tile pipeline: luma at
+    // YCC containers take a dedicated tile pipeline: luma at
     // full resolution, chroma natively on the coarse grid. The mode travels
     // in the header so no decrypt-side flags are needed.
-    if (dimgs.get_sampling_mode() == CS_MODE_YCC420 ||
-        dimgs.get_sampling_mode() == CS_MODE_YCC422 ||
-        dimgs.get_sampling_mode() == CS_MODE_YCC420_HF ||
-        dimgs.get_sampling_mode() == CS_MODE_YCC422_HF) {
+    if (cs_is_ycc(dimgs.get_sampling_mode())) {
         return decrypt_image_tiled_ycc420(dimgs, output_path, num_tiles, overlap,
             iterations, nun_threads, coef, show_preview, tv,
             full_res, solver, fista_iters, reweights, basis, wscale,
-            photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager);
+            photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager,
+            hr_applied_out);
     }
     if (photo_up.y_dual_tv > 0.0f || photo_up.y_confidence > 0.0f)
         std::cerr << "Note: --y-dual-tv/--y-confidence require a YCC container; ignoring for BGR" << std::endl;
@@ -1272,6 +1403,21 @@ int decrypt_image::decrypt_image_tiled(
     CsUpscalePipeline pipe;
     if (pipe_upscale)
         pipe.start(photo_up, decrypted_image_tiles, hr_tiles, &hr_grid_mutex);
+    // HR anchors for the fused cs-sr solve: global output-geometry list +
+    // output stride; each worker maps its own tile origin (see decrypt_tiles).
+    CsHrSrCtx hr_sr_ctx;
+    if (is_sr && !full_res && !use_dict && !dimgs.hr_samples.empty() &&
+        (photo_up.sr_hr_weight > 0.0f ||
+            (photo_up.sr_hr_red_radius > 0.0f && photo_up.sr_red > 0.0f))) {
+        hr_sr_ctx.anchors = &dimgs.hr_samples;
+        hr_sr_ctx.stride = sampled_mat.cols * 2;
+        hr_sr_ctx.weight = photo_up.sr_hr_weight;
+        hr_sr_ctx.red_radius = photo_up.sr_hr_red_radius;
+    }
+    if (photo_up.sr_hr_red_radius > 0.0f && photo_up.sr_red > 0.0f &&
+        !(is_sr && !full_res && !use_dict && !dimgs.hr_samples.empty())) {
+        std::cerr << "Note: --hr-red-radius needs cs-sr with --hr-detail anchors; using uniform RED" << std::endl;
+    }
         decrypt_tiles_thread = std::thread([&]() {
             decrypt_tiles(nun_threads, encrypted_image_tiles, indices_reconfigured,
                 decrypted_image_tiles, coordinates, num_tiles, overlap, iterations,
@@ -1282,7 +1428,8 @@ int decrypt_image::decrypt_image_tiled(
                 is_sr && !full_res && !use_dict, photo_up.sr_red, sr_d,
                 photo_up.sr_red_denoiser, photo_up.sr_dncnn_model, fsrcnn_model,
                 is_direct && !full_res && !use_dict, sr_cascade, grain_tv, use_onsager,
-                red_model, photo_up.sr_red_decay, is_dip && !full_res && !use_dict);
+                red_model, photo_up.sr_red_decay, is_dip && !full_res && !use_dict,
+                hr_sr_ctx);
         });
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
@@ -1351,6 +1498,16 @@ int decrypt_image::decrypt_image_tiled(
             cs_final_polish_updown(reconstructed, photo_up)) {
             prof.mark("polish");
         }
+        // HR-detail anchors (modes 4/9): exact native-luma replacements on
+        // the final composite, applied last so smoothing passes cannot move
+        // them. Out-of-range anchors (geometry mismatch) are skipped.
+        if (!dimgs.hr_samples.empty() && !reconstructed.empty()) {
+            const size_t applied = cs_apply_hr_detail(reconstructed, dimgs.hr_samples);
+            dimgs.hr_applied = applied;
+            if (hr_applied_out) *hr_applied_out = applied;
+            std::cout << "HR-detail: applied " << applied << "/"
+                      << dimgs.hr_samples.size() << " anchors" << std::endl;
+        }
         cv::imwrite(output_path, reconstructed);
         prof.mark("write");
     }
@@ -1370,7 +1527,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
     int nun_threads, float coef, bool show_preview, float tv,
     bool full_res, int solver,
     int fista_iters, int reweights, int basis, float wscale,
-    const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv, float grain_tv, bool use_onsager) {
+    const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv, float grain_tv, bool use_onsager, size_t* hr_applied_out) {
     if (solver == CS_SOLVER_FISTA_JOINT) {
         std::cerr << "Warning: joint solver needs one shared RGB grid; ycc split sampling degrades to per-channel FISTA" << std::endl;
     }
@@ -1478,12 +1635,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         const bool ycc_is_sr = cs_is_superres_backend(photo_up.backend);
         const bool ycc_is_direct = cs_is_srdirect_backend(photo_up.backend);
         const bool ycc_is_dip = cs_is_dip_backend(photo_up.backend);
-        // CS-SR / sr-direct / dip refine BGR tiles against full-grid random
-        // samples; ycc split sampling (luma/chroma on separate grids) keeps
-        // the AVIR fused path here (one note, no failure).
-        if ((ycc_is_sr || ycc_is_direct || ycc_is_dip) && !full_res)
-            std::cerr << "Note: cs-sr/sr-direct/dip fall back to AVIR for ycc containers"
-                " (luma/chroma split sampling)" << std::endl;
+        const bool ycc_sr_cascade = (photo_up.sr_init == "cascade");
         // Coupled-dict SR needs no split-grid operator (post-solve tiles),
         // so it stays available here; warmed before the workers start.
         const cs_coupled_dict* ycc_sr_d = nullptr;
@@ -1496,6 +1648,28 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 std::cerr << "Error: --sr-dict model failed to load" << std::endl;
                 return -3;
             }
+        }
+        const bool ycc_use_dict = (ycc_sr_d != nullptr);
+        // ONNX RED denoiser: same fail-fast warm-up as the BGR pipeline so
+        // the fused workers only read the session cache (NLM needs none).
+        const int ycc_red_kind = cs_onnx_kind_for(photo_up.sr_red_denoiser);
+        const bool ycc_use_onnx_red = ycc_is_sr && !full_res && !ycc_use_dict &&
+            photo_up.sr_red > 0.0f && ycc_red_kind >= 0;
+        const std::string ycc_red_model = ycc_use_onnx_red ?
+            cs_red_model_for(photo_up.sr_red_denoiser, photo_up.sr_dncnn_model,
+                photo_up.sr_red_model) : std::string();
+        if (ycc_use_onnx_red && !cs_onnx_available(ycc_red_model, ycc_red_kind)) {
+            std::cerr << "Error: RED model failed to load ('" << ycc_red_model << "')" << std::endl;
+            return -3;
+        }
+        if (ycc_is_direct && !full_res && !ycc_use_dict && photo_up.sr_red > 0.0f) {
+            std::cerr << "Note: --red is ignored with sr-direct (single-stage solve has no RED passes)" << std::endl;
+        }
+        if (ycc_is_dip && !full_res && !ycc_use_dict && photo_up.sr_red > 0.0f) {
+            std::cerr << "Note: --red is ignored with dip (untrained-prior solve has no RED passes)" << std::endl;
+        }
+        if (ycc_sr_cascade && full_res) {
+            std::cerr << "Warning: --sr-init is meaningless with --full-res; ignoring" << std::endl;
         }
         const bool ycc_fuse = !dual_tv && !full_res && (photo_up.backend == "avir" || ycc_is_sr || ycc_is_direct || ycc_is_dip || ycc_sr_d ||
             photo_up.backend == "fsrcnn");
@@ -1529,6 +1703,21 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         if (ycc_pipe)
             ycc_upipe.start(photo_up, decrypted, ycc_hr_tiles,
                             &ycc_hr_grid_mutex);
+        // HR anchors for the fused cs-sr solve (luma tile origin maps the
+        // same way as the BGR path; stride is the luma output width).
+        CsHrSrCtx ycc_hr_sr_ctx;
+        if (ycc_is_sr && !full_res && !ycc_use_dict && !dimgs.hr_samples.empty() &&
+            (photo_up.sr_hr_weight > 0.0f ||
+                (photo_up.sr_hr_red_radius > 0.0f && photo_up.sr_red > 0.0f))) {
+            ycc_hr_sr_ctx.anchors = &dimgs.hr_samples;
+            ycc_hr_sr_ctx.stride = cols * 2;
+            ycc_hr_sr_ctx.weight = photo_up.sr_hr_weight;
+            ycc_hr_sr_ctx.red_radius = photo_up.sr_hr_red_radius;
+        }
+        if (photo_up.sr_hr_red_radius > 0.0f && photo_up.sr_red > 0.0f &&
+            !(ycc_is_sr && !full_res && !ycc_use_dict && !dimgs.hr_samples.empty())) {
+            std::cerr << "Note: --hr-red-radius needs cs-sr with --hr-detail anchors; using uniform RED" << std::endl;
+        }
         if (dual_tv && photo_up.backend != "avir")
             std::cerr << "Note: --y-dual-tv uses AVIR for both candidate grids" << std::endl;
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
@@ -1539,7 +1728,12 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             (ycc_fuse || ycc_pipe) ? &ycc_hr_grid_mutex : nullptr, chroma_sub_v, ycc_sr_d,
             (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "",
             photo_up.y_confidence, photo_up.y_dual_tv,
-            dual_tv ? &low_tv_tiles : nullptr, grain_tv, use_onsager);
+            dual_tv ? &low_tv_tiles : nullptr, grain_tv, use_onsager,
+            ycc_is_sr && !full_res && !ycc_use_dict, photo_up.sr_red,
+            photo_up.sr_red_denoiser, photo_up.sr_dncnn_model,
+            ycc_is_direct && !full_res && !ycc_use_dict, ycc_sr_cascade,
+            ycc_red_model, photo_up.sr_red_decay,
+            ycc_is_dip && !full_res && !ycc_use_dict, ycc_hr_sr_ctx);
         if (ycc_pipe) ycc_upipe.finish();
 
         if (show_preview) {
@@ -1677,6 +1871,16 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // as the BGR pipeline (misses keep the image untouched).
         if (!photo_up.final_polish.empty() && !reconstructed.empty())
             cs_final_polish_updown(reconstructed, photo_up);
+
+        // HR-detail anchors (modes 4/9): exact native-luma replacements on
+        // the final composite (see the BGR pipeline above).
+        if (!dimgs.hr_samples.empty() && !reconstructed.empty()) {
+            const size_t applied = cs_apply_hr_detail(reconstructed, dimgs.hr_samples);
+            dimgs.hr_applied = applied;
+            if (hr_applied_out) *hr_applied_out = applied;
+            std::cout << "HR-detail: applied " << applied << "/"
+                      << dimgs.hr_samples.size() << " anchors" << std::endl;
+        }
 
         cv::imwrite(output_path, reconstructed);
     }

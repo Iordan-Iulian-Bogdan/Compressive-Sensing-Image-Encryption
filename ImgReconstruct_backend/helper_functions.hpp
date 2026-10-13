@@ -229,8 +229,23 @@ pipeline (like "avir", not a subprocess pipe). */
 bool cs_is_srdirect_backend(const std::string& backend);
 
 /** @brief true for the untrained-prior SR backend ("dip").
-Same fused 2x handling as cs-sr (BGR containers; ycc falls back). */
+Same fused 2x handling as cs-sr (luma-only solve, ycc via luma path). */
 bool cs_is_dip_backend(const std::string& backend);
+
+/** @brief HR-anchor context for the CS-SR fused solve (--hr-detail).
+Exact native-luma anchors (global output-geometry indices) enter the HR
+coefficient solve as extra data terms beside the LR samples, so the anchor
+neighborhoods improve too — not just the anchor pixels (post-hoc
+replacement still pins those exactly afterwards). Anchors outside this
+tile map to nothing here (neighbor tiles own them). Empty anchors, zero
+stride, or zero weight disable the term bit-identically. */
+struct CsHrSrCtx {
+    const std::vector<CsHrSample>* anchors = nullptr;
+    int stride = 0;     // output-geometry row stride (image width)
+    int ox = 0, oy = 0; // this tile's origin in output geometry
+    float weight = 1.0f;
+    float red_radius = 0.0f; // anchor-proximity RED radius in HR px (0 = uniform RED)
+};
 
 /** @brief CS super-resolution 2x refinement of one solved LR tile (CPU, DCT).
 Luminance-only: a sparse DCT correction around an AVIR warm start is solved
@@ -248,7 +263,8 @@ red_decay in [0,1] schedules the blend per pass (HQS-style: 1.0 keeps all
 passes identical, <1 decays geometrically). Falls back to AVIR when the basis is
 not DCT, the sample set is empty, or the tile is degenerate. coef/tv/iterations/reweights/
 basis/wscale mirror the LR solve conventions. lr_tile is the solved CV_8UC3
-tile; hr_out is the 2x CV_8UC3 result. */
+tile; hr_out is the 2x CV_8UC3 result. hr_sr carries tile-mapped HR-detail
+anchors as in-solve data terms (weight 0 = post-hoc replacement only). */
 // Default DnCNN color model (repo-vendored) for the dncnn RED denoiser.
 #define CS_DNCNN_DEFAULT_MODEL "models/dncnn/dncnn_color.onnx"
 // Default blind color models for the scunet/restormer RED denoisers (not
@@ -296,7 +312,7 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     const std::string& red_denoiser = "nlmeans",
     const std::string& dncnn_model = CS_DNCNN_DEFAULT_MODEL,
     bool sr_cascade = false, const std::string& red_model = "",
-    float red_decay = 1.0f);
+    float red_decay = 1.0f, const CsHrSrCtx& hr_sr = CsHrSrCtx());
 
 /** @brief single-stage SR 2x refinement of one tile (CPU, DCT): the HR luma
 is solved directly against the tile's LR samples (cs_sr_direct_luma, no
@@ -304,9 +320,10 @@ LR-solve warm start) and merged with the AVIR chroma, so one HR solve runs
 instead of three. sr_cascade selects the warm start: false = cold zeros
 with no anchor (init_mode 0), true = multiscale cascade chain
 (cs_sr_cascade_init, init_mode 2, anchored). Falls back to AVIR when the basis is
-not DCT, the sample set is empty, or the tile is degenerate.
-YCC split-sampling containers are not supported here (caller falls back);
-the BGR fused path is the production caller. */
+not DCT, the sample set is empty, or the tile is degenerate. YCC
+containers refine luma-only against the tile's LR luma samples (the BGR2Y
+weights collapse to 1.0 on the gray-as-BGR luma container); chroma comes
+from the AVIR upscale inside. */
 void cs_sr_direct_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
@@ -369,5 +386,45 @@ pixels (caller-allocated). Pure function of the samples (deterministic);
 fista_iters overrides the fixed per-level budget (clamped [4,64]). */
 void cs_sr_cascade_init(const float* b, const int* rix, const int* riy, int m,
     int Lr, int Lc, float coef, int fista_iters, float wscale, float* hr_init);
+
+/** @brief anchor-proximity RED map for one HR tile: per-pixel factor in
+[0,1] scaling the RED-lite blend. Exact Euclidean distance from each pixel
+to the nearest tile-local anchor (openCV distance transform), mapped as
+1-exp(-d^2/2r^2): 0 at anchor pixels (exact truth needs no denoising pull),
+~0.39 at one radius, ~0.86 at two. Empty when the anchor list is empty or
+radius <= 0 (caller keeps legacy uniform RED). Deterministic. */
+cv::Mat cs_hr_red_map(int Hr, int Wc, const std::vector<int>& anchor_idx, float radius);
+
+/** @brief select up to count HR-detail anchors from a native BGR image.
+Resizes the reference to out_w x out_h when it differs (decrypt output
+geometry), ranks pixels by Sobel gradient magnitude on luma with per-cell
+(16x16) top-2 bucketing for spatial spread, and keeps the global top
+`count`. Returns fewer when the image holds fewer candidates. Empty when
+count <= 0 or the image is degenerate. Deterministic. */
+std::vector<CsHrSample> cs_select_hr_detail(const cv::Mat& native_bgr,
+    int out_w, int out_h, int count);
+
+/** @brief serialize + AES-256-CTR encrypt an HR-detail payload into dst
+(CS_HRDETAIL_SAMPLE_BYTES per sample; dst must hold at least that many
+bytes). Counter is the container IV with counter[0] ^= CS_HRDETAIL_TAG.
+Throws std::runtime_error on CNG failure. */
+void cs_write_hr_payload(uint8_t* dst, const std::vector<CsHrSample>& s,
+    const uint8_t key[32], const uint8_t iv[16]);
+
+/** @brief CTR-decrypt + parse an HR-detail payload. len must be a positive
+multiple of CS_HRDETAIL_SAMPLE_BYTES with at most CS_HRDETAIL_MAX_SAMPLES
+samples; returns false otherwise (caller treats it as a corrupt body).
+Counter mirrors cs_write_hr_payload. */
+bool cs_read_hr_payload(const uint8_t* src, size_t len, const uint8_t key[32],
+    const uint8_t iv[16], std::vector<CsHrSample>& out);
+
+/** @brief apply HR-detail anchors to a BGR image in place: converts to
+YCrCb, replaces the Y plane at each in-range anchor index with the stored
+value, converts back. Out-of-range indices are skipped (e.g. a half-res
+decrypt of a half-res-pipeline container). Anchors whose exact Y plus the
+image chroma falls outside BGR gamut (clipped on the way back, Y drifts)
+are reverted instead of injecting clip artifacts. No-op on empty
+input/payload. Returns the number of anchors applied. */
+size_t cs_apply_hr_detail(cv::Mat& bgr, const std::vector<CsHrSample>& s);
 
 #endif  // IMGRECONSTRUCT_BACKEND_HELPER_FUNCTIONS_HPP_

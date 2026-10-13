@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Security design (v2 container format)
@@ -97,6 +98,75 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_YCC420_HF 6            // HF-weighted luma + uniform coarse chroma
 #define CS_MODE_YCC422    7            // luma/chroma-split 4:2:2 sampling (pad = 7)
 #define CS_MODE_YCC422_HF 8            // HF-weighted luma + uniform 4:2:2 chroma (pad = 8)
+#define CS_MODE_BGR_HRDETAIL 4         // uniform random BGR + HR-detail payload (pad = 4)
+#define CS_MODE_YCC420_HRDETAIL 9      // uniform YCC420 + HR-detail payload (pad = 9)
+#define CS_MODE_SEGMASK 10             // per-segment BGR sampling from a label map (pad = 10)
+#define CS_MODE_YCC420_SEG 11          // seg-mask luma + uniform 4:2:0 chroma (pad = 11)
+#define CS_MODE_YCC422_SEG 12          // seg-mask luma + uniform 4:2:2 chroma (pad = 12)
+
+// Per-segment sampling (mode 10) body prefix, little-endian, right after the
+// 32-pixel header:
+//   [0]      nclasses (u8, 1..255)
+//   [1..n]   per-class quantized rates (u8: count_c = round(pix_c * q/255))
+//   [1+n..]  label-map PNG length (u32)
+//   [...]    label-map PNG bytes (8-bit grayscale class ids, pipeline geometry)
+// Measurements (3 bytes each, BGR) follow, padded to whole pixels. Rates are
+// quantized AFTER the global --ratio scale on encrypt so both sides derive
+// identical counts from the shipped bytes; decrypt needs no extra flags.
+struct CsSegPrefix {
+    uint8_t nclasses = 0;
+    std::vector<uint8_t> rates_q;
+    uint32_t seglen = 0;
+    size_t total = 0; // 1 + nclasses + 4 + seglen
+};
+inline bool cs_segmask_parse_prefix(const uint8_t* body, size_t body_bytes, CsSegPrefix& out) {
+    out = CsSegPrefix{};
+    if (body_bytes < 5) return false;
+    const uint8_t n = body[0];
+    if (n == 0) return false;
+    const size_t head = (size_t)1 + n + 4;
+    if (body_bytes < head) return false;
+    out.nclasses = n;
+    out.rates_q.assign(body + 1, body + 1 + n);
+    out.seglen = (uint32_t)body[1 + n] |
+        ((uint32_t)body[2 + n] << 8) |
+        ((uint32_t)body[3 + n] << 16) |
+        ((uint32_t)body[4 + n] << 24);
+    if (out.seglen == 0 || out.seglen > (1u << 24)) return false;
+    if (head + out.seglen > body_bytes) return false;
+    out.total = head + out.seglen;
+    return true;
+}
+// Quantize a [0,1] sampling rate to the shipped u8 (both sides derive counts
+// from these bytes, so encrypt must quantize before drawing, not after).
+inline uint8_t cs_segmask_quantize_rate(float r) {
+    if (!(r > 0.0f)) return 0;
+    if (r >= 1.0f) return 255;
+    return (uint8_t)std::lround(r * 255.0f);
+}
+
+// HR-detail payload (--hr-detail): K native-resolution luma anchors stored
+// as a trailing body section, 6 bytes each (u32 LE output-geometry linear
+// index + u8 luma + 1 zero pad byte = 2 container pixels), AES-256-CTR
+// encrypted with the container key and a domain-separated counter
+// (IV with counter[0] ^= CS_HRDETAIL_TAG). Length is implicit:
+// (body_bytes - measurement_bytes) / CS_HRDETAIL_SAMPLE_BYTES. Covered by
+// the container HMAC like the measurement body. Decrypt applies the anchors
+// as exact post-composite luma replacements.
+#define CS_HRDETAIL_TAG 0x48
+#define CS_HRDETAIL_SAMPLE_BYTES 6
+#define CS_HRDETAIL_MAX_SAMPLES 65536
+// Offset from CS_OFF_PAD for the modes 4/9 HR sample count (u32 LE,
+// 1..CS_HRDETAIL_MAX_SAMPLES). Aliases the HF thumbnail-length field,
+// which is unused outside modes 5/6/8. MAC-covered via the stamped marker.
+#define CS_OFF_HR_COUNT 7
+
+// One HR-detail anchor: linear index into the decrypt output geometry
+// (row-major, output width stride) + native luma value.
+struct CsHrSample {
+    uint32_t idx = 0;
+    uint8_t y = 0;
+};
 
 // Adaptive pad layout (mode = 2), all little-endian:
 //   [0]      mode (= 2)
@@ -113,6 +183,12 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_SAMPLE_BITS_MARKER 0xA7
 #define CS_OFF_LOD_FULL 14          // offset from CS_OFF_PAD: --lod-full
                                     // detail threshold 0..255 (0 = off)
+#define CS_OFF_ADAPTIVE_CUTOFF 7    // offset from CS_OFF_PAD: --adaptive-cutoff
+                                    // hard LOD floor 0..255 (0 = off). Aliases
+                                    // the HF-thumbnail/HR-count u32 field,
+                                    // unused by adaptive-family modes (2 and
+                                    // LOD-luma mode 3); honored only from
+                                    // stamped (MAC-covered) headers.
 
 // Maps --adaptive-strength in [0, 1] to the integer weight_base.
 //   0.0 -> 65535 (essentially uniform: density ratio ~1.004)
@@ -126,6 +202,29 @@ inline int cs_adaptive_base_from_strength(double strength) {
     if (v < 1) v = 1;
     if (v > 65535) v = 65535;
     return v;
+}
+
+// LOD contrast exponent (--adaptive-gamma): reshapes shipped detail bytes
+// as lod_min + round(((v - lod_min) / (255 - lod_min))^gamma * (255 - lod_min)).
+// gamma == 1 is identity; > 1 pushes mid-detail down (stronger edge focus,
+// past what --adaptive-strength 1.0 + --adaptive-floor 0 can express);
+// < 1 flattens toward uniform. Floor and ceiling are fixed points.
+// Applied encrypt-side to the final shipped bytes (after scoring, region
+// blend, and smoothing), so decrypt recomputes identical counts with no
+// format change. No-op when gamma == 1 or the range is degenerate.
+inline void cs_apply_lod_gamma(std::vector<uint8_t>& lod, int lod_min, double gamma) {
+    if (!(gamma > 0.0) || gamma == 1.0) return;
+    const double den = 255.0 - (double)lod_min;
+    if (den <= 0.0) return;
+    for (size_t i = 0; i < lod.size(); ++i) {
+        if (lod[i] <= lod_min) continue; // floor fixed, sub-floor preserved
+        const double t = ((double)lod[i] - (double)lod_min) / den;
+        const double tc = t > 1.0 ? 1.0 : t;
+        int v = lod_min + (int)std::lround(std::pow(tc, gamma) * den);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        lod[i] = (uint8_t)v;
+    }
 }
 
 // lod region: tiles_x * tiles_y bytes after the 32-pixel header, padded to a
@@ -177,13 +276,21 @@ inline int cs_chroma_count(int mode, int m_luma, int rows, int cols) {
     if (mc > cap) mc = cap;
     return mc;
 }
-// Any luma/chroma-split container (uniform, adaptive-luma, or HF-luma).
+// Any luma/chroma-split container (uniform, adaptive-luma, HF-luma, or
+// HR-detail).
 inline bool cs_is_ycc(int mode) {
     return mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 ||
-        mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF;
+        mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF ||
+        mode == CS_MODE_YCC420_HRDETAIL ||
+        mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG;
+}
+// Any container carrying a trailing HR-detail payload.
+inline bool cs_is_hrdetail(int mode) {
+    return mode == CS_MODE_BGR_HRDETAIL || mode == CS_MODE_YCC420_HRDETAIL;
 }
 inline bool cs_is_ycc422(int mode) {
-    return mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF;
+    return mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF ||
+        mode == CS_MODE_YCC422_SEG;
 }
 inline bool cs_is_ycc_hf(int mode) {
     return mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF;
@@ -217,9 +324,12 @@ struct CsHeaderInfo {
     int periodic_samples = 0;        // mode 1: samples per tile; mode 2: lod byte count (sanity)
     int adaptive_base = 256;         // mode 2: weight_base (w = cap * (base + lod))
     uint32_t thumb_len = 0;          // modes 5/6: encrypted thumbnail bytes in body
+    bool hr_detail = false;          // modes 4/9: trailing HR-detail payload present
+    uint32_t hr_count = 0;           // modes 4/9: HR sample count (payload = 6 * count bytes)
     int sample_bits = 8;             // bits per stored sample value (pad+11, 0 = legacy 8)
     int sample_bits_chroma = 8;      // Cr/Cb (pad+12, 0 = same as luma)
     int full_threshold = 0;          // --lod-full detail guarantee (pad+14, 0 = off)
+    int adaptive_cutoff = 0;         // --adaptive-cutoff hard floor (pad+7, 0 = off)
 };
 
 // Sample bit-depth reduction (--sample-bits): measurement values are

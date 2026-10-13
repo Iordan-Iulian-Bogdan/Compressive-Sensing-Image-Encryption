@@ -511,16 +511,51 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
     // tile_size and (mode 1) samples_per_tile as 16-bit little-endian values.
     // Mode 2 stores lod byte count in the second slot as a sanity check.
     const uint8_t mode = buf[CS_OFF_PAD];
-    if (mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422) {
+    if (mode == CS_MODE_BGR_HRDETAIL) {
+        // Uniform BGR sampling + trailing HR-detail payload. Tile/aux pad
+        // fields must be zero; the sample count rides at CS_OFF_HR_COUNT.
+        out.sampling_mode = mode;
+        out.hr_detail = true;
+        const int tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
+        const int aux = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8) |
+            (buf[CS_OFF_PAD + 5] << 16) | (buf[CS_OFF_PAD + 6] << 24);
+        out.hr_count = (uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT] |
+            ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT + 1] << 8) |
+            ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT + 2] << 16) |
+            ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT + 3] << 24);
+        if (tile != 0 || aux != 0 || out.hr_count == 0 ||
+            out.hr_count > CS_HRDETAIL_MAX_SAMPLES) {
+            out.legacy = true;
+            return false;
+        }
+    }
+    else if (mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 || mode == CS_MODE_YCC420_HRDETAIL ||
+        mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG) {
         // luma/chroma-split container. Pure-uniform modes 3/7 leave the tile
         // fields zero; the LOD-luma variant reuses the adaptive pad layout
         // (tile_size, lod byte count, weight_base). Accept the LOD variant
         // only when the lod count matches the geometry, otherwise fall back
-        // to uniform (tolerant read of pre-LOD containers).
+        // to uniform (tolerant read of pre-LOD containers). Mode 9
+        // (HR-detail) is uniform-only: any tile grid is rejected.
         out.sampling_mode = mode;
+        if (mode == CS_MODE_YCC420_HRDETAIL) out.hr_detail = true;
         const int tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);
         const int lodc = buf[CS_OFF_PAD + 3] | (buf[CS_OFF_PAD + 4] << 8);
-        if (tile > 0 && lodc == cs_lod_bytes(out.rows, out.cols, tile)) {
+        if (mode == CS_MODE_YCC420_HRDETAIL) {
+            // Uniform-only: any tile grid is rejected, and the sample
+            // count rides at CS_OFF_HR_COUNT.
+            out.hr_count = (uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT] |
+                ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT + 1] << 8) |
+                ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT + 2] << 16) |
+                ((uint32_t)buf[CS_OFF_PAD + CS_OFF_HR_COUNT + 3] << 24);
+            if (tile != 0 || out.hr_count == 0 ||
+                out.hr_count > CS_HRDETAIL_MAX_SAMPLES) {
+                out.legacy = true;
+                return false;
+            }
+        }
+        else if (tile > 0 && lodc == cs_lod_bytes(out.rows, out.cols, tile) &&
+            mode != CS_MODE_YCC420_HRDETAIL) {
             out.periodic_tile = tile;
             out.periodic_samples = lodc;
             const int base = buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_BASE] |
@@ -554,6 +589,11 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
             out.legacy = true;
             return false;
         }
+    }
+    else if (mode == CS_MODE_SEGMASK) {
+        // Per-segment sampling: per-class rates + PNG label map ride in the
+        // body prefix (parsed by the sampler); no pad geometry to validate.
+        out.sampling_mode = mode;
     }
     else if (mode == CS_MODE_PERIODIC || mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) {
         out.sampling_mode = mode;
@@ -618,6 +658,15 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
     // legacy zeroed pad always decodes as off.
     out.full_threshold = (buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] == CS_SAMPLE_BITS_MARKER)
         ? buf[CS_OFF_PAD + CS_OFF_LOD_FULL] : 0;
+    // --adaptive-cutoff hard floor: only adaptive-family writers stamp it
+    // (mode 2, LOD-luma mode 3); other modes alias this byte for thumbnail
+    // lengths / HR counts, so gate strictly by mode.
+    out.adaptive_cutoff = 0;
+    if (buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] == CS_SAMPLE_BITS_MARKER &&
+        (out.sampling_mode == CS_MODE_ADAPTIVE ||
+            (out.sampling_mode == CS_MODE_YCC420 && out.periodic_tile > 0))) {
+        out.adaptive_cutoff = buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_CUTOFF];
+    }
     return true;
 }
 

@@ -1,0 +1,38 @@
+{
+  "source": "ImgReconstruct_backend/IMG_3690.png",
+  "width": 4032,
+  "height": 3024,
+  "label_map": "scene.labels.png",
+  "format": "8-bit grayscale PNG; pixel value is class ID, not display brightness",
+  "coordinate_origin": "top-left",
+  "method": "Manually guided region polygons and strokes; OpenCV GrabCut with two iterations for cabinet, wall, trim, fixtures and perch; existing five-iteration bird mask preserved. Cage region uses a manually traced visible surface envelope.",
+  "coverage": "Every pixel belongs to exactly one class. No inferred geometry behind the bird.",
+  "limitations": [
+    "Approximate scene-region segmentation, not manually verified pixel-perfect ground truth.",
+    "Cage region includes bars, gaps and background seen through the cage envelope; it is not an individual-wire mask.",
+    "Other room contents groups unresolved lower-left background objects and any residual pixels.",
+    "Cabinet metal fixtures groups the visible curved metal piece, handles and lower support; uncertain object identity is not resolved.",
+    "Fine feathers, claws and blurred object boundaries may require manual correction."
+  ],
+  "classes": [
+    {"id": 0, "name": "other_room_contents", "rgb": [110, 110, 110]},
+    {"id": 1, "name": "bird", "rgb": [70, 200, 70]},
+    {"id": 2, "name": "blue_cabinet", "rgb": [40, 120, 230]},
+    {"id": 3, "name": "wall", "rgb": [245, 225, 100]},
+    {"id": 4, "name": "wooden_trim", "rgb": [180, 110, 50]},
+    {"id": 5, "name": "cage_region", "rgb": [200, 70, 210]},
+    {"id": 6, "name": "cabinet_metal_fixtures", "rgb": [80, 220, 235]},
+    {"id": 7, "name": "wooden_perch", "rgb": [245, 170, 50]}
+  ],
+  "outputs": {
+    "color_map": "scene.colors.png",
+    "preview_with_legend": "scene.preview.png",
+    "per_class_masks": "scene.mask.<class_name>.png (255 for class, 0 elsewhere)",
+    "pixel_counts": "scene.stats.csv"
+  },
+  "reproduction": {
+    "temporary_source": "C:/Users/bogdani/AppData/Local/Temp/opencode/segment_scene.cpp",
+    "temporary_build_script": "C:/Users/bogdani/AppData/Local/Temp/opencode/build_segment_scene.bat",
+    "arguments": ["ImgReconstruct_backend/IMG_3690.png", "parakeet.mask.png", "scene"]
+  }
+}

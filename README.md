@@ -74,7 +74,26 @@ are pushed over flat ones. `--adaptive-strength <s>` (default 0.5) sets that
 base: `s=0` → 65535 (essentially uniform, like random), `s=0.5` → 256
 (tuned default, density ratio near 1.8× so flat tiles retain enough coverage
 for the wavefront warm-start while detail tiles still get a clear bonus),
-`s=1` → 1 (maximum LOD bias, density ratio near 7.8×). The base is stored in
+`s=1` → 1 (maximum LOD bias, density ratio near 7.8×). Past that,
+`--adaptive-gamma <g>` in [0.1, 4] (default 1 = off) reshapes the shipped
+detail bytes as `floor + ((v-floor)/(255-floor))^g`: `g > 1` pushes
+mid-detail down for stronger edge focus (verified visually: `g=3` collapses
+sampling onto the subject's edges), `g < 1` flattens toward uniform. It
+applies encrypt-side to the final shipped bytes (after scoring, region
+blend, and smoothing), so decrypt recomputes identical counts with no format
+change; combine with `--adaptive-floor 0` for the maximum contrast. Past
+even that, `--adaptive-cutoff <n>` in [0, 255] (default 0 = off) hard-zeros
+tiles scoring below `n`: proportional allocation can never fully starve the
+background (saturated edge tiles cap at 100% and the rest spills), but a
+cutoff genuinely blacklists it — survivors absorb the budget up to capacity
+and any unplaceable remainder is dropped (smaller container as a side
+effect). The cutoff travels in the authenticated pad (adaptive mode 2 and
+LOD-luma YCC) so decrypt agrees with no extra flags; cutoff wins over
+`--lod-full` on overlap. Verified on IMG_3690 (`--ycc420 --ratio 0.25
+--adaptive --tile-size 16 --strength 1 --floor 0 --gamma 3 --cutoff 100
+--full-res`): background essentially black, samples pinned to the subject's
+edges, container 1.35 MB. Start around 40–60 for a wider net; 100+ keeps
+only the hottest edges and starves the decrypt warm-start in flat areas. The base is stored in
 the authenticated pad so decryption regenerates the exact counts. The lod
 byte array is stored immediately after the
 header (one byte per tile, row-major, zero-padded to a whole container
@@ -110,6 +129,20 @@ spectral ties Laplacian within ±0.1 dB at default and maximum strength
 (27.2/27.6 dB) — rank orders correlate on natural content; spectral is the
 cheaper deterministic alternative to the pilot solve, complementary where
 edge magnitude misleads (smooth high-contrast gradients).
+
+**Per-segment sampling:** `--seg-mask <f> --seg-rates <l>` (mode 10) samples
+each segmentation class at its own rate instead of scoring tiles. `<f>` is an
+8-bit label map (pixel value = class id, resized to the pipeline geometry
+with nearest-neighbor) or a BGR color mask matched to the scene palette by
+nearest color; `<l>` is a comma list of per-class rates in [0,1] in id order
+(ids past the list score 0), e.g. `0.02,0.6,0.02,0.02,0.05,0.08,0.05,0.05`
+(digits and commas only, so it survives PowerShell native-arg passing).
+`--ratio` scales every rate globally. Rates are quantized to u8 and shipped
+with a PNG of the label map in the body prefix, so decrypt regenerates the
+identical per-class draws with no flags. Exclusive with all other sampling
+flags except `--ycc420`/`--ycc422`, which absorb it like the adaptive LOD
+path: the rates drive the luma budget (modes 11/12) while chroma stays
+uniform. `--show-mask`/`--sample-split` work unchanged.
 
 ### YCC 4:2:0 split sampling (`--ycc420`)
 
@@ -308,7 +341,7 @@ Alternatively point CMake at any OpenCV with CMake config files via `-DOpenCV_DI
 ### CLI usage
 
 ```
-ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R] [--periodic] [--adaptive] [--hf-focus] [--ycc420] [--tile-size N] [--adaptive-floor N] [--adaptive-strength S] [--lod-full N] [--sample-bits L[,C]] [--show-mask] [--full-res]
+ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R] [--periodic] [--adaptive] [--hf-focus] [--ycc420] [--tile-size N] [--adaptive-floor N] [--adaptive-strength S] [--lod-full N] [--seg-mask F --seg-rates L] [--sample-bits L[,C]] [--show-mask] [--full-res]
 ImgReconstruct_backend decrypt  <input.png> <output.png> [--password <pw>] [--tiles N] [--overlap N] [--iterations N] [--threads N] [--coef F] [--per-tile-coef] [--per-tile-tv] [--manual] [--no-preview] [--photo-upscaler avir|waifu2x] [--device cpu|gpu]
 ImgReconstruct_backend roundtrip <input.png> <output.png> [options]
 ImgReconstruct_backend compare   <original.png> <decrypted.png> <out_prefix> [--amp F]
@@ -380,7 +413,7 @@ fast deterministic neural option (and the harness fits ESPCN/ECBSR/SPAN
 weights with the same 2x contract).
 
 `--photo-upscaler cs-sr` enables CPU 2× compressed-sensing super-resolution
-for BGR containers in the default half-resolution pipeline. Each reconstructed
+in the default half-resolution pipeline. Each reconstructed
 LR tile is first upscaled with AVIR; a reweighted-L1 FISTA solve then refines a
 sparse HR DCT correction of the **luma channel only** against the **original
 sampled LR luma** (BGR samples combined with the YCrCb weights) using a 2×2
@@ -389,8 +422,9 @@ optional `--tv` smoothness penalty. The anchor preserves HR detail that LR
 measurements alone cannot determine; chroma comes straight from the AVIR
 upscale, so one HR solve runs instead of three. It uses the existing tile
 overlap and feather blending; small/unsampled tiles and wavelet-basis solves
-use AVIR. `--ycc420`/`--ycc422` also use AVIR because split luma/chroma
-sampling needs a different SR operator; `--full-res` skips upscaling entirely.
+use AVIR. `--ycc420`/`--ycc422` refine luma-only against the tile's LR luma
+samples the same way (the YCrCb weights collapse to 1.0 on the luma
+container); `--full-res` skips upscaling entirely.
 Example:
 `ImgReconstruct_backend roundtrip input.png output.png --ratio 0.5 --photo-upscaler cs-sr --no-preview`.
 Measured at ratio 0.5: IMG_3690 photo 27.17 dB / 0.784 SSIM vs. AVIR's
@@ -432,8 +466,8 @@ warm start inside the coefficients) and merged with the AVIR chroma.
 Measured on the fixture it trails the two-stage path on real photos
 (warm-start economics dominate: integrated direct 26.79 dB / 0.707 in
 128 s vs 27.31 dB / 0.813 in 50 s for two-stage+RED), but it is available
-for BGR containers when the LR stage is best skipped; ycc containers fall
-back to AVIR and `--red` is ignored there (single-stage solve has no RED
+for BGR containers when the LR stage is best skipped; ycc containers refine
+luma-only the same way and `--red` is ignored there (single-stage solve has no RED
 passes). `--sr-dict` takes precedence over both CS backends.
 
 `--sr-init avir|cascade` (default `avir`, decrypt/roundtrip only) selects
@@ -449,7 +483,7 @@ tiny Deep Decoder generator (nearest-upsample + channel mixes + ReLU,
 final sigmoid; underparameterized vs the HR pixels) is fit by Adam from a
 fixed seed against the tile's own LR luma samples (2x2-box forward model)
 plus the usual AVIR anchor — no training data, no weights, no basis, CPU
-only, luma-only with AVIR chroma. BGR containers (ycc falls back to AVIR).
+only, luma-only with AVIR chroma (ycc containers refine luma-only the same way).
 The generator is a residual head over the AVIR luma (zero-initialised output
 weights, so it starts exactly at AVIR). Every fifth measured sample is held
 out; Adam fits the rest, and the weights from the best held-out step are
@@ -458,6 +492,37 @@ IMG_3690 at ratio 0.5, one tile: AVIR 23.21 dB, DIP 23.15 dB at about 140 s
 (about 280x slower). The previous non-residual version scored 22.92 dB on the
 same crop. The earlier 19.59 dB synthetic result did not transfer to photos
 and should be disregarded. DIP is kept as an experiment, not a quality path.
+
+`--hr-detail <n>` (encrypt/roundtrip only, prototype) stores `n` native-luma
+edge anchors as a trailing AES-CTR payload (BGR mode 4, `--ycc420` mode 9;
+uniform sampling + 8-bit samples only, decrypt auto-detects from the mode
+byte). Anchors are top Sobel-magnitude luma pixels with per-cell top-2
+bucketing for spatial spread (6 bytes each: u32 index + u8 value). Decrypt
+applies them as exact post-composite luma replacements, reverting anchors
+whose exact luma plus solver chroma falls outside BGR gamut instead of
+injecting clip artifacts. With `--photo-upscaler cs-sr` the anchors also
+enter the HR coefficient solve as exact data terms beside the LR samples
+(point-sampling is orthonormal, so each anchor pulls its own pixel at full
+weight with a `2*hr_w` Lipschitz fold), improving neighborhoods too, not
+just anchor pixels. `--hr-weight <f>` in [0, 16] (default 1) scales that
+term; 0 keeps post-hoc replacement only. Measured on IMG_3690, ycc420 ratio
+0.5, 16384 anchors (+96 KB, +4.4%): converged `--tiles 12 --iterations 16`
+gives 29.56 dB / edge 21.81 dB post-hoc-only vs 29.57 dB / edge 21.82 dB
+in-solve, edge-MAE 15.397 → 15.386, admitted anchors 16354 → 16377 —
+small but consistent across every metric (synthetic rig: anchor pixels
+−33%, neighborhoods −2%). Starved settings (few giant tiles, few
+iterations) saturate global metrics and show almost nothing; use `compare`'s
+Edge-PSNR/Edge-MAE lines to see edge movement.
+
+`--hr-red-radius <r>` (default 0 = uniform RED) scales the RED-lite blend per
+pixel by `1-exp(-d²/2r²)` from the nearest in-tile anchor, so exact anchors
+take (almost) no denoising pull. Measured negative: same setup plus
+`--red 0.5` gives 29.63 dB / edge 21.85 dB uniform vs 29.61 dB / 21.84 dB at
+`r=8` (edge-MAE 15.323 → 15.351), while `r=0.5` (anchor pixels only) is
+bit-for-bit equivalent to uniform. Mechanism: anchor pixels are post-hoc
+pinned exactly anyway, so their in-solve RED pull was harmless — suppressing
+RED around them only deprives edge neighborhoods of denoising exactly where
+the solve is noisiest. Kept as an opt-in experiment; uniform RED stands.
 
 `--device gpu` (decrypt, `--solver fista|joint`) offloads the batched tile solves to an AMD GPU over HIP: tile/channel solves queue up and flush as batched kernel groups (proximal-gradient + momentum over FFT-DCT transforms with sampled gradients; joint: row-coupled group threshold over stacked planes), while CDF97 and any device failure silently fall back to the CPU path (output differs from CPU only by float rounding). Set `CS_GPU_DEBUG=1` for per-batch timing lines. Building requires an AMD HIP SDK (7.2 tested) with the target GPU in `HipArch` (`hip_build.targets` compiles `cs_gpu.hip` through `hipcc` at link time).
 

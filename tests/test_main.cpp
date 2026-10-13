@@ -2287,6 +2287,537 @@ void test_onsager() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HR-detail payload (--hr-detail): native-luma edge anchors as a trailing
+// CTR-encrypted body section (modes 4/9). Unit pins for selection, codec
+// and apply, plus container roundtrips through the real encrypt/decrypt.
+// ---------------------------------------------------------------------------
+void test_hr_detail() {
+    check(cs_is_hrdetail(CS_MODE_BGR_HRDETAIL) &&
+        cs_is_hrdetail(CS_MODE_YCC420_HRDETAIL),
+        "hr-detail: backend selection");
+    check(!cs_is_hrdetail(CS_MODE_RANDOM) && !cs_is_hrdetail(CS_MODE_YCC420),
+        "hr-detail: non-hr modes rejected");
+    check(cs_is_ycc(CS_MODE_YCC420_HRDETAIL) && !cs_is_ycc(CS_MODE_BGR_HRDETAIL),
+        "hr-detail: ycc membership");
+
+    // Selection: structured image yields in-range deterministic anchors
+    // whose values match the reference gray plane.
+    const cv::Mat edge = make_test_image(128, 96);
+    cv::Mat edge_gray;
+    cv::cvtColor(edge, edge_gray, cv::COLOR_BGR2GRAY);
+    const std::vector<CsHrSample> a1 = cs_select_hr_detail(edge, 128, 96, 64);
+    const std::vector<CsHrSample> a2 = cs_select_hr_detail(edge, 128, 96, 64);
+    check(a1.size() == 64, "hr-detail: selection count");
+    bool same = (a1.size() == a2.size());
+    bool in_range = true, values_ok = true;
+    for (size_t k = 0; k < a1.size() && (same || in_range || values_ok); ++k) {
+        if (a1[k].idx != a2[k].idx || a1[k].y != a2[k].y) same = false;
+        if (a1[k].idx >= (uint32_t)(128 * 96)) { in_range = false; continue; }
+        if (a1[k].y != edge_gray.at<uint8_t>(a1[k].idx / 128, a1[k].idx % 128))
+            values_ok = false;
+    }
+    check(same, "hr-detail: selection deterministic");
+    check(in_range, "hr-detail: selection in range");
+    check(values_ok, "hr-detail: selection values match gray");
+    check(cs_select_hr_detail(edge, 128, 96, 0).empty(),
+        "hr-detail: zero count selects nothing");
+    check(cs_select_hr_detail(cv::Mat(), 128, 96, 64).empty(),
+        "hr-detail: empty image selects nothing");
+    check(cs_select_hr_detail(cv::Mat::zeros(64, 64, CV_8UC3), 64, 64, 64).empty(),
+        "hr-detail: flat image selects nothing");
+
+    // Codec roundtrip under a fixed key/IV, plus corrupt-length rejection.
+    uint8_t key[32], iv[16];
+    for (int i = 0; i < 32; ++i) key[i] = (uint8_t)(i * 3 + 1);
+    for (int i = 0; i < 16; ++i) iv[i] = (uint8_t)(i * 5 + 2);
+    std::vector<uint8_t> wire(a1.size() * CS_HRDETAIL_SAMPLE_BYTES);
+    cs_write_hr_payload(wire.data(), a1, key, iv);
+    std::vector<CsHrSample> back;
+    check(cs_read_hr_payload(wire.data(), wire.size(), key, iv, back),
+        "hr-detail: codec roundtrip parses");
+    bool codec_same = (back.size() == a1.size());
+    for (size_t k = 0; k < back.size() && codec_same; ++k)
+        codec_same = (back[k].idx == a1[k].idx && back[k].y == a1[k].y);
+    check(codec_same, "hr-detail: codec roundtrip identical");
+    std::vector<CsHrSample> junk;
+    check(!cs_read_hr_payload(wire.data(), 0, key, iv, junk),
+        "hr-detail: empty payload rejected");
+    check(!cs_read_hr_payload(wire.data(), 7, key, iv, junk),
+        "hr-detail: misaligned payload rejected");
+    check(!cs_read_hr_payload(wire.data(),
+        (size_t)(CS_HRDETAIL_MAX_SAMPLES + 1) * CS_HRDETAIL_SAMPLE_BYTES,
+        key, iv, junk),
+        "hr-detail: oversized payload rejected");
+
+    // Apply: exact luma replacement at anchor positions, OOB skipped.
+    // Neutral-gray canvas admits every Y (no gamut clipping).
+    cv::Mat canvas(24, 32, CV_8UC3, cv::Scalar(100, 100, 100));
+    const std::vector<CsHrSample> put = { {0, 200}, {100, 50}, {(uint32_t)(24 * 32 - 1), 128},
+        {(uint32_t)(24 * 32 + 5), 200} };
+    const size_t applied = cs_apply_hr_detail(canvas, put);
+    check(applied == 3, "hr-detail: apply skips out-of-range");
+    cv::Mat canvas_ycc;
+    cv::cvtColor(canvas, canvas_ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> canvas_chs;
+    cv::split(canvas_ycc, canvas_chs);
+    check(canvas_chs[0].at<uint8_t>(0, 0) == 200 &&
+        canvas_chs[0].at<uint8_t>(100 / 32, 100 % 32) == 50 &&
+        canvas_chs[0].at<uint8_t>(23, 31) == 128,
+        "hr-detail: apply sets exact luma");
+
+    // Container roundtrips (BGR mode 4 + YCC420 mode 9) through the real
+    // encrypt/decrypt: mode header, parsed sample count, and exact anchor
+    // values on the final output.
+    const std::string input_path = ".cs_test_hr_input.png";
+    const std::string output_path = ".cs_test_hr_output.png";
+    const std::string password = "hr-detail-roundtrip-password";
+    const cv::Mat original = make_test_image(160, 120);
+    check(cv::imwrite(input_path, original), "hr-detail: write source image");
+    cv::Mat original_gray;
+    cv::cvtColor(original, original_gray, cv::COLOR_BGR2GRAY);
+    for (int splitmode : {0, 1}) {
+        const bool ycc = (splitmode == 1);
+        const char* tag = ycc ? "hr-detail ycc420" : "hr-detail bgr";
+        const int want_mode = ycc ? CS_MODE_YCC420_HRDETAIL : CS_MODE_BGR_HRDETAIL;
+        cv::Mat encrypted;
+        const int encrypt_rc = encrypt_image::encrypt_image_tiled(
+            input_path, "", password, 0.5f, 0, &encrypted,
+            false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f,
+            ycc, false, 8, 0, 0, false, false, "", 48);
+        check(encrypt_rc == 0, (std::string(tag) + ": encrypt").c_str());
+        if (encrypt_rc != 0) continue;
+        decrypt_image container(encrypted, password);
+        check(container.get_sampling_mode() == want_mode,
+            (std::string(tag) + ": mode header").c_str());
+        if (ycc) {
+            cv::Mat y, ym, cr, crm, cb, cbm;
+            container.get_sampled_ycc420(y, ym, cr, crm, cb, cbm);
+            check(container.get_hr_samples().size() == 48,
+                (std::string(tag) + ": payload parsed").c_str());
+        } else {
+            cv::Mat sm, mm;
+            container.get_sampled_mat(sm, mm);
+            check(container.get_hr_samples().size() == 48,
+                (std::string(tag) + ": payload parsed").c_str());
+        }
+        CSencryption::params = AUTO_PARAM;
+        size_t admitted = 0;
+        CsPhotoUpscalerOptions no_up;
+        const int decrypt_rc = decrypt_image::decrypt_image_tiled(
+            encrypted, output_path, password, 1, 8, 3, 2, 0.01f, false, 0.0f,
+            false, CS_SOLVER_FISTA, 0, 2, CS_BASIS_DCT, 2.0f, no_up,
+            false, false, 0.0f, false, &admitted);
+        check(decrypt_rc == 0, (std::string(tag) + ": decrypt").c_str());
+        const cv::Mat decoded = cv::imread(output_path, cv::IMREAD_COLOR);
+        check(!decoded.empty(), (std::string(tag) + ": output readable").c_str());
+        if (!decoded.empty() && decoded.size() == original.size()) {
+            cv::Mat dec_ycc;
+            cv::cvtColor(decoded, dec_ycc, cv::COLOR_BGR2YCrCb);
+            std::vector<cv::Mat> dec_chs;
+            cv::split(dec_ycc, dec_chs);
+            // Admitted anchors land within conversion noise; gamut-clipped
+            // ones are reverted by construction, so the drift-free count
+            // must match the decrypt-reported admitted count exactly.
+            int clean = 0, worst = 0;
+            for (const CsHrSample& s : container.get_hr_samples()) {
+                if (s.idx >= (uint32_t)(decoded.cols * decoded.rows)) continue;
+                const int v = dec_chs[0].at<uint8_t>(s.idx / decoded.cols, s.idx % decoded.cols);
+                const int d = std::abs(v - (int)s.y);
+                worst = (std::max)(worst, d);
+                if (d <= 1) ++clean;
+            }
+            std::printf("       %s anchors admitted: %d/%d, worst drift: %d\n",
+                tag, clean, (int)container.get_hr_samples().size(), worst);
+            check(admitted > 0 && clean == (int)admitted,
+                (std::string(tag) + ": anchors exact on output").c_str());
+        }
+        std::remove(output_path.c_str());
+    }
+    // Prototype scope guard: non-uniform sampling refuses the payload.
+    {
+        cv::Mat enc_bad;
+        check(encrypt_image::encrypt_image_tiled(
+            input_path, "", password, 0.5f, 64, &enc_bad,
+            true, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f,
+            false, false, 8, 0, 0, false, false, "", 48) != 0,
+            "hr-detail: adaptive combination refused");
+    }
+    std::remove(input_path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// HR anchors inside the CS-SR solve (--hr-weight): exact-HR data terms pull
+// anchor pixels AND their neighborhoods, beyond post-hoc replacement.
+// ---------------------------------------------------------------------------
+static double hr_anchor_mean_err(const cv::Mat& hr_bgr, const cv::Mat& truth_gray,
+    const std::vector<CsHrSample>& anchors, int stride, bool centers_only) {
+    cv::Mat ycc;
+    cv::cvtColor(hr_bgr, ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> chs;
+    cv::split(ycc, chs);
+    double sum = 0.0;
+    int cnt = 0;
+    const int W = chs[0].cols, H = chs[0].rows;
+    for (const CsHrSample& s : anchors) {
+        const int gx = (int)(s.idx % (uint32_t)stride);
+        const int gy = (int)(s.idx / (uint32_t)stride);
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                if (centers_only && (dx != 0 || dy != 0)) continue;
+                if (!centers_only && dx == 0 && dy == 0) continue;
+                const int x = gx + dx, y = gy + dy;
+                if (x < 0 || y < 0 || x >= W || y >= H) continue;
+                if (x >= truth_gray.cols || y >= truth_gray.rows) continue;
+                sum += std::abs((int)chs[0].at<uint8_t>(y, x) -
+                    (int)truth_gray.at<uint8_t>(y, x));
+                ++cnt;
+            }
+        }
+    }
+    return cnt > 0 ? sum / cnt : 0.0;
+}
+
+void test_hr_sr_anchors() {
+    // Same synthetic rig as test_cs_super_resolution: true 80x80 HR,
+    // 40x40 measured LR, biased solve, full-grid packed container.
+    const cv::Mat original = make_test_image(80, 80);
+    cv::Mat measured, solved;
+    cv::resize(original, measured, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+    cv::add(measured, cv::Scalar(8, 8, 8), solved);
+    const int m = measured.rows * measured.cols;
+    cv::Mat packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+    std::vector<int> rx, ry;
+    rx.reserve(m); ry.reserve(m);
+    for (int row = 0; row < measured.rows; ++row)
+        for (int col = 0; col < measured.cols; ++col) {
+            rx.push_back(row); ry.push_back(col);
+            packed.at<cv::Vec3b>(CS_HEADER_PIXELS + row * measured.cols + col) =
+                measured.at<cv::Vec3b>(row, col);
+        }
+    cv::Mat orig_gray;
+    cv::cvtColor(original, orig_gray, cv::COLOR_BGR2GRAY);
+    // True-HR anchors at spread positions, plus one out-of-tile anchor
+    // (exercises the skip path).
+    const int pts[8][2] = {{10,10},{30,12},{55,20},{70,33},{15,45},{40,60},{62,70},{25,25}};
+    std::vector<CsHrSample> anchors;
+    for (int k = 0; k < 8; ++k) {
+        CsHrSample s;
+        s.idx = (uint32_t)(pts[k][1] * 80 + pts[k][0]);
+        s.y = orig_gray.at<uint8_t>(pts[k][1], pts[k][0]);
+        anchors.push_back(s);
+    }
+    anchors.push_back({(uint32_t)(200 * 80 + 200), 128});
+    CsHrSrCtx ctx;
+    ctx.anchors = &anchors;
+    ctx.stride = 80;
+    ctx.ox = 0; ctx.oy = 0;
+    ctx.weight = 1.0f;
+
+    cv::Mat plain, anchored;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, plain);
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, anchored, 0.0f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, ctx);
+    check(anchored.size() == original.size() && anchored.type() == CV_8UC3,
+        "hr-sr: anchored solve keeps 2x geometry and color type");
+    // Empty anchors: bit-identical to the unanchored call.
+    CsHrSrCtx empty;
+    cv::Mat nohr;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, nohr, 0.0f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, empty);
+    check(cv::norm(nohr, plain, cv::NORM_INF) == 0,
+        "hr-sr: empty anchors are bit-identical to plain");
+    // Weight 0: likewise identical (post-hoc replacement only).
+    CsHrSrCtx zero = ctx;
+    zero.weight = 0.0f;
+    cv::Mat zerow;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, zerow, 0.0f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, zero);
+    check(cv::norm(zerow, plain, cv::NORM_INF) == 0,
+        "hr-sr: zero weight is bit-identical to plain");
+    // Same tile-local mapping framed in a larger canvas (stride 160,
+    // origin 40,40): bit-identical output proves origin/stride plumbing.
+    std::vector<CsHrSample> reframed;
+    for (const CsHrSample& s : anchors) {
+        const int gx = (int)(s.idx % 80u), gy = (int)(s.idx / 80u);
+        CsHrSample r;
+        r.idx = (uint32_t)((gy + 40) * 160 + (gx + 40));
+        r.y = s.y;
+        reframed.push_back(r);
+    }
+    CsHrSrCtx ctx2;
+    ctx2.anchors = &reframed;
+    ctx2.stride = 160;
+    ctx2.ox = 40; ctx2.oy = 40;
+    ctx2.weight = 1.0f;
+    cv::Mat refr;
+    cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+        8, 2, 0, CS_BASIS_DCT, 2.0f, refr, 0.0f, "nlmeans",
+        CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, ctx2);
+    check(cv::norm(refr, anchored, cv::NORM_INF) == 0,
+        "hr-sr: reframed anchors are bit-identical");
+    // The actual claim: anchors AND their neighborhoods improve.
+    if (!anchored.empty() && !plain.empty()) {
+        const double plain_c = hr_anchor_mean_err(plain, orig_gray, anchors, 80, true);
+        const double anchored_c = hr_anchor_mean_err(anchored, orig_gray, anchors, 80, true);
+        const double plain_n = hr_anchor_mean_err(plain, orig_gray, anchors, 80, false);
+        const double anchored_n = hr_anchor_mean_err(anchored, orig_gray, anchors, 80, false);
+        std::printf("       hr-sr center err: %.3f -> %.3f, neighbor err: %.3f -> %.3f\n",
+            plain_c, anchored_c, plain_n, anchored_n);
+        check(anchored_c < plain_c, "hr-sr: anchor pixels improve in-solve");
+        check(anchored_n < plain_n, "hr-sr: anchor neighborhoods improve in-solve");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edge-region scores (compare/reporting): truth-defined top-10% gradient
+// mask with PSNR/MAE over masked pixels. Deterministic, no quality module.
+// ---------------------------------------------------------------------------
+void test_edge_scores() {
+    const cv::Mat img = make_test_image(96, 64);
+    double p = -2.0, mae = -2.0, share = -2.0;
+    cs_quality::edge_scores(img, img, p, mae, share);
+    check(p == 99.0 && mae == 0.0, "edge-scores: identical images score 99/0");
+    check(share > 0.05 && share < 0.2, "edge-scores: mask share near 10%");
+    cv::Mat shifted;
+    cv::Canny(img, shifted, 50, 150);
+    cv::cvtColor(shifted, shifted, cv::COLOR_GRAY2BGR);
+    double p2 = -2.0, mae2 = -2.0, share2 = -2.0;
+    cs_quality::edge_scores(img, shifted, p2, mae2, share2);
+    check(p2 >= 0.0 && p2 < 99.0 && mae2 > 0.0, "edge-scores: degraded image finite");
+    check(share2 == share, "edge-scores: mask depends on original only");
+    cv::Mat small;
+    cv::resize(img, small, cv::Size(48, 32));
+    double p3 = -2.0, mae3 = -2.0, share3 = -2.0;
+    cs_quality::edge_scores(img, small, p3, mae3, share3);
+    check(p3 < 0.0 && mae3 < 0.0 && share3 == 0.0, "edge-scores: size mismatch rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Anchor-weighted RED (--hr-red-radius): the RED-lite blend scales per
+// pixel from 0 at anchor pixels to full far away, instead of uniform.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// LOD contrast exponent (--adaptive-gamma): reshapes shipped detail bytes
+// past what strength 1.0 + floor 0 can express, with no format change.
+// ---------------------------------------------------------------------------
+void test_adaptive_gamma() {
+    const std::vector<uint8_t> lod = { 0, 32, 128, 200, 255 };
+    std::vector<uint8_t> id = lod;
+    cs_apply_lod_gamma(id, 32, 1.0);
+    check(id == lod, "adaptive gamma: 1.0 is identity");
+    std::vector<uint8_t> empty;
+    cs_apply_lod_gamma(empty, 32, 2.0);
+    check(empty.empty(), "adaptive gamma: empty stays empty");
+    cs_apply_lod_gamma(id, 32, 0.0);
+    check(id == lod, "adaptive gamma: non-positive gamma is a no-op");
+    cs_apply_lod_gamma(id, 32, -2.0);
+    check(id == lod, "adaptive gamma: negative gamma is a no-op");
+    std::vector<uint8_t> deg = { 10, 200, 255 };
+    cs_apply_lod_gamma(deg, 255, 2.0);
+    check((deg == std::vector<uint8_t>{ 10, 200, 255 }),
+        "adaptive gamma: degenerate floor leaves bytes untouched");
+    // gamma 2 with floor 32: fixed points hold, mids pushed down.
+    // (128-32)/223 = 0.4305^2 * 223 = 41.3 -> 73;
+    // (200-32)/223 = 0.7534^2 * 223 = 126.6 -> 159.
+    std::vector<uint8_t> g = lod;
+    cs_apply_lod_gamma(g, 32, 2.0);
+    check(g[0] == 0 && g[1] == 32 && g[4] == 255,
+        "adaptive gamma: sub-floor preserved, floor/ceiling fixed");
+    check(g[2] == 73 && g[3] == 159, "adaptive gamma: gamma 2 value check");
+    // gamma < 1 flattens: mids rise (sqrt(0.4305) * 223 = 146.3 -> 178).
+    std::vector<uint8_t> f = lod;
+    cs_apply_lod_gamma(f, 32, 0.5);
+    check(f[2] == 178 && f[2] > lod[2], "adaptive gamma: gamma 0.5 lifts mids");
+    // monotonicity preserved on a spread ramp at high gamma.
+    std::vector<uint8_t> ramp;
+    for (int v = 0; v < 256; v += 7) ramp.push_back((uint8_t)v);
+    cs_apply_lod_gamma(ramp, 0, 4.0);
+    check(std::is_sorted(ramp.begin(), ramp.end()),
+        "adaptive gamma: monotonicity preserved at gamma 4");
+    // end effect: gamma concentrates the budget on the top tile by pushing
+    // mid-detail down (extremes barely move relative to the floor, so the
+    // discriminating case has a mid tile: {lo, mid, lo, hi}, floor 10).
+    const std::vector<uint8_t> lod2 = { 10, 130, 10, 250 };
+    const auto plain_counts = cs_compute_tile_sample_counts(lod2, 400, 64, 64, 32, 1);
+    std::vector<uint8_t> sharp = lod2;
+    cs_apply_lod_gamma(sharp, 10, 3.0);
+    const auto sharp_counts = cs_compute_tile_sample_counts(sharp, 400, 64, 64, 32, 1);
+    check(sharp_counts[1] < plain_counts[1] &&
+        sharp_counts[3] > plain_counts[3],
+        "adaptive gamma: gamma 3 starves mid tile, feeds top tile");
+}
+
+// ---------------------------------------------------------------------------
+// Hard LOD cutoff (--adaptive-cutoff): tiles below the cutoff get zero
+// samples; survivors absorb the budget (fail-soft when they saturate).
+// ---------------------------------------------------------------------------
+void test_adaptive_cutoff() {
+    const std::vector<uint8_t> lod2 = { 10, 130, 10, 250 };
+    const auto nocut = cs_compute_tile_sample_counts(lod2, 400, 64, 64, 32, 1);
+    const auto cut = cs_compute_tile_sample_counts(lod2, 400, 64, 64, 32, 1, 0, 200);
+    check(cut[0] == 0 && cut[1] == 0 && cut[2] == 0 && cut[3] == 400,
+        "adaptive cutoff: sub-cutoff tiles get zero, survivor absorbs");
+    long long sum = 0;
+    for (int c : cut) sum += c;
+    check(sum == 400, "adaptive cutoff: total preserved when survivors fit");
+    const auto allcut = cs_compute_tile_sample_counts(lod2, 400, 64, 64, 32, 1, 0, 255);
+    check(std::all_of(allcut.begin(), allcut.end(), [](int v) { return v == 0; }),
+        "adaptive cutoff: cutoff above max zeroes everything");
+    const auto def = cs_compute_tile_sample_counts(lod2, 400, 64, 64, 32, 1, 0);
+    check(def == nocut, "adaptive cutoff: default 0 is bit-identical to legacy call");
+    // cutoff wins over --lod-full on overlap (tile lod 130 qualifies at
+    // threshold 100 but is cut at 200; tile 250 takes its capacity).
+    const auto cf = cs_compute_tile_sample_counts(lod2, 2000, 64, 64, 32, 1, 100, 200);
+    check(cf[1] == 0 && cf[3] == 1024,
+        "adaptive cutoff: cutoff wins over lod-full on overlap");
+    // container roundtrip: cutoff holds fewer measurements, decrypts fine.
+    const std::string input_path = ".cs_test_cutoff_in.png";
+    const std::string output_path = ".cs_test_cutoff_out.png";
+    const std::string password = "adaptive-cutoff-password";
+    const cv::Mat original = make_test_image(160, 120);
+    check(cv::imwrite(input_path, original), "adaptive cutoff: write source image");
+    cv::Mat enc_cut, enc_plain;
+    const int enc_cut_rc = encrypt_image::encrypt_image_tiled(
+        input_path, "", password, 0.5f, 32, &enc_cut,
+        true, 0, 1.0f, false, false, false, 0.05f, "", 0.5f, 0.0f,
+        false, false, 8, 0, 0, false, false, "", 0, 1.0f, 100);
+    check(enc_cut_rc == 0, "adaptive cutoff: encrypt with cutoff");
+    const int enc_plain_rc = encrypt_image::encrypt_image_tiled(
+        input_path, "", password, 0.5f, 32, &enc_plain,
+        true, 0, 1.0f, false, false, false, 0.05f, "", 0.5f, 0.0f,
+        false, false, 8, 0, 0, false, false, "", 0, 1.0f, 0);
+    check(enc_plain_rc == 0, "adaptive cutoff: encrypt without cutoff");
+    if (enc_cut_rc == 0 && enc_plain_rc == 0) {
+        decrypt_image cont_cut(enc_cut, password);
+        decrypt_image cont_plain(enc_plain, password);
+        check(cont_cut.get_sampling_mode() == CS_MODE_ADAPTIVE,
+            "adaptive cutoff: mode header");
+        cv::Mat sm1, mm1, sm2, mm2;
+        cont_cut.get_sampled_mat(sm1, mm1);
+        cont_plain.get_sampled_mat(sm2, mm2);
+        const int n_cut = cv::countNonZero(mm1.reshape(1)) / 3;
+        const int n_plain = cv::countNonZero(mm2.reshape(1)) / 3;
+        std::printf("       adaptive cutoff samples: %d vs %d without\n", n_cut, n_plain);
+        check(n_cut < n_plain && n_cut > 0,
+            "adaptive cutoff: fewer measurements, none lost entirely");
+        CSencryption::params = AUTO_PARAM;
+        const int decrypt_rc = decrypt_image::decrypt_image_tiled(
+            enc_cut, output_path, password, 1, 8, 3, 2, 0.01f, false);
+        check(decrypt_rc == 0, "adaptive cutoff: decrypt");
+        const cv::Mat decoded = cv::imread(output_path, cv::IMREAD_COLOR);
+        check(!decoded.empty(), "adaptive cutoff: output readable");
+        std::remove(output_path.c_str());
+    }
+    // validation: cutoff without an adaptive path is refused.
+    {
+        cv::Mat enc_bad;
+        check(encrypt_image::encrypt_image_tiled(
+            input_path, "", password, 0.5f, 0, &enc_bad,
+            false, 0, 1.0f, false, false, false, 0.05f, "", 0.5f, 0.0f,
+            false, false, 8, 0, 0, false, false, "", 0, 1.0f, 100) != 0,
+            "adaptive cutoff: uniform combination refused");
+    }
+    std::remove(input_path.c_str());
+}
+
+void test_anchor_weighted_red() {
+    // Map unit pins: exact distance falloff on a 16x16 tile.
+    {
+        const std::vector<int> idx = { 5 * 16 + 5 };
+        const cv::Mat map = cs_hr_red_map(16, 16, idx, 4.0f);
+        check(!map.empty() && map.type() == CV_32F && map.size() == cv::Size(16, 16),
+            "hr-red: map geometry and type");
+        bool center_zero = false, far_full = false, monotone = true;
+        float prev = -1.0f;
+        if (!map.empty()) {
+            center_zero = (map.at<float>(5, 5) == 0.0f);
+            far_full = (map.at<float>(15, 15) > 0.99f);
+            for (int x = 5; x < 16; ++x) {
+                const float v = map.at<float>(5, x);
+                if (v < prev || v < 0.0f || v > 1.0f) { monotone = false; break; }
+                prev = v;
+            }
+        }
+        check(center_zero, "hr-red: zero factor at anchor pixels");
+        check(far_full, "hr-red: full factor far from anchors");
+        check(monotone, "hr-red: factor rises monotonically with distance");
+        check(cs_hr_red_map(16, 16, {}, 4.0f).empty(),
+            "hr-red: no anchors means uniform (empty map)");
+        check(cs_hr_red_map(16, 16, idx, 0.0f).empty(),
+            "hr-red: zero radius means uniform (empty map)");
+        check(cs_hr_red_map(16, 16, { 99999 }, 4.0f).empty(),
+            "hr-red: out-of-tile anchors mean uniform (empty map)");
+        check(cs_hr_red_map(0, 16, idx, 4.0f).empty(),
+            "hr-red: degenerate geometry means uniform (empty map)");
+    }
+    // Solve level on the synthetic rig: modulated RED differs from uniform
+    // RED, while no-anchors/radius-0 stay bit-identical to uniform.
+    {
+        const cv::Mat original = make_test_image(80, 80);
+        cv::Mat measured, solved;
+        cv::resize(original, measured, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
+        cv::add(measured, cv::Scalar(8, 8, 8), solved);
+        const int m = measured.rows * measured.cols;
+        cv::Mat packed(CS_HEADER_PIXELS + m, 1, CV_8UC3, cv::Scalar(0, 0, 0));
+        std::vector<int> rx, ry;
+        rx.reserve(m); ry.reserve(m);
+        for (int row = 0; row < measured.rows; ++row)
+            for (int col = 0; col < measured.cols; ++col) {
+                rx.push_back(row); ry.push_back(col);
+                packed.at<cv::Vec3b>(CS_HEADER_PIXELS + row * measured.cols + col) =
+                    measured.at<cv::Vec3b>(row, col);
+            }
+        cv::Mat orig_gray;
+        cv::cvtColor(original, orig_gray, cv::COLOR_BGR2GRAY);
+        const int pts[8][2] = {{10,10},{30,12},{55,20},{70,33},{15,45},{40,60},{62,70},{25,25}};
+        std::vector<CsHrSample> anchors;
+        for (int k = 0; k < 8; ++k) {
+            CsHrSample s;
+            s.idx = (uint32_t)(pts[k][1] * 80 + pts[k][0]);
+            s.y = orig_gray.at<uint8_t>(pts[k][1], pts[k][0]);
+            anchors.push_back(s);
+        }
+        cv::Mat uniform, modulated;
+        cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+            8, 2, 0, CS_BASIS_DCT, 2.0f, uniform, 0.5f);
+        CsHrSrCtx ctx;
+        ctx.anchors = &anchors;
+        ctx.stride = 80;
+        ctx.weight = 0.0f; // isolate RED modulation from the data term
+        ctx.red_radius = 8.0f;
+        cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+            8, 2, 0, CS_BASIS_DCT, 2.0f, modulated, 0.5f, "nlmeans",
+            CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, ctx);
+        check(modulated.size() == original.size() && modulated.type() == CV_8UC3,
+            "hr-red: modulated solve keeps 2x geometry and color type");
+        if (!modulated.empty() && !uniform.empty()) {
+            check(cv::norm(modulated, uniform, cv::NORM_INF) != 0,
+                "hr-red: modulation changes the RED solve");
+        }
+        CsHrSrCtx noanchors;
+        noanchors.red_radius = 8.0f;
+        cv::Mat norad;
+        cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+            8, 2, 0, CS_BASIS_DCT, 2.0f, norad, 0.5f, "nlmeans",
+            CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, noanchors);
+        check(cv::norm(norad, uniform, cv::NORM_INF) == 0,
+            "hr-red: no anchors stays bit-identical to uniform RED");
+        CsHrSrCtx zerorad = ctx;
+        zerorad.red_radius = 0.0f;
+        cv::Mat zrad;
+        cs_sr_upscale_tile_2x(solved, packed, rx, ry, 0.018f, 0.0f,
+            8, 2, 0, CS_BASIS_DCT, 2.0f, zrad, 0.5f, "nlmeans",
+            CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, zerorad);
+        check(cv::norm(zrad, uniform, cv::NORM_INF) == 0,
+            "hr-red: zero radius stays bit-identical to uniform RED");
+    }
+}
+
 void test_hf_focus_roundtrip() {
     const std::string input_path = ".cs_test_hf_input.png";
     const std::string output_path = ".cs_test_hf_output.png";
@@ -3075,6 +3606,12 @@ int main(int argc, char* argv[]) {
     test_onnx_denoisers();
     test_onsager();
     test_hf_focus_roundtrip();
+    test_adaptive_gamma();
+    test_adaptive_cutoff();
+    test_anchor_weighted_red();
+    test_edge_scores();
+    test_hr_detail();
+    test_hr_sr_anchors();
     test_hf_weighted_spread();
     test_adaptive_tile_grid_limit();
     test_sample_bits();
