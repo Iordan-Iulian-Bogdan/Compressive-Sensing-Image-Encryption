@@ -4,16 +4,19 @@
 #include "image_preview.hpp"
 #include "cs_gpu.h"
 #include "cs_dict.hpp"
+#include "cs_wavelet.hpp"
 #include "avir.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <cctype>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <utility>
 #include <algorithm>
 #include <thread>
@@ -21,6 +24,19 @@
 #include <omp.h>
 
 namespace {
+// Per-tile solver settings for the single-stage segment solve (majority
+// vote per tile). Defined up here so both wavefront solvers can take an
+// optional per-tile grid; vote resolution lives further below.
+struct CsSegClassParams {
+    int iterations = 5;
+    float coef = 0.01f;
+    float tv = 0.0f;
+    int solver = 0;
+    int fista_iters = 0;
+    int reweights = 2;
+    int basis = 0;
+    float wscale = 2.0f;
+};
 // Opt-in phase profiler for decrypt_image_tiled: set CS_PROFILE=1 to print
 // one "profile[...]" line per call on stderr with phase=milliseconds since
 // the previous mark. When off, overhead is a handful of clock reads.
@@ -212,7 +228,8 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
         if (labels.rows != rows || labels.cols != cols) {
             cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
         }
-        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key);
+        seg_rates_q = pre.rates_q;
+        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
         if ((int)ri_x.size() != m) {
             throw std::runtime_error("seg-mask container: count mismatch");
         }
@@ -364,7 +381,8 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         if (labels.rows != rows || labels.cols != cols) {
             cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
         }
-        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key);
+        seg_rates_q = pre.rates_q;
+        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
         if ((int)ri_x.size() != m) {
             throw std::runtime_error("seg-mask container: count mismatch");
         }
@@ -665,7 +683,8 @@ static void build_neighbor_warm_start(cv::Mat refs[3],
 void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, std::vector<std::vector<indices>> indices,
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
     int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x, float sr_red, const cs_coupled_dict* sr_dict, const std::string& sr_red_denoiser, const std::string& sr_dncnn_model,     const std::string& sr_fsrcnn_model, bool sr_direct_2x, bool sr_cascade, float grain_tv, bool use_onsager,
-    const std::string& red_model, float red_decay, bool sr_dip_2x, const CsHrSrCtx& hr_sr) {
+    const std::string& red_model, float red_decay, bool sr_dip_2x, const CsHrSrCtx& hr_sr,
+    const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -723,9 +742,21 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 const int i = i_lo + t;
                 const int j = w - i;
 
+                if (mats_in[i][j].empty()) continue;
+                // Single-stage segment solve: this tile's class params win;
+                // without them the global solve settings apply (bit-identical).
+                const CsSegClassParams* STP = seg_tile_params ? &(*seg_tile_params)[i][j] : nullptr;
+                const int t_iterations = STP ? STP->iterations : iterations;
+                const float t_coef_base = STP ? STP->coef : coef;
+                const float t_tv_base = STP ? STP->tv : tv;
+                const int t_solver = STP ? STP->solver : solver;
+                const int t_fista_iters = STP ? STP->fista_iters : fista_iters;
+                const int t_reweights = STP ? STP->reweights : reweights;
+                const int t_basis = STP ? STP->basis : basis;
+                const float t_wscale = STP ? STP->wscale : wscale;
                 auto sp_a = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, false, false, basis, thumbnail_seed);
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, false, false, t_basis, thumbnail_seed);
                 auto sp_b = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 if (sp) g_solveprof.warm_ns += cs_solveprof_ns_since(sp_a);
 
@@ -736,12 +767,12 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 // starved tiles solve under a stronger prior, rich tiles relaxed
                 // (tv follows the same law under its own flag; base tv 0 stays 0)
                 const float tile_coef = per_tile_coef
-                    ? cs_per_tile_coef(coef, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
-                    : coef;
+                    ? cs_per_tile_coef(t_coef_base, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
+                    : t_coef_base;
                 const float tile_tv = per_tile_tv
-                    ? cs_per_tile_coef(tv, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
-                    : tv;
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, iterations, tile_coef, mats_out[i][j], tile_tv, solver, fista_iters, reweights, basis, wscale, use_onsager);
+                    ? cs_per_tile_coef(t_tv_base, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
+                    : t_tv_base;
+                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, t_iterations, tile_coef, mats_out[i][j], tile_tv, t_solver, t_fista_iters, t_reweights, t_basis, t_wscale, use_onsager);
                 if (sp) { g_solveprof.call_ns += cs_solveprof_ns_since(sp_c); g_solveprof.tiles += 1; }
                 // grain-adaptive per-tile TV (--grain-tv): tiles whose
                 // measured noise exceeds the reference get a luma ROF
@@ -788,8 +819,8 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                         // (no LR-solve warm start in the coefficients).
                         cs_sr_direct_upscale_tile_2x(mats_out[i][j], mats_in[i][j],
                             indices[i][j].ri_x_g, indices[i][j].ri_y_g,
-                            tile_coef, tile_tv, iterations, reweights, fista_iters,
-                            basis, wscale, hr, sr_cascade);
+                            tile_coef, tile_tv, t_iterations, t_reweights, t_fista_iters,
+                            t_basis, t_wscale, hr, sr_cascade);
                     }
                     else if (superres_2x) {
                         // Tile-mapped HR anchors join the solve (neighborhood
@@ -800,8 +831,8 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                         tile_hr.oy = coordinates[i][j].y * 2;
                         cs_sr_upscale_tile_2x(mats_out[i][j], mats_in[i][j],
                             indices[i][j].ri_x_g, indices[i][j].ri_y_g,
-                            tile_coef, tile_tv, iterations, reweights, fista_iters,
-                            basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
+                            tile_coef, tile_tv, t_iterations, t_reweights, t_fista_iters,
+                            t_basis, t_wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
                             sr_cascade, red_model, red_decay, tile_hr);
                     }
                     else if (sr_dip_2x) {
@@ -821,6 +852,12 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                     else if (!hr.empty()) {
                         hr.copyTo((*hr_out)[i][j]);
                     }
+                }
+                else if (hr_out && hr_grid_mutex && !pipe && !fuse_upscale) {
+                    // Publish an immutable completed LR tile for preview;
+                    // never let the UI read a tile being solved in place.
+                    std::lock_guard<std::mutex> lk(*hr_grid_mutex);
+                    (*hr_out)[i][j] = mats_out[i][j].clone();
                 }
             }
             catch (const std::exception& e) {
@@ -871,15 +908,19 @@ static void decrypt_tiles_ycc420(int num_threads,
     const std::string& sr_dncnn_model = CS_DNCNN_DEFAULT_MODEL,
     bool sr_direct_2x = false, bool sr_cascade = false,
     const std::string& red_model = "", float red_decay = 1.0f,
-    bool sr_dip_2x = false, const CsHrSrCtx& hr_sr = CsHrSrCtx()) {
+    bool sr_dip_2x = false, const CsHrSrCtx& hr_sr = CsHrSrCtx(),
+    int chroma_iterations = -1, float chroma_coef = -1.0f,
+    const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr) {
 
     if (y_confidence > 0.0f && basis != CS_BASIS_DCT)
         std::cerr << "Note: --y-confidence requires --basis dct; ignoring for wavelet" << std::endl;
 
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
     const int iters_off = iterations / 2;
-    const int iters_c = iterations - iters_off;
-    const float coef_c = coef * 0.5f;
+    // Optional chroma settings; segment solves use their own class settings.
+    const int chroma_it = chroma_iterations >= 0 ? chroma_iterations : iterations;
+    const int iters_c = chroma_it - chroma_it / 2;
+    const float coef_c = (chroma_coef >= 0.0f ? chroma_coef : coef) * 0.5f;
     // joint group-sparsity needs one shared RGB grid; the per-plane calls
     // below are per-channel FISTA either way, so no dispatch is needed.
 
@@ -926,8 +967,23 @@ static void decrypt_tiles_ycc420(int num_threads,
                 const int j = w - i;
                 if (y_meas[i][j].empty()) continue;
 
+                const CsSegClassParams* STP = seg_tile_params ? &(*seg_tile_params)[i][j] : nullptr;
+                const int t_iterations = STP ? STP->iterations : iterations;
+                const float t_coef_base = STP ? STP->coef : coef;
+                const float t_tv_base = STP ? STP->tv : tv;
+                const int t_solver = STP ? STP->solver : solver;
+                const int t_fista_iters = STP ? STP->fista_iters : fista_iters;
+                const int t_reweights = STP ? STP->reweights : reweights;
+                const int t_basis = STP ? STP->basis : basis;
+                const float t_wscale = STP ? STP->wscale : wscale;
+                // Chroma follows the tile's class params (same convention as
+                // the per-class passes); otherwise the pinned/global settings.
+                const int t_chroma_it = STP ? STP->iterations : chroma_it;
+                const int t_iters_c = t_chroma_it - t_chroma_it / 2;
+                const float t_coef_c = (STP ? STP->coef : (chroma_coef >= 0.0f ? chroma_coef : coef)) * 0.5f;
+
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, basis, thumbnail_seed, chroma_sub_v);
+                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, t_basis, thumbnail_seed, chroma_sub_v);
 
                 const int Th = mats_out[i][j].rows;
                 const int Tw = mats_out[i][j].cols;
@@ -944,7 +1000,7 @@ static void decrypt_tiles_ycc420(int num_threads,
                     if (x0[c].empty() || x0[c].size() != coarse_want) {
                         if (x0[c].empty()) {
                             x0[c] = cv::Mat(coarse_want, CV_32F, cv::Scalar(0.5f));
-                            if (basis == CS_BASIS_CDF97) {
+                            if (t_basis == CS_BASIS_CDF97) {
                                 cs_dwt_forward((float*)x0[c].data, cTh, cTw,
                                     cs_dwt_levels(cTh, cTw));
                             } else {
@@ -961,11 +1017,11 @@ static void decrypt_tiles_ycc420(int num_threads,
                 // luma-only per-tile scaling (chroma draws stay uniform, so
                 // coef_c is untouched; tv follows under its own flag)
                 const float tile_coef_y = per_tile_coef
-                    ? cs_per_tile_coef(coef, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
-                    : coef;
+                    ? cs_per_tile_coef(t_coef_base, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
+                    : t_coef_base;
                 const float tile_tv_y = per_tile_tv
-                    ? cs_per_tile_coef(tv, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
-                    : tv;
+                    ? cs_per_tile_coef(t_tv_base, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
+                    : t_tv_base;
                 // FISTA-only (joint degrades to per-channel FISTA at the
                 // dispatcher): luma at full tile resolution, chroma natively
                 // on the half-resolution grid, where proximal updates are
@@ -973,7 +1029,7 @@ static void decrypt_tiles_ycc420(int num_threads,
                 auto solve_plane = [&](const cv::Mat& meas, float c, int R, int C,
                     const std::vector<int>& rx, const std::vector<int>& ry,
                     int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t) {
-                    reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, reweights, fista_iters, basis, wscale, use_onsager);
+                    reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, t_reweights, t_fista_iters, t_basis, t_wscale, use_onsager);
                 };
                 // Solve high-TV first as the base, then low-TV from the same
                 // neighbour warm start (independent, not a continuation).
@@ -982,21 +1038,21 @@ static void decrypt_tiles_ycc420(int num_threads,
                 cv::Mat y_low = mixed ? x0[0].clone() : cv::Mat();
                 if (!y_low.empty())
                     solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                        y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations,
+                        y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, t_iterations,
                         x0[0], false, dummy, y_dual_tv);
                 cv::Mat& low = y_low.empty() ? x0[0] : y_low;
                 solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                    y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, iterations, low,
+                    y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, t_iterations, low,
                     false, dummy, tile_tv_y);
                 if (y_confidence > 0.0f)
                     cs_refine_y_confidence(y_meas[i][j], y_idx[i][j].ri_x_g,
                         y_idx[i][j].ri_y_g, low, y_confidence, tile_coef_y,
-                        tile_tv_y, iterations, fista_iters, basis, wscale);
-                solve_plane(cr_meas[i][j], coef_c, cTh, cTw,
-                    cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, iters_c, x0[1],
+                        tile_tv_y, t_iterations, t_fista_iters, t_basis, t_wscale);
+                solve_plane(cr_meas[i][j], t_coef_c, cTh, cTw,
+                    cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, t_iters_c, x0[1],
                     true, x0[2], 0.0f);
-                solve_plane(cb_meas[i][j], coef_c, cTh, cTw,
-                    cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, iters_c, x0[2],
+                solve_plane(cb_meas[i][j], t_coef_c, cTh, cTw,
+                    cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, t_iters_c, x0[2],
                     false, dummy, 0.0f);
 
                 cv::Mat cr_full, cb_full;
@@ -1050,8 +1106,8 @@ static void decrypt_tiles_ycc420(int num_threads,
                     else if (sr_direct_2x) {
                         cs_sr_direct_upscale_tile_2x(mats_out[i][j], y_meas[i][j],
                             y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g,
-                            tile_coef_y, tile_tv_y, iterations, reweights, fista_iters,
-                            basis, wscale, hr, sr_cascade);
+                            tile_coef_y, tile_tv_y, t_iterations, t_reweights, t_fista_iters,
+                            t_basis, t_wscale, hr, sr_cascade);
                     }
                     else if (superres_2x) {
                         CsHrSrCtx tile_hr = hr_sr;
@@ -1059,8 +1115,8 @@ static void decrypt_tiles_ycc420(int num_threads,
                         tile_hr.oy = coordinates[i][j].y * 2;
                         cs_sr_upscale_tile_2x(mats_out[i][j], y_meas[i][j],
                             y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g,
-                            tile_coef_y, tile_tv_y, iterations, reweights, fista_iters,
-                            basis, wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
+                            tile_coef_y, tile_tv_y, t_iterations, t_reweights, t_fista_iters,
+                            t_basis, t_wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
                             sr_cascade, red_model, red_decay, tile_hr);
                     }
                     else if (sr_dip_2x) {
@@ -1078,6 +1134,10 @@ static void decrypt_tiles_ycc420(int num_threads,
                     else if (!hr.empty()) {
                         hr.copyTo((*hr_out)[i][j]);
                     }
+                }
+                else if (hr_out && hr_grid_mutex && !pipe && !fuse_upscale) {
+                    std::lock_guard<std::mutex> lk(*hr_grid_mutex);
+                    (*hr_out)[i][j] = mats_out[i][j].clone();
                 }
             }
             catch (const std::exception& e) {
@@ -1112,10 +1172,415 @@ int decrypt_image::decrypt_image_tiled(
     bool per_tile_tv,
     float grain_tv,
     bool use_onsager,
-    const std::string& seg_solve_mask
+    const std::string& seg_solve_mask,
+    const std::string& seg_params
 ) {
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
-    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve_mask);
+    return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve_mask, seg_params);
+}
+
+// --seg-params per-class solver overrides ("cls:knob=value,...;...") ------
+// Knobs: iterations|coef|tv|solver|fista-iters|reweights|basis|wscale.
+// Everything is validated up front (fail fast before any solve); classes
+// without an entry inherit the global decrypt settings.
+struct CsSegOverride {
+    bool has_iterations = false;
+    bool has_coef = false;
+    bool has_tv = false;
+    bool has_solver = false;
+    bool has_fista_iters = false;
+    bool has_reweights = false;
+    bool has_basis = false;
+    bool has_wscale = false;
+    int iterations = 0;
+    float coef = 0.0f;
+    float tv = 0.0f;
+    int solver = 0;
+    int fista_iters = 0;
+    int reweights = 0;
+    int basis = 0;
+    float wscale = 0.0f;
+};
+
+static std::string cs_seg_trim(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace((unsigned char)s[b])) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+static int cs_seg_parse_int(const std::string& tok, const char* what) {
+    try {
+        size_t pos = 0;
+        const int v = std::stoi(tok, &pos);
+        if (pos != tok.size()) throw std::runtime_error("x");
+        return v;
+    }
+    catch (...) {
+        throw std::runtime_error(std::string("seg-params: bad integer for ") + what + " in '" + tok + "'");
+    }
+}
+
+static float cs_seg_parse_float(const std::string& tok, const char* what) {
+    try {
+        size_t pos = 0;
+        const float v = std::stof(tok, &pos);
+        if (pos != tok.size()) throw std::runtime_error("x");
+        return v;
+    }
+    catch (...) {
+        throw std::runtime_error(std::string("seg-params: bad number for ") + what + " in '" + tok + "'");
+    }
+}
+
+static std::map<int, CsSegOverride> cs_seg_parse_spec(const std::string& spec) {
+    std::map<int, CsSegOverride> out;
+    size_t p = 0;
+    while (true) {
+        const size_t q = spec.find(';', p);
+        const std::string entry = cs_seg_trim((q == std::string::npos) ? spec.substr(p) : spec.substr(p, q - p));
+        if (!entry.empty()) {
+            const size_t c = entry.find(':');
+            if (c == std::string::npos) {
+                throw std::runtime_error("seg-params: entry without 'cls:' in '" + entry + "'");
+            }
+            const int cls = cs_seg_parse_int(cs_seg_trim(entry.substr(0, c)), "class id");
+            if (cls < 0 || cls > 255) {
+                throw std::runtime_error("seg-params: class id must be in [0, 255]");
+            }
+            CsSegOverride& o = out[cls];
+            size_t k = c + 1;
+            while (true) {
+                const size_t m = entry.find(',', k);
+                const std::string kv = cs_seg_trim((m == std::string::npos) ? entry.substr(k) : entry.substr(k, m - k));
+                if (kv.empty()) {
+                    throw std::runtime_error("seg-params: empty knob in '" + entry + "'");
+                }
+                const size_t e = kv.find('=');
+                if (e == std::string::npos) {
+                    throw std::runtime_error("seg-params: knob without '=' in '" + kv + "'");
+                }
+                const std::string knob = cs_seg_trim(kv.substr(0, e));
+                const std::string val = cs_seg_trim(kv.substr(e + 1));
+                if (knob == "iterations") {
+                    o.iterations = cs_seg_parse_int(val, "iterations");
+                    if (o.iterations < 1 || o.iterations > 50) throw std::runtime_error("seg-params: iterations must be in [1, 50]");
+                    o.has_iterations = true;
+                }
+                else if (knob == "coef") {
+                    o.coef = cs_seg_parse_float(val, "coef");
+                    if (!(o.coef > 0.0f)) throw std::runtime_error("seg-params: coef must be positive");
+                    o.has_coef = true;
+                }
+                else if (knob == "tv") {
+                    o.tv = cs_seg_parse_float(val, "tv");
+                    if (!(o.tv >= 0.0f)) throw std::runtime_error("seg-params: tv must be >= 0");
+                    o.has_tv = true;
+                }
+                else if (knob == "solver") {
+                    if (cs_solver_from_name(val, o.solver) != 0) throw std::runtime_error("seg-params: solver must be fista or joint");
+                    o.has_solver = true;
+                }
+                else if (knob == "fista-iters") {
+                    o.fista_iters = cs_seg_parse_int(val, "fista-iters");
+                    if (o.fista_iters < 0 || o.fista_iters > 500) throw std::runtime_error("seg-params: fista-iters must be in [0, 500]");
+                    o.has_fista_iters = true;
+                }
+                else if (knob == "reweights") {
+                    o.reweights = cs_seg_parse_int(val, "reweights");
+                    if (o.reweights < 1 || o.reweights > 5) throw std::runtime_error("seg-params: reweights must be in [1, 5]");
+                    o.has_reweights = true;
+                }
+                else if (knob == "basis") {
+                    if (cs_basis_from_name(val, o.basis) != 0) throw std::runtime_error("seg-params: basis must be dct or wavelet");
+                    o.has_basis = true;
+                }
+                else if (knob == "wscale") {
+                    o.wscale = cs_seg_parse_float(val, "wscale");
+                    if (!(o.wscale > 0.0f) || !(o.wscale <= 16.0f)) throw std::runtime_error("seg-params: wscale must be in (0, 16]");
+                    o.has_wscale = true;
+                }
+                else {
+                    throw std::runtime_error("seg-params: unknown knob '" + knob + "' (iterations|coef|tv|solver|fista-iters|reweights|basis|wscale)");
+                }
+                if (m == std::string::npos) break;
+                k = m + 1;
+            }
+        }
+        if (q == std::string::npos) break;
+        p = q + 1;
+    }
+    return out;
+}
+
+// Effective per-solve settings: globals with one class's overrides applied.
+// Retain every tile intersecting the segment, including mixed-label tiles.
+// The integral mask makes scheduling independent of measurement density.
+struct CsSegmentTiles {
+    cv::Mat segment, integral, support;
+    int kept = 0, boundary = 0, skipped = 0;
+    explicit CsSegmentTiles(const cv::Mat& mask) : segment(mask) {
+        if (!mask.empty()) {
+            cv::Mat binary;
+            mask.convertTo(binary, CV_8U, 1.0 / 255.0);
+            cv::integral(binary, integral, CV_64F);
+            support = cv::Mat::zeros(mask.size(), CV_8U);
+        }
+    }
+    bool retain(const cv::Rect& r) {
+        if (segment.empty()) return true;
+        const double count = integral.at<double>(r.y+r.height, r.x+r.width)
+            - integral.at<double>(r.y, r.x+r.width)
+            - integral.at<double>(r.y+r.height, r.x) + integral.at<double>(r.y,r.x);
+        if (count == 0) { ++skipped; return false; }
+        ++kept;
+        if (count < r.area()) ++boundary;
+        support(r).setTo(255);
+        return true;
+    }
+    cv::Mat weights(cv::Size size, int overlap) const {
+        if (segment.empty()) return {};
+        cv::Mat w, covered;
+        segment.convertTo(w, CV_32F, 1.0/255.0);
+        // Only a narrow boundary band mixes class candidates. Full-tile
+        // context is retained, but unsupported predictions never contribute.
+        if (overlap > 0)
+            cv::GaussianBlur(w, w, {}, (std::min)(8.0, overlap / 3.0), 0, cv::BORDER_REPLICATE);
+        if (w.size() != size) cv::resize(w, w, size, 0, 0, cv::INTER_LINEAR);
+        cv::resize(support, covered, size, 0, 0, cv::INTER_NEAREST);
+        w.setTo(0, covered == 0);
+        std::cout << "seg-tiles: kept=" << kept << " boundary=" << boundary
+                  << " skipped=" << skipped << std::endl;
+        return w;
+    }
+};
+
+struct CsSegmentComposite {
+    cv::Mat sum, weight, detail;
+    void add(const cv::Mat& canvas, const cv::Mat& w,
+        const cv::Mat& owner_mask, int overlap, double density) {
+        if (sum.empty()) {
+            sum = cv::Mat::zeros(canvas.size(), CV_32FC3);
+            weight = cv::Mat::zeros(canvas.size(), CV_32F);
+            detail = cv::Mat::zeros(canvas.size(), CV_32FC3);
+        }
+        if (canvas.size() != sum.size() || w.size() != sum.size())
+            throw std::runtime_error("segment composite: inconsistent canvas geometry");
+        cv::Mat f, w3, owner;
+        canvas.convertTo(f, CV_32FC3);
+        cv::resize(owner_mask, owner, canvas.size(), 0, 0, cv::INTER_NEAREST);
+        owner.convertTo(owner, CV_32F, 1.0 / 255.0);
+        if (overlap > 0 && density < 0.4) {
+            // Range weights follow actual image edges, not the approximate
+            // segmentation contour. This damps ringing without turning a
+            // slightly misregistered label into a new color discontinuity.
+            cv::Mat owned3, smooth, distance, gate;
+            cv::bilateralFilter(f, smooth, 13, 18.0, 4.0, cv::BORDER_REPLICATE);
+            cv::Mat binary;
+            owner.convertTo(binary, CV_8U, 255.0);
+            cv::distanceTransform(binary, distance, cv::DIST_L2, 3);
+            gate = 1.0f - distance / (float)overlap;
+            cv::max(gate, 0, gate);
+            cv::min(gate, 1, gate);
+            cv::multiply(gate, owner, gate);
+            cv::merge(std::vector<cv::Mat>{gate, gate, gate}, owned3);
+            cv::Mat correction;
+            cv::multiply(smooth - f, owned3, correction);
+            f += correction;
+        }
+        // Two-band reconciliation: only low frequencies are feathered.
+        // All high-frequency content (including the segment's denoising)
+        // stays with its original label. Normalize the blur by valid support
+        // so sparse class canvases cannot pull black pixels into the seam.
+        cv::Mat low;
+        if (overlap > 0) {
+            cv::Mat valid = (w > 0), valid_f, valid3, numerator, denominator;
+            valid.convertTo(valid_f, CV_32F, 1.0 / 255.0);
+            cv::merge(std::vector<cv::Mat>{valid_f, valid_f, valid_f}, valid3);
+            cv::multiply(f, valid3, numerator);
+            const double sigma = (std::min)(8.0, overlap / 3.0);
+            cv::GaussianBlur(numerator, numerator, {}, sigma, 0, cv::BORDER_REPLICATE);
+            cv::GaussianBlur(valid_f, denominator, {}, sigma, 0, cv::BORDER_REPLICATE);
+            cv::max(denominator, 1e-6, denominator);
+            cv::merge(std::vector<cv::Mat>{denominator, denominator, denominator}, valid3);
+            cv::divide(numerator, valid3, low);
+        } else low = f;
+        cv::Mat owner3, residual;
+        cv::merge(std::vector<cv::Mat>{owner, owner, owner}, owner3);
+        cv::multiply(f - low, owner3, residual);
+        detail += residual;
+        cv::merge(std::vector<cv::Mat>{w,w,w}, w3);
+        cv::Mat weighted_low;
+        cv::multiply(low, w3, weighted_low);
+        sum += weighted_low;
+        weight += w;
+    }
+    cv::Mat finish(bool partial = false) const {
+        if (sum.empty() || (!partial && cv::countNonZero(weight <= 0) != 0))
+            throw std::runtime_error("segment composite: uncovered pixels");
+        std::vector<cv::Mat> channels;
+        cv::split(sum, channels);
+        cv::Mat divisor;
+        cv::max(weight, 1e-12, divisor);
+        for (auto& c : channels) cv::divide(c, divisor, c);
+        cv::Mat out;
+        cv::merge(channels, out);
+        out += detail;
+        out.convertTo(out, CV_8UC3);
+        return out;
+    }
+};
+
+// Cheap single-image boundary calm for the single-stage solve: edge-aware
+// bilateral correction near low-density segment frontiers, no re-solves.
+// Range weights follow actual image edges rather than the approximate label
+// contour, so ringing is damped without baking a misregistered contour into
+// a new discontinuity. Strength fades to zero one overlap width inside the
+// class; dense segments pass through untouched.
+static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
+    const cv::Mat& sample_mask, const std::vector<int>& classes, int overlap) {
+    if (overlap <= 0 || img.empty() || seg_ids.empty() || sample_mask.empty()) return;
+    cv::Mat ids = seg_ids, mask = sample_mask;
+    if (ids.size() != img.size())
+        cv::resize(ids, ids, img.size(), 0, 0, cv::INTER_NEAREST);
+    if (mask.size() != img.size())
+        cv::resize(mask, mask, img.size(), 0, 0, cv::INTER_NEAREST);
+    cv::Mat chan;
+    if (mask.channels() == 1) chan = mask;
+    else cv::extractChannel(mask, chan, 0);
+    // Restrict the expensive bilateral to the union of low-density boundary
+    // bands (dilated by the filter radius): bands are a small fraction of
+    // the frame, so this is ~50x cheaper than full-frame filtering.
+    cv::Mat band_union = cv::Mat::zeros(ids.size(), CV_8U);
+    std::vector<cv::Mat> low_masks;
+    for (int c : classes) {
+        cv::Mat in_c = (ids == c);
+        const int area = cv::countNonZero(in_c);
+        if (area == 0) continue;
+        cv::Mat m;
+        cv::bitwise_and(chan, in_c, m);
+        if ((double)cv::countNonZero(m) / (double)area >= 0.4) continue;
+        low_masks.push_back(in_c);
+        cv::Mat dist;
+        cv::distanceTransform(in_c, dist, cv::DIST_L2, 3);
+        cv::bitwise_or(band_union, dist <= (float)overlap, band_union);
+    }
+    if (low_masks.empty()) return;
+    cv::Mat work_zone;
+    cv::dilate(band_union, work_zone, cv::getStructuringElement(cv::MORPH_ELLIPSE, {33, 33}));
+    cv::Rect crop = cv::boundingRect(work_zone);
+    crop &= cv::Rect(0, 0, img.cols, img.rows);
+    if (crop.empty()) return;
+    cv::Mat f;
+    img.convertTo(f, CV_32FC3);
+    cv::Mat smooth_crop;
+    cv::bilateralFilter(f(crop), smooth_crop, 13, 18.0, 4.0, cv::BORDER_REPLICATE);
+    int touched = 0;
+    for (const cv::Mat& in_full : low_masks) {
+        cv::Mat in_c = in_full(crop);
+        cv::Mat owner, distance, gate, gate3, correction;
+        in_c.convertTo(owner, CV_32F, 1.0 / 255.0);
+        cv::distanceTransform(in_c, distance, cv::DIST_L2, 3);
+        gate = 1.0f - distance / (float)overlap;
+        cv::max(gate, 0, gate);
+        cv::min(gate, 1, gate);
+        cv::multiply(gate, owner, gate);
+        cv::merge(std::vector<cv::Mat>{gate, gate, gate}, gate3);
+        cv::Mat f_crop = f(crop);
+        cv::multiply(smooth_crop - f_crop, gate3, correction);
+        f_crop += correction;
+        touched++;
+    }
+    if (touched > 0) {
+        f.convertTo(img, CV_8UC3);
+        std::cout << "seg-solve: boundary calm on " << touched << " low-density classes" << std::endl;
+    }
+}
+
+static void cs_seg_apply_override(CsSegClassParams& p, const CsSegOverride& o) {
+    if (o.has_iterations) p.iterations = o.iterations;
+    if (o.has_coef) p.coef = o.coef;
+    if (o.has_tv) p.tv = o.tv;
+    if (o.has_solver) p.solver = o.solver;
+    if (o.has_fista_iters) p.fista_iters = o.fista_iters;
+    if (o.has_reweights) p.reweights = o.reweights;
+    if (o.has_basis) p.basis = o.basis;
+    if (o.has_wscale) p.wscale = o.wscale;
+}
+
+// Single-stage segment solve: every tile is solved exactly once — pure tiles
+// with their own class's parameters, mixed tiles with the highest-rate
+// intersecting class's. No per-class solver passes, no cross-canvas blending;
+// neighboring tiles meet through the standard cosine-feathered tile blend,
+// exactly like global per-tile coef scaling.
+struct CsSegSinglePass {
+    const cv::Mat* ids = nullptr; // solve-geometry label map (ids-geometry == tile geometry)
+    CsSegClassParams base;
+    const std::map<int, CsSegOverride>* spec = nullptr;
+    const std::vector<uint8_t>* rates_q = nullptr; // tie-break only (higher rate wins)
+};
+
+// Resolve one CsSegClassParams per tile. Pure tiles use their own class.
+// Mixed tiles use the highest-rate intersecting class: the dense side keeps
+// its detail, and over-serving the sparse side is harmless (verified: full
+// background at bird iterations loses nothing). Majority vote only breaks
+// ties without rate information (lower id wins). One scan per tile —
+// negligible next to a FISTA solve.
+static void cs_seg_resolve_tile_params(const CsSegSinglePass& sp,
+    const std::vector<std::vector<TileCoord>>& coords,
+    const std::vector<std::vector<cv::Mat>>& tile_mats, int num_tiles,
+    std::vector<std::vector<CsSegClassParams>>& out, std::vector<int>& winners) {
+    out.assign(num_tiles, std::vector<CsSegClassParams>(num_tiles, sp.base));
+    winners.assign(num_tiles * num_tiles, -1);
+    if (!sp.ids || sp.ids->empty()) return;
+    const cv::Mat& ids = *sp.ids;
+    std::vector<int> counts(256, 0);
+    const auto rate_of = [&](int c) {
+        return (sp.rates_q && c >= 0 && c < (int)sp.rates_q->size()) ? (*sp.rates_q)[c] : 0;
+    };
+    for (int i = 0; i < num_tiles; ++i) {
+        for (int j = 0; j < num_tiles; ++j) {
+            if (tile_mats[i][j].empty()) continue;
+            const int x0 = coords[i][j].x, y0 = coords[i][j].y;
+            const int xe = (std::min)(x0 + tile_mats[i][j].cols, ids.cols);
+            const int ye = (std::min)(y0 + tile_mats[i][j].rows, ids.rows);
+            std::fill(counts.begin(), counts.end(), 0);
+            for (int y = y0; y < ye; ++y) {
+                const uint8_t* row = ids.ptr<uint8_t>(y);
+                for (int x = x0; x < xe; ++x) counts[row[x]]++;
+            }
+            int distinct = 0, sole = 0;
+            for (int c = 0; c < 256; ++c) {
+                if (counts[c] > 0) { distinct++; sole = c; }
+            }
+            int best = sole, best_n = counts[sole];
+            if (distinct > 1) {
+                // Mixed tile: highest sampled rate wins (detail preserved
+                // where it matters); ties fall back to majority, then id.
+                best = -1;
+                best_n = -1;
+                int best_q = -1;
+                for (int c = 0; c < 256; ++c) {
+                    if (counts[c] == 0) continue;
+                    const int qc = rate_of(c);
+                    if (qc > best_q || (qc == best_q && (best < 0 || counts[c] > best_n ||
+                        (counts[c] == best_n && c < best)))) {
+                        best = c;
+                        best_n = counts[c];
+                        best_q = qc;
+                    }
+                }
+            }
+            winners[i * num_tiles + j] = best;
+            CsSegClassParams cp = sp.base;
+            if (sp.spec) {
+                const auto oit = sp.spec->find(best);
+                if (oit != sp.spec->end()) cs_seg_apply_override(cp, oit->second);
+            }
+            out[i][j] = cp;
+        }
+    }
 }
 
 int decrypt_image::decrypt_image_tiled(
@@ -1141,7 +1606,8 @@ int decrypt_image::decrypt_image_tiled(
     float grain_tv,
     bool use_onsager,
     size_t* hr_applied_out,
-    const std::string& seg_solve_mask
+    const std::string& seg_solve_mask,
+    const std::string& seg_params
 ) {
     PhaseLog prof;
     if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT) {
@@ -1237,7 +1703,7 @@ int decrypt_image::decrypt_image_tiled(
             iterations, nun_threads, coef, show_preview, tv,
             full_res, solver, fista_iters, reweights, basis, wscale,
             photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager,
-            hr_applied_out);
+            hr_applied_out, seg_solve_mask, seg_params);
     }
     if (photo_up.y_dual_tv > 0.0f || photo_up.y_confidence > 0.0f)
         std::cerr << "Note: --y-dual-tv/--y-confidence require a YCC container; ignoring for BGR" << std::endl;
@@ -1262,16 +1728,39 @@ int decrypt_image::decrypt_image_tiled(
         dimgs.get_sampled_mat(sampled_mat, masked_mat);
 
         // Tile-split + per-tile solve + composite as one reusable unit: the
-        // standard path runs it once on all samples; --seg-solve runs it per
-        // class on class-restricted samples and hard-combines by label.
+        // standard path runs it once on all samples; --seg-solve runs it once
+        // with per-tile class parameters (majority vote, no per-class passes).
         // (Body kept at its original indentation; sm/mm are the inputs.)
         auto solve_grid = [&](const cv::Mat& sm, const cv::Mat& mm, bool use_preview,
-                cv::Mat& grid_out) -> int {
+                const CsSegClassParams& P, cv::Mat& grid_out,
+                const cv::Mat& active_segment, cv::Mat& blend_weight,
+                const CsSegSinglePass* segpass = nullptr) -> int {
+        CsSegmentTiles active(active_segment);
+        for (auto& row : decrypted_image_tiles) for (auto& tile : row) tile.release();
+        for (auto& row : indices_reconfigured) for (auto& idx : row) {
+            idx.ri_x_g.clear(); idx.ri_y_g.clear();
+        }
         // we split the sampled image into tiles
         // every tile overlaps with other neighboring tiles  
         // this is done because otherwise the titles wont quite match with eachother along the borders
         // this becomes more obvious as the numer of samples goes down, aka more compression 
         splitImageIntoTiles(sm, encrypted_image_tiles, coordinates, num_tiles, overlap);
+        // Single-stage segment solve: one resolved param set per tile by
+        // majority vote; every tile is solved exactly once with its own
+        // class's settings (no per-class passes, no cross-canvas blending).
+        std::vector<std::vector<CsSegClassParams>> seg_tiles;
+        std::vector<int> seg_winners;
+        if (segpass) {
+            cs_seg_resolve_tile_params(*segpass, coordinates, encrypted_image_tiles,
+                num_tiles, seg_tiles, seg_winners);
+            std::vector<int> per_class(256, 0);
+            for (int v : seg_winners) if (v >= 0) per_class[v]++;
+            std::cout << "seg-solve: single stage, per-class tile counts:";
+            for (int c = 0; c < 256; ++c)
+                if (per_class[c] > 0) std::cout << " " << c << "=" << per_class[c];
+            std::cout << std::endl;
+        }
+        const auto* seg_tile_params = seg_tiles.empty() ? nullptr : &seg_tiles;
 
         cv::Size tile_size;
         int estimated_number_of_samples = 0;
@@ -1279,6 +1768,13 @@ int decrypt_image::decrypt_image_tiled(
         for (int i = 0; i < num_tiles; i++) {
             for (int j = 0; j < num_tiles; j++) {
 
+                const cv::Mat& tile = encrypted_image_tiles[i][j];
+                if (tile.empty()) continue;
+                const cv::Rect rect(coordinates[i][j].x, coordinates[i][j].y, tile.cols, tile.rows);
+                if (!active.retain(rect)) {
+                    encrypted_image_tiles[i][j].release();
+                    continue;
+                }
                 std::vector<int> ri_x_g, ri_y_g;
 
                 // reserving space to avoid realocations
@@ -1405,7 +1901,8 @@ int decrypt_image::decrypt_image_tiled(
                       &hr_grid_mutex);
     }
     else if (use_preview) {
-        preview.Start(windowName, reconstructed, coordinates, decrypted_image_tiles);
+        preview.Start(windowName, reconstructed, coordinates, hr_tiles,
+                      &hr_grid_mutex);
     }
 
     CsUpscalePipeline pipe;
@@ -1428,16 +1925,16 @@ int decrypt_image::decrypt_image_tiled(
     }
         decrypt_tiles_thread = std::thread([&]() {
             decrypt_tiles(nun_threads, encrypted_image_tiles, indices_reconfigured,
-                decrypted_image_tiles, coordinates, num_tiles, overlap, iterations,
-                tile_size, coef, tv, solver,
-                fista_iters, reweights, basis, wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
+                decrypted_image_tiles, coordinates, num_tiles, overlap, P.iterations,
+                tile_size, P.coef, P.tv, P.solver,
+                P.fista_iters, P.reweights, P.basis, P.wscale, dimgs.thumb_seed, per_tile_coef, per_tile_tv,
                 &hr_tiles, fuse_upscale, pipe_upscale ? &pipe : nullptr,
-                (fuse_upscale || pipe_upscale) ? &hr_grid_mutex : nullptr,
+                (fuse_upscale || pipe_upscale || use_preview) ? &hr_grid_mutex : nullptr,
                 is_sr && !full_res && !use_dict, photo_up.sr_red, sr_d,
                 photo_up.sr_red_denoiser, photo_up.sr_dncnn_model, fsrcnn_model,
                 is_direct && !full_res && !use_dict, sr_cascade, grain_tv, use_onsager,
                 red_model, photo_up.sr_red_decay, is_dip && !full_res && !use_dict,
-                hr_sr_ctx);
+                hr_sr_ctx, seg_tile_params);
         });
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
@@ -1480,7 +1977,8 @@ int decrypt_image::decrypt_image_tiled(
             blend_feather = overlap * 2;
         }
 
-        reconstructed = reconstructImage(decrypted_image_tiles, coordinates);
+        reconstructed = cv::Mat::zeros(sm.rows * (full_res ? 1 : 2),
+            sm.cols * (full_res ? 1 : 2), CV_8UC3);
 
         // cosine-feathered compositing across the overlapping tile borders:
         // ramp width == scaled overlap means non-overlapped interiors keep
@@ -1488,20 +1986,33 @@ int decrypt_image::decrypt_image_tiled(
         // (fewer visible seams than the legacy 0.5 alpha blend)
         reconstructed = blendTilesWithImage(decrypted_image_tiles, coordinates, reconstructed, 0.5f, blend_feather);
             grid_out = reconstructed;
+            blend_weight = active.weights(grid_out.size(), overlap);
             return 0;
         }; // solve_grid
 
         cv::Mat reconstructed;
+        // Base per-solve settings (globals, possibly auto-derived above);
+        // --seg-params overrides them per class. The spec parses once here
+        // so malformed entries fail before any solve runs.
+        CsSegClassParams base_p;
+        base_p.iterations = iterations;
+        base_p.coef = coef;
+        base_p.tv = tv;
+        base_p.solver = solver;
+        base_p.fista_iters = fista_iters;
+        base_p.reweights = reweights;
+        base_p.basis = basis;
+        base_p.wscale = wscale;
+        const std::map<int, CsSegOverride> seg_spec = seg_params.empty()
+            ? std::map<int, CsSegOverride>() : cs_seg_parse_spec(seg_params);
+        if (!seg_params.empty() && seg_solve_mask.empty()) {
+            throw std::runtime_error("--seg-params needs --seg-solve");
+        }
         if (!seg_solve_mask.empty()) {
-            // Isolated per-class solves: each class is solved only from its
-            // own samples (everything else zeroed out), then hard-combined
-            // by label. YCC containers solve luma/chroma jointly and are
-            // rejected here (BGR modes only).
+            // Keep mixed tiles in each intersecting class's solve: a global
+            // boundary solve would discard the class's regularization.
             if (cs_is_ycc(dimgs.get_sampling_mode())) {
                 throw std::runtime_error("--seg-solve needs a BGR container; YCC-seg containers solve luma/chroma jointly");
-            }
-            if (show_preview) {
-                std::cout << "Note: --seg-solve disables the live preview (one solve per class); nothing will be shown" << std::endl;
             }
             cv::Mat mask_raw = cv::imread(seg_solve_mask, cv::IMREAD_UNCHANGED);
             if (mask_raw.empty()) {
@@ -1518,34 +2029,35 @@ int decrypt_image::decrypt_image_tiled(
             if (classes.empty()) {
                 throw std::runtime_error("--seg-solve: mask holds no classes");
             }
-            std::cout << "seg-solve: " << classes.size() << " isolated class solves (hard combine)" << std::endl;
-            // Class canvases return at solve geometry (2x after the fused
-            // upscale unless --full-res): combine at canvas geometry with a
-            // nearest-neighbor labels map, then the shared tail below brings
-            // the composite to final size exactly like the standard path.
-            cv::Mat comb_ids = seg_ids;
-            reconstructed = cv::Mat::zeros(sampled_mat.size(), CV_8UC3);
-            cv::Mat class_canvas;
-            for (int c : classes) {
-                const cv::Mat in_class_full = (seg_ids == c);
-                const double share = 100.0 * cv::countNonZero(in_class_full) / (double)seg_ids.total();
-                cv::Mat sm_c, mm_c;
-                sampled_mat.copyTo(sm_c);
-                masked_mat.copyTo(mm_c);
-                sm_c.setTo(cv::Scalar(0, 0, 0), ~in_class_full);
-                mm_c.setTo(cv::Scalar(0, 0, 0), ~in_class_full);
-                std::cout << "seg-solve: class " << c << " (" << share << "% of pixels) ..." << std::endl;
-                const int class_rc = solve_grid(sm_c, mm_c, false, class_canvas);
-                if (class_rc != 0) return class_rc;
-                if (class_canvas.size() != comb_ids.size()) {
-                    cv::resize(seg_ids, comb_ids, class_canvas.size(), 0, 0, cv::INTER_NEAREST);
-                    reconstructed = cv::Mat::zeros(class_canvas.size(), CV_8UC3);
-                }
-                class_canvas.copyTo(reconstructed, comb_ids == c);
+            // Single solver stage: every tile is solved exactly once, with
+            // the resolved parameters of its majority class (--seg-params
+            // overrides apply per tile). Neighboring tiles meet through the
+            // standard cosine-feathered tile blend, so there is no second
+            // solver stage and no cross-canvas seam reconciliation.
+            std::cout << "seg-solve: " << classes.size() << " classes, single stage" << std::endl;
+            for (const auto& kv : seg_spec) {
+                CsSegClassParams cp = base_p;
+                cs_seg_apply_override(cp, kv.second);
+                std::cout << "seg-solve: class " << kv.first
+                          << " [iters=" << cp.iterations << " coef=" << cp.coef
+                          << " tv=" << cp.tv << " solver=" << cp.solver
+                          << " fista-iters=" << cp.fista_iters << " reweights=" << cp.reweights
+                          << " basis=" << cp.basis << " wscale=" << cp.wscale << "]" << std::endl;
             }
+            CsSegSinglePass segpass;
+            segpass.ids = &seg_ids;
+            segpass.base = base_p;
+            segpass.spec = &seg_spec;
+            segpass.rates_q = &dimgs.get_seg_rates_q();
+            cv::Mat unused_weight;
+            const int grid_rc = solve_grid(sampled_mat, masked_mat, show_preview, base_p,
+                reconstructed, {}, unused_weight, &segpass);
+            if (grid_rc != 0) return grid_rc;
+            cs_seg_calm_boundaries(reconstructed, seg_ids, masked_mat, classes, overlap);
         }
         else {
-            const int grid_rc = solve_grid(sampled_mat, masked_mat, show_preview, reconstructed);
+            cv::Mat unused_weight;
+            const int grid_rc = solve_grid(sampled_mat, masked_mat, show_preview, base_p, reconstructed, {}, unused_weight);
             if (grid_rc != 0) return grid_rc;
         }
 
@@ -1596,7 +2108,8 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
     int nun_threads, float coef, bool show_preview, float tv,
     bool full_res, int solver,
     int fista_iters, int reweights, int basis, float wscale,
-    const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv, float grain_tv, bool use_onsager, size_t* hr_applied_out) {
+    const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv, float grain_tv, bool use_onsager, size_t* hr_applied_out,
+    const std::string& seg_solve_mask, const std::string& seg_params) {
     if (solver == CS_SOLVER_FISTA_JOINT) {
         std::cerr << "Warning: joint solver needs one shared RGB grid; ycc split sampling degrades to per-channel FISTA" << std::endl;
     }
@@ -1608,7 +2121,18 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // per-plane sampled images + 0/1 masks (luma full-res, chroma coarse)
         cv::Mat Y, Ym, Cr, Crm, Cb, Cbm;
         dimgs.get_sampled_ycc420(Y, Ym, Cr, Crm, Cb, Cbm);
-        const int rows = Y.rows, cols = Y.cols;
+
+        // Luma/chroma split + per-plane solve + merge as one reusable unit:
+        // the standard path runs it once; --seg-solve runs it once with
+        // per-tile class parameters (majority vote, no per-class passes).
+        auto solve_ycc_grid = [&](const cv::Mat& Y0, const cv::Mat& Ym0,
+                const cv::Mat& Cr0, const cv::Mat& Crm0,
+                const cv::Mat& Cb0, const cv::Mat& Cbm0,
+                const CsSegClassParams& P, const CsSegClassParams& Pc, bool use_preview,
+                cv::Mat& grid_out, const cv::Mat& active_segment,
+                cv::Mat& blend_weight, const CsSegSinglePass* segpass = nullptr) -> int {
+        CsSegmentTiles active(active_segment);
+        const int rows = Y0.rows, cols = Y0.cols;
 
         // luma tiling reuses the standard splitter; chroma tiles cover the
         // matching coarse rects (4:2:0 halves both axes, 4:2:2 halves the
@@ -1616,8 +2140,21 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // agree)
         std::vector<std::vector<cv::Mat>> y_tiles, y_mask_tiles;
         std::vector<std::vector<TileCoord>> coordinates, mask_coords;
-        splitImageIntoTiles(Y, y_tiles, coordinates, num_tiles, overlap);
-        splitImageIntoTiles(Ym, y_mask_tiles, mask_coords, num_tiles, overlap);
+        splitImageIntoTiles(Y0, y_tiles, coordinates, num_tiles, overlap);
+        splitImageIntoTiles(Ym0, y_mask_tiles, mask_coords, num_tiles, overlap);
+        std::vector<std::vector<CsSegClassParams>> seg_tiles;
+        std::vector<int> seg_winners;
+        if (segpass) {
+            cs_seg_resolve_tile_params(*segpass, coordinates, y_tiles,
+                num_tiles, seg_tiles, seg_winners);
+            std::vector<int> per_class(256, 0);
+            for (int v : seg_winners) if (v >= 0) per_class[v]++;
+            std::cout << "seg-solve: single stage, per-class tile counts:";
+            for (int c = 0; c < 256; ++c)
+                if (per_class[c] > 0) std::cout << " " << c << "=" << per_class[c];
+            std::cout << std::endl;
+        }
+        const auto* seg_tile_params = seg_tiles.empty() ? nullptr : &seg_tiles;
         const bool chroma_sub_v = !cs_is_ycc422(dimgs.get_sampling_mode());
 
         std::vector<std::vector<cv::Mat>> cr_tiles(num_tiles, std::vector<cv::Mat>(num_tiles)),
@@ -1641,14 +2178,15 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 if (y_tiles[i][j].empty() || y_mask_tiles[i][j].empty()) continue;
                 const int x = coordinates[i][j].x, y0 = coordinates[i][j].y;
                 const int w = y_tiles[i][j].cols, h = y_tiles[i][j].rows;
+                if (!active.retain(cv::Rect(x,y0,w,h))) continue;
                 const int cx = x / 2, cy = chroma_sub_v ? y0 / 2 : y0;
                 const int cw = (x + w + 1) / 2 - x / 2;
                 const int ch = chroma_sub_v ? (y0 + h + 1) / 2 - y0 / 2 : h;
                 const cv::Rect crect(cx, cy, cw, ch);
-                cr_tiles[i][j] = Cr(crect).clone();
-                cr_mask_tiles[i][j] = Crm(crect).clone();
-                cb_tiles[i][j] = Cb(crect).clone();
-                cb_mask_tiles[i][j] = Cbm(crect).clone();
+                cr_tiles[i][j] = Cr0(crect).clone();
+                cr_mask_tiles[i][j] = Crm0(crect).clone();
+                cb_tiles[i][j] = Cb0(crect).clone();
+                cb_mask_tiles[i][j] = Cbm0(crect).clone();
 
                 // local indices by scanning the tile masks (1 == sampled)
                 std::vector<int> ylx, yly, crlx, crly, cblx, cbly;
@@ -1754,7 +2292,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         ImagePreview preview;
         std::mutex ycc_hr_grid_mutex;
         std::vector<std::vector<TileCoord>> ycc_hr_coordinates;
-        if ((ycc_fuse || ycc_pipe) && show_preview) {
+        if ((ycc_fuse || ycc_pipe) && use_preview) {
             ycc_hr_coordinates = coordinates;
             for (int i = 0; i < num_tiles; ++i)
                 for (int j = 0; j < num_tiles; ++j) {
@@ -1764,8 +2302,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             preview.Start(windowName, reconstructed, ycc_hr_coordinates,
                           ycc_hr_tiles, &ycc_hr_grid_mutex);
         }
-        else if (show_preview) {
-            preview.Start(windowName, reconstructed, coordinates, decrypted);
+        else if (use_preview) {
+            preview.Start(windowName, reconstructed, coordinates, ycc_hr_tiles,
+                          &ycc_hr_grid_mutex);
         }
 
         CsUpscalePipeline ycc_upipe;
@@ -1790,11 +2329,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         if (dual_tv && photo_up.backend != "avir")
             std::cerr << "Note: --y-dual-tv uses AVIR for both candidate grids" << std::endl;
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
-            decrypted, coordinates, num_tiles, overlap, iterations, tile_size, coef, tv,
-            solver, fista_iters, reweights, basis, wscale,
+            decrypted, coordinates, num_tiles, overlap, P.iterations, tile_size, P.coef, P.tv,
+            P.solver, P.fista_iters, P.reweights, P.basis, P.wscale,
             std::cref(dimgs.thumb_seed), per_tile_coef, per_tile_tv,
             &ycc_hr_tiles, ycc_fuse, ycc_pipe ? &ycc_upipe : nullptr,
-            (ycc_fuse || ycc_pipe) ? &ycc_hr_grid_mutex : nullptr, chroma_sub_v, ycc_sr_d,
+            (ycc_fuse || ycc_pipe || use_preview) ? &ycc_hr_grid_mutex : nullptr, chroma_sub_v, ycc_sr_d,
             (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "",
             photo_up.y_confidence, photo_up.y_dual_tv,
             dual_tv ? &low_tv_tiles : nullptr, grain_tv, use_onsager,
@@ -1802,10 +2341,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             photo_up.sr_red_denoiser, photo_up.sr_dncnn_model,
             ycc_is_direct && !full_res && !ycc_use_dict, ycc_sr_cascade,
             ycc_red_model, photo_up.sr_red_decay,
-            ycc_is_dip && !full_res && !ycc_use_dict, ycc_hr_sr_ctx);
+            ycc_is_dip && !full_res && !ycc_use_dict, ycc_hr_sr_ctx,
+            Pc.iterations, Pc.coef, seg_tile_params);
         if (ycc_pipe) ycc_upipe.finish();
 
-        if (show_preview) {
+        if (use_preview) {
             preview.Stop();
         }
 
@@ -1842,7 +2382,8 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             ycc_blend_feather = overlap * 2;
         }
 
-        reconstructed = reconstructImage(decrypted, coordinates);
+        reconstructed = cv::Mat::zeros(rows * (full_res ? 1 : 2),
+            cols * (full_res ? 1 : 2), CV_8UC3);
 
         // shared tail with the BGR pipeline: feathered compositing in 2x
         // geometry, resize to 2x the recorded size
@@ -1934,6 +2475,73 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                                  "(degenerate blend); nothing written\n";
                 }
             }
+        }
+            grid_out = reconstructed;
+            blend_weight = active.weights(grid_out.size(), overlap);
+            return 0;
+        }; // solve_ycc_grid
+
+        cv::Mat reconstructed;
+        CsSegClassParams base_p;
+        base_p.iterations = iterations;
+        base_p.coef = coef;
+        base_p.tv = tv;
+        base_p.solver = solver;
+        base_p.fista_iters = fista_iters;
+        base_p.reweights = reweights;
+        base_p.basis = basis;
+        base_p.wscale = wscale;
+        const std::map<int, CsSegOverride> seg_spec = seg_params.empty()
+            ? std::map<int, CsSegOverride>() : cs_seg_parse_spec(seg_params);
+        if (!seg_params.empty() && seg_solve_mask.empty()) {
+            throw std::runtime_error("--seg-params needs --seg-solve");
+        }
+        if (!seg_solve_mask.empty()) {
+            // Preserve each class's solver settings even on mixed tiles.
+            if (photo_up.y_dual_tv > 0.0f) {
+                throw std::runtime_error("--seg-solve cannot be combined with --y-dual-tv");
+            }
+            cv::Mat mask_raw = cv::imread(seg_solve_mask, cv::IMREAD_UNCHANGED);
+            if (mask_raw.empty()) {
+                throw std::runtime_error("--seg-solve: cannot load '" + seg_solve_mask + "'");
+            }
+            cv::Mat seg_ids = cs_segmask_resolve_ids(mask_raw, Y.rows, Y.cols);
+            bool seen[256] = { false };
+            for (int y = 0; y < seg_ids.rows; ++y) {
+                const uint8_t* row = seg_ids.ptr<uint8_t>(y);
+                for (int x = 0; x < seg_ids.cols; ++x) seen[row[x]] = true;
+            }
+            std::vector<int> classes;
+            for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
+            if (classes.empty()) {
+                throw std::runtime_error("--seg-solve: mask holds no classes");
+            }
+            std::cout << "seg-solve: " << classes.size() << " classes, single stage" << std::endl;
+            for (const auto& kv : seg_spec) {
+                CsSegClassParams cp = base_p;
+                cs_seg_apply_override(cp, kv.second);
+                std::cout << "seg-solve: class " << kv.first
+                          << " [iters=" << cp.iterations << " coef=" << cp.coef
+                          << " tv=" << cp.tv << " solver=" << cp.solver
+                          << " fista-iters=" << cp.fista_iters << " reweights=" << cp.reweights
+                          << " basis=" << cp.basis << " wscale=" << cp.wscale << "]" << std::endl;
+            }
+            CsSegSinglePass segpass;
+            segpass.ids = &seg_ids;
+            segpass.base = base_p;
+            segpass.spec = &seg_spec;
+            segpass.rates_q = &dimgs.get_seg_rates_q();
+            cv::Mat unused_weight;
+            const int grid_rc = solve_ycc_grid(Y, Ym, Cr, Crm, Cb, Cbm, base_p, base_p,
+                show_preview, reconstructed, {}, unused_weight, &segpass);
+            if (grid_rc != 0) return grid_rc;
+            cs_seg_calm_boundaries(reconstructed, seg_ids, Ym, classes, overlap);
+        }
+        else {
+            cv::Mat unused_weight;
+            const int grid_rc = solve_ycc_grid(Y, Ym, Cr, Crm, Cb, Cbm, base_p, base_p,
+                show_preview, reconstructed, {}, unused_weight);
+            if (grid_rc != 0) return grid_rc;
         }
 
         // Final polish (--final-polish): same whole-image up-then-down pass

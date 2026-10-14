@@ -363,11 +363,45 @@ void CSencryption::returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int
 // from one shared RNG stream, then one global shuffle fixes the measurement
 // order. Deterministic from (key, labels, rates): encryption draws it,
 // decryption regenerates it from the shipped body prefix.
+// seg_blend W > 0: each class splits into interior (distance to any frontier
+// > W, own rate) plus a narrow boundary band (distance <= W, boosted rate
+// max(own q, adjacent-class q)); interior then band draw per class in
+// ascending order. W == 0 keeps the legacy single-pool loop verbatim so old
+// containers regenerate bit-identically.
+cv::Mat cs_segmask_density(const cv::Mat& labels,
+    const std::vector<uint8_t>& rates_q, int width) {
+    if (labels.empty() || labels.type() != CV_8U || width < 0 || width > CS_SEGBLEND_MAX)
+        throw std::runtime_error("seg-mask density: invalid labels or width");
+    cv::Mat rates(labels.size(), CV_64F);
+    for (int y = 0; y < labels.rows; ++y)
+        for (int x = 0; x < labels.cols; ++x) {
+            const unsigned c = labels.at<uint8_t>(y, x);
+            rates.at<double>(y, x) = c < rates_q.size() ? rates_q[c] : 0;
+        }
+    cv::Mat kernel(1, 2 * width + 1, CV_64F);
+    for (int i = -width; i <= width; ++i)
+        kernel.at<double>(0, i + width) = width + 1 - std::abs(i);
+    cv::Mat filtered;
+    // Integer-valued kernel and input: all intermediate sums fit exactly in
+    // double, avoiding CPU/GPU-dependent floating probability regeneration.
+    cv::sepFilter2D(rates, filtered, CV_64F, kernel, kernel, {-1, -1}, 0, cv::BORDER_REPLICATE);
+    const double side = (width + 1.0) * (width + 1.0);
+    cv::Mat density(labels.size(), CV_16U);
+    for (int y = 0; y < labels.rows; ++y)
+        for (int x = 0; x < labels.cols; ++x)
+            density.at<uint16_t>(y, x) = (uint16_t)std::llround(filtered.at<double>(y, x) * 257.0 / (side * side));
+    return density;
+}
+
 void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
-    const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32])
+    const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32],
+    int seg_blend, bool smooth_blend)
 {
     if (labels.empty() || labels.rows != xm || labels.cols != ym || labels.type() != CV_8U) {
         throw std::runtime_error("seg-mask sampling: label map geometry mismatch");
+    }
+    if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
+        throw std::runtime_error("seg-mask sampling: blend width out of range");
     }
 
     std::seed_seq seq(key, key + 32);
@@ -379,20 +413,39 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
     ri_x.clear();
     ri_y.clear();
 
-    std::vector<int> pool;
-    pool.reserve(1024);
-    for (size_t c = 0; c < rates_q.size(); ++c) {
-        if (rates_q[c] == 0) continue;
-        pool.clear();
-        for (int r = 0; r < xm; ++r) {
-            const uint8_t* row = labels.ptr<uint8_t>(r);
-            for (int col = 0; col < ym; ++col) {
-                if (row[col] == (uint8_t)c) pool.push_back(r * ym + col);
+    if (smooth_blend && seg_blend > 0) {
+        const cv::Mat density = cs_segmask_density(labels, rates_q, seg_blend);
+        for (int y = 0; y < xm; ++y)
+            for (int x = 0; x < ym; ++x) {
+                const uint64_t threshold = ((uint64_t)density.at<uint16_t>(y, x) * (1ull << 32) + 32767) / 65535;
+                if ((uint64_t)generator() < threshold) {
+                    ri_x.push_back(y); ri_y.push_back(x);
+                }
             }
+        shuffle(ri_x, shuffle_seed);
+        shuffle(ri_y, shuffle_seed);
+        return;
+    }
+
+    // Narrow boundary bands per class (W > 0 only): own-label pixels within
+    // W px of any frontier. Same label map both sides => identical bands.
+    std::vector<cv::Mat> band;
+    if (seg_blend > 0) {
+        band.assign(rates_q.size(), cv::Mat());
+        for (size_t c = 0; c < rates_q.size(); ++c) {
+            cv::Mat is_c = (labels == (uint8_t)c);
+            if (cv::countNonZero(is_c) == 0) continue;
+            cv::Mat dist;
+            cv::distanceTransform(is_c, dist, cv::DIST_L2, 3);
+            cv::Mat near = (dist <= (double)seg_blend) & (dist > 0.0);
+            if (cv::countNonZero(near) != 0) band[c] = near;
         }
+    }
+
+    auto draw_pool = [&](std::vector<int>& pool, uint8_t q) {
         const size_t pix = pool.size();
-        if (pix == 0) continue;
-        size_t want = (size_t)std::llround((double)pix * (double)rates_q[c] / 255.0);
+        if (pix == 0 || q == 0) return;
+        size_t want = (size_t)std::llround((double)pix * (double)q / 255.0);
         if (want > pix) want = pix;
         for (size_t k = 0; k < want; ++k) {
             std::uniform_int_distribution<size_t> pick(k, pix - 1);
@@ -402,6 +455,42 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
             ri_x.push_back(lin / ym);
             ri_y.push_back(lin % ym);
         }
+    };
+
+    std::vector<int> pool, bpool;
+    pool.reserve(1024);
+    // Adjacent-class boost: classes sharing a frontier with c (3x3 dilation
+    // touch). Flat within the band by design — the band is narrow, and a
+    // ramp would need inexact per-pixel draws on both sides.
+    cv::Mat dilated;
+    for (size_t c = 0; c < rates_q.size(); ++c) {
+        uint8_t qc = rates_q[c];
+        const bool has_band = seg_blend > 0 && c < band.size() && !band[c].empty();
+        if (qc == 0 && !has_band) continue;
+        pool.clear();
+        bpool.clear();
+        uint8_t qb = qc;
+        if (has_band) {
+            cv::dilate(labels == (uint8_t)c, dilated, cv::Mat());
+            for (int r = 0; r < xm; ++r) {
+                const uint8_t* lrow = labels.ptr<uint8_t>(r);
+                const uint8_t* drow = dilated.ptr<uint8_t>(r);
+                for (int col = 0; col < ym; ++col) {
+                    if (drow[col] && lrow[col] != (uint8_t)c && lrow[col] < rates_q.size())
+                        qb = (std::max)(qb, rates_q[lrow[col]]);
+                }
+            }
+        }
+        for (int r = 0; r < xm; ++r) {
+            const uint8_t* lrow = labels.ptr<uint8_t>(r);
+            const uint8_t* brow = has_band ? band[c].ptr<uint8_t>(r) : nullptr;
+            for (int col = 0; col < ym; ++col) {
+                if (lrow[col] != (uint8_t)c) continue;
+                (brow && brow[col] ? bpool : pool).push_back(r * ym + col);
+            }
+        }
+        draw_pool(pool, qc);
+        if (has_band) draw_pool(bpool, qb);
     }
 
     shuffle(ri_x, shuffle_seed);

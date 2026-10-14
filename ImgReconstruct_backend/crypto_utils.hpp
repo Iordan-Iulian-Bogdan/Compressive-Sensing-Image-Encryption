@@ -108,30 +108,45 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 // 32-pixel header:
 //   [0]      nclasses (u8, 1..255)
 //   [1..n]   per-class quantized rates (u8: count_c = round(pix_c * q/255))
-//   [1+n..]  label-map PNG length (u32)
+//   [1+n..]  label-map PNG length (u32) with the --seg-blend width (0..128)
+//            stashed in the top byte; the PNG itself is the low 24 bits
 //   [...]    label-map PNG bytes (8-bit grayscale class ids, pipeline geometry)
 // Measurements (3 bytes each, BGR) follow, padded to whole pixels. Rates are
 // quantized AFTER the global --ratio scale on encrypt so both sides derive
 // identical counts from the shipped bytes; decrypt needs no extra flags.
+// The above is the legacy layout (including flat boosted bands). New smooth
+// blends use [0][version=1][width][nclasses][rates][u32 PNG length][PNG].
+// The zero marker is invalid to older readers, preventing silent mis-sampling.
+#define CS_SEGBLEND_MAX 128
 struct CsSegPrefix {
     uint8_t nclasses = 0;
     std::vector<uint8_t> rates_q;
     uint32_t seglen = 0;
+    uint8_t blend = 0;
+    bool smooth_blend = false;
     size_t total = 0; // 1 + nclasses + 4 + seglen
 };
 inline bool cs_segmask_parse_prefix(const uint8_t* body, size_t body_bytes, CsSegPrefix& out) {
     out = CsSegPrefix{};
     if (body_bytes < 5) return false;
-    const uint8_t n = body[0];
+    // Extended prefix: [0][version=1][width][nclasses][rates][u32 PNG length].
+    // A separate version keeps existing flat-band containers readable.
+    const bool extended = body[0] == 0;
+    if (extended && (body_bytes < 8 || body[1] != 1 || body[2] == 0 || body[2] > CS_SEGBLEND_MAX)) return false;
+    const size_t offset = extended ? 3 : 0;
+    const uint8_t n = body[offset];
     if (n == 0) return false;
-    const size_t head = (size_t)1 + n + 4;
+    const size_t head = offset + 1 + n + 4;
     if (body_bytes < head) return false;
     out.nclasses = n;
-    out.rates_q.assign(body + 1, body + 1 + n);
-    out.seglen = (uint32_t)body[1 + n] |
-        ((uint32_t)body[2 + n] << 8) |
-        ((uint32_t)body[3 + n] << 16) |
-        ((uint32_t)body[4 + n] << 24);
+    out.rates_q.assign(body + offset + 1, body + offset + 1 + n);
+    const uint8_t* len = body + offset + 1 + n;
+    const uint32_t raw = (uint32_t)len[0] | ((uint32_t)len[1] << 8) |
+        ((uint32_t)len[2] << 16) | ((uint32_t)len[3] << 24);
+    out.smooth_blend = extended;
+    out.blend = extended ? body[2] : (uint8_t)(raw >> 24);
+    out.seglen = extended ? raw : raw & 0x00ffffffu;
+    if (out.blend > CS_SEGBLEND_MAX) return false;
     if (out.seglen == 0 || out.seglen > (1u << 24)) return false;
     if (head + out.seglen > body_bytes) return false;
     out.total = head + out.seglen;

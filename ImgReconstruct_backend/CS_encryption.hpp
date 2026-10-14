@@ -27,6 +27,11 @@ std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, 
 void cs_hf_thumb_weights(const cv::Mat& thumbnail, std::vector<float>& weights,
     int& weight_cols, int& weight_rows);
 
+// Compact triangular filtering of local rates. CV_16U probability map;
+// support is exactly width pixels per axis, not an unbounded Gaussian.
+cv::Mat cs_segmask_density(const cv::Mat& labels,
+    const std::vector<uint8_t>& rates_q, int width);
+
 class CSencryption {
 protected:
     cv::Mat encrypted_img, input_img;
@@ -62,8 +67,12 @@ protected:
     // One shared RNG stream draws classes in ascending id order, then one
     // global shuffle fixes the measurement order — fully deterministic from
     // (key, labels, rates) so encryption and decryption agree.
+    // seg_blend (0..128, pixels): smooth_blend selects compact local density
+    // smoothing and per-pixel draws. False regenerates the older flat boosted
+    // bands. W == 0 always runs the original class-budget sampler.
     void returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
-        const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32]);
+        const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32],
+        int seg_blend = 0, bool smooth_blend = false);
     void returnHfWeightedIndices(std::vector<int>& ri_x, std::vector<int>& ri_y,
         int rows, int cols, const std::vector<uint8_t>& lod, int m_total,
         const uint8_t key[32], int tile_size, int weight_base,

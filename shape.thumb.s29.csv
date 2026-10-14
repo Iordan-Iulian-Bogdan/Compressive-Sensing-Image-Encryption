@@ -1,0 +1,4 @@
+operator,seed,steps_per_reweight,reweights,lambda,measurements_per_channel,payload_bytes,seconds,psnr,mae
+random_points,29,100,2,0.005,8320,24960,0.311409,23.5218,10.1122
+square_means,29,100,2,0.005,8320,24960,0.353961,27.9813,5.90569
+tetromino_means,29,100,2,0.005,8320,24960,0.356018,27.6779,6.66044

@@ -1405,9 +1405,13 @@ cv::Mat cs_segmask_resolve_ids(const cv::Mat& mask_raw, int rows, int cols) {
  * standard BGR pipeline, so tiling/decrypt are unchanged.
  */
 void encrypt_image::encrypt_segmask(const float& pixel_p, const std::string& password,
-    const std::string& mask_path, const std::vector<float>& rates, int sample_bits, int chroma_bits) {
+    const std::string& mask_path, const std::vector<float>& rates, int sample_bits, int chroma_bits,
+    int seg_blend) {
     if (rates.empty() || rates.size() > 255) {
         throw std::runtime_error("seg-mask: need 1..255 per-class rates (--seg-rates)");
+    }
+    if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
+        throw std::runtime_error("--seg-blend must be in [0, 128] pixels");
     }
     cv::Mat mask_raw = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
     if (mask_raw.empty()) {
@@ -1436,13 +1440,21 @@ void encrypt_image::encrypt_segmask(const float& pixel_p, const std::string& pas
     }
     cs_key_valid = true;
 
-    returnSegMaskIndices(ri_x, ri_y, rows, cols, ids, q, cs_key);
+    returnSegMaskIndices(ri_x, ri_y, rows, cols, ids, q, cs_key, seg_blend, true);
     const int m_written = (int)ri_x.size();
     if (m_written == 0) {
         throw std::runtime_error("seg-mask: rates select zero samples (raise a rate)");
     }
     m = m_written;
     bm = (float)m / (float)((long long)rows * cols);
+    if (seg_blend > 0) {
+        // Bitrate cost of the boosted boundary bands vs the unblended draw.
+        std::vector<int> bx, by;
+        returnSegMaskIndices(bx, by, rows, cols, ids, q, cs_key, 0);
+        const double over = bx.empty() ? 0.0 : 100.0 * ((double)m_written - (double)bx.size()) / (double)bx.size();
+        std::cout << "seg-mask: smooth blend " << seg_blend << "px sample change "
+            << over << "% samples (" << bx.size() << " -> " << m_written << ")" << std::endl;
+    }
 
     // Label-map payload at pipeline geometry (decrypt decodes + redraws).
     std::vector<uint8_t> png;
@@ -1453,6 +1465,7 @@ void encrypt_image::encrypt_segmask(const float& pixel_p, const std::string& pas
     }
     std::vector<uint8_t> prefix;
     prefix.reserve(1 + q.size() + 4);
+    if (seg_blend > 0) prefix.insert(prefix.end(), {0, 1, (uint8_t)seg_blend});
     prefix.push_back((uint8_t)q.size());
     prefix.insert(prefix.end(), q.begin(), q.end());
     const uint32_t sl = (uint32_t)png.size();
@@ -1510,12 +1523,15 @@ void encrypt_image::encrypt_segmask(const float& pixel_p, const std::string& pas
  */
 void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::string& password,
     const std::string& mask_path, const std::vector<float>& rates,
-    int sample_bits, int chroma_bits, int mode) {
+    int sample_bits, int chroma_bits, int mode, int seg_blend) {
     if (mode != CS_MODE_YCC420_SEG && mode != CS_MODE_YCC422_SEG) {
         throw std::runtime_error("seg-mask ycc: bad split mode (internal error)");
     }
     if (rates.empty() || rates.size() > 255) {
         throw std::runtime_error("seg-mask: need 1..255 per-class rates (--seg-rates)");
+    }
+    if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
+        throw std::runtime_error("--seg-blend must be in [0, 128] pixels");
     }
     cv::Mat mask_raw = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
     if (mask_raw.empty()) {
@@ -1543,7 +1559,7 @@ void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::stri
 
     // luma follows the segment budget; chroma stays uniform on the mode's
     // coarse grids (same helper as the uniform/LOD-luma split paths)
-    returnSegMaskIndices(ri_x, ri_y, rows, cols, ids, q, cs_key);
+    returnSegMaskIndices(ri_x, ri_y, rows, cols, ids, q, cs_key, seg_blend, true);
     const int mY_written = (int)ri_x.size();
     if (mY_written == 0) {
         throw std::runtime_error("seg-mask: rates select zero samples (raise a rate)");
@@ -1574,10 +1590,18 @@ void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::stri
     }
     std::vector<uint8_t> prefix;
     prefix.reserve(1 + q.size() + 4);
+    if (seg_blend > 0) prefix.insert(prefix.end(), {0, 1, (uint8_t)seg_blend});
     prefix.push_back((uint8_t)q.size());
     prefix.insert(prefix.end(), q.begin(), q.end());
     const uint32_t sl = (uint32_t)png.size();
     for (int b = 0; b < 4; ++b) prefix.push_back((uint8_t)((sl >> (b * 8)) & 0xff));
+    if (seg_blend > 0) {
+        std::vector<int> bx, by;
+        returnSegMaskIndices(bx, by, rows, cols, ids, q, cs_key, 0);
+        const double over = bx.empty() ? 0.0 : 100.0 * ((double)mY_written - (double)bx.size()) / (double)bx.size();
+        std::cout << "seg-mask: smooth blend " << seg_blend << "px luma sample change "
+            << over << "% luma samples (" << bx.size() << " -> " << mY_written << ")" << std::endl;
+    }
     const size_t pre_bytes = prefix.size() + png.size();
 
     const size_t meas_bytes = (size_t)mY_written + (size_t)2 * mC;
@@ -2025,7 +2049,8 @@ int encrypt_image::encrypt_image_tiled(
     float lod_gamma,
     int lod_cutoff,
     const std::string& seg_mask,
-    const std::string& seg_rates
+    const std::string& seg_rates,
+    int seg_blend
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -2081,6 +2106,12 @@ int encrypt_image::encrypt_image_tiled(
         const bool seg_mode = !seg_mask.empty() || !seg_rates.empty();
         if (seg_mode && (seg_mask.empty() || seg_rates.empty())) {
             throw std::runtime_error("--seg-mask and --seg-rates must be given together");
+        }
+        if (seg_blend != 0 && !seg_mode) {
+            throw std::runtime_error("--seg-blend needs --seg-mask/--seg-rates");
+        }
+        if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
+            throw std::runtime_error("--seg-blend must be in [0, 128] pixels");
         }
         if (seg_mode && (hf_focus || adaptive || two_pass || spectral || !regions_json.empty() ||
             lod_smooth > 0.0f || lod_full > 0 || tile_size > 0 || hr_detail > 0 ||
@@ -2147,10 +2178,10 @@ int encrypt_image::encrypt_image_tiled(
             const std::vector<float> seg_rate_list = parse_seg_rates(seg_rates);
             if (ycc420 || ycc422) {
                 const int seg_mode = ycc422 ? CS_MODE_YCC422_SEG : CS_MODE_YCC420_SEG;
-                encrypt_img.encrypt_ycc420_segmask(compression_ratio, password, seg_mask, seg_rate_list, sample_bits, chroma_bits, seg_mode);
+                encrypt_img.encrypt_ycc420_segmask(compression_ratio, password, seg_mask, seg_rate_list, sample_bits, chroma_bits, seg_mode, seg_blend);
             }
             else {
-                encrypt_img.encrypt_segmask(compression_ratio, password, seg_mask, seg_rate_list, sample_bits, chroma_bits);
+                encrypt_img.encrypt_segmask(compression_ratio, password, seg_mask, seg_rate_list, sample_bits, chroma_bits, seg_blend);
             }
         }
         else if (hf_focus) {

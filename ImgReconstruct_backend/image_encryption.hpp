@@ -43,7 +43,7 @@ public:
     // prefix, so decrypt regenerates the identical positions with no flags.
     void encrypt_segmask(const float& pixel_p, const std::string& password,
         const std::string& mask_path, const std::vector<float>& rates,
-        int sample_bits = 8, int chroma_bits = 0);
+        int sample_bits = 8, int chroma_bits = 0, int seg_blend = 0);
 
     // Per-segment luma + uniform chroma (modes 11/12): same seg-mask luma
     // budget as encrypt_segmask, each chroma plane sampled uniformly on its
@@ -51,7 +51,8 @@ public:
     // [Y x mY][Cr x mC][Cb x mC]; decrypt auto-detects.
     void encrypt_ycc420_segmask(const float& pixel_p, const std::string& password,
         const std::string& mask_path, const std::vector<float>& rates,
-        int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG);
+        int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG,
+        int seg_blend = 0);
 
     // YCC 4:2:0 with LOD-driven luma (mode 3 + shipped lod bytes; mode 7 for
     // 4:2:2): same LOD sources as encrypt_adaptive (Laplacian / two-pass /
@@ -107,7 +108,7 @@ public:
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
     */
-    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string& seg_mask = "", const std::string& seg_rates = "");
+    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string& seg_mask = "", const std::string& seg_rates = "", int seg_blend = 0);
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at

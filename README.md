@@ -143,17 +143,64 @@ identical per-class draws with no flags. Exclusive with all other sampling
 flags except `--ycc420`/`--ycc422`, which absorb it like the adaptive LOD
 path: the rates drive the luma budget (modes 11/12) while chroma stays
 uniform. `--show-mask`/`--sample-split` work unchanged.
+`--seg-blend <w>` (0..128 pixels, default 0 = off) smoothly filters the
+per-pixel target rates with a compact separable triangular kernel, radius
+`w` in each axis at encryption geometry. Unlike a flat boosted band, the
+density ramps across the frontier and returns continuously to the original
+rates. A straight 20%/80% boundary meets near 50%; the high side gives up
+some samples as the low side gains them. Constant interiors outside the
+kernel support are unchanged (at corners support is a square, not a radial
+distance cutoff). Nearby classes contribute locally, including at junctions.
+The resulting 16-bit probabilities drive a deterministic keyed draw without
+replacement of pixel positions; totals fluctuate slightly around the target.
+With YCC this changes luma density; chroma remains uniformly sampled with
+its count derived from the realized luma count.
 
-**Per-segment solve:** `--seg-solve <f>` (decrypt/roundtrip, BGR containers
-only) solves each class of the label/color mask `<f>` in isolation — only
-that class's samples, everything else zeroed — and hard-combines the class
-canvases by label. Expect boundary ringing/seams: a hard-zeroed edge is not
-DCT/wavelet-sparse, so each solve extrapolates blind across its borders.
-Costs one full solve per class and disables the live preview. Measured on
-the IMG_3690 thumbnail: 16.2 dB isolated vs 17.4 dB joint from the same
-seg container.
+New blended containers use a versioned prefix `[0,1,width,nclasses,...]`;
+decrypt selects the stored algorithm automatically. Existing unblended and
+flat-band containers retain their original sampling algorithms. Re-encrypt
+to obtain the smooth ramp; decrypting an old file cannot change its samples.
+Width 0 retains the original class-budget sampler. Tests:
+`scripts\test_seg_blend.bat` (after `build_cpu.bat main`).
+
+**Per-segment solve:** `--seg-solve <f>` (decrypt/roundtrip, BGR or YCC) runs
+a single solver stage over all tiles: each tile is solved exactly once with
+the parameters of its majority class from the label/color mask `<f>`
+(majority vote over the tile rect; ties prefer the higher sampled class, or
+the lower id without rate information). `--seg-params` overrides apply per
+tile through the same vote. Neighboring tiles solved with different settings
+meet through the standard cosine-feathered tile blend — there are no
+per-segment solver passes and no cross-canvas seam reconciliation. The run
+logs per-class tile counts. After the single solve, low-density segment
+boundaries receive an edge-aware bilateral calm (13-pixel window, color
+sigma 18, spatial sigma 4, fading out one overlap width inside the class;
+restricted to the boundary bands' bounding region, ~7 s at full-res).
+YCC chroma follows the tile's class parameters (half the coefficient and
+roughly half the iterations, as in ordinary YCC reconstruction). The live
+preview is the standard tile-progress window. Measured on the full-res
+scene (96-grid, blend-6 container): single stage base-8/bird-12 + calm,
+55.8 s, 35.40 dB; single stage global-12 + calm, 59.0 s, 35.83 dB —
+against ~74 s / 36.01 dB for the former multi-pass solver. The remaining
+gap is concentrated at segment boundaries; global iterations recover the
+rest everywhere else.
+`--seg-params "cls:knob=value,...;..."` overrides solver
+settings per class (needs `--seg-solve`), e.g.
+`1:iterations=8,coef=0.03,tv=0.05;5:iterations=6` — knobs are
+`iterations|coef|tv|solver|fista-iters|reweights|basis|wscale` (`solver`
+`fista|joint`, `basis` `dct|wavelet`); unlisted classes inherit the global
+decrypt settings, and malformed entries fail before any solve runs.
+`scripts/sweep_segsolve.ps1` grid-searches these knobs across `--ratio`
+values (seg-solve cells plus an optional joint baseline per ratio),
+recording PSNR/edge-PSNR/timings to CSV with a best-per-ratio summary —
+run it on the thumbnail for speed, then validate the winner at full size.
 
 ### YCC 4:2:0 split sampling (`--ycc420`)
+
+**Measurement-shape experiment:** See [measurement_shapes_results.md](measurement_shapes_results.md)
+for the matched random-point / square-average / T-tetromino-average benchmark,
+raw 8-bit payloads, full-resolution results, and experimental segmentation-guided
+budgets. Build and run with `scripts\bench_measurement_shapes.bat`. This is a
+standalone operator experiment, not a new encrypted-container mode.
 
 On decrypt, `--y-confidence 0.3` enables an optional second CPU FISTA pass
 for luma in YCC420/422 containers. It blurs the binary sample mask (5-pixel

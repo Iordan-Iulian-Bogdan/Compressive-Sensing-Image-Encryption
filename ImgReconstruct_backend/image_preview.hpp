@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <functional>
 
 // Owns the optional live preview thread used while image tiles are solved.
 // grid_mutex (optional) serializes the per-poll reconstructImage against
@@ -24,14 +25,16 @@ class ImagePreview {
    void Start(const std::string& window_name, cv::Mat& reconstructed,
               const std::vector<std::vector<TileCoord>>& coordinates,
               const std::vector<std::vector<cv::Mat>>& image_tiles,
-              std::mutex* grid_mutex = nullptr);
+               std::mutex* grid_mutex = nullptr,
+               std::function<cv::Mat(const cv::Mat&)> transform = {});
    void Stop();
 
   private:
    void Run(const std::string& window_name, cv::Mat& reconstructed,
             const std::vector<std::vector<TileCoord>>& coordinates,
             const std::vector<std::vector<cv::Mat>>& image_tiles,
-            std::mutex* grid_mutex);
+             std::mutex* grid_mutex,
+             std::function<cv::Mat(const cv::Mat&)> transform);
 
    std::atomic<bool> stop_requested_{true};
    std::thread thread_;

@@ -132,6 +132,11 @@ private:
     // order. No-op at 8 bits.
     void unpack_container_measurements(const std::vector<cs_body_section>& sections);
 
+    // Shipped per-class quantized rates of a seg container (empty for other
+    // modes); cached during sampling so the single-stage solver can break
+    // mixed-tile votes toward the higher sampled class.
+    std::vector<uint8_t> seg_rates_q;
+
 public:
     decrypt_image(const std::string input_path, const std::string& password = "");
 
@@ -156,6 +161,7 @@ public:
     cv::Size get_org_size();
 
     int get_sampling_mode() const { return sampling_mode; }
+    const std::vector<uint8_t>& get_seg_rates_q() const { return seg_rates_q; }
     bool has_hr_detail() const { return hr_detail; }
     const std::vector<CsHrSample>& get_hr_samples() const { return hr_samples; }
     size_t get_hr_applied() const { return hr_applied; }
@@ -192,9 +198,9 @@ public:
     /** @brief decrypts tiles from an already-loaded encrypted image (in-memory, no PNG roundtrip).
     Shared implementation for both overloads. Note: the Mat is const but the impl needs a copy.
     */
-    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr, const std::string& seg_solve_mask = "");
+    static int decrypt_image_tiled(const cv::Mat& encrypted_img_in, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr, const std::string& seg_solve_mask = "", const std::string& seg_params = "");
 
-    static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, const std::string& seg_solve_mask = "");
+    static int decrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, const std::string& seg_solve_mask = "", const std::string& seg_params = "");
 
     /** @brief YCC 4:2:0 tile pipeline for mode-3 containers (auto-selected by
     decrypt_image_tiled from the header; never called directly with other
@@ -203,7 +209,7 @@ public:
     each chroma plane natively on its half-resolution grid, then merges
     YCrCb -> BGR per tile. FISTA_JOINT degrades to per-channel FISTA.
     */
-    static int decrypt_image_tiled_ycc420(decrypt_image& dimgs, const std::string& output_path, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr);
+    static int decrypt_image_tiled_ycc420(decrypt_image& dimgs, const std::string& output_path, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr, const std::string& seg_solve_mask = "", const std::string& seg_params = "");
 
 };
 
