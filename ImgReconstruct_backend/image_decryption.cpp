@@ -1977,8 +1977,16 @@ int decrypt_image::decrypt_image_tiled(
             blend_feather = overlap * 2;
         }
 
-        reconstructed = cv::Mat::zeros(sm.rows * (full_res ? 1 : 2),
-            sm.cols * (full_res ? 1 : 2), CV_8UC3);
+        // Blend canvas: the plain tile paste for the standard path (the
+        // zero-overlap alpha blend composites tiles against it, so zeros
+        // would halve every pixel). Segment solves keep the zeros canvas:
+        // released (inactive-class) tiles must contribute nothing.
+        if (segpass) {
+            reconstructed = cv::Mat::zeros(sm.rows * (full_res ? 1 : 2),
+                sm.cols * (full_res ? 1 : 2), CV_8UC3);
+        } else {
+            reconstructed = reconstructImage(decrypted_image_tiles, coordinates);
+        }
 
         // cosine-feathered compositing across the overlapping tile borders:
         // ramp width == scaled overlap means non-overlapped interiors keep
@@ -2382,8 +2390,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             ycc_blend_feather = overlap * 2;
         }
 
-        reconstructed = cv::Mat::zeros(rows * (full_res ? 1 : 2),
-            cols * (full_res ? 1 : 2), CV_8UC3);
+        // Plain tile paste as the blend canvas (zeros would halve every
+        // pixel in the zero-overlap alpha blend; see the BGR solve_grid).
+        reconstructed = reconstructImage(decrypted, coordinates);
 
         // shared tail with the BGR pipeline: feathered compositing in 2x
         // geometry, resize to 2x the recorded size
