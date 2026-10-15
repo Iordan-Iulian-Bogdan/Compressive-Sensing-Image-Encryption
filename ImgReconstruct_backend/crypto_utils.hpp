@@ -105,6 +105,10 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_YCC422_SEG 12          // seg-mask luma + uniform 4:2:2 chroma (pad = 12)
 #define CS_MODE_TCLUSTER 13            // random T-tetromino point clusters, BGR (pad = 13)
 #define CS_MODE_TMEANS 14              // random T-tetromino mean groups, BGR (pad = 14)
+#define CS_MODE_YCC420_TCLUSTER 15     // T-cluster luma + uniform 4:2:0 chroma (pad = 15)
+#define CS_MODE_YCC420_TMEANS 16       // T-means luma + uniform 4:2:0 chroma (pad = 16)
+#define CS_MODE_YCC422_TCLUSTER 17     // T-cluster luma + uniform 4:2:2 chroma (pad = 17)
+#define CS_MODE_YCC422_TMEANS 18       // T-means luma + uniform 4:2:2 chroma (pad = 18)
 
 // Per-segment sampling (mode 10) body prefix, little-endian, right after the
 // 32-pixel header:
@@ -275,7 +279,8 @@ inline int cs_lod_pixels(int rows, int cols, int tile_size) {
 // parameterize all four split modes (3/6 halve both axes, 7/8 halve width
 // only); the cs_ycc420_* names remain for older 4:2:0-only call sites.
 inline void cs_chroma_dims(int mode, int rows, int cols, int& crows, int& ccols) {
-    if (mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF) {
+    if (mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF ||
+        mode == CS_MODE_YCC422_TCLUSTER || mode == CS_MODE_YCC422_TMEANS) {
         crows = rows;
         ccols = (cols + 1) / 2;
     } else {
@@ -299,7 +304,19 @@ inline bool cs_is_ycc(int mode) {
     return mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 ||
         mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF ||
         mode == CS_MODE_YCC420_HRDETAIL ||
-        mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG;
+        mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG ||
+        mode == CS_MODE_YCC420_TCLUSTER || mode == CS_MODE_YCC420_TMEANS ||
+        mode == CS_MODE_YCC422_TCLUSTER || mode == CS_MODE_YCC422_TMEANS;
+}
+// T-tetromino sampling in any container (BGR modes 13/14, T-luma YCC
+// modes 15-18). T-means modes need the averaging (weight-aware) solver.
+inline bool cs_is_tcluster(int mode) {
+    return mode == CS_MODE_TCLUSTER || mode == CS_MODE_YCC420_TCLUSTER ||
+        mode == CS_MODE_YCC422_TCLUSTER;
+}
+inline bool cs_is_tmeans(int mode) {
+    return mode == CS_MODE_TMEANS || mode == CS_MODE_YCC420_TMEANS ||
+        mode == CS_MODE_YCC422_TMEANS;
 }
 // Any container carrying a trailing HR-detail payload.
 inline bool cs_is_hrdetail(int mode) {
@@ -307,7 +324,8 @@ inline bool cs_is_hrdetail(int mode) {
 }
 inline bool cs_is_ycc422(int mode) {
     return mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF ||
-        mode == CS_MODE_YCC422_SEG;
+        mode == CS_MODE_YCC422_SEG || mode == CS_MODE_YCC422_TCLUSTER ||
+        mode == CS_MODE_YCC422_TMEANS;
 }
 inline bool cs_is_ycc_hf(int mode) {
     return mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF;

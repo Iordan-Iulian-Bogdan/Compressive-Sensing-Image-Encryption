@@ -530,7 +530,9 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
         }
     }
     else if (mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 || mode == CS_MODE_YCC420_HRDETAIL ||
-        mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG) {
+        mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG ||
+        mode == CS_MODE_YCC420_TCLUSTER || mode == CS_MODE_YCC420_TMEANS ||
+        mode == CS_MODE_YCC422_TCLUSTER || mode == CS_MODE_YCC422_TMEANS) {
         // luma/chroma-split container. Pure-uniform modes 3/7 leave the tile
         // fields zero; the LOD-luma variant reuses the adaptive pad layout
         // (tile_size, lod byte count, weight_base). Accept the LOD variant

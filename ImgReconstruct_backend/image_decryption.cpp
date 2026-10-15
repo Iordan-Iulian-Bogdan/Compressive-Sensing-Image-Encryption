@@ -435,6 +435,10 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     size_t body_off = 0;
     int mY_written = m;
     int chroma_mode = sampling_mode;
+    // T-luma modes (15-18): chroma machinery runs on the base split mode.
+    if (cs_is_tcluster(sampling_mode) || cs_is_tmeans(sampling_mode)) {
+        chroma_mode = cs_is_ycc422(sampling_mode) ? CS_MODE_YCC422 : CS_MODE_YCC420;
+    }
     if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG) {
         // Seg-luma variant: the body prefix [nclasses][rates][seglen][label
         // PNG] regenerates the luma draw; chroma stays uniform on the base
@@ -463,6 +467,57 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
             throw std::runtime_error("seg-mask container: count mismatch");
         }
         mY_written = m;
+    }
+    else if (cs_is_tcluster(sampling_mode) || cs_is_tmeans(sampling_mode)) {
+        // T-luma: same pair stream as BGR modes on the full-res luma grid;
+        // chroma stays uniform (handled below on chroma_mode). m is points
+        // (tcluster) or groups (tmeans). Group geometry lands in tgrp_*
+        // for per-tile filtering; values land post-unpack below.
+        std::vector<int> pairs;
+        const int want = cs_is_tmeans(sampling_mode) ? m : (m + 3) / 4;
+        returnTetrominoPairIds(pairs, rows, cols, want, cs_key);
+        const int cell_cols = cols / 4;
+        ri_x.clear();
+        ri_y.clear();
+        int xs[4], ys[4];
+        if (cs_is_tmeans(sampling_mode)) {
+            if ((int)pairs.size() != m) {
+                throw std::runtime_error("tmeans container: count mismatch");
+            }
+            tgrp_off.assign(m + 1, 0);
+            tgrp_px.assign((size_t)m * 4, 0);
+            tgrp_w.assign((size_t)m * 4, 0.25f);
+            tgrp_val.assign((size_t)m, cv::Vec3b(0, 0, 0));
+            ri_x.reserve((size_t)m * 4);
+            ri_y.reserve((size_t)m * 4);
+            for (int k = 0; k < m; ++k) {
+                const int cell = pairs[(size_t)k] / 4, g = pairs[(size_t)k] % 4;
+                cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+                tgrp_off[(size_t)k + 1] = (k + 1) * 4;
+                for (int q = 0; q < 4; ++q) {
+                    tgrp_px[(size_t)k * 4 + q] = ys[q] * cols + xs[q];
+                    ri_x.push_back(ys[q]);
+                    ri_y.push_back(xs[q]);
+                }
+            }
+            mY_written = m;
+        }
+        else {
+            ri_x.reserve(pairs.size() * 4);
+            ri_y.reserve(pairs.size() * 4);
+            for (int p : pairs) {
+                const int cell = p / 4, g = p % 4;
+                cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+                for (int q = 0; q < 4; ++q) {
+                    ri_x.push_back(ys[q]);
+                    ri_y.push_back(xs[q]);
+                }
+            }
+            if ((int)ri_x.size() != m) {
+                throw std::runtime_error("tcluster container: count mismatch");
+            }
+            mY_written = m;
+        }
     }
     else if (cs_is_ycc_hf(sampling_mode)) {
         if (periodic_tile <= 0) throw std::runtime_error("ycc-hf container missing HF tile size");
@@ -570,7 +625,19 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     cb = cv::Mat::zeros(crows, ccols, CV_8U);
     cb_mask = cv::Mat::zeros(crows, ccols, CV_8U);
 
-    for (int k = 0; k < mY_written; k++) {
+    if (cs_is_tmeans(sampling_mode)) {
+        // Group values (post-unpack body): splat each mean on its 4 luma
+        // pixels (display/coverage); the solve uses tgrp_* + tgrp_val.
+        for (int k = 0; k < m; ++k) {
+            tgrp_val[(size_t)k] = cv::Vec3b(body[k], body[k], body[k]);
+            for (int q = tgrp_off[(size_t)k]; q < tgrp_off[(size_t)k + 1]; ++q) {
+                const int px = tgrp_px[(size_t)q];
+                y.at<uint8_t>(px / cols, px % cols) = body[k];
+                y_mask.at<uint8_t>(px / cols, px % cols) = 1;
+            }
+        }
+    }
+    else for (int k = 0; k < mY_written; k++) {
         y.at<uint8_t>(ri_x[k], ri_y[k]) = body[k];
         y_mask.at<uint8_t>(ri_x[k], ri_y[k]) = 1;
     }
@@ -1046,10 +1113,18 @@ static void decrypt_tiles_ycc420(int num_threads,
         int cnt = 0;
         for (int ii = 0; ii < num_tiles; ++ii)
             for (int jj = 0; jj < num_tiles; ++jj) {
-                const int mm = (int)y_idx[ii][jj].ri_x_g.size();
+                const int mm = cs_tile_meas_count(y_idx[ii][jj]);
                 if (mm > 0) { sum += mm; ++cnt; }
             }
         if (cnt > 0) coef_mean_my = (double)sum / cnt;
+    }
+    // Averaged (T-means) luma has no in-solve SR/DIP operator yet.
+    if (superres_2x || sr_direct_2x || sr_dip_2x) {
+        for (int ii = 0; ii < num_tiles; ++ii)
+            for (int jj = 0; jj < num_tiles; ++jj)
+                if (!y_idx[ii][jj].rg_off.empty()) {
+                    throw std::runtime_error("--sampling tmeans needs the standard/AVIR path (no sr-direct/cs-sr/dip operator yet)");
+                }
     }
 
     for (int w = 0; w <= 2 * (num_tiles - 1); ++w) {
@@ -1113,37 +1188,50 @@ static void decrypt_tiles_ycc420(int num_threads,
                 cv::Mat dummy;
                 // luma-only per-tile scaling (chroma draws stay uniform, so
                 // coef_c is untouched; tv follows under its own flag)
+                const struct indices& y_tidx = y_idx[i][j];
                 const float tile_coef_y = per_tile_coef
-                    ? cs_per_tile_coef(t_coef_base, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
+                    ? cs_per_tile_coef(t_coef_base, cs_tile_meas_count(y_tidx), coef_mean_my)
                     : t_coef_base;
                 const float tile_tv_y = per_tile_tv
-                    ? cs_per_tile_coef(t_tv_base, (int)y_idx[i][j].ri_x_g.size(), coef_mean_my)
+                    ? cs_per_tile_coef(t_tv_base, cs_tile_meas_count(y_tidx), coef_mean_my)
                     : t_tv_base;
+                // Grouped luma (T-means) rides the weight-aware core;
+                // chroma draws are always uniform points.
+                cs_meas_groups y_grps;
+                const cs_meas_groups* y_pgrps = nullptr;
+                if (!y_tidx.rg_off.empty() && (int)y_tidx.rg_off.size() > 1) {
+                    y_grps.off = y_tidx.rg_off.data();
+                    y_grps.px = y_tidx.rg_px.data();
+                    y_grps.w = y_tidx.rg_w.data();
+                    y_grps.ng = (int)y_tidx.rg_off.size() - 1;
+                    y_pgrps = &y_grps;
+                }
                 // FISTA-only (joint degrades to per-channel FISTA at the
                 // dispatcher): luma at full tile resolution, chroma natively
                 // on the half-resolution grid, where proximal updates are
                 // exact at the near-flat warm starts.
                 auto solve_plane = [&](const cv::Mat& meas, float c, int R, int C,
                     const std::vector<int>& rx, const std::vector<int>& ry,
-                    int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t) {
-                    reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, t_reweights, t_fista_iters, t_basis, t_wscale, use_onsager);
+                    int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t,
+                    const cs_meas_groups* pg = nullptr) {
+                    reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, t_reweights, t_fista_iters, t_basis, t_wscale, use_onsager, pg);
                 };
                 // Solve high-TV first as the base, then low-TV from the same
                 // neighbour warm start (independent, not a continuation).
                 const bool mixed = low_tv_tiles && y_dual_tv > 0.0f &&
-                    cs_y_mixed_density(y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, Th, Tw);
+                    cs_y_mixed_density(y_tidx.ri_x_g, y_tidx.ri_y_g, Th, Tw);
                 cv::Mat y_low = mixed ? x0[0].clone() : cv::Mat();
                 if (!y_low.empty())
                     solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                        y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, t_iterations,
-                        x0[0], false, dummy, y_dual_tv);
+                        y_tidx.ri_x_g, y_tidx.ri_y_g, t_iterations,
+                        x0[0], false, dummy, y_dual_tv, y_pgrps);
                 cv::Mat& low = y_low.empty() ? x0[0] : y_low;
                 solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                    y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g, t_iterations, low,
-                    false, dummy, tile_tv_y);
+                    y_tidx.ri_x_g, y_tidx.ri_y_g, t_iterations, low,
+                    false, dummy, tile_tv_y, y_pgrps);
                 if (y_confidence > 0.0f)
-                    cs_refine_y_confidence(y_meas[i][j], y_idx[i][j].ri_x_g,
-                        y_idx[i][j].ri_y_g, low, y_confidence, tile_coef_y,
+                    cs_refine_y_confidence(y_meas[i][j], y_tidx.ri_x_g,
+                        y_tidx.ri_y_g, low, y_confidence, tile_coef_y,
                         tile_tv_y, t_iterations, t_fista_iters, t_basis, t_wscale);
                 solve_plane(cr_meas[i][j], t_coef_c, cTh, cTw,
                     cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, t_iters_c, x0[1],
@@ -2392,13 +2480,66 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 cv::cvtColor(cr_tiles[i][j], cr_bgr, cv::COLOR_GRAY2BGR);
                 cv::cvtColor(cb_tiles[i][j], cb_bgr, cv::COLOR_GRAY2BGR);
                 encrypt_image y_img(y_bgr, false), cr_img(cr_bgr, false), cb_img(cb_bgr, false);
-                y_img.encrypt(ylx, yly);
+                if (cs_is_tmeans(dimgs.get_sampling_mode())) {
+                    // Grouped luma: filter the global T groups by this tile
+                    // rect (clip + renormalize, BGR-prep convention); ri
+                    // lists stay empty, counts derive from ng.
+                    const std::vector<int>& goff = dimgs.get_tgrp_off();
+                    const std::vector<int>& gpx = dimgs.get_tgrp_px();
+                    const std::vector<float>& ggw = dimgs.get_tgrp_w();
+                    const std::vector<cv::Vec3b>& gval = dimgs.get_tgrp_val();
+                    const int ng = (int)goff.size() - 1;
+                    const int gw_all = Y0.cols;
+                    indices ygroups;
+                    ygroups.rg_off.reserve((size_t)ng + 1);
+                    ygroups.rg_px.reserve((size_t)ng * 4);
+                    ygroups.rg_w.reserve((size_t)ng * 4);
+                    ygroups.rg_off.push_back(0);
+                    std::vector<cv::Vec3b> yvals;
+                    yvals.reserve((size_t)ng);
+                    for (int g = 0; g < ng; ++g) {
+                        bool hit = false;
+                        for (int e = goff[(size_t)g]; e < goff[(size_t)g + 1]; ++e) {
+                            const int gx = gpx[(size_t)e] % gw_all;
+                            const int gy = gpx[(size_t)e] / gw_all;
+                            if (gx >= x && gx < x + w && gy >= y0 && gy < y0 + h) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if (!hit) continue;
+                        int kept = 0;
+                        for (int e = goff[(size_t)g]; e < goff[(size_t)g + 1]; ++e) {
+                            const int gx = gpx[(size_t)e] % gw_all;
+                            const int gy = gpx[(size_t)e] / gw_all;
+                            if (gx >= x && gx < x + w && gy >= y0 && gy < y0 + h) ++kept;
+                        }
+                        if (kept == 0) continue;
+                        const float renorm = 4.0f / (float)kept;
+                        for (int e = goff[(size_t)g]; e < goff[(size_t)g + 1]; ++e) {
+                            const int gx = gpx[(size_t)e] % gw_all;
+                            const int gy = gpx[(size_t)e] / gw_all;
+                            if (gx >= x && gx < x + w && gy >= y0 && gy < y0 + h) {
+                                ygroups.rg_px.push_back((gy - y0) * w + (gx - x));
+                                ygroups.rg_w.push_back(ggw[(size_t)e] * renorm);
+                            }
+                        }
+                        ygroups.rg_off.push_back((int)ygroups.rg_px.size());
+                        const uint8_t v = gval[(size_t)g][0];
+                        yvals.push_back(cv::Vec3b(v, v, v));
+                    }
+                    y_idx[i][j] = ygroups;
+                    y_img.encrypt_values(yvals);
+                }
+                else {
+                    y_img.encrypt(ylx, yly);
+                    y_idx[i][j] = { ylx, yly };
+                }
                 cr_img.encrypt(crlx, crly);
                 cb_img.encrypt(cblx, cbly);
                 y_eph[i][j] = y_img.get_mat();
                 cr_eph[i][j] = cr_img.get_mat();
                 cb_eph[i][j] = cb_img.get_mat();
-                y_idx[i][j] = { ylx, yly };
                 cr_idx[i][j] = { crlx, crly };
                 cb_idx[i][j] = { cblx, cbly };
                 tile_size = y_img.get_size();

@@ -1491,6 +1491,88 @@ void test_tsampling() {
         std::remove(tmp_out.c_str());
     }
 
+    // YCC420 with T-tetromino luma (full-res manual like the CLI runs).
+    // Sparse YCC needs iterations to converge (same as uniform YCC at
+    // matched ratios); tmeans uses 40, tcluster defaults.
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_ycc420_t(0.5f, password, 8, 0, CS_MODE_YCC420, CS_MODE_YCC420_TCLUSTER);
+        cv::Mat container = enc.get_mat();
+        check(!container.empty(), "tsampling: ycc420 tcluster encrypt to memory");
+        const cv::Mat flat = container.reshape(0, (int)container.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC420_TCLUSTER, "tsampling: ycc420 tcluster header mode=15");
+        const std::string tmp_out = ".cs_test_tsampling_ytc.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 5, 4, 0.01f, false,
+            0.0f, true) == 0, "tsampling: ycc420 tcluster decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "tsampling: ycc420 tcluster output readable");
+        if (!dec.empty()) {
+            const double p = cs_quality::psnr(original, dec);
+            std::printf("       tsampling ycc420 tcluster PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 13.0, "tsampling: ycc420 tcluster PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_ycc420_t(0.25f, password, 8, 0, CS_MODE_YCC420, CS_MODE_YCC420_TMEANS);
+        cv::Mat container = enc.get_mat();
+        check(!container.empty(), "tsampling: ycc420 tmeans encrypt to memory");
+        const cv::Mat flat = container.reshape(0, (int)container.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC420_TMEANS, "tsampling: ycc420 tmeans header mode=16");
+        const std::string tmp_out = ".cs_test_tsampling_ytm.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
+            0.0f, true) == 0, "tsampling: ycc420 tmeans decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "tsampling: ycc420 tmeans output readable");
+        if (!dec.empty()) {
+            const double p = cs_quality::psnr(original, dec);
+            std::printf("       tsampling ycc420 tmeans PSNR (ratio 0.25, it40): %.2f dB\n", p);
+            // Sparse YCC needs iterations to converge (same as uniform YCC
+            // at matched ratios); the bar pins the wired-up grouped path
+            // (~9 dB garbage when miswired), not content quality.
+            check(p > 16.0, "tsampling: ycc420 tmeans PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_ycc420_t(0.5f, password, 8, 0, CS_MODE_YCC422, CS_MODE_YCC422_TCLUSTER);
+        cv::Mat container = enc.get_mat();
+        const cv::Mat flat = container.reshape(0, (int)container.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC422_TCLUSTER, "tsampling: ycc422 tcluster header mode=17");
+        const std::string tmp_out = ".cs_test_tsampling_ytc422.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 5, 4, 0.01f, false,
+            0.0f, true) == 0, "tsampling: ycc422 tcluster decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "tsampling: ycc422 tcluster output readable");
+        if (!dec.empty()) {
+            const double p = cs_quality::psnr(original, dec);
+            std::printf("       tsampling ycc422 tcluster PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 13.0, "tsampling: ycc422 tcluster PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_ycc420_t(0.25f, password, 8, 0, CS_MODE_YCC422, CS_MODE_YCC422_TMEANS);
+        cv::Mat container = enc.get_mat();
+        const cv::Mat flat = container.reshape(0, (int)container.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC422_TMEANS, "tsampling: ycc422 tmeans header mode=18");
+        const std::string tmp_out = ".cs_test_tsampling_ytm422.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
+            0.0f, true) == 0, "tsampling: ycc422 tmeans decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "tsampling: ycc422 tmeans output readable");
+        if (!dec.empty()) {
+            const double p = cs_quality::psnr(original, dec);
+            std::printf("       tsampling ycc422 tmeans PSNR (ratio 0.25, it40): %.2f dB\n", p);
+            // Same iteration physics as the 420 sibling (see above).
+            check(p > 16.0, "tsampling: ycc422 tmeans PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+
     std::remove(tmp_in.c_str());
 }
 

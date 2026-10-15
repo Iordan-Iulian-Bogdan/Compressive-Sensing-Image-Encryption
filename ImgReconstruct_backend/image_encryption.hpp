@@ -74,6 +74,11 @@ public:
     // rounded mean per selected pair (max useful ratio 0.25). BGR only.
     void encrypt_tcluster(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
     void encrypt_tmeans(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
+    // YCC split with T-tetromino luma (modes 15-18): split_mode selects the
+    // chroma geometry (CS_MODE_YCC420/422), tmode the luma draw + container
+    // mode (TCLUSTER/TMEANS variant matching the split).
+    void encrypt_ycc420_t(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits,
+        int split_mode, int tmode);
 
     // Adaptive periodic encryption: per-tile LOD bytes drive sample counts
     // (high detail -> more measurements). lod_min floors the 8-bit score so

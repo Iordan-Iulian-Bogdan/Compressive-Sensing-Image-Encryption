@@ -199,8 +199,9 @@ run it on the thumbnail for speed, then validate the winner at full size.
 
 ### T-tetromino sampling (`--sampling tcluster|tmeans`)
 
-`--sampling` selects the sampling atom (default `points` = uniform random,
-BGR-only, exclusive with other sampling flags; decrypt auto-detects):
+`--sampling` selects the sampling atom (default `points` = uniform random;
+exclusive with other sampling flags except `--ycc420`/`--ycc422`; decrypt
+auto-detects):
 - `tcluster` (mode 13): random subset of (4x4 cell, T-group) pairs from the
 fixed bench partition; all 4 pixels of each selected pair stored as
 individual point values (gaps between clusters). Same container/solver
@@ -208,11 +209,17 @@ machinery as points. Measured full-res crop: 22.07 dB at 0.5 (vs 20.63
 points), 13.72 at 0.25 (vs 15.60) — helps at high ratios, hurts in gaps.
 - `tmeans` (mode 14): one rounded mean per selected pair (max useful ratio
 0.25 = full pair coverage; higher requests clamp with a note). Needs the
-weight-aware FISTA scatter (true-average rows); standard/AVIR/joint paths
-supported, sr-direct/cs-sr/dip/GPU rejected with a clear error, YCC
-rejected at encrypt. Measured full-res crop: 32.56 dB at 0.25 (vs 15.60
+weight-aware FISTA scatter (true-average rows, Lipschitz-rescaled step);
+standard/AVIR/joint paths supported, sr-direct/cs-sr/dip/GPU rejected
+with a clear error. Measured full-res crop: 32.56 dB at 0.25 (vs 15.60
 points), 30.06 at 0.2, 16.13 at 0.1; auto 0.2 reaches 23.92 dB (vs 23.58
 points at 0.5 — wins with 2.5x fewer measurements).
+- With `--ycc420`/`--ycc422` the T draw applies to luma (modes 15-18,
+chroma stays uniform): tcluster 17.18/16.79 dB at 0.5 (vs 17.42 points),
+tmeans 31.74/31.78 dB at 0.25 with `--iterations 40` (vs 28.50 points at
+equal bytes). Sparse YCC needs iterations to converge — same physics as
+uniform YCC at matched ratios (standard 0.25 also needs it40); defaults
+undercook both equally.
 
 ### YCC 4:2:0 split sampling (`--ycc420`)
 

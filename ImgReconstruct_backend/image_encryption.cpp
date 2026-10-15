@@ -1071,6 +1071,147 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     sampling_mode = mode;
 }
 
+/** @brief YCC split with T-tetromino luma (modes 15-18): luma sampled from
+ * the fixed bench T partition on the full-res Y plane — T-cluster stores Y
+ * at all 4 pixels of each selected pair, T-means stores one rounded Y mean
+ * per pair (max useful ratio 0.25, higher clamps with a note). Chroma keeps
+ * the uniform coarse-grid draw on the base split geometry (420/422 via
+ * split_mode). Body layout identical to encrypt_ycc420: [Y x m][Cr][Cb].
+ * Metadata carries the luma budget m; decrypt regenerates the pair stream
+ * and the chroma draws from (key, m, geometry).
+ */
+void encrypt_image::encrypt_ycc420_t(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits,
+    int split_mode, int tmode) {
+    if ((split_mode != CS_MODE_YCC420 && split_mode != CS_MODE_YCC422) ||
+        (tmode != CS_MODE_YCC420_TCLUSTER && tmode != CS_MODE_YCC420_TMEANS &&
+         tmode != CS_MODE_YCC422_TCLUSTER && tmode != CS_MODE_YCC422_TMEANS)) {
+        throw std::runtime_error("ycc tetromino: bad split/t mode (internal error)");
+    }
+    if ((split_mode == CS_MODE_YCC420) !=
+        (tmode == CS_MODE_YCC420_TCLUSTER || tmode == CS_MODE_YCC420_TMEANS)) {
+        throw std::runtime_error("ycc tetromino: split/mode mismatch (internal error)");
+    }
+    bm = pixel_p;
+    const bool means = (tmode == CS_MODE_YCC420_TMEANS || tmode == CS_MODE_YCC422_TMEANS);
+    const int max_pairs = (rows / 4) * (cols / 4) * 4;
+    int pairs;
+    if (means) {
+        pairs = (int)((long long)rows * cols * bm);
+        if (pairs < 1) pairs = 1;
+        if (pairs > max_pairs) {
+            std::cout << "Note: --sampling tmeans clamps to full pair coverage ("
+                      << max_pairs << " luma measurements)" << std::endl;
+            pairs = max_pairs;
+        }
+    } else {
+        const int want = (int)((long long)rows * cols * bm);
+        pairs = (want + 3) / 4;
+        if (pairs < 1) pairs = 1;
+        if (pairs > max_pairs) pairs = max_pairs;
+    }
+
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+
+    std::vector<int> pair_ids;
+    returnTetrominoPairIds(pair_ids, rows, cols, pairs, cs_key);
+    const int cell_cols = cols / 4;
+    int xs[4], ys[4];
+    // member ri_* keep every luma group pixel (mask display + sample-split
+    // classification); the luma solve uses the pair stream, not these.
+    ri_x.clear();
+    ri_y.clear();
+    ri_x.reserve(pair_ids.size() * 4);
+    ri_y.reserve(pair_ids.size() * 4);
+    cv::Mat ycc;
+    cv::cvtColor(input_img, ycc, cv::COLOR_BGR2YCrCb);
+    std::vector<cv::Mat> planes;
+    cv::split(ycc, planes);
+    std::vector<uint8_t> luma;
+    luma.reserve(pair_ids.size() * (means ? 1 : 4));
+    for (int p : pair_ids) {
+        const int cell = p / 4, g = p % 4;
+        cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+        if (means) {
+            int acc = 0;
+            for (int q = 0; q < 4; ++q) {
+                ri_x.push_back(ys[q]);
+                ri_y.push_back(xs[q]);
+                acc += planes[0].at<uint8_t>(ys[q], xs[q]);
+            }
+            luma.push_back((uint8_t)((acc + 2) / 4));
+        } else {
+            for (int q = 0; q < 4; ++q) {
+                ri_x.push_back(ys[q]);
+                ri_y.push_back(xs[q]);
+                luma.push_back(planes[0].at<uint8_t>(ys[q], xs[q]));
+            }
+        }
+    }
+    m = (int)luma.size();
+
+    // chroma stays uniform on the base split geometry
+    returnYcc420ChromaIndices(rows, cols, m, cs_key, split_mode);
+    const int mC = m_chroma;
+    int crows, ccols;
+    cs_chroma_dims(split_mode, rows, cols, crows, ccols);
+    cv::Mat cr_small, cb_small;
+    cv::resize(planes[1], cr_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
+    cv::resize(planes[2], cb_small, cv::Size(ccols, crows), 0, 0, cv::INTER_AREA);
+
+    const size_t body_bytes = (size_t)m + (size_t)2 * mC;
+    const int body_pixels = (int)((body_bytes + 2) / 3);
+    const int total = next_perfect_square(body_pixels + CS_HEADER_PIXELS + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+
+    buf[CS_OFF_PAD] = (uint8_t)tmode;
+
+    uint8_t* body = buf + CS_HEADER_BYTES;
+    for (int k = 0; k < m; k++) {
+        body[k] = luma[(size_t)k];
+    }
+    for (int k = 0; k < mC; k++) {
+        body[m + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
+        body[m + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
+    }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        const size_t y0 = (size_t)CS_HEADER_BYTES;
+        encrypted_img = cs_pack_container_body(encrypted_img, {
+            { y0, (size_t)m, sample_bits, 0, false },
+            { y0 + (size_t)m, (size_t)mC, chroma_bits, 0, false },
+            { y0 + (size_t)m + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+
+    sampling_mode = tmode;
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
 // Forward declarations (defined alongside encrypt_adaptive below): LOD
 // region blending + density smoothing shared with encrypt_adaptive.
 std::vector<uint8_t> blend_llm_lod(const std::vector<uint8_t>& base,
@@ -2296,8 +2437,8 @@ int encrypt_image::encrypt_image_tiled(
         if (tmodes && (hf_focus || adaptive || two_pass || spectral || !regions_json.empty() ||
             lod_smooth > 0.0f || lod_full > 0 || tile_size > 0 || hr_detail > 0 ||
             lod_cutoff > 0 || lod_gamma != 1.0f || !seg_mask.empty() || !seg_rates.empty() ||
-            seg_blend != 0 || ycc420 || ycc422)) {
-            throw std::runtime_error("--sampling tcluster|tmeans is BGR-only and exclusive with other sampling flags (--adaptive/--periodic/--tile-size/--hf-focus/--hr-detail/--ycc420/--ycc422/--seg-mask/--seg-rates/--seg-blend/--lod-*)");
+            seg_blend != 0)) {
+            throw std::runtime_error("--sampling tcluster|tmeans is exclusive with other sampling flags (--adaptive/--periodic/--tile-size/--hf-focus/--hr-detail/--seg-mask/--seg-rates/--seg-blend/--lod-*)");
         }
         // Per-segment sampling (mode 10) is exclusive with every other
         // sampling path; the unused adaptive knobs self-reject below
@@ -2396,19 +2537,31 @@ int encrypt_image::encrypt_image_tiled(
         }
         else if (ycc420 || ycc422) {
             // luma/chroma-split sampling (mode travels in the header so
-            // decrypt needs no new flags). Adaptive LOD flags
-            // (--adaptive/--two-pass/--regions/--lod-smooth/--lod-full) are
-            // absorbed: they drive the luma budget while chroma stays uniform.
+            // decrypt needs no new flags). T-tetromino luma rides the same
+            // split geometry with uniform chroma (modes 15-18).
             const int split_mode = ycc422 ? CS_MODE_YCC422 : CS_MODE_YCC420;
-            const bool ycc_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0 || spectral;
-            if (ycc_adaptive) {
-                const int ts = tile_size > 0 ? tile_size : 64;
-                const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
-                encrypt_img.encrypt_ycc420_adaptive(compression_ratio, password, ts, lod_min, wbase,
-                    two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full, split_mode, spectral, lod_gamma, lod_cutoff);
-            } else {
-                const int hr_mode = hr_samples.empty() ? split_mode : CS_MODE_YCC420_HRDETAIL;
-                encrypt_img.encrypt_ycc420(compression_ratio, password, sample_bits, chroma_bits, hr_mode, hr_samples);
+            if (sampling == "tcluster" || sampling == "tmeans") {
+                const bool is_means = (sampling == "tmeans");
+                const int tmode = ycc422
+                    ? (is_means ? CS_MODE_YCC422_TMEANS : CS_MODE_YCC422_TCLUSTER)
+                    : (is_means ? CS_MODE_YCC420_TMEANS : CS_MODE_YCC420_TCLUSTER);
+                encrypt_img.encrypt_ycc420_t(compression_ratio, password, sample_bits, chroma_bits,
+                    split_mode, tmode);
+            }
+            else {
+                // Adaptive LOD flags
+                // (--adaptive/--two-pass/--regions/--lod-smooth/--lod-full) are
+                // absorbed: they drive the luma budget while chroma stays uniform.
+                const bool ycc_adaptive = adaptive || two_pass || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0 || spectral;
+                if (ycc_adaptive) {
+                    const int ts = tile_size > 0 ? tile_size : 64;
+                    const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
+                    encrypt_img.encrypt_ycc420_adaptive(compression_ratio, password, ts, lod_min, wbase,
+                        two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full, split_mode, spectral, lod_gamma, lod_cutoff);
+                } else {
+                    const int hr_mode = hr_samples.empty() ? split_mode : CS_MODE_YCC420_HRDETAIL;
+                    encrypt_img.encrypt_ycc420(compression_ratio, password, sample_bits, chroma_bits, hr_mode, hr_samples);
+                }
             }
         }
         else if (adaptive || lod_full > 0 || spectral) {

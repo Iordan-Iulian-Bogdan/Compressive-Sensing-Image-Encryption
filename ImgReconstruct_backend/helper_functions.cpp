@@ -719,7 +719,21 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     const int m = grouped ? groups->ng : (int)ri_x.size();
     if (reweights < 1) reweights = 1;
     if (reweights > 5) reweights = 5;
-    const cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+    cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+    if (grouped) {
+        // Averaged rows are shorter than point rows (true-average weights),
+        // so the smooth-part Lipschitz 2*||A||^2 drops below lip. Groups are
+        // disjoint within a tile, hence ||A||^2 = max row norm^2: rescale
+        // the fixed step to match instead of stepping 4x conservatively.
+        float maxn2 = 0.0f;
+        for (int k = 0; k < groups->ng; ++k) {
+            float rn2 = 0.0f;
+            for (int e = groups->off[k]; e < groups->off[k + 1]; ++e)
+                rn2 += groups->w[e] * groups->w[e];
+            if (rn2 > maxn2) maxn2 = rn2;
+        }
+        if (maxn2 > 0.0f) bx.lip = 2.0f * maxn2;
+    }
 
     std::vector<float> b;
     cs_extract_channel_measurements(pixel_measurements, channel, m, b);
@@ -1265,7 +1279,19 @@ void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const floa
     const int m = grouped ? groups->ng : (int)ri_x.size();
     if (reweights < 1) reweights = 1;
     if (reweights > 5) reweights = 5;
-    const cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+    cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+    if (grouped) {
+        // Same Lipschitz rescaling as the single-channel path: disjoint
+        // averaged rows shorten ||A||^2 to the max row norm^2.
+        float maxn2 = 0.0f;
+        for (int k = 0; k < groups->ng; ++k) {
+            float rn2 = 0.0f;
+            for (int e = groups->off[k]; e < groups->off[k + 1]; ++e)
+                rn2 += groups->w[e] * groups->w[e];
+            if (rn2 > maxn2) maxn2 = rn2;
+        }
+        if (maxn2 > 0.0f) bx.lip = 2.0f * maxn2;
+    }
 
     std::vector<float> b0, b1, b2;
     cs_extract_channel_measurements(pixel_measurements, 0, m, b0);
