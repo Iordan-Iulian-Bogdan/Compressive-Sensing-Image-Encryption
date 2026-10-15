@@ -3637,6 +3637,126 @@ void test_dual_tv_split() {
     }
 }
 
+void test_seg_auto() {
+    // Built-in segmentation: deterministic ids, sane classes, sane rates.
+    cv::Mat img = make_test_image(192, 144);
+    {
+        cv::Mat a, b;
+        cs_seg_auto_ids(img, 8, 144, 192, a);
+        cs_seg_auto_ids(img, 8, 144, 192, b);
+        check(a.size() == img.size() && a.type() == CV_8U, "seg-auto: ids geometry/type");
+        bool same = true;
+        for (int y = 0; y < a.rows && same; ++y) {
+            const uint8_t* ra = a.ptr<uint8_t>(y);
+            const uint8_t* rb = b.ptr<uint8_t>(y);
+            for (int x = 0; x < a.cols; ++x) {
+                if (ra[x] != rb[x] || ra[x] >= 8) { same = false; break; }
+            }
+        }
+        check(same, "seg-auto: deterministic, classes in range");
+    }
+    // Degenerate inputs rejected, tiny images accepted.
+    {
+        cv::Mat ids;
+        bool threw = false;
+        try { cs_seg_auto_ids(img, 1, 144, 192, ids); }
+        catch (...) { threw = true; }
+        check(threw, "seg-auto: 1 class rejected");
+        threw = false;
+        try { cs_seg_auto_ids(cv::Mat(), 4, 0, 0, ids); }
+        catch (...) { threw = true; }
+        check(threw, "seg-auto: empty image rejected");
+        cv::Mat tiny(24, 32, CV_8UC3, cv::Scalar(90, 90, 90));
+        cs_seg_auto_ids(tiny, 2, 24, 32, ids);
+        check(ids.rows == 24 && ids.cols == 32, "seg-auto: tiny image works");
+    }
+    // Auto rates: range, flat-is-uniform, detail ordering.
+    {
+        cv::Mat ids;
+        cs_seg_auto_ids(img, 4, 144, 192, ids);
+        const std::vector<float> r = cs_seg_auto_rates(img, ids, 4);
+        bool range = r.size() == 4;
+        for (float v : r) range = range && v >= 0.0f && v <= 1.0f;
+        check(range, "seg-auto rates: 4 values in [0,1]");
+        cv::Mat flat(64, 64, CV_8UC3, cv::Scalar(120, 120, 120));
+        cv::Mat fids;
+        cs_seg_auto_ids(flat, 2, 64, 64, fids);
+        const std::vector<float> fr = cs_seg_auto_rates(flat, fids, 2);
+        check(fr.size() == 2 && fr[0] == 1.0f && fr[1] == 1.0f, "seg-auto rates: flat image uniform 1.0");
+        // left half flat, right half noisy: noisy class must win
+        cv::Mat half(64, 64, CV_8UC3, cv::Scalar(120, 120, 120));
+        cv::randu(half(cv::Rect(32, 0, 32, 64)), cv::Scalar(0, 0, 0), cv::Scalar(255, 255, 255));
+        cv::Mat hids(64, 64, CV_8U, cv::Scalar(0));
+        hids(cv::Rect(32, 0, 32, 64)).setTo(1);
+        const std::vector<float> hr = cs_seg_auto_rates(half, hids, 2);
+        check(hr.size() == 2 && hr[1] > hr[0], "seg-auto rates: detail class outranks flat");
+    }
+    // End-to-end seg-auto roundtrip (mode 10, auto rates).
+    const std::string password = "seg-auto-test-password";
+    const std::string tmp_in = ".cs_test_segauto_in.png";
+    cv::imwrite(tmp_in, img);
+    {
+        cv::Mat encrypted;
+        check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &encrypted,
+            false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+            8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 8) == 0,
+            "seg-auto roundtrip: encrypt");
+        check(!encrypted.empty(), "seg-auto roundtrip: encrypt to memory");
+        const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_SEGMASK, "seg-auto roundtrip: header mode=10");
+        const std::string tmp_out = ".cs_test_segauto_out.png";
+        check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "seg-auto roundtrip: decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "seg-auto roundtrip: output readable");
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, img.size());
+            const double p = cs_quality::psnr(img, sized);
+            std::printf("       seg-auto roundtrip PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 9.0, "seg-auto roundtrip: PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+    // YCC seg-auto smoke (mode 11, auto rates).
+    {
+        cv::Mat encrypted;
+        check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &encrypted,
+            false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, true, false,
+            8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 6) == 0,
+            "seg-auto ycc: encrypt");
+        const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC420_SEG, "seg-auto ycc: header mode=11");
+        const std::string tmp_out = ".cs_test_segauto_ycc.png";
+        check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "seg-auto ycc: decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "seg-auto ycc: output readable");
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, img.size());
+            const double p = cs_quality::psnr(img, sized);
+            std::printf("       seg-auto ycc PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 9.0, "seg-auto ycc: PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+    // Validation: bad class count and mask+auto conflict fail before solving.
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, nullptr,
+        false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+        8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 1) != 0,
+        "seg-auto: 1 class rejected");
+    {
+        // rates override with auto: accepted (trailing classes score 0)
+        cv::Mat encrypted;
+        check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &encrypted,
+            false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+            8, 0, 0, false, false, "", 0, 1.0f, 0, "", "0.9,0.1", 0, "points", 4) == 0,
+            "seg-auto: --seg-rates override accepted");
+    }
+    std::remove(tmp_in.c_str());
+}
+
 void test_per_tile_coef() {
     // exact math: sqrt scaling with [0.25x, 4x] clamps and degenerate guards
     check(cs_per_tile_coef(0.01f, 100, 400.0) == 0.02f, "per-tile-coef: sqrt upscale");
@@ -3861,6 +3981,7 @@ int main(int argc, char* argv[]) {
     test_y_dual_tv_blend();
     test_y_dual_tv_color_segment();
     test_dual_tv_split();
+    test_seg_auto();
     test_per_tile_coef();
     test_gpu_fista_agreement();
 

@@ -279,7 +279,14 @@ void print_usage(const char* exe) {
   "                        --ratio scales every rate globally. With --ycc420\n"
   "                        or --ycc422 the rates drive the luma budget while\n"
   "                        chroma stays uniform (modes 11/12).\n"
-  "  --seg-blend <w>       encrypt/roundtrip only, needs --seg-mask: sample\n"
+  "  --seg-auto <k>        encrypt/roundtrip only: built-in k-means scene\n"
+  "                        segmentation into <k> classes (2..255) in Lab space\n"
+  "                        with detail-driven per-class rates (flat classes get\n"
+  "                        ~0.08, top detail 1.0; --seg-rates overrides). No\n"
+  "                        mask file needed; the label map ships in the\n"
+  "                        container, so decrypt needs no new flags. Works\n"
+  "                        with --ycc420/--ycc422 and --seg-blend.\n"
+  "  --seg-blend <w>       encrypt/roundtrip only, needs --seg-mask or --seg-auto: sample\n"
   "                        a <w>-pixel band (0..128, 0 = off) on each\n"
   "                        side of every segment frontier with a smooth local\n"
   "                        density ramp (compact triangular filter). Keeps\n"
@@ -532,6 +539,7 @@ int main(int argc, char* argv[])
     std::string seg_rates;
     int seg_blend = 0;
     std::string sampling = "points";
+    int seg_auto = 0;
     std::string seg_solve;
     std::string seg_params;
     bool show_mask = false;
@@ -990,6 +998,19 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             seg_solve = v;
         }
+        else if (a == "--seg-auto") {
+            const char* v = next("class count 2..255");
+            if (!v) return 64;
+            try {
+                size_t pos = 0;
+                seg_auto = std::stoi(v, &pos);
+                if (pos != std::string(v).size()) throw std::runtime_error("trailing characters");
+            }
+            catch (...) {
+                std::cerr << "Error: --seg-auto needs an integer in [2, 255]" << std::endl;
+                return 64;
+            }
+        }
         else if (a == "--sampling") {
             const char* v = next("points|tcluster|tmeans");
             if (!v) return 64;
@@ -1145,6 +1166,10 @@ int main(int argc, char* argv[])
         seg_mask.clear();
         seg_rates.clear();
     }
+    if (seg_auto != 0 && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --seg-auto is encrypt-side only; ignoring for decrypt" << std::endl;
+        seg_auto = 0;
+    }
     if (seg_blend != 0 && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --seg-blend is encrypt-side only; ignoring for decrypt" << std::endl;
         seg_blend = 0;
@@ -1153,8 +1178,8 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --sampling is encrypt-side only (decrypt auto-detects); ignoring for decrypt" << std::endl;
         sampling = "points";
     }
-    if (seg_blend != 0 && (seg_mask.empty() || seg_rates.empty())) {
-        std::cerr << "Error: --seg-blend needs --seg-mask/--seg-rates" << std::endl;
+    if (seg_blend != 0 && (seg_mask.empty() || seg_rates.empty()) && seg_auto == 0) {
+        std::cerr << "Error: --seg-blend needs --seg-mask/--seg-rates or --seg-auto" << std::endl;
         return 64;
     }
     if (seg_blend < 0 || seg_blend > 128) {
@@ -1293,7 +1318,7 @@ int main(int argc, char* argv[])
 output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
 full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
-seg_rates, seg_blend, sampling);
+seg_rates, seg_blend, sampling, seg_auto);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
@@ -1305,7 +1330,7 @@ seg_rates, seg_blend, sampling);
 output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
 full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
-seg_rates, seg_blend, sampling);
+seg_rates, seg_blend, sampling, seg_auto);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params);

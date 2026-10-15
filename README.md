@@ -142,8 +142,14 @@ nearest color; `<l>` is a comma list of per-class rates in [0,1] in id order
 (digits and commas only, so it survives PowerShell native-arg passing).
 `--ratio` scales every rate globally. Rates are quantized to u8 and shipped
 with a PNG of the label map in the body prefix, so decrypt regenerates the
-identical per-class draws with no flags. Exclusive with all other sampling
-flags except `--ycc420`/`--ycc422`, which absorb it like the adaptive LOD
+identical per-class draws with no flags. `--seg-auto <k>` (2..255) replaces
+the mask file with built-in k-means scene segmentation in Lab space (480px
+working copy, classes sorted by size desc, speckle components reassigned to
+the neighborhood mode, deterministic fixed seed) plus detail-driven rates
+(mean Sobel energy per class: flat classes ~0.08, top detail 1.0, flat images
+uniform 1.0); `--seg-rates` overrides the auto rates. The auto label map
+ships identically, so decrypt needs no new flags. Exclusive with all other
+sampling flags except `--ycc420`/`--ycc422`, which absorb it like the adaptive LOD
 path: the rates drive the luma budget (modes 11/12) while chroma stays
 uniform. `--show-mask`/`--sample-split` work unchanged.
 `--seg-blend <w>` (0..128 pixels, default 0 = off) smoothly filters the

@@ -47,6 +47,11 @@ public:
     void encrypt_segmask(const float& pixel_p, const std::string& password,
         const std::string& mask_path, const std::vector<float>& rates,
         int sample_bits = 8, int chroma_bits = 0, int seg_blend = 0);
+    // Same sampling as encrypt_segmask but from resolved ids (used by
+    // --seg-auto, which has no mask file).
+    void encrypt_segmask_ids(const float& pixel_p, const std::string& password,
+        const cv::Mat& ids, const std::vector<float>& rates,
+        int sample_bits = 8, int chroma_bits = 0, int seg_blend = 0);
 
     // Per-segment luma + uniform chroma (modes 11/12): same seg-mask luma
     // budget as encrypt_segmask, each chroma plane sampled uniformly on its
@@ -54,6 +59,11 @@ public:
     // [Y x mY][Cr x mC][Cb x mC]; decrypt auto-detects.
     void encrypt_ycc420_segmask(const float& pixel_p, const std::string& password,
         const std::string& mask_path, const std::vector<float>& rates,
+        int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG,
+        int seg_blend = 0);
+    // Same as encrypt_ycc420_segmask but from resolved ids (--seg-auto).
+    void encrypt_ycc420_segmask_ids(const float& pixel_p, const std::string& password,
+        const cv::Mat& ids, const std::vector<float>& rates,
         int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG,
         int seg_blend = 0);
 
@@ -125,7 +135,7 @@ public:
     static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const
 std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string&
 seg_mask = "", const std::string& seg_rates = "", int seg_blend = 0,
-    const std::string& sampling = "points");
+    const std::string& sampling = "points", int seg_auto = 0);
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at
@@ -145,6 +155,15 @@ private:
 // palette by nearest color, everything resizes with INTER_NEAREST).
 std::vector<float> parse_seg_rates(const std::string& s);
 cv::Mat cs_segmask_resolve_ids(const cv::Mat& mask_raw, int rows, int cols);
+// Built-in scene segmentation (--seg-auto): k-means in Lab on a capped
+// working copy, classes sorted by size desc, tiny components reassigned to
+// the neighborhood mode, upscaled NEAREST to rows x cols. Deterministic
+// (fixed OpenCV RNG seed, state restored). No models or downloads.
+void cs_seg_auto_ids(const cv::Mat& bgr, int classes, int rows, int cols, cv::Mat& ids);
+// Auto per-class rates from mean Sobel gradient energy (detail proxy):
+// r = 0.08 + 0.92*(d/dmax)^0.75 over the classes present in ids; flat
+// images (dmax == 0) get uniform 1.0.
+std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int classes);
 
 // Per-tile spectral LOD bytes (free function for test access): each tile's
 // gray DCT energy whitened by the image's global radial spectral decay,

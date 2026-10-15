@@ -1710,6 +1710,154 @@ cv::Mat cs_segmask_resolve_ids(const cv::Mat& mask_raw, int rows, int cols) {
     throw std::runtime_error("seg-mask: need an 8-bit grayscale label map or a BGR color mask");
 }
 
+void cs_seg_auto_ids(const cv::Mat& bgr, int classes, int rows, int cols, cv::Mat& ids) {
+    if (classes < 2 || classes > 255) {
+        throw std::runtime_error("--seg-auto needs 2..255 classes");
+    }
+    if (bgr.empty() || bgr.channels() != 3) {
+        throw std::runtime_error("--seg-auto needs a color image");
+    }
+    if (rows <= 0 || cols <= 0) {
+        throw std::runtime_error("--seg-auto: bad pipeline geometry");
+    }
+    // Working copy capped at 480px long side (INTER_AREA down, k-means is
+    // O(pixels * classes)); labels return NEAREST to pipeline geometry.
+    const int lw = bgr.cols, lh = bgr.rows;
+    const double s = (std::max)(lw, lh) > 480 ? 480.0 / (std::max)(lw, lh) : 1.0;
+    cv::Mat small;
+    if (s < 1.0) cv::resize(bgr, small, cv::Size(), s, s, cv::INTER_AREA);
+    else small = bgr;
+    cv::Mat lab;
+    cv::cvtColor(small, lab, cv::COLOR_BGR2Lab);
+    cv::Mat data;
+    lab.convertTo(data, CV_32F);
+    data = data.reshape(1, small.rows * small.cols);
+
+    // Deterministic: fixed OpenCV RNG seed, global state restored after.
+    const uint64_t saved_rng = cv::theRNG().state;
+    cv::setRNGSeed(0x5EEDC10C);
+    cv::Mat labels, centers;
+    cv::kmeans(data, classes, labels,
+        cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 10, 1.0),
+        3, cv::KMEANS_PP_CENTERS, centers);
+    cv::theRNG().state = saved_rng;
+
+    cv::Mat flat = labels.reshape(1, small.rows);
+    // Remap by size desc (class 0 = largest): stable, content-ordered ids.
+    std::vector<int> sizes((size_t)classes, 0);
+    for (int y = 0; y < flat.rows; ++y) {
+        const int32_t* row = flat.ptr<int32_t>(y);
+        for (int x = 0; x < flat.cols; ++x) {
+            if (row[x] >= 0 && row[x] < classes) sizes[(size_t)row[x]]++;
+        }
+    }
+    std::vector<int> order((size_t)classes);
+    for (int c = 0; c < classes; ++c) order[(size_t)c] = c;
+    std::sort(order.begin(), order.end(),
+        [&](int a, int b) { return sizes[(size_t)a] > sizes[(size_t)b]; });
+    int lut[256];
+    for (int c = 0; c < 256; ++c) lut[c] = 0;
+    int next_id = 0;
+    for (int c : order) {
+        if (sizes[(size_t)c] == 0) continue; // k-means dropped this cluster
+        lut[c] = next_id++;
+    }
+    cv::Mat remapped(flat.size(), CV_8U);
+    for (int y = 0; y < flat.rows; ++y) {
+        const int32_t* srow = flat.ptr<int32_t>(y);
+        uint8_t* drow = remapped.ptr<uint8_t>(y);
+        for (int x = 0; x < flat.cols; ++x) drow[x] = (uint8_t)lut[srow[x]];
+    }
+
+    // Reassign speckle components (< max(48, 0.05% of seg pixels)) to the
+    // 5x5 neighborhood mode from the pre-cleanup map (one pass). Skipped
+    // when the image is too fragmented (> 25% speckle: keep raw k-means).
+    const int total = remapped.rows * remapped.cols;
+    const int min_area = (std::max)(48, total * 5 / 10000);
+    cv::Mat tiny = cv::Mat::zeros(remapped.size(), CV_8U);
+    long long tiny_count = 0;
+    for (int c = 0; c < next_id; ++c) {
+        cv::Mat is_c = (remapped == c);
+        cv::Mat comp, stats, cent;
+        const int ncomp = cv::connectedComponentsWithStats(is_c, comp, stats, cent, 8, CV_32S);
+        for (int k = 1; k < ncomp; ++k) {
+            if (stats.at<int>(k, cv::CC_STAT_AREA) < min_area) {
+                cv::Mat sel = (comp == k);
+                sel.copyTo(tiny, sel);
+                tiny_count += stats.at<int>(k, cv::CC_STAT_AREA);
+            }
+        }
+    }
+    cv::Mat clean = remapped.clone();
+    if (tiny_count > 0 && tiny_count <= total / 4) {
+        for (int y = 0; y < clean.rows; ++y) {
+            uint8_t* drow = clean.ptr<uint8_t>(y);
+            for (int x = 0; x < clean.cols; ++x) {
+                if (!tiny.at<uint8_t>(y, x)) continue;
+                int hist[256] = { 0 };
+                for (int dy = -2; dy <= 2; ++dy) {
+                    const int yy = y + dy;
+                    if (yy < 0 || yy >= clean.rows) continue;
+                    const uint8_t* srow = remapped.ptr<uint8_t>(yy);
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        const int xx = x + dx;
+                        if (xx < 0 || xx >= clean.cols) continue;
+                        hist[srow[xx]]++;
+                    }
+                }
+                int best = drow[x], bv = -1;
+                for (int c = 0; c < next_id; ++c) {
+                    if (hist[c] > bv) { bv = hist[c]; best = c; }
+                }
+                drow[x] = (uint8_t)best;
+            }
+        }
+    }
+
+    if (clean.rows != rows || clean.cols != cols) {
+        cv::resize(clean, ids, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
+    } else {
+        ids = clean;
+    }
+}
+
+std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int classes) {
+    std::vector<float> rates((size_t)(classes > 0 ? classes : 1), 1.0f);
+    if (bgr.empty() || ids.empty() || bgr.size() != ids.size() || classes <= 0) {
+        return rates;
+    }
+    cv::Mat gray;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat gx, gy, mag;
+    cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
+    cv::magnitude(gx, gy, mag);
+    std::vector<double> sum((size_t)classes, 0.0);
+    std::vector<long long> cnt((size_t)classes, 0);
+    for (int y = 0; y < ids.rows; ++y) {
+        const uint8_t* irow = ids.ptr<uint8_t>(y);
+        const float* mrow = mag.ptr<float>(y);
+        for (int x = 0; x < ids.cols; ++x) {
+            const int c = irow[x];
+            if (c < 0 || c >= classes) continue;
+            sum[(size_t)c] += mrow[x];
+            cnt[(size_t)c]++;
+        }
+    }
+    double dmax = 0.0;
+    std::vector<double> det((size_t)classes, 0.0);
+    for (int c = 0; c < classes; ++c) {
+        if (cnt[(size_t)c] > 0) det[(size_t)c] = sum[(size_t)c] / (double)cnt[(size_t)c];
+        if (det[(size_t)c] > dmax) dmax = det[(size_t)c];
+    }
+    if (!(dmax > 0.0)) return rates; // flat image: uniform 1.0
+    for (int c = 0; c < classes; ++c) {
+        const double f = det[(size_t)c] / dmax;
+        rates[(size_t)c] = (float)(0.08 + 0.92 * std::pow(f, 0.75));
+    }
+    return rates;
+}
+
 /** @brief Per-segment encryption: each class id of the mask draws its own
  * budgeted share (count_c = round(pix_c * q_c / 255) with q the quantized
  * rate AFTER the global pixel_p scale), then one global shuffle fixes the
@@ -1718,19 +1866,28 @@ cv::Mat cs_segmask_resolve_ids(const cv::Mat& mask_raw, int rows, int cols) {
  * standard BGR pipeline, so tiling/decrypt are unchanged.
  */
 void encrypt_image::encrypt_segmask(const float& pixel_p, const std::string& password,
-    const std::string& mask_path, const std::vector<float>& rates, int sample_bits, int chroma_bits,
-    int seg_blend) {
+    const std::string& mask_path, const std::vector<float>& rates,
+    int sample_bits, int chroma_bits, int seg_blend) {
+    cv::Mat mask_raw = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
+    if (mask_raw.empty()) {
+        throw std::runtime_error("seg-mask: cannot load '" + mask_path + "'");
+    }
+    cv::Mat ids = cs_segmask_resolve_ids(mask_raw, rows, cols);
+    encrypt_segmask_ids(pixel_p, password, ids, rates, sample_bits, chroma_bits, seg_blend);
+}
+
+void encrypt_image::encrypt_segmask_ids(const float& pixel_p, const std::string& password,
+    const cv::Mat& ids, const std::vector<float>& rates,
+    int sample_bits, int chroma_bits, int seg_blend) {
     if (rates.empty() || rates.size() > 255) {
         throw std::runtime_error("seg-mask: need 1..255 per-class rates (--seg-rates)");
     }
     if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
         throw std::runtime_error("--seg-blend must be in [0, 128] pixels");
     }
-    cv::Mat mask_raw = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
-    if (mask_raw.empty()) {
-        throw std::runtime_error("seg-mask: cannot load '" + mask_path + "'");
+    if (ids.empty() || ids.type() != CV_8U || ids.rows != rows || ids.cols != cols) {
+        throw std::runtime_error("seg-mask: label map must be 8-bit at pipeline geometry");
     }
-    cv::Mat ids = cs_segmask_resolve_ids(mask_raw, rows, cols);
 
     // Quantize AFTER the global scale so decrypt (which only sees the
     // shipped bytes) reproduces the counts exactly. Ids past the rate list
@@ -1837,6 +1994,17 @@ void encrypt_image::encrypt_segmask(const float& pixel_p, const std::string& pas
 void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::string& password,
     const std::string& mask_path, const std::vector<float>& rates,
     int sample_bits, int chroma_bits, int mode, int seg_blend) {
+    cv::Mat mask_raw = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
+    if (mask_raw.empty()) {
+        throw std::runtime_error("seg-mask: cannot load '" + mask_path + "'");
+    }
+    cv::Mat ids = cs_segmask_resolve_ids(mask_raw, rows, cols);
+    encrypt_ycc420_segmask_ids(pixel_p, password, ids, rates, sample_bits, chroma_bits, mode, seg_blend);
+}
+
+void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::string& password,
+    const cv::Mat& ids, const std::vector<float>& rates,
+    int sample_bits, int chroma_bits, int mode, int seg_blend) {
     if (mode != CS_MODE_YCC420_SEG && mode != CS_MODE_YCC422_SEG) {
         throw std::runtime_error("seg-mask ycc: bad split mode (internal error)");
     }
@@ -1846,11 +2014,9 @@ void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::stri
     if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
         throw std::runtime_error("--seg-blend must be in [0, 128] pixels");
     }
-    cv::Mat mask_raw = cv::imread(mask_path, cv::IMREAD_UNCHANGED);
-    if (mask_raw.empty()) {
-        throw std::runtime_error("seg-mask: cannot load '" + mask_path + "'");
+    if (ids.empty() || ids.type() != CV_8U || ids.rows != rows || ids.cols != cols) {
+        throw std::runtime_error("seg-mask: label map must be 8-bit at pipeline geometry");
     }
-    cv::Mat ids = cs_segmask_resolve_ids(mask_raw, rows, cols);
 
     std::vector<uint8_t> q;
     q.reserve(rates.size());
@@ -2379,7 +2545,8 @@ int encrypt_image::encrypt_image_tiled(
     const std::string& seg_mask,
     const std::string& seg_rates,
     int seg_blend,
-    const std::string& sampling
+    const std::string& sampling,
+    int seg_auto
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -2444,8 +2611,14 @@ int encrypt_image::encrypt_image_tiled(
         // sampling path; the unused adaptive knobs self-reject below
         // (--adaptive-gamma/--adaptive-cutoff need an adaptive path) except
         // strength/floor, which are rejected here.
-        const bool seg_mode = !seg_mask.empty() || !seg_rates.empty();
-        if (seg_mode && (seg_mask.empty() || seg_rates.empty())) {
+        if (seg_auto != 0 && (seg_auto < 2 || seg_auto > 255)) {
+            throw std::runtime_error("--seg-auto needs 2..255 classes (0 = off)");
+        }
+        if (seg_auto > 0 && !seg_mask.empty()) {
+            throw std::runtime_error("--seg-auto and --seg-mask are mutually exclusive (two label sources)");
+        }
+        const bool seg_mode = !seg_mask.empty() || !seg_rates.empty() || seg_auto > 0;
+        if (seg_mode && !seg_auto && (seg_mask.empty() || seg_rates.empty())) {
             throw std::runtime_error("--seg-mask and --seg-rates must be given together");
         }
         if (seg_blend != 0 && !seg_mode) {
@@ -2457,7 +2630,7 @@ int encrypt_image::encrypt_image_tiled(
         if (seg_mode && (hf_focus || adaptive || two_pass || spectral || !regions_json.empty() ||
             lod_smooth > 0.0f || lod_full > 0 || tile_size > 0 || hr_detail > 0 ||
             lod_cutoff > 0 || adaptive_strength != 0.5f || lod_min != 32)) {
-            throw std::runtime_error("--seg-mask is exclusive with other sampling flags (--adaptive/--two-pass/--spectral/--regions/--lod-smooth/--lod-full/--adaptive-cutoff/--adaptive-strength/--adaptive-floor/--periodic/--tile-size/--hf-focus/--hr-detail)");
+            throw std::runtime_error("--seg-mask/--seg-auto is exclusive with other sampling flags (--adaptive/--two-pass/--spectral/--regions/--lod-smooth/--lod-full/--adaptive-cutoff/--adaptive-strength/--adaptive-floor/--periodic/--tile-size/--hf-focus/--hr-detail)");
         }
         if (hr_detail > 0) {
             // Prototype scope: uniform sampling only (BGR mode 0, YCC420
@@ -2523,6 +2696,44 @@ int encrypt_image::encrypt_image_tiled(
             }
             else {
                 encrypt_img.encrypt_segmask(compression_ratio, password, seg_mask, seg_rate_list, sample_bits, chroma_bits, seg_blend);
+            }
+        }
+        else if (seg_auto > 0) {
+            // built-in segmentation: k-means ids at pipeline geometry plus
+            // detail-driven rates (or the --seg-rates override, whose short
+            // lists leave trailing classes at 0). Same containers/modes as
+            // --seg-mask, so decrypt needs no new flags.
+            // Segment at the sampling geometry (rows x cols members, which
+            // the ctor leaves unstretched; the mult-8 stretch applies to
+            // input_img pixels only and sampling never addresses it).
+            cv::Mat auto_ids;
+            cs_seg_auto_ids(input_img, seg_auto, input_img.rows, input_img.cols, auto_ids);
+            std::vector<float> auto_rates = seg_rates.empty()
+                ? cs_seg_auto_rates(input_img, auto_ids, seg_auto)
+                : parse_seg_rates(seg_rates);
+            {
+                std::vector<long long> cls_sz((size_t)seg_auto, 0);
+                for (int y = 0; y < auto_ids.rows; ++y) {
+                    const uint8_t* row = auto_ids.ptr<uint8_t>(y);
+                    for (int x = 0; x < auto_ids.cols; ++x) {
+                        if (row[x] < seg_auto) cls_sz[(size_t)row[x]]++;
+                    }
+                }
+                std::cout << "seg-auto: " << seg_auto << " classes";
+                for (int c = 0; c < seg_auto; ++c) {
+                    char rb[32];
+                    std::snprintf(rb, sizeof(rb), "%.2f",
+                        c < (int)auto_rates.size() ? auto_rates[(size_t)c] : 0.0f);
+                    std::cout << " [" << c << "]px=" << cls_sz[(size_t)c] << " r=" << rb;
+                }
+                std::cout << (seg_rates.empty() ? " (auto rates)" : " (--seg-rates override)") << std::endl;
+            }
+            if (ycc420 || ycc422) {
+                const int seg_mode = ycc422 ? CS_MODE_YCC422_SEG : CS_MODE_YCC420_SEG;
+                encrypt_img.encrypt_ycc420_segmask_ids(compression_ratio, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
+            }
+            else {
+                encrypt_img.encrypt_segmask_ids(compression_ratio, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_blend);
             }
         }
         else if (hf_focus) {
