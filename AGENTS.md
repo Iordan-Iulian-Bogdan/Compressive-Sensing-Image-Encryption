@@ -22,6 +22,7 @@ C++ image encryption via compressive sensing with FISTA reconstruction (per-chan
 ## Conventions
 - For large logs or file analysis, use sandboxed processing (ctx tools) and only return derived summaries.
 - Test commands for the user: write ALL output files (decrypts, comparisons, error maps) to the repo root `C:\Users\iorda\OneDrive\Documents\Compressive-Sensing-Image-Encryption-CPU_Limited_memory_BFGS` using relative paths (e.g. `wavelet.dec.png`, never `$env:TEMP` or absolute temp paths).
+- NEVER delete `third_party/` (untracked local deps: onnxruntime, nunif — builds fail without it, and it is invisible to git). If a build fails on missing `onnxruntime_cxx_api.h`, restore from the `BFG2S` clone on the Desktop, never re-download.
 
 # context-mode - MANDATORY routing rules
 

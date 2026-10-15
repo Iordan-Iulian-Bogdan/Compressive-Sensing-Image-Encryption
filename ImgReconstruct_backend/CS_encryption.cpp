@@ -9,6 +9,23 @@
 
 int CSencryption::params = AUTO_PARAM;
 
+namespace {
+// Fixed T-tetromino partition of each 4x4 acquisition cell (bench layout):
+// row-major cell value -> group 0..3.
+const uint8_t kTetroGroup[16] = { 0,0,0,2, 1,0,2,2, 1,1,3,2, 1,3,3,3 };
+}  // namespace
+
+void cs_tetro_group_pixels(int cell_r, int cell_c, int g, int xs[4], int ys[4]) {
+    int n = 0;
+    for (int k = 0; k < 16 && n < 4; ++k) {
+        if (kTetroGroup[k] == g) {
+            xs[n] = cell_c + k % 4;
+            ys[n] = cell_r + k / 4;
+            ++n;
+        }
+    }
+}
+
 std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, int m_total,
     int rows, int cols, int tile_size, int weight_base, int full_threshold, int cutoff)
 {
@@ -222,6 +239,34 @@ void CSencryption::returnRandomIndices(std::vector<int>& ri_x, std::vector<int>&
 
     shuffle(ri_x, shuffle_seed);
     shuffle(ri_y, shuffle_seed);
+}
+
+// Tetromino-pair subset (modes 13/14): partial Fisher-Yates over the
+// cells*4 (cell, T-group) pair pool selects EXACTLY numPairs distinct
+// pairs; the taken prefix is already in random order, so no second shuffle
+// is needed. Pair id = cell * 4 + group with cells row-major over the
+// xm/4 x ym/4 grid of 4x4 acquisition cells (see cs_tetro_group_pixels).
+// Fully deterministic from (key, geometry, numPairs).
+void CSencryption::returnTetrominoPairIds(std::vector<int>& pairs, int xm, int ym, int numPairs, const uint8_t key[32]) {
+    if (xm % 4 != 0 || ym % 4 != 0) {
+        throw std::runtime_error("tetromino sampling needs dimensions divisible by 4");
+    }
+    const int total = (xm / 4) * (ym / 4) * 4;
+    if (numPairs < 0 || numPairs > total) {
+        throw std::runtime_error("requested pair count exceeds the number of available tetromino pairs");
+    }
+    std::seed_seq seq(key, key + 32);
+    std::mt19937 generator(seq);
+
+    std::vector<int> pool(total);
+    std::iota(pool.begin(), pool.end(), 0);
+    pairs.resize(numPairs);
+    for (int k = 0; k < numPairs; ++k) {
+        std::uniform_int_distribution<int> pick(k, total - 1);
+        const int j = pick(generator);
+        std::swap(pool[k], pool[j]);
+        pairs[k] = pool[k];
+    }
 }
 
 // Periodic tile-based sampling: generate random indices within one canonical

@@ -595,6 +595,11 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
         // body prefix (parsed by the sampler); no pad geometry to validate.
         out.sampling_mode = mode;
     }
+    else if (mode == CS_MODE_TCLUSTER || mode == CS_MODE_TMEANS) {
+        // T-tetromino sampling: the key + geometry regenerate the pair
+        // stream; no pad geometry to validate.
+        out.sampling_mode = mode;
+    }
     else if (mode == CS_MODE_PERIODIC || mode == CS_MODE_ADAPTIVE || mode == CS_MODE_HF_FOCUS) {
         out.sampling_mode = mode;
         out.periodic_tile = buf[CS_OFF_PAD + 1] | (buf[CS_OFF_PAD + 2] << 8);

@@ -176,6 +176,11 @@ void print_usage(const char* exe) {
         "                        (encrypt/roundtrip only; decrypt auto-detects\n"
         "                        the mode from the container)\n"
         "  --tile-size <n>       periodic tile size (default 64)\n"
+        "  --sampling <name>     point atom: points (default, uniform random),\n"
+        "                        tcluster (random T-tetromino 4-pixel clusters),\n"
+        "                        tmeans (one mean per random T-tetromino; max\n"
+        "                        useful ratio 0.25). BGR-only, exclusive with\n"
+        "                        other sampling flags; decrypt auto-detects.\n"
         "  --ycc420              encrypt with luma/chroma-split 4:2:0 sampling: Y\n"
   "                        at full resolution, each chroma plane sampled on\n"
   "                        its half-resolution grid (~1.5 bytes/px stored\n"
@@ -524,6 +529,7 @@ int main(int argc, char* argv[])
     std::string seg_mask;
     std::string seg_rates;
     int seg_blend = 0;
+    std::string sampling = "points";
     std::string seg_solve;
     std::string seg_params;
     bool show_mask = false;
@@ -982,6 +988,15 @@ int main(int argc, char* argv[])
             if (!v) return 64;
             seg_solve = v;
         }
+        else if (a == "--sampling") {
+            const char* v = next("points|tcluster|tmeans");
+            if (!v) return 64;
+            sampling = v;
+            if (sampling != "points" && sampling != "tcluster" && sampling != "tmeans") {
+                std::cerr << "Error: --sampling must be points|tcluster|tmeans" << std::endl;
+                return 64;
+            }
+        }
         else if (a == "--seg-params") {
             const char* v = next("per-class solver overrides");
             if (!v) return 64;
@@ -1132,6 +1147,10 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --seg-blend is encrypt-side only; ignoring for decrypt" << std::endl;
         seg_blend = 0;
     }
+    if (sampling != "points" && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --sampling is encrypt-side only (decrypt auto-detects); ignoring for decrypt" << std::endl;
+        sampling = "points";
+    }
     if (seg_blend != 0 && (seg_mask.empty() || seg_rates.empty())) {
         std::cerr << "Error: --seg-blend needs --seg-mask/--seg-rates" << std::endl;
         return 64;
@@ -1268,7 +1287,11 @@ int main(int argc, char* argv[])
         const bool use_adaptive = adaptive || two_pass || spectral || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask, seg_rates, seg_blend);
+            rc = encrypt_image::encrypt_image_tiled(input,
+output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
+full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
+chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
+seg_rates, seg_blend, sampling);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
@@ -1276,7 +1299,11 @@ int main(int argc, char* argv[])
         }
         else { // roundtrip: decrypt the in-memory encrypted image, no disk roundtrip
             cv::Mat encrypted;
-            rc = encrypt_image::encrypt_image_tiled(input, output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask, full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits, chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask, seg_rates, seg_blend);
+            rc = encrypt_image::encrypt_image_tiled(input,
+output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
+full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
+chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
+seg_rates, seg_blend, sampling);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params);

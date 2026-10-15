@@ -146,7 +146,7 @@ void decrypt_image::unpack_container_measurements(
     encrypted_img = raw.reshape(0, (int)raw_pixels);
 }
 
-void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, bool use_onsager) {
+void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, bool use_onsager, const cs_meas_groups* groups) {
 
     // FISTA solvers (BGR only): reweighted-L1 per channel, or
     // SOMP-structured joint group-L2,1 over all three channels. Same
@@ -166,7 +166,7 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
             fista_channel_begin(ct[ch], encrypted_img, ch, coef, rows, cols,
                 ri_x_g, ri_y_g,
                 ch == 0 ? num_iterations : num_iterations - num_iterations_offset,
-                ref[ch], tv, reweights, fista_iters, basis, wscale, use_onsager);
+                ref[ch], tv, reweights, fista_iters, basis, wscale, use_onsager, groups);
         for (int ch = 0; ch < 3; ++ch)
             fista_channel_end(ct[ch], ref[ch]);
         cv::merge(ref, 3, out);
@@ -174,7 +174,7 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
         return;
     }
     if (solver == CS_SOLVER_FISTA_JOINT) {
-        reconstruct_image_fista_joint(encrypted_img, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref, tv, reweights, fista_iters, basis, wscale);
+        reconstruct_image_fista_joint(encrypted_img, coef, rows, cols, ri_x_g, ri_y_g, num_iterations, ref, tv, reweights, fista_iters, basis, wscale, groups);
         cv::merge(ref, 3, out);
         out.convertTo(out, CV_8UC3);
         return;
@@ -296,6 +296,67 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
         meas0 = CS_HEADER_PIXELS + lod_pixels +
                 static_cast<int>((static_cast<size_t>(thumbnail_length) + 2) / 3);
     }
+    else if (sampling_mode == CS_MODE_TCLUSTER) {
+        // T-cluster points: regenerate the identical pair stream, expand to
+        // pixel coords in the same order encrypt wrote them (pair-contiguous,
+        // no second shuffle on either side).
+        std::vector<int> pairs;
+        returnTetrominoPairIds(pairs, rows, cols, (m + 3) / 4, cs_key);
+        const int cell_cols = cols / 4;
+        ri_x.clear();
+        ri_y.clear();
+        ri_x.reserve(pairs.size() * 4);
+        ri_y.reserve(pairs.size() * 4);
+        int xs[4], ys[4];
+        for (int p : pairs) {
+            const int cell = p / 4, g = p % 4;
+            cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+            for (int q = 0; q < 4; ++q) {
+                ri_x.push_back(ys[q]);
+                ri_y.push_back(xs[q]);
+            }
+        }
+        if ((int)ri_x.size() != m) {
+            throw std::runtime_error("tcluster container: count mismatch");
+        }
+    }
+    else if (sampling_mode == CS_MODE_TMEANS) {
+        // T-means groups: same pair stream as encrypt (body order = pair
+        // order); group k owns body[k]. Builds the global group list for
+        // per-tile filtering; per-tile code skips the mask scan for this
+        // mode. sampled/masked mats get the mean splatted on the 4 pixels
+        // (display/coverage only; the solve uses tgrp_*).
+        std::vector<int> pairs;
+        returnTetrominoPairIds(pairs, rows, cols, m, cs_key);
+        if ((int)pairs.size() != m) {
+            throw std::runtime_error("tmeans container: count mismatch");
+        }
+        const int cell_cols = cols / 4;
+        tgrp_off.assign(m + 1, 0);
+        tgrp_px.assign((size_t)m * 4, 0);
+        // True-average rows (1/4 per pixel): predictions equal the stored
+        // means exactly. (Unit-norm 0.5 rows would need sqrt-scaled payloads
+        // that overflow u8; the conservative fixed FISTA step stays stable
+        // since the true Lipschitz only shrinks.)
+        tgrp_w.assign((size_t)m * 4, 0.25f);
+        ri_x.clear();
+        ri_y.clear();
+        ri_x.reserve((size_t)m * 4);
+        ri_y.reserve((size_t)m * 4);
+        int xs[4], ys[4];
+        for (int k = 0; k < m; ++k) {
+            const int cell = pairs[(size_t)k] / 4, g = pairs[(size_t)k] % 4;
+            cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+            tgrp_off[(size_t)k + 1] = (k + 1) * 4;
+            for (int q = 0; q < 4; ++q) {
+                tgrp_px[(size_t)k * 4 + q] = ys[q] * cols + xs[q];
+                ri_x.push_back(ys[q]);
+                ri_y.push_back(xs[q]);
+                // values land below (post-unpack); mask marks coverage now
+                masked_mat.at<cv::Vec3b>(ys[q], xs[q]) = cv::Vec3b(1, 1, 1);
+            }
+        }
+    }
     else {
         // returnRandomIndices writes into [0, m) without resizing
         ri_x.resize(m);
@@ -308,20 +369,35 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
     // Bit-packed (--sample-bits) bodies unpack first: one flat section of
     // 3 values per measurement at the pixel offset meas0 (lod/thumbnail raw
     // prefixes already accounted in meas0 above).
-    const int m_count = (int)ri_x.size();
+    // T-means carries m group values (not 4m pixel values); the shared
+    // 1:1 scatter below does not apply (group values land per-group after).
+    const int m_count = (sampling_mode == CS_MODE_TMEANS) ? m : (int)ri_x.size();
     if (sample_bits != 8 || sample_bits_chroma != 8) {
         unpack_container_measurements({ { (size_t)meas0 * 3,
             (size_t)3 * (size_t)m_count, sample_bits, sample_bits_chroma, true } });
     }
-    const int enc_limit = (int)encrypted_img.total();
-    for (int base = 0; base < m_count; base += 32) {
-        const int chunk = (std::min)(32, m_count - base);
-        const int enc = meas0 + base;
-        if (enc + chunk > enc_limit) break;
-        for (int j = 0; j < chunk; ++j) {
-            const int k = base + j;
-            sampled_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = encrypted_img.at<cv::Vec3b>(enc + j);
-            masked_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = cv::Vec3b(1, 1, 1);
+    if (sampling_mode == CS_MODE_TMEANS) {
+        tgrp_val.assign((size_t)m, cv::Vec3b(0, 0, 0));
+        for (int k = 0; k < m; ++k) {
+            const cv::Vec3b v = encrypted_img.at<cv::Vec3b>(meas0 + k);
+            tgrp_val[(size_t)k] = v;
+            for (int q = tgrp_off[(size_t)k]; q < tgrp_off[(size_t)k + 1]; ++q) {
+                const int px = tgrp_px[(size_t)q];
+                sampled_mat.at<cv::Vec3b>(px / cols, px % cols) = v;
+            }
+        }
+    }
+    else {
+        const int enc_limit = (int)encrypted_img.total();
+        for (int base = 0; base < m_count; base += 32) {
+            const int chunk = (std::min)(32, m_count - base);
+            const int enc = meas0 + base;
+            if (enc + chunk > enc_limit) break;
+            for (int j = 0; j < chunk; ++j) {
+                const int k = base + j;
+                sampled_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = encrypted_img.at<cv::Vec3b>(enc + j);
+                masked_mat.at<cv::Vec3b>(ri_x[k], ri_y[k]) = cv::Vec3b(1, 1, 1);
+            }
         }
     }
 
@@ -688,6 +764,15 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
+    // Averaged (T-means) tiles have no in-solve SR/DIP operator yet: those
+    // backends read ri vectors, which stay empty on grouped tiles.
+    if (superres_2x || sr_direct_2x || sr_dip_2x) {
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j)
+                if (!indices[i][j].rg_off.empty()) {
+                    throw std::runtime_error("--sampling tmeans needs the standard/AVIR path (no sr-direct/cs-sr/dip operator yet)");
+                }
+    }
     const bool sp = g_solveprof.on;
     auto sp_wall0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
@@ -715,7 +800,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
         int cnt = 0;
         for (int i = 0; i < num_tiles; ++i)
             for (int j = 0; j < num_tiles; ++j) {
-                const int mm = (int)indices[i][j].ri_x_g.size();
+                const int mm = cs_tile_meas_count(indices[i][j]);
                 if (mm > 0) { sum += mm; ++cnt; }
             }
         if (cnt > 0) coef_mean_m = (double)sum / cnt;
@@ -766,13 +851,25 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
 
                 // starved tiles solve under a stronger prior, rich tiles relaxed
                 // (tv follows the same law under its own flag; base tv 0 stays 0)
+                // Grouped tiles count groups (ri lists stay empty there).
+                const struct indices& t_idx = indices[i][j];
+                const int t_count = cs_tile_meas_count(t_idx);
                 const float tile_coef = per_tile_coef
-                    ? cs_per_tile_coef(t_coef_base, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
+                    ? cs_per_tile_coef(t_coef_base, t_count, coef_mean_m)
                     : t_coef_base;
                 const float tile_tv = per_tile_tv
-                    ? cs_per_tile_coef(t_tv_base, (int)indices[i][j].ri_x_g.size(), coef_mean_m)
+                    ? cs_per_tile_coef(t_tv_base, t_count, coef_mean_m)
                     : t_tv_base;
-                dimgs.decrypt(x0, indices[i][j].ri_x_g, indices[i][j].ri_y_g, t_iterations, tile_coef, mats_out[i][j], tile_tv, t_solver, t_fista_iters, t_reweights, t_basis, t_wscale, use_onsager);
+                cs_meas_groups grps;
+                const cs_meas_groups* pgrps = nullptr;
+                if (!t_idx.rg_off.empty() && (int)t_idx.rg_off.size() > 1) {
+                    grps.off = t_idx.rg_off.data();
+                    grps.px = t_idx.rg_px.data();
+                    grps.w = t_idx.rg_w.data();
+                    grps.ng = (int)t_idx.rg_off.size() - 1;
+                    pgrps = &grps;
+                }
+                dimgs.decrypt(x0, t_idx.ri_x_g, t_idx.ri_y_g, t_iterations, tile_coef, mats_out[i][j], tile_tv, t_solver, t_fista_iters, t_reweights, t_basis, t_wscale, use_onsager, pgrps);
                 if (sp) { g_solveprof.call_ns += cs_solveprof_ns_since(sp_c); g_solveprof.tiles += 1; }
                 // grain-adaptive per-tile TV (--grain-tv): tiles whose
                 // measured noise exceeds the reference get a luma ROF
@@ -1776,6 +1873,7 @@ int decrypt_image::decrypt_image_tiled(
                     continue;
                 }
                 std::vector<int> ri_x_g, ri_y_g;
+                indices tile_idx;
 
                 // reserving space to avoid realocations
                 ri_x_g.reserve(estimated_number_of_samples);
@@ -1786,27 +1884,95 @@ int decrypt_image::decrypt_image_tiled(
                 // the origin cannot be re-derived arithmetically here
                 const int base_row = coordinates[i][j].y;
                 const int base_col = coordinates[i][j].x;
+                const int tile_w = encrypted_image_tiles[i][j].cols;
+                const int tile_h = encrypted_image_tiles[i][j].rows;
 
-                for (int q = 0; q < encrypted_image_tiles[i][j].rows; q++) {
-                    for (int k = 0; k < encrypted_image_tiles[i][j].cols; k++) {
-                        if (mm.at<cv::Vec3b>(base_row + q, base_col + k) == cv::Vec3b(1, 1, 1)) {
-                            ri_x_g.push_back(q);
-                            ri_y_g.push_back(k);
+                if (dimgs.get_sampling_mode() == CS_MODE_TMEANS) {
+                    // Grouped measurements: keep groups with any pixel in
+                    // this tile's rect (Centroid-free overlap rule, same as
+                    // point double-counting; feathering renormalizes).
+                    // ri_x_g/ri_y_g stay empty; counts derive from ng.
+                    const std::vector<int>& goff = dimgs.get_tgrp_off();
+                    const std::vector<int>& gpx = dimgs.get_tgrp_px();
+                    const std::vector<float>& ggw = dimgs.get_tgrp_w();
+                    const std::vector<cv::Vec3b>& gval = dimgs.get_tgrp_val();
+                    const int ng = (int)goff.size() - 1;
+                    const int gw_all = sm.cols;
+                    tile_idx.rg_off.reserve((size_t)ng + 1);
+                    tile_idx.rg_px.reserve((size_t)ng * 4);
+                    tile_idx.rg_w.reserve((size_t)ng * 4);
+                    tile_idx.rg_off.push_back(0);
+                    std::vector<cv::Vec3b> gvals;
+                    gvals.reserve((size_t)ng);
+                    for (int g = 0; g < ng; ++g) {
+                        bool hit = false;
+                        for (int e = goff[(size_t)g]; e < goff[(size_t)g + 1]; ++e) {
+                            const int gx = gpx[(size_t)e] % gw_all;
+                            const int gy = gpx[(size_t)e] / gw_all;
+                            if (gx >= base_col && gx < base_col + tile_w &&
+                                gy >= base_row && gy < base_row + tile_h) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if (!hit) continue;
+                        // Clip straddling groups to this tile's rect and
+                        // renormalize the kept weights (x4/kept) so each
+                        // tile's rows still predict the stored mean.
+                        int kept = 0;
+                        for (int e = goff[(size_t)g]; e < goff[(size_t)g + 1]; ++e) {
+                            const int gx = gpx[(size_t)e] % gw_all;
+                            const int gy = gpx[(size_t)e] / gw_all;
+                            if (gx >= base_col && gx < base_col + tile_w &&
+                                gy >= base_row && gy < base_row + tile_h) {
+                                ++kept;
+                            }
+                        }
+                        if (kept == 0) continue;
+                        const float renorm = 4.0f / (float)kept;
+                        for (int e = goff[(size_t)g]; e < goff[(size_t)g + 1]; ++e) {
+                            const int gx = gpx[(size_t)e] % gw_all;
+                            const int gy = gpx[(size_t)e] / gw_all;
+                            if (gx >= base_col && gx < base_col + tile_w &&
+                                gy >= base_row && gy < base_row + tile_h) {
+                                tile_idx.rg_px.push_back((gy - base_row) * tile_w + (gx - base_col));
+                                tile_idx.rg_w.push_back(ggw[(size_t)e] * renorm);
+                            }
+                        }
+                        tile_idx.rg_off.push_back((int)tile_idx.rg_px.size());
+                        gvals.push_back(gval[(size_t)g]);
+                    }
+                    estimated_number_of_samples = (int)tile_idx.rg_off.size() - 1;
+
+                    decrypted_image_tiles[i][j] = cv::Mat::zeros(tile_h, tile_w, CV_8UC3);
+                    encrypt_image img(encrypted_image_tiles[i][j], false);
+                    indices_reconfigured[i][j] = tile_idx;
+                    img.encrypt_values(gvals);
+                    encrypted_image_tiles[i][j] = img.get_mat();
+                    tile_size = img.get_size();
+                }
+                else {
+                    for (int q = 0; q < encrypted_image_tiles[i][j].rows; q++) {
+                        for (int k = 0; k < encrypted_image_tiles[i][j].cols; k++) {
+                            if (mm.at<cv::Vec3b>(base_row + q, base_col + k) == cv::Vec3b(1, 1, 1)) {
+                                ri_x_g.push_back(q);
+                                ri_y_g.push_back(k);
+                            }
                         }
                     }
+
+                    // we use the the number of previous samples as estimations,
+                    // all tiles are going to have roughly the same number of samples
+                    estimated_number_of_samples = ri_x_g.size();
+
+                    decrypted_image_tiles[i][j] = cv::Mat::zeros(encrypted_image_tiles[i][j].rows, encrypted_image_tiles[i][j].cols, CV_8UC3);
+                    encrypt_image img(encrypted_image_tiles[i][j], false);
+
+                    indices_reconfigured[i][j] = { ri_x_g, ri_y_g };
+                    img.encrypt(ri_x_g, ri_y_g);
+                    encrypted_image_tiles[i][j] = img.get_mat();
+                    tile_size = img.get_size();
                 }
-
-                // we use the the number of previous samples as estimations, 
-                // all tiles are going to have roughly the same number of samples
-                estimated_number_of_samples = ri_x_g.size();
-
-                decrypted_image_tiles[i][j] = cv::Mat::zeros(encrypted_image_tiles[i][j].rows, encrypted_image_tiles[i][j].cols, CV_8UC3);
-                encrypt_image img(encrypted_image_tiles[i][j], false);
-
-                indices_reconfigured[i][j] = { ri_x_g, ri_y_g };
-                img.encrypt(ri_x_g, ri_y_g);
-                encrypted_image_tiles[i][j] = img.get_mat();
-                tile_size = img.get_size();
             }
         }
         prof.mark("prep");

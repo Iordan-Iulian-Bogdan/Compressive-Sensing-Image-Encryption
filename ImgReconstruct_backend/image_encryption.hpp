@@ -21,6 +21,9 @@ public:
 
     void encrypt(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0, const std::vector<CsHrSample>& hr_detail = {});
     void encrypt(const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g);
+    // Per-tile mini-container from explicit values (T-means groups): body
+    // holds vals in order, plain header like encrypt(ri_x_g, ri_y_g).
+    void encrypt_values(const std::vector<cv::Vec3b>& vals);
 
     // YCC 4:2:0 split encryption (mode 3; mode 7 = 4:2:2): BGR -> YCrCb,
     // chroma downsampled to the mode's coarse grid, luma sampled at full
@@ -66,6 +69,12 @@ public:
     // then repeat across the image. tile_size should divide the image dimensions.
     void encrypt_periodic(const float& pixel_p, const std::string& password, int tile_size, int sample_bits = 8, int chroma_bits = 0);
 
+    // T-cluster point sampling (mode 13): random (cell, T-group) pairs,
+    // 4 point values per pair. T-means grouped sampling (mode 14): one
+    // rounded mean per selected pair (max useful ratio 0.25). BGR only.
+    void encrypt_tcluster(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
+    void encrypt_tmeans(const float& pixel_p, const std::string& password, int sample_bits = 8, int chroma_bits = 0);
+
     // Adaptive periodic encryption: per-tile LOD bytes drive sample counts
     // (high detail -> more measurements). lod_min floors the 8-bit score so
     // flat tiles are never starved. adaptive_strength in [0,1] scales LOD bias
@@ -108,7 +117,10 @@ public:
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
     */
-    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string& seg_mask = "", const std::string& seg_rates = "", int seg_blend = 0);
+    static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const
+std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string&
+seg_mask = "", const std::string& seg_rates = "", int seg_blend = 0,
+    const std::string& sampling = "points");
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at

@@ -20,6 +20,12 @@
  * over full_threshold on overlap. Decrypt recomputes identical counts, so
  * the cutoff travels in the authenticated header with the other parameters.
  */
+// Fixed T-tetromino partition of each 4x4 acquisition cell (bench layout,
+// bench_measurement_shapes "exact T geometry"): row-major cell value ->
+// group 0..3 (0 0 0 2 / 1 0 2 2 / 1 1 3 2 / 1 3 3 3). Writes the 4 pixel
+// coords (global image coords) of group g in cell (cell_r, cell_c).
+void cs_tetro_group_pixels(int cell_r, int cell_c, int g, int xs[4], int ys[4]);
+
 std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, int m_total,
     int rows, int cols, int tile_size, int weight_base = 256, int full_threshold = 0,
     int cutoff = 0);
@@ -47,6 +53,15 @@ protected:
     bool cs_key_valid = false;
 
     void returnRandomIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym, int numOfIndices, const uint8_t key[32]);
+
+    // Tetromino-pair subset (modes 13/14): random subset of (4x4 cell,
+    // T-group) pairs from the fixed bench partition (see cs_tetro_group_pixels).
+    // Partial Fisher-Yates over the cell*4 pair pool, so exactly numPairs
+    // distinct pairs in random order. Fully deterministic from (key,
+    // geometry, numPairs): encryption and decryption regenerate identical
+    // pair streams. xm/ym must be multiples of 4 (the global_image pad
+    // guarantees this on the standard path).
+    void returnTetrominoPairIds(std::vector<int>& pairs, int xm, int ym, int numPairs, const uint8_t key[32]);
 
     // Periodic tile-based sampling: one random per-tile pattern, replicated
     // across the image. samples_per_tile positions are drawn inside one

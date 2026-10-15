@@ -18,6 +18,36 @@
 
 struct indices {
     std::vector<int> ri_x_g, ri_y_g;
+    // Averaged measurements (T-means): group lists in tile-local flat
+    // pixel indices. rg_off has ng+1 entries; group g covers
+    // rg_px[rg_off[g] .. rg_off[g+1]) with true-average weights rg_w[]
+    // (0.25f). Empty = legacy point samples (implicit weight 1).
+    // Point-mode tiles keep ri_x_g/ri_y_g; grouped tiles leave them
+    // empty and set these instead (counts derive from ng).
+    std::vector<int> rg_off, rg_px;
+    // True-average row weights (1/group-size, i.e. 0.25f): group
+    // predictions equal the stored means exactly.
+    std::vector<float> rg_w;
+};
+
+// Per-tile measurement count for regularization scaling: grouped tiles
+// count groups, point tiles count pixels.
+inline int cs_tile_meas_count(const indices& idx) {
+    if (!idx.rg_off.empty()) return (int)idx.rg_off.size() - 1;
+    return (int)idx.ri_x_g.size();
+}
+
+// Grouped-measurement view for the FISTA data term: ng groups, flat
+// tile-local pixel indices and true-average row weights (1/group-size,
+// so predictions equal the stored means; the fixed FISTA step stays
+// stable because the true Lipschitz only shrinks vs point rows).
+// nullptr/empty = legacy point samples. The pointed-to vectors (tile
+// lists) outlive the solve.
+struct cs_meas_groups {
+    const int* off = nullptr;
+    const int* px = nullptr;
+    const float* w = nullptr;
+    int ng = 0;
 };
 
 int nextClosestDivisible(int x, int y);
@@ -136,7 +166,7 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     const int& iterations, cv::Mat& ref, bool copy_next_ref = false, cv::Mat& next_ref = cs_null_mat(),
     float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f,
-    bool use_onsager = false);
+    bool use_onsager = false, const cs_meas_groups* groups = nullptr);
 
 // Block-aware 2D DCT on a CV_32F plane: dct_block <= 0 is the legacy
 // whole-plane transform (bit-identical); >0 applies an independent
@@ -201,13 +231,15 @@ struct fista_channel_task {
     std::vector<float> b;
     int basis = CS_BASIS_DCT;
     float wscale = 2.0f;
+    const cs_meas_groups* groups = nullptr;  // grouped (averaged) measurements, else null
     cs_gpu::FistaHandle h = nullptr;  // null => already done (CPU/fallback)
 };
 void fista_channel_begin(fista_channel_task& t, const cv::Mat& pixel_measurements,
     const int& channel, const float& param_c, const int& rows, const int& cols,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations,
     cv::Mat& ref, float tv = 0.0f, int reweights = 2, int fista_iters = 0,
-    int basis = CS_BASIS_DCT, float wscale = 2.0f, bool use_onsager = false);
+    int basis = CS_BASIS_DCT, float wscale = 2.0f, bool use_onsager = false,
+    const cs_meas_groups* groups = nullptr);
 void fista_channel_end(fista_channel_task& t, cv::Mat& ref);
 
 /** @brief SOMP-structured joint RGB solve: stacked group-L2,1 FISTA with
@@ -216,7 +248,8 @@ planes (CV_32F, 0..255, full tile size) out, ready for cv::merge.
 */
 void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
-    const int& iterations, cv::Mat refs[3], float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f);
+    const int& iterations, cv::Mat refs[3], float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f,
+    const cs_meas_groups* groups = nullptr);
 
 /** @brief true for the CS super-resolution upscaler backends ("cs", "cs-sr").
 Selected via --photo-upscaler; handled as a fused 2x path in the decrypt

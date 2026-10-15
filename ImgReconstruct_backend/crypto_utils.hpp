@@ -103,6 +103,8 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_SEGMASK 10             // per-segment BGR sampling from a label map (pad = 10)
 #define CS_MODE_YCC420_SEG 11          // seg-mask luma + uniform 4:2:0 chroma (pad = 11)
 #define CS_MODE_YCC422_SEG 12          // seg-mask luma + uniform 4:2:2 chroma (pad = 12)
+#define CS_MODE_TCLUSTER 13            // random T-tetromino point clusters, BGR (pad = 13)
+#define CS_MODE_TMEANS 14              // random T-tetromino mean groups, BGR (pad = 14)
 
 // Per-segment sampling (mode 10) body prefix, little-endian, right after the
 // 32-pixel header:

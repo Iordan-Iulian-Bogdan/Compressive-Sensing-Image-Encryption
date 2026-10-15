@@ -57,7 +57,10 @@ Header layout (v2, 32 pixels = 96 bytes at the start of the container):
 [81..95] sampling mode + geometry (authenticated):
           [81]     mode: 0 = random, 1 = periodic, 2 = adaptive,
                    3 = YCC420, 5 = HF-focus, 6 = YCC420 + HF-focus,
-                   7 = YCC422, 8 = YCC422 + HF-focus
+                   7 = YCC422, 8 = YCC422 + HF-focus,
+                   13 = T-cluster points, 14 = T-means groups
+                   (4 = BGR HR-detail, 9 = YCC420 HR-detail,
+                   10/11/12 = seg-mask family)
          [82..83] tile_size (LE, modes 1 and 2)
          [84..85] mode 1: samples_per_tile; mode 2: lod byte count (sanity)
          [86..87] mode 2: weight_base (LE uint16; strength → base mapping below)
@@ -193,6 +196,23 @@ decrypt settings, and malformed entries fail before any solve runs.
 values (seg-solve cells plus an optional joint baseline per ratio),
 recording PSNR/edge-PSNR/timings to CSV with a best-per-ratio summary —
 run it on the thumbnail for speed, then validate the winner at full size.
+
+### T-tetromino sampling (`--sampling tcluster|tmeans`)
+
+`--sampling` selects the sampling atom (default `points` = uniform random,
+BGR-only, exclusive with other sampling flags; decrypt auto-detects):
+- `tcluster` (mode 13): random subset of (4x4 cell, T-group) pairs from the
+fixed bench partition; all 4 pixels of each selected pair stored as
+individual point values (gaps between clusters). Same container/solver
+machinery as points. Measured full-res crop: 22.07 dB at 0.5 (vs 20.63
+points), 13.72 at 0.25 (vs 15.60) — helps at high ratios, hurts in gaps.
+- `tmeans` (mode 14): one rounded mean per selected pair (max useful ratio
+0.25 = full pair coverage; higher requests clamp with a note). Needs the
+weight-aware FISTA scatter (true-average rows); standard/AVIR/joint paths
+supported, sr-direct/cs-sr/dip/GPU rejected with a clear error, YCC
+rejected at encrypt. Measured full-res crop: 32.56 dB at 0.25 (vs 15.60
+points), 30.06 at 0.2, 16.13 at 0.1; auto 0.2 reaches 23.92 dB (vs 23.58
+points at 0.5 — wins with 2.5x fewer measurements).
 
 ### YCC 4:2:0 split sampling (`--ycc420`)
 

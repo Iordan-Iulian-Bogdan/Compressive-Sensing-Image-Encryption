@@ -1336,6 +1336,165 @@ void test_twopass_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b2. T-tetromino sampling (tcluster points + tmeans groups)
+// ---------------------------------------------------------------------------
+void test_tsampling() {
+    // Fixed-partition geometry: 8x8 grid -> 16 groups of 4, disjoint and
+    // complete, each group a T-tetromino (3 leaves + 1 branch by Manhattan
+    // adjacency, mirroring the bench self-test).
+    {
+        bool ok = true;
+        std::vector<int> seen(64, 0);
+        for (int cell = 0; cell < 4; ++cell) {
+            for (int g = 0; g < 4; ++g) {
+                int xs[4], ys[4];
+                cs_tetro_group_pixels((cell / 2) * 4, (cell % 2) * 4, g, xs, ys);
+                int deg[4] = { 0, 0, 0, 0 };
+                for (int a = 0; a < 4; ++a) {
+                    // helper returns global coords already (origin included)
+                    const int gx = xs[a], gy = ys[a];
+                    if (gx < 0 || gx >= 8 || gy < 0 || gy >= 8) ok = false;
+                    else seen[(size_t)gy * 8 + gx]++;
+                    for (int b = 0; b < 4; ++b) {
+                        if (a != b && std::abs(xs[a] - xs[b]) + std::abs(ys[a] - ys[b]) == 1) deg[a]++;
+                    }
+                }
+                int leaves = 0, branches = 0;
+                for (int a = 0; a < 4; ++a) {
+                    if (deg[a] == 1) leaves++;
+                    else if (deg[a] >= 2) branches++;
+                    else ok = false;
+                }
+                ok = ok && (leaves == 3 && branches == 1);
+            }
+        }
+        for (int v : seen) ok = ok && (v == 1);
+        check(ok, "tsampling: fixed partition disjoint+complete, all groups T-shaped");
+    }
+
+    // Grouped solve on a constant tile recovers it (catches operator/value
+    // scaling bugs: unit-norm rows against raw means decode at 1/4, true
+    // averages decode exactly).
+    {
+        const int S = 8;
+        const float c = 0.4f;
+        std::vector<int> off = { 0 };
+        std::vector<int> px;
+        std::vector<float> w;
+        for (int cell = 0; cell < 4; ++cell) {
+            for (int g = 0; g < 4; ++g) {
+                int xs[4], ys[4];
+                cs_tetro_group_pixels((cell / 2) * 4, (cell % 2) * 4, g, xs, ys);
+                for (int q = 0; q < 4; ++q) {
+                    px.push_back(ys[q] * S + xs[q]);
+                    w.push_back(0.25f);
+                }
+                off.push_back((int)px.size());
+            }
+        }
+        cs_meas_groups G{ off.data(), px.data(), w.data(), 16 };
+        cv::Mat meas(1, CS_HEADER_PIXELS + 16, CV_8UC3, cv::Scalar(0, 0, 0));
+        const int v = (int)(c * 255.0f + 0.5f);
+        for (int k = 0; k < 16; ++k) meas.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = cv::Vec3b(v, v, v);
+        cv::Mat ref(S, S, CV_32F, cv::Scalar(0));
+        std::vector<int> empty;
+        reconstruct_color_channel_fista(meas, 0, 1e-6f, S, S, empty, empty, 2, ref,
+            false, cs_null_mat(), 0.0f, 1, 0, CS_BASIS_DCT, 1.0f, false, &G);
+        const double mean = cv::mean(cv::Mat(S, S, CV_32F, ref.data))[0];
+        std::printf("       tsampling grouped const: mean=%.2f (expect ~%.1f)\n", mean, c * 255.0);
+        check(std::fabs(mean - c * 255.0) < 1.5, "tsampling: grouped constant tile decodes exactly");
+    }
+
+    // End-to-end container roundtrips on synthetic content (half-res
+    // defaults like the ycc sibling tests).
+    const std::string password = "tsampling-test-password";
+    cv::Mat original = make_test_image(192, 144);
+    const std::string tmp_in = ".cs_test_tsampling_in.png";
+    cv::imwrite(tmp_in, original);
+
+    // tcluster points, ratio 0.5
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_tcluster(0.5f, password, 8, 0);
+        cv::Mat container = enc.get_mat();
+        check(!container.empty(), "tsampling: tcluster encrypt to memory");
+        const cv::Mat flat = container.reshape(0, (int)container.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_TCLUSTER, "tsampling: tcluster header mode=13");
+        const std::string tmp_out = ".cs_test_tsampling_tc.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "tsampling: tcluster decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "tsampling: tcluster output readable");
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, original.size());
+            const double p = cs_quality::psnr(original, sized);
+            std::printf("       tsampling tcluster PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 13.0, "tsampling: tcluster PSNR sane");
+        }
+        std::remove(tmp_out.c_str());
+    }
+
+    // tcluster full coverage (ratio 1.0): every pixel exactly once
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_tcluster(1.0f, password, 8, 0);
+        cv::Mat container = enc.get_mat();
+        const std::string tmp_out = ".cs_test_tsampling_tc1.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "tsampling: tcluster full-coverage decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, original.size());
+            const double p = cs_quality::psnr(original, sized);
+            std::printf("       tsampling tcluster PSNR (ratio 1.0): %.2f dB\n", p);
+            check(p > 27.0, "tsampling: tcluster full coverage near-exact");
+        }
+        std::remove(tmp_out.c_str());
+    }
+
+    // tmeans groups, ratio 0.25 (full pair coverage)
+    {
+        encrypt_image enc(tmp_in);
+        enc.encrypt_tmeans(0.25f, password, 8, 0);
+        cv::Mat container = enc.get_mat();
+        check(!container.empty(), "tsampling: tmeans encrypt to memory");
+        const cv::Mat flat = container.reshape(0, (int)container.total());
+        check(flat.data[CS_OFF_PAD] == CS_MODE_TMEANS, "tsampling: tmeans header mode=14");
+        const std::string tmp_out = ".cs_test_tsampling_tm.png";
+        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "tsampling: tmeans decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        check(!dec.empty(), "tsampling: tmeans output readable");
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, original.size());
+            const double p = cs_quality::psnr(original, sized);
+            std::printf("       tsampling tmeans PSNR (ratio 0.25): %.2f dB\n", p);
+            check(p > 24.0, "tsampling: tmeans PSNR sane");
+            // joint SOMP through the grouped path
+            const std::string tmp_joint = ".cs_test_tsampling_tmj.png";
+            check(decrypt_image::decrypt_image_tiled(container, tmp_joint, password, 4, 24, 5, 4, 0.01f, false,
+                0.0f, false, CS_SOLVER_FISTA_JOINT) == 0, "tsampling: tmeans joint decrypt succeeds");
+            cv::Mat decj = cv::imread(tmp_joint, cv::IMREAD_COLOR);
+            check(!decj.empty(), "tsampling: tmeans joint output readable");
+            if (!decj.empty()) {
+                cv::Mat jsized;
+                cv::resize(decj, jsized, original.size());
+                const double pj = cs_quality::psnr(original, jsized);
+                std::printf("       tsampling tmeans joint PSNR: %.2f dB\n", pj);
+                check(pj > 20.0, "tsampling: tmeans joint PSNR sane");
+            }
+            std::remove(tmp_joint.c_str());
+        }
+        std::remove(tmp_out.c_str());
+    }
+
+    std::remove(tmp_in.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // 5c. LLM region-guided sampling roundtrip (canned parrot-style JSON)
 // ---------------------------------------------------------------------------
 // Inline --regions JSON blends box-weighted tile scores over the signal
@@ -3595,6 +3754,7 @@ int main(int argc, char* argv[]) {
     test_lod_full_roundtrip();
     test_ycc420_roundtrip();
     test_ycc422_roundtrip();
+    test_tsampling();
     test_twopass_roundtrip();
     test_regions_roundtrip();
     test_photo_roundtrip();

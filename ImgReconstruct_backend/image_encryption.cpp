@@ -797,6 +797,178 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
+/** @brief T-cluster point sampling (mode 13): random subset of (4x4 cell,
+ * T-group) pairs from the fixed bench partition; all 4 pixels of each
+ * selected pair are stored as individual point measurements (gaps between
+ * clusters). Same container layout as uniform random; only the index draw
+ * differs, so decrypt needs no new flags beyond the mode byte.
+ */
+void encrypt_image::encrypt_tcluster(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits) {
+    bm = pixel_p;
+    const int want = (int)((long long)rows * cols * bm);
+    // pairs of 4 point measurements; ratio 1.0 selects every pair (full
+    // coverage, every pixel exactly once). Keep at least one pair so the
+    // pattern stays valid at extreme low ratios.
+    int pairs = (want + 3) / 4;
+    if (pairs < 1) pairs = 1;
+    const int max_pairs = (rows / 4) * (cols / 4) * 4;
+    if (pairs > max_pairs) pairs = max_pairs;
+
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+
+    std::vector<int> pair_ids;
+    returnTetrominoPairIds(pair_ids, rows, cols, pairs, cs_key);
+    ri_x.clear();
+    ri_y.clear();
+    ri_x.reserve((size_t)pairs * 4);
+    ri_y.reserve((size_t)pairs * 4);
+    const int cell_cols = cols / 4;
+    int xs[4], ys[4];
+    for (int p : pair_ids) {
+        const int cell = p / 4, g = p % 4;
+        cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+        for (int q = 0; q < 4; ++q) {
+            ri_x.push_back(ys[q]);
+            ri_y.push_back(xs[q]);
+        }
+    }
+    m = (int)ri_x.size();
+
+    const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+
+    buf[CS_OFF_PAD] = CS_MODE_TCLUSTER;
+    for (int k = 0; k < m; k++) {
+        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
+    }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img,
+            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+
+    sampling_mode = CS_MODE_TCLUSTER;
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
+/** @brief T-means grouped sampling (mode 14): random subset of (4x4 cell,
+ * T-group) pairs; each selected pair contributes ONE measurement per
+ * channel = the rounded mean of its 4 pixels. Max useful ratio is 0.25
+ * (every pair selected = the bench fixed-geometry case); higher requests
+ * clamp with a note. Solver needs the averaging operator (weight-aware
+ * scatter); point-sample code paths must not interpret these values.
+ */
+void encrypt_image::encrypt_tmeans(const float& pixel_p, const std::string& password, int sample_bits, int chroma_bits) {
+    bm = pixel_p;
+    const int max_pairs = (rows / 4) * (cols / 4) * 4;
+    int pairs = (int)((long long)rows * cols * bm);
+    if (pairs < 1) pairs = 1;
+    if (pairs > max_pairs) {
+        std::cout << "Note: --sampling tmeans clamps to full pair coverage ("
+                  << max_pairs << " measurements)" << std::endl;
+        pairs = max_pairs;
+    }
+
+    uint8_t salt[CS_SALT_BYTES];
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+
+    std::vector<int> pair_ids;
+    returnTetrominoPairIds(pair_ids, rows, cols, pairs, cs_key);
+    // member ri_* keep every group pixel (mask display + sample-split
+    // classification); the solve uses the group structure, not these.
+    ri_x.clear();
+    ri_y.clear();
+    ri_x.reserve((size_t)pairs * 4);
+    ri_y.reserve((size_t)pairs * 4);
+    const int cell_cols = cols / 4;
+    int xs[4], ys[4];
+    std::vector<cv::Vec3b> means;
+    means.reserve((size_t)pairs);
+    for (int p : pair_ids) {
+        const int cell = p / 4, g = p % 4;
+        cs_tetro_group_pixels((cell / cell_cols) * 4, (cell % cell_cols) * 4, g, xs, ys);
+        int acc[3] = { 0, 0, 0 };
+        for (int q = 0; q < 4; ++q) {
+            ri_x.push_back(ys[q]);
+            ri_y.push_back(xs[q]);
+            const cv::Vec3b v = input_img.at<cv::Vec3b>(ys[q], xs[q]);
+            acc[0] += v[0];
+            acc[1] += v[1];
+            acc[2] += v[2];
+        }
+        // rounded to nearest, half ties up (bench convention)
+        means.push_back(cv::Vec3b((uint8_t)((acc[0] + 2) / 4), (uint8_t)((acc[1] + 2) / 4), (uint8_t)((acc[2] + 2) / 4)));
+    }
+    m = (int)means.size();
+
+    const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+
+    buf[CS_OFF_PAD] = CS_MODE_TMEANS;
+    for (int k = 0; k < m; k++) {
+        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = means[(size_t)k];
+    }
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img,
+            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
+        buf = encrypted_img.data;
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+
+    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+
+    sampling_mode = CS_MODE_TMEANS;
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
 /** @brief YCC 4:2:0 split encryption (mode 3): BGR -> YCrCb, chroma planes
  * downsampled 2x (INTER_AREA), then luma sampled at full resolution and each
  * chroma plane sampled on its own coarse grid with a domain-separated key.
@@ -1991,6 +2163,21 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
  * These containers are ephemeral (in-memory only) and carry no password
  * context; measurements start at CS_HEADER_PIXELS, same as v2 containers.
  */
+void encrypt_image::encrypt_values(const std::vector<cv::Vec3b>& vals) {
+    m = (int)vals.size();
+    const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    cs_write_header_plain(encrypted_img.data, total * 3, text);
+
+    for (int k = 0; k < m; k++) {
+        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = vals[(size_t)k];
+    }
+
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
 void encrypt_image::encrypt(const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g) {
     m = ri_x_g.size();
     int n = rows * cols;
@@ -2050,7 +2237,8 @@ int encrypt_image::encrypt_image_tiled(
     int lod_cutoff,
     const std::string& seg_mask,
     const std::string& seg_rates,
-    int seg_blend
+    int seg_blend,
+    const std::string& sampling
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -2098,6 +2286,18 @@ int encrypt_image::encrypt_image_tiled(
         }
         if (hr_detail < 0 || hr_detail > CS_HRDETAIL_MAX_SAMPLES) {
             throw std::runtime_error("--hr-detail must be in [0, 65536] (0 = off)");
+        }
+        // T-shaped sampling (modes 13/14) is BGR-only and exclusive with
+        // every other sampling path; decrypt auto-detects from the mode.
+        const bool tmodes = (sampling == "tcluster" || sampling == "tmeans");
+        if (sampling != "points" && !tmodes) {
+            throw std::runtime_error("--sampling must be points|tcluster|tmeans");
+        }
+        if (tmodes && (hf_focus || adaptive || two_pass || spectral || !regions_json.empty() ||
+            lod_smooth > 0.0f || lod_full > 0 || tile_size > 0 || hr_detail > 0 ||
+            lod_cutoff > 0 || lod_gamma != 1.0f || !seg_mask.empty() || !seg_rates.empty() ||
+            seg_blend != 0 || ycc420 || ycc422)) {
+            throw std::runtime_error("--sampling tcluster|tmeans is BGR-only and exclusive with other sampling flags (--adaptive/--periodic/--tile-size/--hf-focus/--hr-detail/--ycc420/--ycc422/--seg-mask/--seg-rates/--seg-blend/--lod-*)");
         }
         // Per-segment sampling (mode 10) is exclusive with every other
         // sampling path; the unused adaptive knobs self-reject below
@@ -2221,6 +2421,12 @@ int encrypt_image::encrypt_image_tiled(
             const int wbase = cs_adaptive_base_from_strength(adaptive_strength);
             encrypt_img.encrypt_adaptive(compression_ratio, password, ts, lod_min, wbase, two_pass, pilot_ratio,
                 regions_json, region_blend, lod_smooth, sample_bits, chroma_bits, lod_full, spectral, lod_gamma, lod_cutoff);
+        }
+        else if (sampling == "tcluster") {
+            encrypt_img.encrypt_tcluster(compression_ratio, password, sample_bits, chroma_bits);
+        }
+        else if (sampling == "tmeans") {
+            encrypt_img.encrypt_tmeans(compression_ratio, password, sample_bits, chroma_bits);
         }
         else if (tile_size > 0) {
             // periodic tile-based sampling: one random per-tile pattern,

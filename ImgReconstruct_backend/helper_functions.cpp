@@ -392,14 +392,32 @@ inline void cs_synth_adj(float* p, int rows, int cols, const cs_fista_basis& bx)
 static float cs_fista_grad(const float* y, float* pix, float* sc, float* g,
     const float* b, const int* rix, const int* riy, int m,
     int rows, int cols, float tv_lambda, const cs_fista_basis& bx,
-    const float* zcorr = nullptr, float oc = 0.0f, float* zsave = nullptr)
+    const float* zcorr = nullptr, float oc = 0.0f, float* zsave = nullptr,
+    const cs_meas_groups* groups = nullptr)
 {
     const int n = rows * cols;
     std::memcpy(pix, y, sizeof(float) * (size_t)n);
     cs_synth(pix, rows, cols, bx);
     std::memset(sc, 0, sizeof(float) * (size_t)n);
     float fx = 0.0f;
-    for (int k = 0; k < m; ++k) {
+    if (groups && groups->ng > 0) {
+        // Averaged measurements: b[k] is the k-th group mean; predict it
+        // from its weighted pixels, scatter w*residual back (adjoint of
+        // the normalized averaging rows). Groups are disjoint by
+        // construction; += keeps it correct regardless.
+        for (int k = 0; k < groups->ng; ++k) {
+            float pred = 0.0f;
+            for (int e = groups->off[k]; e < groups->off[k + 1]; ++e)
+                pred += groups->w[e] * pix[groups->px[e]];
+            float diff = pred - b[k];
+            if (zcorr) diff -= oc * zcorr[k];
+            for (int e = groups->off[k]; e < groups->off[k + 1]; ++e)
+                sc[groups->px[e]] += groups->w[e] * diff;
+            if (zsave) zsave[k] = diff;
+            fx += diff * diff;
+        }
+    }
+    else for (int k = 0; k < m; ++k) {
         const int idx = rix[k] * cols + riy[k];
         // LDAMP-style Onsager: debias the residual with the previous
         // residual scaled by the denoiser divergence (zcorr/oc supplied by
@@ -427,13 +445,23 @@ static float cs_fista_grad(const float* y, float* pix, float* sc, float* g,
 // pix/sc are scratch (size n).
 static float cs_smooth_fx(const float* xc, float* pix, float* sc,
     const float* b, const int* rix, const int* riy, int m,
-    int rows, int cols, float tv_lambda, const cs_fista_basis& bx)
+    int rows, int cols, float tv_lambda, const cs_fista_basis& bx,
+    const cs_meas_groups* groups = nullptr)
 {
     const int n = rows * cols;
     std::memcpy(pix, xc, sizeof(float) * (size_t)n);
     cs_synth(pix, rows, cols, bx);
     float fx = 0.0f;
-    for (int k = 0; k < m; ++k) {
+    if (groups && groups->ng > 0) {
+        for (int k = 0; k < groups->ng; ++k) {
+            float pred = 0.0f;
+            for (int e = groups->off[k]; e < groups->off[k + 1]; ++e)
+                pred += groups->w[e] * pix[groups->px[e]];
+            const float diff = pred - b[k];
+            fx += diff * diff;
+        }
+    }
+    else for (int k = 0; k < m; ++k) {
         const int idx = rix[k] * cols + riy[k];
         const float diff = pix[idx] - b[k];
         fx += diff * diff;
@@ -455,15 +483,18 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
     const cs_fista_basis& bx,
     std::vector<float>& y, std::vector<float>& x_prev,
     std::vector<float>& grad, std::vector<float>& pix, std::vector<float>& sc,
-    bool use_onsager = false)
+    bool use_onsager = false, const cs_meas_groups* groups = nullptr)
 {
     const int n = rows * cols;
+    // Grouped measurements (T-means) count groups, not pixels, for the
+    // Onsager scaling/state below.
+    const int meff = (groups && groups->ng > 0) ? groups->ng : m;
     // LDAMP-style Onsager state: previous corrected residual (size m) and
     // the soft-threshold divergence (support fraction) that scales it.
     // Per-call state (resets each reweight pass, whose weights/thresholds
     // define a fresh problem); disabled keeps legacy behavior exactly.
-    const bool oc_on = use_onsager && m > 0;
-    std::vector<float> zprev(oc_on ? (size_t)m : 0, 0.0f);
+    const bool oc_on = use_onsager && meff > 0;
+    std::vector<float> zprev(oc_on ? (size_t)meff : 0, 0.0f);
     float dof_prev = 0.0f;
     // Backtrack whenever the fixed step is not known-safe: CDF97
     // (biorthogonal, no exact Lipschitz) or any tv > 0. The smoothed-TV
@@ -482,9 +513,9 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
     float t = 1.0f;
     for (int k = 0; k < iters; ++k) {
         auto sp_t = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-        const float oc = oc_on ? dof_prev / (float)m : 0.0f;
+        const float oc = oc_on ? dof_prev / (float)meff : 0.0f;
         const float fy = cs_fista_grad(yy, pix.data(), sc.data(), grad.data(), b, rix, riy, m, rows, cols, tv_lambda, bx,
-            oc_on ? zprev.data() : nullptr, oc, oc_on ? zprev.data() : nullptr);
+            oc_on ? zprev.data() : nullptr, oc, oc_on ? zprev.data() : nullptr, groups);
         if (sp) { g_solveprof.fs_grad_ns += sp_ns_since(sp_t); sp_t = std::chrono::steady_clock::now(); }
         float step = 1.0f / L;
         if (bt) {
@@ -500,7 +531,7 @@ static void cs_fista_core_single(float* x, const float* b, const int* rix, const
                     const float av = std::fabs(v);
                     z[(size_t)i] = (av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f;
                 }
-                const float fz = cs_smooth_fx(z.data(), pix.data(), sc.data(), b, rix, riy, m, rows, cols, tv_lambda, bx);
+                const float fz = cs_smooth_fx(z.data(), pix.data(), sc.data(), b, rix, riy, m, rows, cols, tv_lambda, bx, groups);
                 double dot = 0.0, dz2 = 0.0;
                 for (int i = 0; i < n; ++i) {
                     const double dz = (double)z[(size_t)i] - yy[i];
@@ -556,7 +587,8 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
     const cs_fista_basis& bx,
     std::vector<float>& y, std::vector<float>& xp,
     std::vector<float>& grad, std::vector<float>& z,
-    std::vector<float>& pix, std::vector<float>& sc)
+    std::vector<float>& pix, std::vector<float>& sc,
+    const cs_meas_groups* groups = nullptr)
 {
     const int n = rows * cols;
     // Backtrack under tv > 0 for the same reason as cs_fista_core_single:
@@ -578,7 +610,8 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
     for (int k = 0; k < iters; ++k) {
         float fy = 0.0f;
         for (int c = 0; c < 3; ++c) {
-            fy += cs_fista_grad(yc[c], pix.data(), sc.data(), gc[c], bb[c], rix, riy, m, rows, cols, tv_lambda, bx);
+            fy += cs_fista_grad(yc[c], pix.data(), sc.data(), gc[c], bb[c], rix, riy, m, rows, cols, tv_lambda, bx,
+                nullptr, 0.0f, nullptr, groups);
         }
         if (bt) {
             for (int trial = 0; ; ++trial) {
@@ -597,7 +630,7 @@ static void cs_fista_core_joint(float* x0, float* x1, float* x2,
                 }
                 float fz = 0.0f;
                 for (int c = 0; c < 3; ++c) {
-                    fz += cs_smooth_fx(zc[c], pix.data(), sc.data(), bb[c], rix, riy, m, rows, cols, tv_lambda, bx);
+                    fz += cs_smooth_fx(zc[c], pix.data(), sc.data(), bb[c], rix, riy, m, rows, cols, tv_lambda, bx, groups);
                 }
                 double dot = 0.0, dz2 = 0.0;
                 for (int c = 0; c < 3; ++c) {
@@ -673,13 +706,17 @@ static void cs_extract_channel_measurements(const cv::Mat& pixel_measurements, i
 void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const int& channel, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     const int& iterations, cv::Mat& ref, bool copy_next_ref, cv::Mat& next_ref,
-    float tv, int reweights, int fista_iters, int basis, float wscale, bool use_onsager)
+    float tv, int reweights, int fista_iters, int basis, float wscale, bool use_onsager,
+    const cs_meas_groups* groups)
 {
     if (!ref.isContinuous()) ref = ref.clone();
     const bool sp = g_solveprof.on;
     auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     const int n = rows * cols;
-    const int m = (int)ri_x.size();
+    // Grouped tiles count groups (mini-container holds group means in
+    // group order); point tiles count pixels.
+    const int grouped = (groups && groups->ng > 0) ? 1 : 0;
+    const int m = grouped ? groups->ng : (int)ri_x.size();
     if (reweights < 1) reweights = 1;
     if (reweights > 5) reweights = 5;
     const cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
@@ -692,7 +729,8 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     const int inner = cs_fista_inner_iters(iterations, fista_iters);
     float* x = (float*)ref.data;
     if (sp) g_solveprof.wrap_setup_ns += sp_ns_since(sp_t0);
-    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0) {
+    // Grouped (averaged) measurements have no HIP kernel: CPU fallback.
+    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0 && !grouped) {
         // GPU path: batched with concurrent callers inside cs_gpu; the tail
         // (ref chain copy + IDCT + 255) stays on the CPU below, unchanged.
         // tv rides per-problem: 0 takes the sampled fast path, >0 the TV
@@ -727,7 +765,8 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     } else for (int r = 0; r < reweights; ++r) {
         auto sp_c = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
         cs_fista_core_single(x, b.data(), ri_x.data(), ri_y.data(), m, rows, cols,
-            w.data(), param_c, tv, inner, bx, y, x_prev, grad, pix, sc, use_onsager);
+            w.data(), param_c, tv, inner, bx, y, x_prev, grad, pix, sc, use_onsager,
+            grouped ? groups : nullptr);
         if (sp) g_solveprof.wrap_core_ns += sp_ns_since(sp_c);
         if (r + 1 < reweights) {
             auto sp_w = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
@@ -1144,14 +1183,16 @@ void fista_channel_begin(fista_channel_task& t, const cv::Mat& pixel_measurement
     const int& channel, const float& param_c, const int& rows, const int& cols,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y, const int& iterations,
     cv::Mat& ref, float tv, int reweights, int fista_iters, int basis, float wscale,
-    bool use_onsager)
+    bool use_onsager, const cs_meas_groups* groups)
 {
     if (!ref.isContinuous()) ref = ref.clone();
     t.basis = basis;
     t.wscale = wscale;
+    t.groups = (groups && groups->ng > 0) ? groups : nullptr;
     const bool sp = g_solveprof.on;
     auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0) {
+    // Grouped (averaged) measurements have no HIP kernel: CPU fallback.
+    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0 && !t.groups) {
         const int m = (int)ri_x.size();
         const int inner = cs_fista_inner_iters(iterations, fista_iters);
         if (reweights < 1) reweights = 1;
@@ -1178,7 +1219,7 @@ void fista_channel_begin(fista_channel_task& t, const cv::Mat& pixel_measurement
         // CPU (or CDF97): unchanged full blocking solve + tail inline
         reconstruct_color_channel_fista(pixel_measurements, channel, param_c, rows, cols,
             ri_x, ri_y, iterations, ref, false, cs_null_mat(), tv, reweights, fista_iters,
-            basis, wscale, use_onsager);
+            basis, wscale, use_onsager, t.groups);
         t.h = nullptr;
     }
 }
@@ -1213,13 +1254,15 @@ void fista_channel_end(fista_channel_task& t, cv::Mat& ref)
 
 void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const float& param_c,
     const int& rows, const int& cols, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
-    const int& iterations, cv::Mat refs[3], float tv, int reweights, int fista_iters, int basis, float wscale)
+    const int& iterations, cv::Mat refs[3], float tv, int reweights, int fista_iters, int basis, float wscale,
+    const cs_meas_groups* groups)
 {
     for (int ch = 0; ch < 3; ++ch) {
         if (!refs[ch].isContinuous()) refs[ch] = refs[ch].clone();
     }
     const int n = rows * cols;
-    const int m = (int)ri_x.size();
+    const int grouped = (groups && groups->ng > 0) ? 1 : 0;
+    const int m = grouped ? groups->ng : (int)ri_x.size();
     if (reweights < 1) reweights = 1;
     if (reweights > 5) reweights = 5;
     const cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
@@ -1236,7 +1279,7 @@ void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const floa
     float* x0 = (float*)refs[0].data;
     float* x1 = (float*)refs[1].data;
     float* x2 = (float*)refs[2].data;
-    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0) {
+    if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0 && !grouped) {
         // GPU path: stacked group solve inside cs_gpu (same batching as the
         // single-channel path); tails below stay on the CPU, unchanged.
         cs_gpu::FistaProblem pb;
@@ -1260,7 +1303,7 @@ void reconstruct_image_fista_joint(const cv::Mat& pixel_measurements, const floa
     } else for (int r = 0; r < reweights; ++r) {
         cs_fista_core_joint(x0, x1, x2, b0.data(), b1.data(), b2.data(),
             ri_x.data(), ri_y.data(), m, rows, cols, w.data(), param_c, tv, inner, bx,
-            y, xp, grad, z, pix, sc);
+            y, xp, grad, z, pix, sc, grouped ? groups : nullptr);
         if (r + 1 < reweights) {
             float mx = 0.0f;
             for (int i = 0; i < n; ++i) {

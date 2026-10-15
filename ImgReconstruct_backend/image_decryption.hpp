@@ -137,6 +137,16 @@ private:
     // mixed-tile votes toward the higher sampled class.
     std::vector<uint8_t> seg_rates_q;
 
+    // Mode 14 (CS_MODE_TMEANS) global group list in container-body order:
+    // tgrp_off[g]..tgrp_off[g+1] index tgrp_px (flat row-major pixel
+    // indices), tgrp_w holds the unit-norm row weights (0.5f). Empty for
+    // point-sample modes, whose per-tile lists stay in ri_x_g/ri_y_g.
+    std::vector<int> tgrp_off, tgrp_px;
+    std::vector<float> tgrp_w;
+    // Per-group BGR values in body order (mode 14), for per-tile
+    // mini-containers in the prep loop.
+    std::vector<cv::Vec3b> tgrp_val;
+
 public:
     decrypt_image(const std::string input_path, const std::string& password = "");
 
@@ -144,7 +154,7 @@ public:
 
     decrypt_image(cv::Mat input, const std::string& password = "");
 
-    void decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, float tv = 0.0f, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, bool use_onsager = false);
+    void decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, const std::vector<int>& ri_y_g, const int num_iterations, const float coef, cv::Mat& out, float tv = 0.0f, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, bool use_onsager = false, const cs_meas_groups* groups = nullptr);
 
     void get_mat(cv::Mat& dest);
 
@@ -162,6 +172,12 @@ public:
 
     int get_sampling_mode() const { return sampling_mode; }
     const std::vector<uint8_t>& get_seg_rates_q() const { return seg_rates_q; }
+    // Mode 14 group accessors (empty unless get_sampled_mat ran on a
+    // T-means container); per-tile code filters these by tile rect.
+    const std::vector<int>& get_tgrp_off() const { return tgrp_off; }
+    const std::vector<int>& get_tgrp_px() const { return tgrp_px; }
+    const std::vector<float>& get_tgrp_w() const { return tgrp_w; }
+    const std::vector<cv::Vec3b>& get_tgrp_val() const { return tgrp_val; }
     bool has_hr_detail() const { return hr_detail; }
     const std::vector<CsHrSample>& get_hr_samples() const { return hr_samples; }
     size_t get_hr_applied() const { return hr_applied; }
