@@ -327,6 +327,46 @@ static float cs_tv_grad_phi(const float* pix, float* tvgrad, int rows, int cols)
     return phi;
 }
 
+float cs_auto_reg_coefficient(int sampling_mode, float ratio, int num_tiles) {
+    if (cs_is_ycc(sampling_mode)) return -1.0f;
+    float r = ratio < 0.05f ? 0.05f : (ratio > 1.0f ? 1.0f : ratio);
+    const int nt = num_tiles > 0 ? num_tiles : 1;
+    float base;
+    // Tile-grid factor: small tiles hold fewer pixels per solve and need a
+    // stronger prior. Seg needs it at every ratio (single global coef must
+    // compromise across density variation: 0.46-0.6x at tiles=1); uniform
+    // only when starved (ratio < 0.5), where it recovers ~1 dB at tiles=1.
+    float tf = 1.0f;
+    const bool segm = (sampling_mode == CS_MODE_SEGMASK);
+    if (segm || r < 0.5f) {
+        tf = std::pow((float)nt / 64.0f, 0.15f);
+        if (tf < 0.5f) tf = 0.5f;
+        if (tf > 1.2f) tf = 1.2f;
+    }
+    if (segm) {
+        base = 0.045f * std::pow(r, -0.75f);
+    } else if (sampling_mode == CS_MODE_RANDOM) {
+        base = 0.01875f / r;
+    } else {
+        return -1.0f;
+    }
+    float coef = base * tf;
+    if (coef < 0.01f) coef = 0.01f;
+    if (coef > 0.3f) coef = 0.3f;
+    return coef;
+}
+
+float cs_auto_reg_tv(int sampling_mode, float ratio) {
+    if (cs_is_ycc(sampling_mode)) return -1.0f;
+    if (sampling_mode == CS_MODE_SEGMASK) {
+        return ratio < 0.5f ? 0.01f : 0.0f;
+    }
+    if (sampling_mode == CS_MODE_RANDOM) {
+        return 0.0f;
+    }
+    return -1.0f;
+}
+
 // Block-aware 2D DCT (see helper_functions.hpp): whole-plane legacy at
 // block <= 0, per-BxB orthonormal DCTs otherwise. Edge blocks clipped to
 // the plane stay orthogonal (cv::dct handles arbitrary sizes), so forward

@@ -168,6 +168,21 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     float tv = 0.0f, int reweights = 2, int fista_iters = 0, int basis = CS_BASIS_DCT, float wscale = 2.0f,
     bool use_onsager = false, const cs_meas_groups* groups = nullptr);
 
+// Automatic regularization from the Params-test sweep (bird photo, DCT,
+// wscale 2, tiles 64/96/128 + full-res spot checks; see Params-test/).
+// coef: seg (SEGMASK) follows 0.045*ratio^-0.75 (sparse regions need a
+// strong prior); uniform random follows 0.01875/ratio. Both scale by a
+// tile-grid factor (num_tiles/64)^0.15 in [0.5, 1.2] — always for seg
+// (one global coef compromises across density variation), only below
+// ratio 0.5 for uniform (dense uniform tiles are self-similar). tv:
+// 0.01 for seg below ratio 0.5 (smoothing helps starved regions), else 0.
+// Returns < 0 when the mode is not covered (YCC/adaptive/periodic/HF/
+// T-tetromino: caller keeps legacy behavior). Ratio is clamped to
+// [0.05, 1.0] (validated 0.15-0.5); coef to [0.01, 0.3]. Recommend
+// --per-tile-coef for seg multi-tile solves (measured +1-2 dB).
+float cs_auto_reg_coefficient(int sampling_mode, float ratio, int num_tiles);
+float cs_auto_reg_tv(int sampling_mode, float ratio);
+
 // Block-aware 2D DCT on a CV_32F plane: dct_block <= 0 is the legacy
 // whole-plane transform (bit-identical); >0 applies an independent
 // orthonormal DCT per BxB block (edge blocks clipped to the plane).

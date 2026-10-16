@@ -41,7 +41,10 @@ void print_usage(const char* exe) {
         "  --iterations <n>      decrypt solver iterations (manual mode only)\n"
         "  --threads <n>         decrypt worker threads (manual mode only)\n"
         "  --coef <f>            decrypt solver coefficient (>0; higher = sparser,\n"
-        "                        no upper bound; manual mode only)\n"
+        "                        no upper bound). Default: auto-derived from the\n"
+        "                        container ratio, sampling mode and tile grid\n"
+        "                        (Params-test fitted laws); explicit values win\n"
+        "                        (and switch to manual mode).\n"
         "  --per-tile-coef       scale the L1 coefficient per tile from its\n"
         "                        sample count (starved tiles regularized more,\n"
         "                        rich tiles relaxed; tv stays global unless\n"
@@ -112,7 +115,8 @@ void print_usage(const char* exe) {
   "                        failure skips the pass with a warning\n"
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
-  "                        compression; 0 = off)\n"
+  "                        compression; 0 = off). Default: auto (0.01 for\n"
+  "                        segment sampling below ratio 0.5, else 0).\n"
   "  --red <f>             RED-lite NLM strength for --photo-upscaler cs-sr\n"
   "                        in [0, 1] (0 = off): blends each outer FISTA pass\n"
   "                        toward its fastNlMeans-denoised self; stronger\n"
@@ -509,12 +513,12 @@ int main(int argc, char* argv[])
     bool have_password = false;
     float ratio = 1.0f;
     int tiles = 1, overlap = 24, iterations = 5, threads = 8;
-    float coef = 0.01f;
+    float coef = -1.0f;
     bool per_tile_coef = false;
     bool per_tile_tv = false;
     float grain_tv = 0.0f;
     bool use_onsager = false;
-    float tv_lambda = 0.0f;
+    float tv_lambda = -1.0f;
     bool manual = false;
     bool show_preview = true;
     CsPhotoUpscalerOptions photo_up;

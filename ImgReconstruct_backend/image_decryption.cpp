@@ -1826,8 +1826,8 @@ int decrypt_image::decrypt_image_tiled(
                 throw std::runtime_error("Number of tiles must be at least 1");
             }
 
-            if (coef <= 0.0f) {
-                throw std::runtime_error("Coef must be positive");
+            if (coef <= 0.0f && coef != -1.0f) {
+                throw std::runtime_error("Coef must be positive (-1 = auto-derive)");
             }
 
             if (nun_threads < 1) {
@@ -1868,16 +1868,44 @@ int decrypt_image::decrypt_image_tiled(
             iterations = 8;
         }
 
-        if (dimgs.get_compression_ratio() < 0.5f) {
-            coef = 0.045f;
-        }
-        else
-        {
-            coef = (1.0f / dimgs.get_compression_ratio()) * 0.01875f;
-        }
         num_tiles = 1;
         overlap = 24;
         nun_threads = omp_get_max_threads();
+    }
+
+    // Automatic regularization (Params-test sweep): in AUTO_PARAM mode the
+    // established contract overwrites coef unconditionally (direct API
+    // callers included); the fitted laws replace the old ratio branch on
+    // covered modes (BGR random/seg). tv derives only from the -1.0f
+    // sentinel so explicit values (including the API 0.0 default) win.
+    // In manual mode -1.0f (the CLI default when --coef/--tv are absent)
+    // derives the same way, giving manual multi-tile decrypts fitted
+    // values instead of the flat 0.01/0.0 defaults. Uncovered modes keep
+    // legacy behavior (auto: old ratio branch; manual: 0.01/0.0).
+    {
+        const float ar = dimgs.get_compression_ratio();
+        const int sm = dimgs.get_sampling_mode();
+        const int nt = num_tiles > 0 ? num_tiles : 1;
+        if (CSencryption::params == AUTO_PARAM) {
+            const float dc = cs_auto_reg_coefficient(sm, ar, nt);
+            if (dc >= 0.0f) {
+                coef = dc;
+            }
+            else if (ar < 0.5f) {
+                coef = 0.045f;
+            }
+            else {
+                coef = (1.0f / ar) * 0.01875f;
+            }
+        }
+        else if (coef == -1.0f) {
+            const float dc = cs_auto_reg_coefficient(sm, ar, nt);
+            coef = (dc >= 0.0f) ? dc : 0.01f;
+        }
+        if (tv == -1.0f) {
+            const float dtv = cs_auto_reg_tv(sm, ar);
+            tv = (dtv >= 0.0f) ? dtv : 0.0f;
+        }
     }
 
     // YCC containers take a dedicated tile pipeline: luma at

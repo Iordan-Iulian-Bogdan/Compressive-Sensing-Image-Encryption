@@ -3757,6 +3757,34 @@ void test_seg_auto() {
     std::remove(tmp_in.c_str());
 }
 
+void test_auto_reg_params() {
+    // Params-test fitted laws (single pin each; full curves in results.csv):
+    // seg 0.045*r^-0.75, uniform 0.01875/r, tile factor (n/64)^0.15 in
+    // [0.5, 1.2] below ratio 0.5, tv 0.01 for seg below 0.5 else 0.
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_SEGMASK, 0.3f, 64) - 0.1112f) < 0.002f,
+        "auto-reg: seg 0.3 t64 ~= 0.111");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_SEGMASK, 0.15f, 1) - 0.103f) < 0.004f,
+        "auto-reg: seg 0.15 t1 ~= 0.103 (tile factor)");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_RANDOM, 0.5f, 64) - 0.0375f) < 1e-6f,
+        "auto-reg: uniform 0.5 t64 == 0.0375 (legacy formula)");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_SEGMASK, 0.5f, 1) - 0.0418f) < 0.002f,
+        "auto-reg: seg 0.5 t1 tile-factored (no-factor would 2x overshoot)");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_RANDOM, 0.5f, 1) - 0.0375f) < 1e-6f,
+        "auto-reg: uniform ignores tile factor at 0.5");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_RANDOM, 0.3f, 1) - 0.0335f) < 0.002f,
+        "auto-reg: uniform tile-factored below 0.5");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_RANDOM, 0.15f, 64) - 0.125f) < 0.002f,
+        "auto-reg: uniform 0.15 t64 == 0.125 (extended below 0.5)");
+    check(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.3f, 64) < 0.0f,
+        "auto-reg: YCC uncovered");
+    check(cs_auto_reg_coefficient(CS_MODE_ADAPTIVE, 0.3f, 64) < 0.0f,
+        "auto-reg: adaptive uncovered");
+    check(cs_auto_reg_tv(CS_MODE_SEGMASK, 0.3f) == 0.01f, "auto-reg: seg tv 0.01 below 0.5");
+    check(cs_auto_reg_tv(CS_MODE_SEGMASK, 0.5f) == 0.0f, "auto-reg: seg tv 0 at 0.5");
+    check(cs_auto_reg_tv(CS_MODE_RANDOM, 0.15f) == 0.0f, "auto-reg: uniform tv 0");
+    check(cs_auto_reg_tv(CS_MODE_YCC420, 0.15f) < 0.0f, "auto-reg: YCC tv uncovered");
+}
+
 void test_per_tile_coef() {
     // exact math: sqrt scaling with [0.25x, 4x] clamps and degenerate guards
     check(cs_per_tile_coef(0.01f, 100, 400.0) == 0.02f, "per-tile-coef: sqrt upscale");
@@ -3982,6 +4010,7 @@ int main(int argc, char* argv[]) {
     test_y_dual_tv_color_segment();
     test_dual_tv_split();
     test_seg_auto();
+    test_auto_reg_params();
     test_per_tile_coef();
     test_gpu_fista_agreement();
 
