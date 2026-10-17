@@ -10,6 +10,27 @@
 #include <algorithm>
 #include <iostream>
 
+// Measurement stamping helpers. cv::Mat::at<T>(r,c) recomputes
+// data + step*r + c*elemSize() on every element and the compiler cannot hoist
+// step out of the loop because the source and destination Mats alias through
+// their members. Hoisting the row stride and copying fixed-size elements with
+// memcpy lets the compiler emit a bare load/store per sample instead of an
+// integer multiply plus a member reload. Output is bit-identical.
+static inline void cs_gather_bgr(const uint8_t* base, size_t step,
+                                 const int* rx, const int* ry, int m, uint8_t* dst) {
+    for (int k = 0; k < m; ++k) {
+        std::memcpy(dst + (size_t)k * 3,
+                    base + (size_t)rx[k] * step + (size_t)ry[k] * 3, 3);
+    }
+}
+
+static inline void cs_gather_u8(const uint8_t* base, size_t step,
+                                const int* rx, const int* ry, int m, uint8_t* dst) {
+    for (int k = 0; k < m; ++k) {
+        dst[k] = base[(size_t)rx[k] * step + (size_t)ry[k]];
+    }
+}
+
 // Global radial spectral decay of a gray image: thumbnail (max 128px),
 // orthonormal DCT, mean |F|^2 per radial bin, log-log least-squares slope.
 // Returns alpha in E(f) ~ f^-alpha (natural images ~2). Any degenerate fit
@@ -675,9 +696,8 @@ void encrypt_image::encrypt(const float& pixel_p, const std::string& password, i
     }
 
     // write all m measurements (indices CS_HEADER_PIXELS .. CS_HEADER_PIXELS+m-1)
-    for (int k = 0; k < m; k++) {
-        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
-    }
+    cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m,
+                  encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -768,9 +788,8 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     buf[CS_OFF_PAD + 4] = (uint8_t)((samples_per_tile >> 8) & 0xFF);
 
     // write all m measurements (indices CS_HEADER_PIXELS .. CS_HEADER_PIXELS+m-1)
-    for (int k = 0; k < m; k++) {
-        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
-    }
+    cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m,
+                  encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -851,9 +870,8 @@ void encrypt_image::encrypt_tcluster(const float& pixel_p, const std::string& pa
     }
 
     buf[CS_OFF_PAD] = CS_MODE_TCLUSTER;
-    for (int k = 0; k < m; k++) {
-        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
-    }
+    cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m,
+                  encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -1019,13 +1037,9 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     buf[CS_OFF_PAD] = (uint8_t)mode;
 
     uint8_t* body = buf + CS_HEADER_BYTES;
-    for (int k = 0; k < m; k++) {
-        body[k] = planes[0].at<uint8_t>(ri_x[k], ri_y[k]);
-    }
-    for (int k = 0; k < mC; k++) {
-        body[m + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
-        body[m + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
-    }
+    cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), m, body);
+    cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + m);
+    cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + m + mC);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -1182,10 +1196,8 @@ void encrypt_image::encrypt_ycc420_t(const float& pixel_p, const std::string& pa
     for (int k = 0; k < m; k++) {
         body[k] = luma[(size_t)k];
     }
-    for (int k = 0; k < mC; k++) {
-        body[m + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
-        body[m + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
-    }
+    cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + m);
+    cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + m + mC);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -1325,13 +1337,9 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     std::memcpy(buf + CS_HEADER_BYTES, lod.data(), (size_t)lod_bytes);
 
     uint8_t* body = buf + CS_HEADER_BYTES + (size_t)lod_pixels * 3;
-    for (int k = 0; k < mY_written; k++) {
-        body[k] = planes[0].at<uint8_t>(ri_x[k], ri_y[k]);
-    }
-    for (int k = 0; k < mC; k++) {
-        body[mY_written + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
-        body[mY_written + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
-    }
+    cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), mY_written, body);
+    cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + mY_written);
+    cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + mY_written + mC);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -1956,9 +1964,8 @@ void encrypt_image::encrypt_segmask_ids(const float& pixel_p, const std::string&
     std::memcpy(buf + CS_HEADER_BYTES + prefix.size(), png.data(), png.size());
 
     const int meas0 = CS_HEADER_PIXELS + pre_pixels;
-    for (int k = 0; k < m_written; k++) {
-        encrypted_img.at<cv::Vec3b>(k + meas0) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
-    }
+    cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m_written,
+                  encrypted_img.data + (size_t)meas0 * 3);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -2100,13 +2107,9 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     std::memcpy(buf + CS_HEADER_BYTES + prefix.size(), png.data(), png.size());
 
     uint8_t* body = buf + CS_HEADER_BYTES + pre_bytes;
-    for (int k = 0; k < mY_written; k++) {
-        body[k] = planes[0].at<uint8_t>(ri_x[k], ri_y[k]);
-    }
-    for (int k = 0; k < mC; k++) {
-        body[mY_written + k] = cr_small.at<uint8_t>(ri_cx1[k], ri_cy1[k]);
-        body[mY_written + mC + k] = cb_small.at<uint8_t>(ri_cx2[k], ri_cy2[k]);
-    }
+    cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), mY_written, body);
+    cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + mY_written);
+    cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + mY_written + mC);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -2210,8 +2213,8 @@ void encrypt_image::encrypt_hf_focus(const float& pixel_p,
     if (thumb_padded > thumb_len) std::memset(thumbnail_data + thumb_len, 0, thumb_padded - thumb_len);
     seal_hf_thumb(thumbnail_data, thumb_len, buffer + CS_OFF_IV, cs_key);
     const int measurement_offset = CS_HEADER_PIXELS + lod_pixels + thumb_pixels;
-    for (int i = 0; i < written; ++i)
-        encrypted_img.at<cv::Vec3b>(i + measurement_offset) = input_img.at<cv::Vec3b>(ri_x[i], ri_y[i]);
+    cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), written,
+                  encrypted_img.data + (size_t)measurement_offset * 3);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -2293,11 +2296,9 @@ void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
     if (thumb_padded > thumb_len) std::memset(thumbnail_data + thumb_len, 0, thumb_padded - thumb_len);
     seal_hf_thumb(thumbnail_data, thumb_len, buffer + CS_OFF_IV, cs_key);
     uint8_t* body = thumbnail_data + thumb_padded;
-    for (int i = 0; i < luma_count; ++i) body[i] = planes[0].at<uint8_t>(ri_x[i], ri_y[i]);
-    for (int i = 0; i < m_chroma; ++i) {
-        body[luma_count + i] = cr.at<uint8_t>(ri_cx1[i], ri_cy1[i]);
-        body[luma_count + m_chroma + i] = cb.at<uint8_t>(ri_cx2[i], ri_cy2[i]);
-    }
+    cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), luma_count, body);
+    cs_gather_u8(cr.data, cr.step, ri_cx1.data(), ri_cy1.data(), m_chroma, body + luma_count);
+    cs_gather_u8(cb.data, cb.step, ri_cx2.data(), ri_cy2.data(), m_chroma, body + luma_count + m_chroma);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buffer[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -2440,9 +2441,8 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
 
     // write measurements at regenerated indices
     const int meas0 = CS_HEADER_PIXELS + lod_pixels;
-    for (int k = 0; k < m_written; k++) {
-        encrypted_img.at<cv::Vec3b>(k + meas0) = input_img.at<cv::Vec3b>(ri_x[k], ri_y[k]);
-    }
+    cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m_written,
+                  encrypted_img.data + (size_t)meas0 * 3);
     if (chroma_bits == 0) chroma_bits = sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
     buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
@@ -2495,9 +2495,8 @@ void encrypt_image::encrypt(const std::vector<int>& ri_x_g, const std::vector<in
     cs_write_header_plain(encrypted_img.data, total * 3, text);
 
     // write all m measurements (indices CS_HEADER_PIXELS .. CS_HEADER_PIXELS+m-1)
-    for (int k = 0; k < m; k++) {
-        encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = input_img.at<cv::Vec3b>(ri_x_g[k], ri_y_g[k]);
-    }
+    cs_gather_bgr(input_img.data, input_img.step, ri_x_g.data(), ri_y_g.data(), m,
+                  encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
 
     encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }

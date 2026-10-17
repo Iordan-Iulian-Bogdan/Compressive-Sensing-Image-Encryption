@@ -418,11 +418,14 @@ cv::Mat cs_segmask_density(const cv::Mat& labels,
     if (labels.empty() || labels.type() != CV_8U || width < 0 || width > CS_SEGBLEND_MAX)
         throw std::runtime_error("seg-mask density: invalid labels or width");
     cv::Mat rates(labels.size(), CV_64F);
-    for (int y = 0; y < labels.rows; ++y)
+    for (int y = 0; y < labels.rows; ++y) {
+        const uint8_t* lrow = labels.ptr<uint8_t>(y);
+        double* rrow = rates.ptr<double>(y);
         for (int x = 0; x < labels.cols; ++x) {
-            const unsigned c = labels.at<uint8_t>(y, x);
-            rates.at<double>(y, x) = c < rates_q.size() ? rates_q[c] : 0;
+            const unsigned c = lrow[x];
+            rrow[x] = c < rates_q.size() ? rates_q[c] : 0.0;
         }
+    }
     cv::Mat kernel(1, 2 * width + 1, CV_64F);
     for (int i = -width; i <= width; ++i)
         kernel.at<double>(0, i + width) = width + 1 - std::abs(i);
@@ -432,9 +435,13 @@ cv::Mat cs_segmask_density(const cv::Mat& labels,
     cv::sepFilter2D(rates, filtered, CV_64F, kernel, kernel, {-1, -1}, 0, cv::BORDER_REPLICATE);
     const double side = (width + 1.0) * (width + 1.0);
     cv::Mat density(labels.size(), CV_16U);
-    for (int y = 0; y < labels.rows; ++y)
+    const double inv = 257.0 / (side * side);
+    for (int y = 0; y < labels.rows; ++y) {
+        const double* frow = filtered.ptr<double>(y);
+        uint16_t* drow = density.ptr<uint16_t>(y);
         for (int x = 0; x < labels.cols; ++x)
-            density.at<uint16_t>(y, x) = (uint16_t)std::llround(filtered.at<double>(y, x) * 257.0 / (side * side));
+            drow[x] = (uint16_t)std::llround(frow[x] * inv);
+    }
     return density;
 }
 
