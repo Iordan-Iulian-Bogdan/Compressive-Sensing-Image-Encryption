@@ -216,10 +216,14 @@ int cs_dwt_levels(int rows, int cols) {
 
 namespace {
 int g_dct_block_default = 0;
+int g_pad_radix_default = 0;
 }  // namespace
 
 int cs_default_dct_block() { return g_dct_block_default; }
 void cs_set_default_dct_block(int block) { g_dct_block_default = block; }
+
+int cs_default_pad_radix() { return g_pad_radix_default; }
+void cs_set_default_pad_radix(int on) { g_pad_radix_default = on; }
 
 cs_fista_basis cs_make_basis(int rows, int cols, int basis_id, float wscale,
                              int dct_block) {

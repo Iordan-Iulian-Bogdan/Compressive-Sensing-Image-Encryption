@@ -168,6 +168,11 @@ void print_usage(const char* exe) {
   "  --dct-block <n>      DCT block size: 0 = whole-tile (default),\n"
   "                        else independent DCT per n x n block (try 8,\n"
   "                        16, 32; decrypt/roundtrip only, CPU only)\n"
+  "  --pad-radix          decrypt/roundtrip only, CPU only: solve each DCT\n"
+  "                        tile on a power-of-two canvas (pad -> transform\n"
+  "                        -> crop) so cv::dct hits its fast radix path;\n"
+  "                        ~1.2-1.5x faster, very slightly softer\n"
+  "                        (container unchanged)\n"
   "  --wscale <f>         per-scale threshold ramp (in (0,16], default\n"
   "                        2: coarsest band x1, finest band x wscale, LL\n"
   "                        protected; 1 = uniform; DCT maps it to a\n"
@@ -1116,6 +1121,9 @@ int main(int argc, char* argv[])
                 return 64;
             }
             cs_set_default_dct_block(dct_block);
+        }
+        else if (a == "--pad-radix") {
+            cs_set_default_pad_radix(1);
         }
         else if (a == "--device") {
             const char* v = next("cpu|gpu");

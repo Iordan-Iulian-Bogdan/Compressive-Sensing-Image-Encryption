@@ -24,6 +24,14 @@ struct cs_fista_basis {
 int cs_default_dct_block();
 void cs_set_default_dct_block(int block);
 
+// Process-wide power-of-two-canvas mode (--pad-radix): the per-channel DCT
+// tile solver pads the solve plane to the next power of two per dimension,
+// transforms there (cv::dct fast radix path) and crops back. Decrypt/solver
+// only, CPU only; the container format is unchanged. Set once from
+// --pad-radix (or the CS_PAD_RADIX env override for experiments).
+int cs_default_pad_radix();
+void cs_set_default_pad_radix(int on);
+
 int cs_basis_from_name(const std::string& name, int& out);
 int cs_dwt_levels(int rows, int cols);
 cs_fista_basis cs_make_basis(int rows, int cols, int basis_id,

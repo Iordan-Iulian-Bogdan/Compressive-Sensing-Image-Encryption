@@ -752,14 +752,39 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     if (!ref.isContinuous()) ref = ref.clone();
     const bool sp = g_solveprof.on;
     auto sp_t0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    const int n = rows * cols;
     // Grouped tiles count groups (mini-container holds group means in
     // group order); point tiles count pixels.
     const int grouped = (groups && groups->ng > 0) ? 1 : 0;
     const int m = grouped ? groups->ng : (int)ri_x.size();
     if (reweights < 1) reweights = 1;
     if (reweights > 5) reweights = 5;
-    cs_fista_basis bx = cs_make_basis(rows, cols, basis, wscale);
+    // --pad-radix (or env CS_PAD_RADIX=1 for experiments): solve the tile on
+    // a power-of-two canvas so cv::dct hits its fast radix path (48x56 -> 64x64
+    // is ~1.5x cheaper per transform). Sample coordinates stay in the top-left;
+    // the pad is left unconstrained so the prior extrapolates it, and the tail
+    // crops back. Default off => bit-identical legacy behavior. The canvas is
+    // larger, so decodes run slightly softer (~-0.003 SSIM uniform, ~-0.005
+    // seg); that gap is intrinsic and does not close under coef/tv retuning.
+    static const bool pad_radix_env = []{
+        const char* e = std::getenv("CS_PAD_RADIX"); return e && *e && *e != '0';
+    }();
+    const bool pad_radix = cs_default_pad_radix() != 0 || pad_radix_env;
+    int R = rows, C = cols;
+    if (pad_radix && !grouped && basis == CS_BASIS_DCT &&
+        cs_default_dct_block() <= 0 && !cs_gpu::enabled()) {
+        R = 1; while (R < rows) R <<= 1;
+        C = 1; while (C < cols) C <<= 1;
+    }
+    const bool padded = (R != rows || C != cols);
+    const int n = R * C;
+    std::vector<float> canvas;
+    if (padded) {
+        canvas.assign((size_t)n, 0.0f);
+        const cv::Mat refm(rows, cols, CV_32F, (float*)ref.data);
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(canvas.data() + (size_t)r * C, refm.ptr<float>(r), sizeof(float) * cols);
+    }
+    cs_fista_basis bx = cs_make_basis(R, C, basis, wscale);
     if (grouped) {
         // Averaged rows are shorter than point rows (true-average weights),
         // so the smooth-part Lipschitz 2*||A||^2 drops below lip. Groups are
@@ -781,7 +806,7 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     std::vector<float> w((size_t)n, 1.0f);
     std::vector<float> y((size_t)n), x_prev((size_t)n), grad((size_t)n), pix((size_t)n), sc((size_t)n);
     const int inner = cs_fista_inner_iters(iterations, fista_iters);
-    float* x = (float*)ref.data;
+    float* x = padded ? canvas.data() : (float*)ref.data;
     if (sp) g_solveprof.wrap_setup_ns += sp_ns_since(sp_t0);
     // Grouped (averaged) measurements have no HIP kernel: CPU fallback.
     if (cs_gpu::enabled() && basis != CS_BASIS_CDF97 && cs_default_dct_block() <= 0 && !grouped) {
@@ -804,8 +829,8 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
         pb.rix = ri_x.data();
         pb.riy = ri_y.data();
         pb.m = m;
-        pb.rows = rows;
-        pb.cols = cols;
+        pb.rows = R;
+        pb.cols = C;
         pb.x = x;
         pb.lambda = param_c;
         pb.inner = inner;
@@ -818,7 +843,7 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
         }
     } else for (int r = 0; r < reweights; ++r) {
         auto sp_c = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-        cs_fista_core_single(x, b.data(), ri_x.data(), ri_y.data(), m, rows, cols,
+        cs_fista_core_single(x, b.data(), ri_x.data(), ri_y.data(), m, R, C,
             w.data(), param_c, tv, inner, bx, y, x_prev, grad, pix, sc, use_onsager,
             grouped ? groups : nullptr);
         if (sp) g_solveprof.wrap_core_ns += sp_ns_since(sp_c);
@@ -837,19 +862,33 @@ void reconstruct_color_channel_fista(const cv::Mat& pixel_measurements, const in
     }
 
     auto sp_t1 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    if (copy_next_ref && !next_ref.empty()) {
-        if (!next_ref.isContinuous()) next_ref = next_ref.clone();
-        std::memcpy(next_ref.data, ref.data, sizeof(float) * (size_t)n);
-    }
-
-    if (bx.basis == CS_BASIS_CDF97) {
-        cs_dwt_inverse((float*)ref.data, rows, cols, bx.levels);
-        cv::Mat plane(rows, cols, CV_32F, ref.data);
-        plane = plane * 255.0f;
+    if (padded) {
+        if (copy_next_ref && !next_ref.empty()) {
+            if (!next_ref.isContinuous()) next_ref = next_ref.clone();
+            for (int r = 0; r < rows; ++r)
+                std::memcpy((float*)next_ref.data + (size_t)r * cols, x + (size_t)r * C, sizeof(float) * cols);
+        }
+        cv::Mat Cm(R, C, CV_32F, x);
+        cv::dct(Cm, Cm, cv::DCT_INVERSE);
+        Cm = Cm * 255.0f;
+        cv::Mat refm(rows, cols, CV_32F, (float*)ref.data);
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(refm.ptr<float>(r), Cm.ptr<float>(r), sizeof(float) * cols);
     } else {
-        cv::Mat AtAxb2(rows, cols, CV_32F, (float*)ref.data);
-        cs_dct_inverse(AtAxb2, bx.dct_block);
-        AtAxb2 = AtAxb2 * 255.0f;
+        if (copy_next_ref && !next_ref.empty()) {
+            if (!next_ref.isContinuous()) next_ref = next_ref.clone();
+            std::memcpy(next_ref.data, ref.data, sizeof(float) * (size_t)n);
+        }
+
+        if (bx.basis == CS_BASIS_CDF97) {
+            cs_dwt_inverse((float*)ref.data, rows, cols, bx.levels);
+            cv::Mat plane(rows, cols, CV_32F, ref.data);
+            plane = plane * 255.0f;
+        } else {
+            cv::Mat AtAxb2(rows, cols, CV_32F, (float*)ref.data);
+            cs_dct_inverse(AtAxb2, bx.dct_block);
+            AtAxb2 = AtAxb2 * 255.0f;
+        }
     }
     if (sp) {
         g_solveprof.wrap_tail_ns += sp_ns_since(sp_t1);
