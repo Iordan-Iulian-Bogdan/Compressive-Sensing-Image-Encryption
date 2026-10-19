@@ -292,7 +292,7 @@ inline int cs_lod_pixels(int rows, int cols, int tile_size) {
 // (m_luma positions) while each chroma plane is first downsampled 2x and
 // then sampled on its own coarse grid. The per-plane chroma count derives
 // deterministically from the stored luma budget so no extra header fields
-// are needed — both sides must use cs_ycc420_chroma_count. Container body
+// are needed — both sides must use cs_chroma_count. Container body
 // layout after the 32-pixel header is raw bytes:
 //   [Y x m_luma][Cr x m_chroma][Cb x m_chroma], zero-padded to whole pixels.
 // At the same --ratio this stores ~1.5 bytes/px instead of 3 (BGR modes).
@@ -353,12 +353,6 @@ inline bool cs_is_ycc422(int mode) {
 }
 inline bool cs_is_ycc_hf(int mode) {
     return mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF;
-}
-inline void cs_ycc420_chroma_dims(int rows, int cols, int& crows, int& ccols) {
-    cs_chroma_dims(CS_MODE_YCC420, rows, cols, crows, ccols);
-}
-inline int cs_ycc420_chroma_count(int m_luma, int rows, int cols) {
-    return cs_chroma_count(CS_MODE_YCC420, m_luma, rows, cols);
 }
 // Domain separation for the three per-plane RNG streams: luma uses the key
 // as-is (tag 0), chroma planes use tagged copies. Deterministic on both

@@ -15,7 +15,7 @@ mkdir "%OUT%" 2>nul
 mkdir "%OBJ%" 2>nul
 set "CV490_INC=/I C:\opencv\build\include"
 set "DEFS=/DNDEBUG /D_CONSOLE /D_CRT_SECURE_NO_WARNINGS"
-set "OPTS=/c /O2 /fp:fast /arch:AVX2 /Oi /std:c++17 /EHsc /MD /openmp /Zi /fsanitize=address /D_DISABLE_STL_ANNOTATION"
+set "OPTS=/c /O2 /fp:fast /arch:AVX2 /Oi /std:c++17 /EHsc /MD /openmp /Zi /fsanitize=address /D_DISABLE_STL_ANNOTATION /clang:-Wunused-function /clang:-Wunused-variable /clang:-Wunused-parameter"
 set "BE_INC=/I %ROOT%ImgReconstruct_backend /I %ROOT%third_party\onnxruntime\include"
 set "SYSLIBS=bcrypt.lib libomp.lib user32.lib gdi32.lib kernel32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib shell32.lib winspool.lib comdlg32.lib onnxruntime.lib delayimp.lib amdhip64.lib hipfft.lib"
 

@@ -1817,11 +1817,6 @@ struct CsDncnnEntry {
 static std::mutex g_dncnn_mutex;
 static std::map<std::string, std::unique_ptr<CsDncnnEntry>> g_dncnn_cache;
 static std::map<std::string, bool> g_dncnn_failed;
-// Tile geometry per model kind: DnCNN is tiny (20 layers); SCUNet/Restormer
-// carry far more activations, so they run smaller tiles to bound memory.
-static int cs_onnx_tile_for_kind(int kind) {
-    return kind == CS_ONNX_DNCNN ? 512 : 256;
-}
 
 // The ORT DLL is delay-loaded and resolved from PATH: a stale system DLL
 // older than the vendored headers makes GetApi(ORT_API_VERSION) return null,

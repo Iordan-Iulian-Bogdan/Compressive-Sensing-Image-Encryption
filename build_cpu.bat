@@ -35,7 +35,7 @@ mkdir "%OBJT%" 2>nul
 set "CV490_INC=/I %CV490_ROOT%\build\include"
 set "CV413_INC=/I C:\Users\iorda\OneDrive\Documents\opencv\Release\include"
 set "DEFS=/DNDEBUG /D_CONSOLE /D_CRT_SECURE_NO_WARNINGS"
-set "OPTS=/c /O2 /fp:fast /arch:AVX512 /clang:-mavx512f /clang:-mavx512bw /clang:-mavx512dq /clang:-mavx512vl /clang:-mavx512cd /Oi /std:c++17 /EHsc /MD /openmp /Zi"
+set "OPTS=/c /O2 /fp:fast /arch:AVX512 /clang:-mavx512f /clang:-mavx512bw /clang:-mavx512dq /clang:-mavx512vl /clang:-mavx512cd /Oi /std:c++17 /EHsc /MD /openmp /Zi /clang:-Wunused-function /clang:-Wunused-variable /clang:-Wunused-parameter"
 set "BE_INC=/I %ROOT%ImgReconstruct_backend /I %ROOT%third_party\onnxruntime\include"
 
 echo ============ main objects [opencv 4.90 world] ============
