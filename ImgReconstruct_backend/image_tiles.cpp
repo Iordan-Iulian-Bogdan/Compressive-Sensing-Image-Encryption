@@ -139,6 +139,28 @@ void splitImageIntoTiles(
   }
 }
 
+// Clips a tile placed at (x, y) to the [0, max_x) x [0, max_y) canvas; returns
+// false when nothing of it remains visible.
+static bool clipTileToImage(int x, int y, int tile_width, int tile_height,
+                            int max_x, int max_y, int& clipped_x, int& clipped_y,
+                            int& clipped_width, int& clipped_height) {
+  clipped_x = x;
+  clipped_y = y;
+  clipped_width = tile_width;
+  clipped_height = tile_height;
+  if (clipped_x < 0) {
+    clipped_width += clipped_x;
+    clipped_x = 0;
+  }
+  if (clipped_y < 0) {
+    clipped_height += clipped_y;
+    clipped_y = 0;
+  }
+  clipped_width = (std::min)(clipped_width, max_x - clipped_x);
+  clipped_height = (std::min)(clipped_height, max_y - clipped_y);
+  return clipped_width > 0 && clipped_height > 0;
+}
+
 cv::Mat blendTilesWithImage(
     const std::vector<std::vector<cv::Mat>>& tiles,
     const std::vector<std::vector<TileCoord>>& coordinates,
@@ -162,21 +184,9 @@ cv::Mat blendTilesWithImage(
         const int tile_width = tiles[i][j].cols;
         const int x = coordinates[i][j].x;
         const int y = coordinates[i][j].y;
-        int clipped_x = x;
-        int clipped_y = y;
-        int clipped_width = tile_width;
-        int clipped_height = tile_height;
-        if (clipped_x < 0) {
-          clipped_width += clipped_x;
-          clipped_x = 0;
-        }
-        if (clipped_y < 0) {
-          clipped_height += clipped_y;
-          clipped_y = 0;
-        }
-        clipped_width = (std::min)(clipped_width, max_x - clipped_x);
-        clipped_height = (std::min)(clipped_height, max_y - clipped_y);
-        if (clipped_width <= 0 || clipped_height <= 0) continue;
+        int clipped_x, clipped_y, clipped_width, clipped_height;
+        if (!clipTileToImage(x, y, tile_width, tile_height, max_x, max_y,
+                             clipped_x, clipped_y, clipped_width, clipped_height)) continue;
 
         const cv::Mat tile_roi =
             tiles[i][j](cv::Rect(0, 0, clipped_width, clipped_height));
@@ -244,21 +254,9 @@ cv::Mat blendTilesWithImage(
       if (tiles[i][j].empty()) continue;
       const int x = coordinates[i][j].x;
       const int y = coordinates[i][j].y;
-      int clipped_x = x;
-      int clipped_y = y;
-      int clipped_width = tiles[i][j].cols;
-      int clipped_height = tiles[i][j].rows;
-      if (clipped_x < 0) {
-        clipped_width += clipped_x;
-        clipped_x = 0;
-      }
-      if (clipped_y < 0) {
-        clipped_height += clipped_y;
-        clipped_y = 0;
-      }
-      clipped_width = (std::min)(clipped_width, max_x - clipped_x);
-      clipped_height = (std::min)(clipped_height, max_y - clipped_y);
-      if (clipped_width <= 0 || clipped_height <= 0) continue;
+      int clipped_x, clipped_y, clipped_width, clipped_height;
+      if (!clipTileToImage(x, y, tiles[i][j].cols, tiles[i][j].rows, max_x, max_y,
+                           clipped_x, clipped_y, clipped_width, clipped_height)) continue;
 
       const cv::Mat source =
           tiles[i][j](cv::Rect(0, 0, clipped_width, clipped_height));

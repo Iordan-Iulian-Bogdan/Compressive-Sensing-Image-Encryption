@@ -132,6 +132,10 @@ private:
     // order. No-op at 8 bits.
     void unpack_container_measurements(const std::vector<cs_body_section>& sections);
 
+    // Decrypts + parses the seg-mask body prefix, caches seg_rates_q/seg_ids and
+    // fills ri_x/ri_y; shared by the BGR and YCC-seg sampling paths.
+    CsSegPrefix open_segmask_prefix();
+
     // Shipped per-class quantized rates of a seg container (empty for other
     // modes); cached during sampling so the single-stage solver can break
     // mixed-tile votes toward the higher sampled class.

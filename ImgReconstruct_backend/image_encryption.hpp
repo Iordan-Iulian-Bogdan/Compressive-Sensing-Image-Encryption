@@ -8,6 +8,13 @@ class encrypt_image : CSencryption
 private:
     float bm = 0.0f;
 
+    // Container build steps shared by the encrypt_* modes (see .cpp).
+    void derive_container_key(const std::string& password, uint8_t salt[CS_SALT_BYTES]);
+    uint8_t* alloc_container(int total, const uint8_t salt[CS_SALT_BYTES]);
+    static void stamp_sample_bits(uint8_t* buf, int sample_bits, int& chroma_bits);
+    void finish_container(int total, int sample_bits, int chroma_bits,
+        const std::vector<cs_body_section>& sections);
+
 public:
     encrypt_image(std::string input_path);
 

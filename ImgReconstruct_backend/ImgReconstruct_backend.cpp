@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -436,6 +437,64 @@ bool parse_float(const char* s, float& out) {
     catch (...) { return false; }
 }
 
+// Value helpers for the option table in main(). They return false when the
+// value does not parse or fails `bad`, printing `msg` only when one is given:
+// flags without their own message fail silently, as they always have.
+bool set_int(const char* v, int& out, bool (*bad)(int), const char* msg) {
+    if (!parse_int(v, out)) return false;
+    if (bad && bad(out)) { std::cerr << msg << std::endl; return false; }
+    return true;
+}
+
+bool set_float(const char* v, float& out, bool (*bad)(float), const char* msg) {
+    if (!parse_float(v, out)) return false;
+    if (bad && bad(out)) { std::cerr << msg << std::endl; return false; }
+    return true;
+}
+
+// Whole-token integer via std::stoi; any failure prints `msg`.
+bool set_int_strict(const char* v, int& out, const char* msg) {
+    try {
+        size_t pos = 0;
+        out = std::stoi(v, &pos);
+        if (pos != std::string(v).size()) throw std::runtime_error("trailing characters");
+    }
+    catch (...) {
+        std::cerr << msg << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Decimal in [0, 1] for the luma-confidence flags. /fp:fast may fold
+// isfinite(NaN), so nan/inf spellings are rejected before conversion.
+bool set_unit_decimal(const char* v, float& out, const char* msg) {
+    bool decimal = *v != '\0';
+    bool digit = false;
+    for (const char* p = v; *p; ++p) {
+        if (*p >= '0' && *p <= '9') digit = true;
+        else if (*p != '.' && *p != '+' && *p != '-' && *p != 'e' && *p != 'E') decimal = false;
+    }
+    if (!decimal || !digit || !parse_float(v, out) || out < 0.0f || out > 1.0f) {
+        std::cerr << msg << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Exact-match choice. fold_case lowercases the value first and stores the
+// folded spelling (used by --sr-init and --sr-pnp).
+bool set_choice(const char* v, std::string& out, std::initializer_list<const char*> choices,
+                const char* msg, bool fold_case = false) {
+    std::string s = v;
+    if (fold_case) for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    for (const char* choice : choices) {
+        if (s == choice) { out = s; return true; }
+    }
+    std::cerr << msg << std::endl;
+    return false;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -581,623 +640,263 @@ int main(int argc, char* argv[])
     float wscale = 2.0f;
     int dct_block = 0;
 
-    for (int i = 4; i < argc; i++) {
-        const std::string a = argv[i];
-        auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) {
-                std::cerr << "Error: " << a << " requires a value (" << what << ")" << std::endl;
-                return nullptr;
-            }
-            return argv[++i];
-        };
-
-        if (a == "--password") {
-            const char* v = next("passphrase text");
-            if (!v) return 64;
-            password = v; have_password = true;
-        }
-        else if (a == "--ratio") {
-            const char* v = next("floating point");
-            if (!v || !parse_float(v, ratio)) return 64;
-        }
-        else if (a == "--tiles") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, tiles)) return 64;
-            manual = true;
-        }
-        else if (a == "--overlap") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, overlap)) return 64;
-            manual = true;
-        }
-        else if (a == "--iterations") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, iterations)) return 64;
-            manual = true;
-        }
-        else if (a == "--threads") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, threads)) return 64;
-            manual = true;
-        }
-        else if (a == "--coef") {
-            const char* v = next("floating point");
-            if (!v || !parse_float(v, coef)) return 64;
-            manual = true;
-        }
-        else if (a == "--per-tile-coef") {
-            // decrypt-side only; per-tile counts travel in the container,
-            // so this must not flip decrypt into manual parameter mode
-            per_tile_coef = true;
-        }
-        else if (a == "--per-tile-tv") {
-            // same, for the TV weight (independent flag: tv seams are the
-            // failure mode to watch, keep it separable from coef)
-            per_tile_tv = true;
-        }
-        else if (a == "--grain-tv") {
-            // decrypt-side only: reference noise sigma in gray levels;
-            // per-tile counts travel in the container, so like the other
-            // per-tile flags this must not flip decrypt into manual mode
-            const char* v = next("floating point in (0, 64]");
-            if (!v || !parse_float(v, grain_tv)) return 64;
-            if (grain_tv <= 0.0f || grain_tv > 64.0f) {
-                std::cerr << "Error: --grain-tv must be in (0, 64]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--y-confidence") {
-            const char* v = next("strength in [0,1]");
-            // /fp:fast may optimize away isfinite(NaN); reject non-decimal
-            // tokens before conversion (including nan/inf spellings).
-            bool decimal = v && *v;
-            bool digit = false;
-            if (v) for (const char* p = v; *p; ++p) {
-                if (*p >= '0' && *p <= '9') digit = true;
-                else if (*p != '.' && *p != '+' && *p != '-' && *p != 'e' && *p != 'E') decimal = false;
-            }
-            if (!decimal || !digit || !parse_float(v, photo_up.y_confidence) ||
-                photo_up.y_confidence < 0.0f || photo_up.y_confidence > 1.0f) {
-                std::cerr << "Error: --y-confidence must be in [0,1]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--y-dual-tv") {
-            const char* v = next("TV weight in (0,1]");
-            bool decimal = v && *v;
-            bool digit = false;
-            if (v) for (const char* p = v; *p; ++p) {
-                if (*p >= '0' && *p <= '9') digit = true;
-                else if (*p != '.' && *p != '+' && *p != '-' && *p != 'e' && *p != 'E') decimal = false;
-            }
-            if (!decimal || !digit || !parse_float(v, photo_up.y_dual_tv) ||
-                photo_up.y_dual_tv < 0.0f || photo_up.y_dual_tv > 1.0f) {
-                std::cerr << "Error: --y-dual-tv must be in [0,1]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--y-dual-tv-mask") {
-            const char* v = next("output PNG path");
-            if (!v) return 64;
-            photo_up.y_dual_tv_mask = v;
-        }
-        else if (a == "--dual-tv-split") {
-            const char* v = next("output prefix");
-            if (!v) return 64;
-            photo_up.dual_tv_split = v;
-        }
-        else if (a == "--dual-tv-cutouts") {
-            const char* v = next("output prefix");
-            if (!v) return 64;
-            photo_up.dual_tv_cutouts = v;
-        }
-        else if (a == "--manual") {
-            manual = true;
-        }
-        else if (a == "--no-preview") {
-            show_preview = false;
-        }
-        else if (a == "--photo-upscaler") {
-            const char* v = next("avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
-            if (!v) return 64;
-            if (v != std::string("avir") && v != std::string("cs-sr") && v != std::string("cs") &&
-                v != std::string("sr-direct") && v != std::string("dip") &&
-                v != std::string("fsrcnn") && v != std::string("waifu2x") &&
-                v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
-                std::cerr << "Error: --photo-upscaler must be avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan" << std::endl;
-                return 64;
-            }
-            photo_up.backend = v;
-        }
-        else if (a == "--fsrcnn-model") {
-            const char* v = next("FSRCNN .pb path");
-            if (!v) return 64;
-            photo_up.fsrcnn_model = v;
-        }
-        else if (a == "--waifu2x-cmd") {
-            const char* v = next("command");
-            if (!v) return 64;
-            photo_up.waifu2x_cmd = v;
-        }
-        else if (a == "--waifu2x-args") {
-            const char* v = next("arguments");
-            if (!v) return 64;
-            photo_up.waifu2x_args = v;
-        }
-        else if (a == "--waifu2x-method") {
-            const char* v = next("scale or noise_scale");
-            if (!v) return 64;
-            if (v != std::string("scale") && v != std::string("noise_scale")) {
-                std::cerr << "Error: --waifu2x-method must be scale or noise_scale" << std::endl;
-                return 64;
-            }
-            photo_up.waifu2x_method = v;
-        }
-        else if (a == "--waifu2x-noise") {
-            const char* v = next("integer in [0,3]");
-            if (!v || !parse_int(v, photo_up.waifu2x_noise)) return 64;
-            if (photo_up.waifu2x_noise < 0 || photo_up.waifu2x_noise > 3) {
-                std::cerr << "Error: --waifu2x-noise must be in [0, 3]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--waifu2x-ncnn-cmd") {
-            const char* v = next("command");
-            if (!v) return 64;
-            photo_up.waifu2x_ncnn_cmd = v;
-        }
-        else if (a == "--waifu2x-ncnn-args") {
-            const char* v = next("arguments");
-            if (!v) return 64;
-            photo_up.waifu2x_ncnn_args = v;
-        }
-        else if (a == "--waifu2x-ncnn-model") {
-            const char* v = next("model-dir name or explicit path");
-            if (!v) return 64;
-            photo_up.waifu2x_ncnn_model = v;
-        }
-        else if (a == "--realcugan-cmd") {
-            const char* v = next("command");
-            if (!v) return 64;
-            photo_up.realcugan_cmd = v;
-        }
-        else if (a == "--realcugan-args") {
-            const char* v = next("arguments");
-            if (!v) return 64;
-            photo_up.realcugan_args = v;
-        }
-        else if (a == "--realcugan-model") {
-            const char* v = next("se, pro, nose or an explicit model-dir path");
-            if (!v) return 64;
-            photo_up.realcugan_model = v;
-        }
-        else if (a == "--final-polish") {
-            // post-pipeline whole-image up-then-down pass (decrypt-side
-            // only; subprocess neural backends, same CLIs as per-tile)
-            const char* v = next("waifu2x, waifu2x-ncnn or realcugan");
-            if (!v) return 64;
-            if (v != std::string("waifu2x") &&
-                v != std::string("waifu2x-ncnn") && v != std::string("realcugan")) {
-                std::cerr << "Error: --final-polish must be waifu2x, waifu2x-ncnn or realcugan" << std::endl;
-                return 64;
-            }
-            photo_up.final_polish = v;
-        }
-        else if (a == "--tv") {
-            // does NOT force manual mode: AUTO still derives coef/iterations
-            // from the container ratio; only the TV weight is overridden
-            const char* v = next("floating point");
-            if (!v || !parse_float(v, tv_lambda)) return 64;
-        }
-        else if (a == "--red") {
-            // RED-lite NLM strength for --photo-upscaler cs-sr (0 = off):
-            // does NOT force manual mode, same as --tv
-            const char* v = next("floating point in [0, 1]");
+    // One row per flag. `hint` names the value in the missing-value error
+    // (null for switches); `manual` switches decrypt to manual parameters
+    // when the flag parses; `apply` returns false on a bad value (exit 64).
+    struct Opt {
+        const char* name;
+        const char* hint;
+        bool manual;
+        std::function<bool(const char*)> apply;
+    };
+    const std::vector<Opt> opts = {
+        {"--password", "passphrase text", false, [&](const char* v) { password = v; have_password = true; return true; }},
+        {"--ratio", "floating point", false, [&](const char* v) { return set_float(v, ratio, nullptr, nullptr); }},
+        {"--tiles", "integer", true, [&](const char* v) { return set_int(v, tiles, nullptr, nullptr); }},
+        {"--overlap", "integer", true, [&](const char* v) { return set_int(v, overlap, nullptr, nullptr); }},
+        {"--iterations", "integer", true, [&](const char* v) { return set_int(v, iterations, nullptr, nullptr); }},
+        {"--threads", "integer", true, [&](const char* v) { return set_int(v, threads, nullptr, nullptr); }},
+        {"--coef", "floating point", true, [&](const char* v) { return set_float(v, coef, nullptr, nullptr); }},
+        // decrypt-side switches: per-tile counts travel in the container, so
+        // none of these may flip decrypt into manual parameter mode
+        {"--per-tile-coef", nullptr, false, [&](const char*) { per_tile_coef = true; return true; }},
+        {"--per-tile-tv", nullptr, false, [&](const char*) { per_tile_tv = true; return true; }},
+        {"--grain-tv", "floating point in (0, 64]", false, [&](const char* v) {
+            return set_float(v, grain_tv, [](float x) { return x <= 0.0f || x > 64.0f; },
+                             "Error: --grain-tv must be in (0, 64]");
+        }},
+        {"--y-confidence", "strength in [0,1]", false, [&](const char* v) {
+            return set_unit_decimal(v, photo_up.y_confidence, "Error: --y-confidence must be in [0,1]");
+        }},
+        {"--y-dual-tv", "TV weight in (0,1]", false, [&](const char* v) {
+            return set_unit_decimal(v, photo_up.y_dual_tv, "Error: --y-dual-tv must be in [0,1]");
+        }},
+        {"--y-dual-tv-mask", "output PNG path", false, [&](const char* v) { photo_up.y_dual_tv_mask = v; return true; }},
+        {"--dual-tv-split", "output prefix", false, [&](const char* v) { photo_up.dual_tv_split = v; return true; }},
+        {"--dual-tv-cutouts", "output prefix", false, [&](const char* v) { photo_up.dual_tv_cutouts = v; return true; }},
+        {"--manual", nullptr, true, [&](const char*) { return true; }},
+        {"--no-preview", nullptr, false, [&](const char*) { show_preview = false; return true; }},
+        {"--photo-upscaler", "avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan", false, [&](const char* v) {
+            return set_choice(v, photo_up.backend,
+                {"avir", "cs-sr", "cs", "sr-direct", "dip", "fsrcnn", "waifu2x", "waifu2x-ncnn", "realcugan"},
+                "Error: --photo-upscaler must be avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan");
+        }},
+        {"--fsrcnn-model", "FSRCNN .pb path", false, [&](const char* v) { photo_up.fsrcnn_model = v; return true; }},
+        {"--waifu2x-cmd", "command", false, [&](const char* v) { photo_up.waifu2x_cmd = v; return true; }},
+        {"--waifu2x-args", "arguments", false, [&](const char* v) { photo_up.waifu2x_args = v; return true; }},
+        {"--waifu2x-method", "scale or noise_scale", false, [&](const char* v) {
+            return set_choice(v, photo_up.waifu2x_method, {"scale", "noise_scale"},
+                              "Error: --waifu2x-method must be scale or noise_scale");
+        }},
+        {"--waifu2x-noise", "integer in [0,3]", false, [&](const char* v) {
+            return set_int(v, photo_up.waifu2x_noise, [](int x) { return x < 0 || x > 3; },
+                           "Error: --waifu2x-noise must be in [0, 3]");
+        }},
+        {"--waifu2x-ncnn-cmd", "command", false, [&](const char* v) { photo_up.waifu2x_ncnn_cmd = v; return true; }},
+        {"--waifu2x-ncnn-args", "arguments", false, [&](const char* v) { photo_up.waifu2x_ncnn_args = v; return true; }},
+        {"--waifu2x-ncnn-model", "model-dir name or explicit path", false, [&](const char* v) { photo_up.waifu2x_ncnn_model = v; return true; }},
+        {"--realcugan-cmd", "command", false, [&](const char* v) { photo_up.realcugan_cmd = v; return true; }},
+        {"--realcugan-args", "arguments", false, [&](const char* v) { photo_up.realcugan_args = v; return true; }},
+        {"--realcugan-model", "se, pro, nose or an explicit model-dir path", false, [&](const char* v) { photo_up.realcugan_model = v; return true; }},
+        // post-pipeline whole-image up-then-down pass (decrypt-side only)
+        {"--final-polish", "waifu2x, waifu2x-ncnn or realcugan", false, [&](const char* v) {
+            return set_choice(v, photo_up.final_polish, {"waifu2x", "waifu2x-ncnn", "realcugan"},
+                              "Error: --final-polish must be waifu2x, waifu2x-ncnn or realcugan");
+        }},
+        // weights below do NOT force manual mode: AUTO still derives
+        // coef/iterations from the container ratio; only the weight changes
+        {"--tv", "floating point", false, [&](const char* v) { return set_float(v, tv_lambda, nullptr, nullptr); }},
+        {"--red", "floating point in [0, 1]", false, [&](const char* v) {
             float red = 0.0f;
-            if (!v || !parse_float(v, red)) return 64;
-            if (red < 0.0f || red > 1.0f) {
-                std::cerr << "Error: --red must be in [0, 1]" << std::endl;
-                return 64;
-            }
+            if (!set_float(v, red, [](float x) { return x < 0.0f || x > 1.0f; }, "Error: --red must be in [0, 1]")) return false;
             photo_up.sr_red = red;
-        }
-        else if (a == "--red-denoiser") {
-            const char* v = next("nlmeans, dncnn, scunet or restormer");
-            if (!v) return 64;
-            if (v != std::string("nlmeans") && v != std::string("dncnn") &&
-                v != std::string("scunet") && v != std::string("restormer")) {
-                std::cerr << "Error: --red-denoiser must be nlmeans, dncnn, scunet or restormer" << std::endl;
-                return 64;
-            }
-            photo_up.sr_red_denoiser = v;
-        }
-        else if (a == "--dncnn-model") {
-            const char* v = next("DnCNN ONNX model path");
-            if (!v) return 64;
-            photo_up.sr_dncnn_model = v;
-        }
-        else if (a == "--red-model") {
-            // explicit model file for scunet/restormer (or dncnn override):
-            // decrypt-side only, does not force manual mode
-            const char* v = next("ONNX model file");
-            if (!v) return 64;
-            photo_up.sr_red_model = v;
-        }
-        else if (a == "--red-decay") {
-            // HQS strength schedule: does NOT force manual mode, same as --tv
-            const char* v = next("floating point in [0, 1]");
+            return true;
+        }},
+        {"--red-denoiser", "nlmeans, dncnn, scunet or restormer", false, [&](const char* v) {
+            return set_choice(v, photo_up.sr_red_denoiser, {"nlmeans", "dncnn", "scunet", "restormer"},
+                              "Error: --red-denoiser must be nlmeans, dncnn, scunet or restormer");
+        }},
+        {"--dncnn-model", "DnCNN ONNX model path", false, [&](const char* v) { photo_up.sr_dncnn_model = v; return true; }},
+        {"--red-model", "ONNX model file", false, [&](const char* v) { photo_up.sr_red_model = v; return true; }},
+        {"--red-decay", "floating point in [0, 1]", false, [&](const char* v) {
             float decay = 1.0f;
-            if (!v || !parse_float(v, decay)) return 64;
-            if (decay < 0.0f || decay > 1.0f) {
-                std::cerr << "Error: --red-decay must be in [0, 1]" << std::endl;
-                return 64;
-            }
+            if (!set_float(v, decay, [](float x) { return x < 0.0f || x > 1.0f; }, "Error: --red-decay must be in [0, 1]")) return false;
             photo_up.sr_red_decay = decay;
-        }
-        else if (a == "--hr-weight") {
-            // HR-anchor data-term weight for cs-sr: does NOT force manual
-            // mode, same as --tv
-            const char* v = next("floating point in [0, 16]");
+            return true;
+        }},
+        {"--hr-weight", "floating point in [0, 16]", false, [&](const char* v) {
             float hrw = 1.0f;
-            if (!v || !parse_float(v, hrw)) return 64;
-            if (hrw < 0.0f || hrw > 16.0f) {
-                std::cerr << "Error: --hr-weight must be in [0, 16]" << std::endl;
-                return 64;
-            }
+            if (!set_float(v, hrw, [](float x) { return x < 0.0f || x > 16.0f; }, "Error: --hr-weight must be in [0, 16]")) return false;
             photo_up.sr_hr_weight = hrw;
-        }
-        else if (a == "--hr-red-radius") {
-            // Anchor-proximity RED radius: does NOT force manual mode
-            const char* v = next("floating point in [0, 64]");
+            return true;
+        }},
+        {"--hr-red-radius", "floating point in [0, 64]", false, [&](const char* v) {
             float hrr = 0.0f;
-            if (!v || !parse_float(v, hrr)) return 64;
-            if (hrr < 0.0f || hrr > 64.0f) {
-                std::cerr << "Error: --hr-red-radius must be in [0, 64]" << std::endl;
-                return 64;
-            }
+            if (!set_float(v, hrr, [](float x) { return x < 0.0f || x > 64.0f; }, "Error: --hr-red-radius must be in [0, 64]")) return false;
             photo_up.sr_hr_red_radius = hrr;
-        }
-        else if (a == "--onsager") {
-            // decrypt-side only; per-tile counts travel in the container,
-            // so this must not flip decrypt into manual parameter mode
-            use_onsager = true;
-        }
-        else if (a == "--sr-dict") {
-            // coupled-dictionary SR model: decrypt-side only, takes
-            // precedence over the FISTA cs-sr solve in the fused 2x path
-            const char* v = next("CSD2 dictionary file");
-            if (!v) return 64;
-            photo_up.sr_dict = v;
-        }
-        else if (a == "--sr-init") {
-            // CS SR warm start: decrypt-side only (cs-sr / sr-direct)
-            const char* v = next("avir or cascade");
-            if (!v) return 64;
-            std::string s = v;
-            for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-            if (s != "avir" && s != "cascade") {
-                std::cerr << "Error: --sr-init must be avir or cascade" << std::endl;
-                return 64;
-            }
-            photo_up.sr_init = s;
-        }
-        else if (a == "--sr-prior-model") {
-            // ONNX 2x photo-SR prior for cs-sr: decrypt-side only, does not
-            // force manual mode (same as --red)
-            const char* v = next("ONNX SR model file");
-            if (!v) return 64;
-            photo_up.sr_prior_model = v;
-        }
-        else if (a == "--sr-pnp") {
-            // PnP/RED semantics for the cs-sr denoiser step: decrypt-side
-            // only, does not force manual mode
-            const char* v = next("off, prox or admm");
-            if (!v) return 64;
-            std::string s = v;
-            for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-            if (s != "off" && s != "prox" && s != "admm") {
-                std::cerr << "Error: --sr-pnp must be off, prox or admm" << std::endl;
-                return 64;
-            }
-            photo_up.sr_pnp = s;
-        }
-        else if (a == "--sr-pnp-rho") {
-            const char* v = next("floating point in (0, 8]");
+            return true;
+        }},
+        {"--onsager", nullptr, false, [&](const char*) { use_onsager = true; return true; }},
+        {"--sr-dict", "CSD2 dictionary file", false, [&](const char* v) { photo_up.sr_dict = v; return true; }},
+        {"--sr-init", "avir or cascade", false, [&](const char* v) {
+            return set_choice(v, photo_up.sr_init, {"avir", "cascade"},
+                              "Error: --sr-init must be avir or cascade", true);
+        }},
+        {"--sr-prior-model", "ONNX SR model file", false, [&](const char* v) { photo_up.sr_prior_model = v; return true; }},
+        {"--sr-pnp", "off, prox or admm", false, [&](const char* v) {
+            return set_choice(v, photo_up.sr_pnp, {"off", "prox", "admm"},
+                              "Error: --sr-pnp must be off, prox or admm", true);
+        }},
+        {"--sr-pnp-rho", "floating point in (0, 8]", false, [&](const char* v) {
             float rho = 0.1f;
-            if (!v || !parse_float(v, rho)) return 64;
-            if (!(rho > 0.0f) || rho > 8.0f) {
-                std::cerr << "Error: --sr-pnp-rho must be in (0, 8]" << std::endl;
-                return 64;
-            }
+            if (!set_float(v, rho, [](float x) { return !(x > 0.0f) || x > 8.0f; }, "Error: --sr-pnp-rho must be in (0, 8]")) return false;
             photo_up.sr_pnp_rho = rho;
-        }
-        else if (a == "--sr-pnp-iters") {
-            const char* v = next("integer in [1, 50]");
+            return true;
+        }},
+        {"--sr-pnp-iters", "integer in [1, 50]", false, [&](const char* v) {
             int it = 8;
-            if (!v || !parse_int(v, it)) return 64;
-            if (it < 1 || it > 50) {
-                std::cerr << "Error: --sr-pnp-iters must be in [1, 50]" << std::endl;
-                return 64;
-            }
+            if (!set_int(v, it, [](int x) { return x < 1 || x > 50; }, "Error: --sr-pnp-iters must be in [1, 50]")) return false;
             photo_up.sr_pnp_iters = it;
-        }
-        else if (a == "--periodic") {
-            // encrypt-side only: decrypt auto-detects the mode from the
-            // container header, so this must not flip decrypt into manual
-            // parameter mode (CLI default coef/iterations are wrong for
-            // ratios other than 1.0 and collapse quality to ~11 dB)
-            periodic = true;
-        }
-        else if (a == "--tile-size") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, tile_size)) return 64;
-        }
-        else if (a == "--ycc420") {
-            // encrypt-side only (same as --periodic): luma/chroma-split 4:2:0
-            // sampling; decrypt auto-detects mode 3 from the container header
-            ycc420 = true;
-        }
-        else if (a == "--ycc422") {
-            // encrypt-side only: luma/chroma-split 4:2:2 sampling; decrypt
-            // auto-detects mode 7 from the container header
-            ycc422 = true;
-        }
-        else if (a == "--hf-focus") {
-            hf_focus = true;
-        }
-        else if (a == "--hr-detail") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, hr_detail)) return 64;
-        }
-        else if (a == "--adaptive") {
-            // encrypt-side only (same as --periodic): never forces manual
-            // decrypt parameters â€” mode travels in the authenticated header
-            adaptive = true;
-        }
-        else if (a == "--adaptive-floor") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, adaptive_floor)) return 64;
-            if (adaptive_floor < 0 || adaptive_floor > 255) {
-                std::cerr << "Error: --adaptive-floor must be in [0, 255]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--lod-full") {
-            // encrypt-side detail guarantee; decrypt restores the threshold
-            // from the header, so this must not flip decrypt into manual
-            const char* v = next("integer in [0, 255]");
-            if (!v || !parse_int(v, lod_full)) return 64;
-            if (lod_full < 0 || lod_full > 255) {
-                std::cerr << "Error: --lod-full must be in [0, 255] (0 = off)" << std::endl;
-                return 64;
-            }
-        }
-                else if (a == "--adaptive-strength") {
-            const char* v = next("floating point in [0,1]");
-            if (!v || !parse_float(v, adaptive_strength)) return 64;
-            if (adaptive_strength < 0.0f || adaptive_strength > 1.0f) {
-                std::cerr << "Error: --adaptive-strength must be in [0, 1]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--adaptive-gamma") {
-            const char* v = next("floating point in [0.1, 4]");
-            if (!v || !parse_float(v, adaptive_gamma)) return 64;
-            if (adaptive_gamma < 0.1f || adaptive_gamma > 4.0f) {
-                std::cerr << "Error: --adaptive-gamma must be in [0.1, 4]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--adaptive-cutoff") {
-            const char* v = next("integer in [0, 255]");
-            if (!v || !parse_int(v, adaptive_cutoff)) return 64;
-            if (adaptive_cutoff < 0 || adaptive_cutoff > 255) {
-                std::cerr << "Error: --adaptive-cutoff must be in [0, 255]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--two-pass") {
-            // encrypt-side scoring variant: implies the adaptive container
-            // (mode travels in the header, decrypt auto-detects)
-            two_pass = true;
-        }
-        else if (a == "--spectral") {
-            // encrypt-side scoring variant (spectral-DCT LOD): implies the
-            // adaptive container, mutually exclusive with --two-pass
-            spectral = true;
-        }
-        else if (a == "--pilot-ratio") {
-            const char* v = next("floating point in [0.01,0.25]");
-            if (!v || !parse_float(v, pilot_ratio)) return 64;
-            if (pilot_ratio < 0.01f || pilot_ratio > 0.25f) {
-                std::cerr << "Error: --pilot-ratio must be in [0.01, 0.25]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--regions") {
-            const char* v = next("JSON text");
-            if (!v) return 64;
-            regions_json = v;
-        }
-        else if (a == "--region-blend") {
-            const char* v = next("floating point in [0,1]");
-            if (!v || !parse_float(v, region_blend)) return 64;
-            if (region_blend < 0.0f || region_blend > 1.0f) {
-                std::cerr << "Error: --region-blend must be in [0, 1]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--lod-smooth") {
-            const char* v = next("floating point in [0,8]");
-            if (!v || !parse_float(v, lod_smooth)) return 64;
-            if (lod_smooth < 0.0f || lod_smooth > 8.0f) {
-                std::cerr << "Error: --lod-smooth must be in [0, 8]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--seg-mask") {
-            const char* v = next("label/color mask PNG path");
-            if (!v) return 64;
-            seg_mask = v;
-        }
-        else if (a == "--seg-rates") {
-            const char* v = next("comma-separated per-class rates");
-            if (!v) return 64;
-            seg_rates = v;
-        }
-        else if (a == "--seg-blend") {
-            const char* v = next("boundary blend width in pixels");
-            if (!v) return 64;
-            try {
-                size_t pos = 0;
-                seg_blend = std::stoi(v, &pos);
-                if (pos != std::string(v).size()) throw std::runtime_error("trailing characters");
-            }
-            catch (...) {
-                std::cerr << "Error: --seg-blend needs an integer in [0, 128]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--seg-solve") {
-            const char* v = next("label/color mask PNG path");
-            if (!v) return 64;
-            seg_solve = v;
-        }
-        else if (a == "--seg-auto") {
-            const char* v = next("class count 2..255");
-            if (!v) return 64;
-            try {
-                size_t pos = 0;
-                seg_auto = std::stoi(v, &pos);
-                if (pos != std::string(v).size()) throw std::runtime_error("trailing characters");
-            }
-            catch (...) {
-                std::cerr << "Error: --seg-auto needs an integer in [2, 255]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--sampling") {
-            const char* v = next("points|tcluster|tmeans");
-            if (!v) return 64;
-            sampling = v;
-            if (sampling != "points" && sampling != "tcluster" && sampling != "tmeans") {
-                std::cerr << "Error: --sampling must be points|tcluster|tmeans" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--seg-params") {
-            const char* v = next("per-class solver overrides");
-            if (!v) return 64;
-            seg_params = v;
-        }
-        else if (a == "--show-mask") {
-            // encrypt/roundtrip only: after sampling, save + open the mask
-            show_mask = true;
-        }
-        else if (a == "--sample-split") {
-            // encrypt/roundtrip only: dump under/over-sampled tile canvases
-            const char* v = next("output prefix");
-            if (!v) return 64;
-            sample_split = v;
-        }
-        else if (a == "--sample-bits") {
-            // encrypt-side only (container size lever); decrypt auto-detects
-            // from the header, so this must not flip decrypt into manual
-            const char* v = next("L or L,C, each integer in [1, 8]");
-            if (!v) return 64;
+            return true;
+        }},
+        // encrypt-side switches: decrypt reads the mode from the container header
+        {"--periodic", nullptr, false, [&](const char*) { periodic = true; return true; }},
+        {"--tile-size", "integer", false, [&](const char* v) { return set_int(v, tile_size, nullptr, nullptr); }},
+        {"--ycc420", nullptr, false, [&](const char*) { ycc420 = true; return true; }},
+        {"--ycc422", nullptr, false, [&](const char*) { ycc422 = true; return true; }},
+        {"--hf-focus", nullptr, false, [&](const char*) { hf_focus = true; return true; }},
+        {"--hr-detail", "integer", false, [&](const char* v) { return set_int(v, hr_detail, nullptr, nullptr); }},
+        {"--adaptive", nullptr, false, [&](const char*) { adaptive = true; return true; }},
+        {"--adaptive-floor", "integer", false, [&](const char* v) {
+            return set_int(v, adaptive_floor, [](int x) { return x < 0 || x > 255; }, "Error: --adaptive-floor must be in [0, 255]");
+        }},
+        {"--lod-full", "integer in [0, 255]", false, [&](const char* v) {
+            return set_int(v, lod_full, [](int x) { return x < 0 || x > 255; }, "Error: --lod-full must be in [0, 255] (0 = off)");
+        }},
+        {"--adaptive-strength", "floating point in [0,1]", false, [&](const char* v) {
+            return set_float(v, adaptive_strength, [](float x) { return x < 0.0f || x > 1.0f; }, "Error: --adaptive-strength must be in [0, 1]");
+        }},
+        {"--adaptive-gamma", "floating point in [0.1, 4]", false, [&](const char* v) {
+            return set_float(v, adaptive_gamma, [](float x) { return x < 0.1f || x > 4.0f; }, "Error: --adaptive-gamma must be in [0.1, 4]");
+        }},
+        {"--adaptive-cutoff", "integer in [0, 255]", false, [&](const char* v) {
+            return set_int(v, adaptive_cutoff, [](int x) { return x < 0 || x > 255; }, "Error: --adaptive-cutoff must be in [0, 255]");
+        }},
+        {"--two-pass", nullptr, false, [&](const char*) { two_pass = true; return true; }},
+        {"--spectral", nullptr, false, [&](const char*) { spectral = true; return true; }},
+        {"--pilot-ratio", "floating point in [0.01,0.25]", false, [&](const char* v) {
+            return set_float(v, pilot_ratio, [](float x) { return x < 0.01f || x > 0.25f; }, "Error: --pilot-ratio must be in [0.01, 0.25]");
+        }},
+        {"--regions", "JSON text", false, [&](const char* v) { regions_json = v; return true; }},
+        {"--region-blend", "floating point in [0,1]", false, [&](const char* v) {
+            return set_float(v, region_blend, [](float x) { return x < 0.0f || x > 1.0f; }, "Error: --region-blend must be in [0, 1]");
+        }},
+        {"--lod-smooth", "floating point in [0,8]", false, [&](const char* v) {
+            return set_float(v, lod_smooth, [](float x) { return x < 0.0f || x > 8.0f; }, "Error: --lod-smooth must be in [0, 8]");
+        }},
+        {"--seg-mask", "label/color mask PNG path", false, [&](const char* v) { seg_mask = v; return true; }},
+        {"--seg-rates", "comma-separated per-class rates", false, [&](const char* v) { seg_rates = v; return true; }},
+        {"--seg-blend", "boundary blend width in pixels", false, [&](const char* v) {
+            return set_int_strict(v, seg_blend, "Error: --seg-blend needs an integer in [0, 128]");
+        }},
+        {"--seg-solve", "label/color mask PNG path", false, [&](const char* v) { seg_solve = v; return true; }},
+        {"--seg-auto", "class count 2..255", false, [&](const char* v) {
+            return set_int_strict(v, seg_auto, "Error: --seg-auto needs an integer in [2, 255]");
+        }},
+        {"--sampling", "points|tcluster|tmeans", false, [&](const char* v) {
+            return set_choice(v, sampling, {"points", "tcluster", "tmeans"},
+                              "Error: --sampling must be points|tcluster|tmeans");
+        }},
+        {"--seg-params", "per-class solver overrides", false, [&](const char* v) { seg_params = v; return true; }},
+        {"--show-mask", nullptr, false, [&](const char*) { show_mask = true; return true; }},
+        {"--sample-split", "output prefix", false, [&](const char* v) { sample_split = v; return true; }},
+        {"--sample-bits", "L or L,C, each integer in [1, 8]", false, [&](const char* v) {
             const std::string arg(v);
             const size_t comma = arg.find(',');
             const std::string luma = arg.substr(0, comma);
-            if (!parse_int(luma.c_str(), sample_bits)) return 64;
+            if (!parse_int(luma.c_str(), sample_bits)) return false;
             chroma_sample_bits = sample_bits;
             if (comma != std::string::npos) {
                 if (arg.find(',', comma + 1) != std::string::npos) {
                     std::cerr << "Error: --sample-bits takes L or L,C" << std::endl;
-                    return 64;
+                    return false;
                 }
                 const std::string chroma = arg.substr(comma + 1);
-                if (!parse_int(chroma.c_str(), chroma_sample_bits)) return 64;
+                if (!parse_int(chroma.c_str(), chroma_sample_bits)) return false;
             }
             if (sample_bits < 1 || sample_bits > 8 || chroma_sample_bits < 1 || chroma_sample_bits > 8) {
                 std::cerr << "Error: --sample-bits luma and chroma values must each be in [1, 8]" << std::endl;
-                return 64;
+                return false;
             }
-        }
-        else if (a == "--full-res") {
-            // both sides: skip encrypt 2x downscale AND decrypt 2x upscale
-            full_res = true;
-        }
-        else if (a == "--solver") {
-            const char* v = next("fista|joint");
-            if (!v) return 64;
+            return true;
+        }},
+        {"--full-res", nullptr, false, [&](const char*) { full_res = true; return true; }},
+        {"--solver", "fista|joint", false, [&](const char* v) {
             solver_name = v;
             if (cs_solver_from_name(solver_name, solver) != 0) {
                 std::cerr << "Error: unknown --solver '" << solver_name << "' (fista|joint)" << std::endl;
-                return 64;
+                return false;
             }
-        }
-        else if (a == "--fista-iters") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, fista_iters)) return 64;
-            if (fista_iters < 0 || fista_iters > 500) {
-                std::cerr << "Error: --fista-iters must be in [0, 500]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--reweights") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, reweights)) return 64;
-            if (reweights < 1 || reweights > 5) {
-                std::cerr << "Error: --reweights must be in [1, 5]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--basis") {
-            const char* v = next("dct|wavelet");
-            if (!v) return 64;
+            return true;
+        }},
+        {"--fista-iters", "integer", false, [&](const char* v) {
+            return set_int(v, fista_iters, [](int x) { return x < 0 || x > 500; }, "Error: --fista-iters must be in [0, 500]");
+        }},
+        {"--reweights", "integer", false, [&](const char* v) {
+            return set_int(v, reweights, [](int x) { return x < 1 || x > 5; }, "Error: --reweights must be in [1, 5]");
+        }},
+        {"--basis", "dct|wavelet", false, [&](const char* v) {
             basis_name = v;
             if (cs_basis_from_name(basis_name, basis) != 0) {
                 std::cerr << "Error: unknown --basis '" << basis_name << "' (dct|wavelet)" << std::endl;
-                return 64;
+                return false;
             }
-        }
-        else if (a == "--wscale") {
-            const char* v = next("float");
-            if (!v || !parse_float(v, wscale)) return 64;
-            if (wscale <= 0.0f || wscale > 16.0f) {
-                std::cerr << "Error: --wscale must be in (0, 16]" << std::endl;
-                return 64;
-            }
-        }
-        else if (a == "--dct-block") {
-            const char* v = next("integer");
-            if (!v || !parse_int(v, dct_block)) return 64;
-            if (dct_block != 0 && (dct_block < 2 || dct_block > 1024)) {
-                std::cerr << "Error: --dct-block must be 0 (whole-plane) or in [2, 1024]" << std::endl;
-                return 64;
-            }
+            return true;
+        }},
+        {"--wscale", "float", false, [&](const char* v) {
+            return set_float(v, wscale, [](float x) { return x <= 0.0f || x > 16.0f; }, "Error: --wscale must be in (0, 16]");
+        }},
+        {"--dct-block", "integer", false, [&](const char* v) {
+            if (!set_int(v, dct_block, [](int x) { return x != 0 && (x < 2 || x > 1024); },
+                         "Error: --dct-block must be 0 (whole-plane) or in [2, 1024]")) return false;
             cs_set_default_dct_block(dct_block);
-        }
-        else if (a == "--pad-radix") {
-            cs_set_default_pad_radix(1);
-        }
-        else if (a == "--device") {
-            const char* v = next("cpu|gpu");
-            if (!v) return 64;
+            return true;
+        }},
+        {"--pad-radix", nullptr, false, [&](const char*) { cs_set_default_pad_radix(1); return true; }},
+        {"--device", "cpu|gpu", false, [&](const char* v) {
             if (std::strcmp(v, "gpu") == 0) {
                 cs_gpu::set_enabled(true);
             } else if (std::strcmp(v, "cpu") == 0) {
                 cs_gpu::set_enabled(false);
             } else {
                 std::cerr << "Error: unknown --device '" << v << "' (cpu|gpu)" << std::endl;
-                return 64;
+                return false;
             }
+            return true;
+        }},
+    };
+
+    for (int i = 4; i < argc; i++) {
+        const std::string a = argv[i];
+        const Opt* opt = nullptr;
+        for (const Opt& candidate : opts) {
+            if (a == candidate.name) { opt = &candidate; break; }
         }
-        else {
+        if (!opt) {
             std::cerr << "Error: unknown option '" << a << "'" << std::endl;
             print_usage(argv[0]);
             return 64;
         }
+        const char* v = nullptr;
+        if (opt->hint) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << a << " requires a value (" << opt->hint << ")" << std::endl;
+                return 64;
+            }
+            v = argv[++i];
+        }
+        if (!opt->apply(v)) return 64;
+        if (opt->manual) manual = true;
     }
 
     if (!have_password) {

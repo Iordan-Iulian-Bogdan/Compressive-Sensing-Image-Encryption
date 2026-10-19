@@ -126,6 +126,8 @@
     <ClCompile Include="cs_dict.cpp" />
     <ClCompile Include="cs_wavelet.cpp" />
     <ClCompile Include="helper_functions.cpp" />
+    <ClCompile Include="onnx_denoise.cpp" />
+    <ClCompile Include="superres.cpp" />
     <ClCompile Include="image_decryption.cpp" />
     <ClCompile Include="image_encryption.cpp" />
     <ClCompile Include="image_tiles.cpp" />

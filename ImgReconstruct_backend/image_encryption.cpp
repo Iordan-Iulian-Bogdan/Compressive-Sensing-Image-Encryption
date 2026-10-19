@@ -465,6 +465,58 @@ encrypt_image::encrypt_image(const cv::Mat& input, bool global_image) {
     }
 }
 
+// ---- container build steps shared by every encrypt_* mode ----
+
+// Fresh random salt + PBKDF2-derived key for a new container.
+void encrypt_image::derive_container_key(const std::string& password, uint8_t salt[CS_SALT_BYTES]) {
+    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
+        throw std::runtime_error("cryptographic RNG unavailable");
+    }
+    if (!cs_derive_key(password, salt, cs_key)) {
+        throw std::runtime_error("key derivation (PBKDF2) failed");
+    }
+    cs_key_valid = true;
+}
+
+// Allocates the 1 x total container and writes its authenticated header.
+// Metadata carries the budget m; returns the container byte buffer.
+uint8_t* encrypt_image::alloc_container(int total, const uint8_t salt[CS_SALT_BYTES]) {
+    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    uint8_t* buf = encrypted_img.data;
+    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
+        throw std::runtime_error("failed to write authenticated header");
+    }
+    return buf;
+}
+
+// Records the sample bit depths in the authenticated pad (chroma 0 = same as luma).
+void encrypt_image::stamp_sample_bits(uint8_t* buf, int sample_bits, int& chroma_bits) {
+    if (chroma_bits == 0) chroma_bits = sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
+    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+}
+
+// Bit-packs the given body sections (skipped at 8 bits), seals the header
+// after the body exists (the tag covers header + all measurements), then wipes
+// the key material and reshapes the container to a square.
+void encrypt_image::finish_container(int total, int sample_bits, int chroma_bits,
+    const std::vector<cs_body_section>& sections) {
+    size_t sealed_bytes = (size_t)total * 3;
+    if (sample_bits != 8 || chroma_bits != 8) {
+        encrypted_img = cs_pack_container_body(encrypted_img, sections);
+        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    }
+    if (!cs_seal_header(encrypted_img.data, sealed_bytes, cs_key)) {
+        throw std::runtime_error("failed to seal header (HMAC)");
+    }
+    cs_key_valid = false;
+    cs_wipe(cs_key, sizeof(cs_key));
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
 void encrypt_image::get_mat(cv::Mat& dest) {
     encrypted_img.copyTo(dest);
 }
@@ -675,33 +727,18 @@ void encrypt_image::encrypt(const float& pixel_p, const std::string& password, i
     ri_y.resize(m);
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     returnRandomIndices(ri_x, ri_y, rows, cols, m, cs_key);
 
     const int hr_pixels = (int)hr_detail.size() * (CS_HRDETAIL_SAMPLE_BYTES / 3);
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8 + hr_pixels);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     // write all m measurements (indices CS_HEADER_PIXELS .. CS_HEADER_PIXELS+m-1)
     cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m,
                   encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // HR-detail anchors ride as a trailing CTR-encrypted body section
     // (mode 4); bit-packing would corrupt the ciphertext, so the prototype
@@ -722,23 +759,8 @@ void encrypt_image::encrypt(const float& pixel_p, const std::string& password, i
 
     // --sample-bits: bit-pack the flat measurement section (3 values per
     // sample at byte offset CS_HEADER_BYTES); skipped at 8 bits.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        encrypted_img = cs_pack_container_body(encrypted_img,
-            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    // seal after the body exists: the tag covers header + all measurements
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    // key material is no longer needed once the container is sealed
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    finish_container(total, sample_bits, chroma_bits,
+        { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
 }
 
 /** @brief Periodic tile-based encryption: generates random indices within one
@@ -753,13 +775,7 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     bm = pixel_p;
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     // samples per canonical tile from the requested ratio; the total count m
     // follows from the generated pattern (edge tiles hold fewer samples).
@@ -771,13 +787,7 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     m = (int)ri_x.size();
 
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     // record the sampling mode in the authenticated pad region:
     // [pad+0] = 1 (periodic), [pad+1..3) tile_size LE, [pad+3..5) samples_per_tile LE
@@ -790,30 +800,12 @@ void encrypt_image::encrypt_periodic(const float& pixel_p, const std::string& pa
     // write all m measurements (indices CS_HEADER_PIXELS .. CS_HEADER_PIXELS+m-1)
     cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m,
                   encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // --sample-bits: bit-pack the flat measurement section (3 values per
     // sample at byte offset CS_HEADER_BYTES); skipped at 8 bits.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        encrypted_img = cs_pack_container_body(encrypted_img,
-            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    // seal after the body exists: the tag covers header + all measurements
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    // key material is no longer needed once the container is sealed
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    finish_container(total, sample_bits, chroma_bits,
+        { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
 }
 
 /** @brief T-cluster point sampling (mode 13): random subset of (4x4 cell,
@@ -834,13 +826,7 @@ void encrypt_image::encrypt_tcluster(const float& pixel_p, const std::string& pa
     if (pairs > max_pairs) pairs = max_pairs;
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     std::vector<int> pair_ids;
     returnTetrominoPairIds(pair_ids, rows, cols, pairs, cs_key);
@@ -861,38 +847,16 @@ void encrypt_image::encrypt_tcluster(const float& pixel_p, const std::string& pa
     m = (int)ri_x.size();
 
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     buf[CS_OFF_PAD] = CS_MODE_TCLUSTER;
     cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m,
                   encrypted_img.data + (size_t)CS_HEADER_PIXELS * 3);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        encrypted_img = cs_pack_container_body(encrypted_img,
-            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
+    finish_container(total, sample_bits, chroma_bits,
+        { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
     sampling_mode = CS_MODE_TCLUSTER;
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
 /** @brief T-means grouped sampling (mode 14): random subset of (4x4 cell,
@@ -914,13 +878,7 @@ void encrypt_image::encrypt_tmeans(const float& pixel_p, const std::string& pass
     }
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     std::vector<int> pair_ids;
     returnTetrominoPairIds(pair_ids, rows, cols, pairs, cs_key);
@@ -952,39 +910,17 @@ void encrypt_image::encrypt_tmeans(const float& pixel_p, const std::string& pass
     m = (int)means.size();
 
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     buf[CS_OFF_PAD] = CS_MODE_TMEANS;
     for (int k = 0; k < m; k++) {
         encrypted_img.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = means[(size_t)k];
     }
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        encrypted_img = cs_pack_container_body(encrypted_img,
-            { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
+    finish_container(total, sample_bits, chroma_bits,
+        { { (size_t)CS_HEADER_BYTES, (size_t)3 * (size_t)m, sample_bits, chroma_bits, true } });
     sampling_mode = CS_MODE_TMEANS;
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
 /** @brief YCC 4:2:0 split encryption (mode 3): BGR -> YCrCb, chroma planes
@@ -999,13 +935,7 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     m = rows * cols * bm;
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     returnYcc420Indices(rows, cols, m, cs_key, mode);
     const int mC = m_chroma;
@@ -1024,13 +954,7 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     const int body_pixels = (int)((body_bytes + 2) / 3);
     const int hr_pixels = (int)hr_detail.size() * (CS_HRDETAIL_SAMPLE_BYTES / 3);
     const int total = next_perfect_square(body_pixels + CS_HEADER_PIXELS + 8 + hr_pixels);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     // mode (3 or 7) in the authenticated pad region; decrypt restores it
     // from here
@@ -1040,10 +964,7 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
     cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), m, body);
     cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + m);
     cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + m + mC);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // HR-detail anchors ride as a trailing CTR-encrypted body section;
     // bit-packing would corrupt the ciphertext, so 8-bit depths only.
@@ -1063,25 +984,12 @@ void encrypt_image::encrypt_ycc420(const float& pixel_p, const std::string& pass
 
     // --sample-bits: bit-pack the three planes independently (luma, Cr,
     // Cb); skipped at 8 bits.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        const size_t y0 = (size_t)CS_HEADER_BYTES;
-        encrypted_img = cs_pack_container_body(encrypted_img, {
+    const size_t y0 = (size_t)CS_HEADER_BYTES;
+    finish_container(total, sample_bits, chroma_bits,
+        {
             { y0, (size_t)m, sample_bits, 0, false },
             { y0 + (size_t)m, (size_t)mC, chroma_bits, 0, false },
             { y0 + (size_t)m + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    // seal after the body exists: the tag covers header + all measurements
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
     sampling_mode = mode;
 }
 
@@ -1125,13 +1033,7 @@ void encrypt_image::encrypt_ycc420_t(const float& pixel_p, const std::string& pa
     }
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     std::vector<int> pair_ids;
     returnTetrominoPairIds(pair_ids, rows, cols, pairs, cs_key);
@@ -1182,13 +1084,7 @@ void encrypt_image::encrypt_ycc420_t(const float& pixel_p, const std::string& pa
     const size_t body_bytes = (size_t)m + (size_t)2 * mC;
     const int body_pixels = (int)((body_bytes + 2) / 3);
     const int total = next_perfect_square(body_pixels + CS_HEADER_PIXELS + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     buf[CS_OFF_PAD] = (uint8_t)tmode;
 
@@ -1198,30 +1094,15 @@ void encrypt_image::encrypt_ycc420_t(const float& pixel_p, const std::string& pa
     }
     cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + m);
     cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + m + mC);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        const size_t y0 = (size_t)CS_HEADER_BYTES;
-        encrypted_img = cs_pack_container_body(encrypted_img, {
+    const size_t y0 = (size_t)CS_HEADER_BYTES;
+    finish_container(total, sample_bits, chroma_bits,
+        {
             { y0, (size_t)m, sample_bits, 0, false },
             { y0 + (size_t)m, (size_t)mC, chroma_bits, 0, false },
             { y0 + (size_t)m + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
     sampling_mode = tmode;
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
 }
 
 // Forward declarations (defined alongside encrypt_adaptive below): LOD
@@ -1266,13 +1147,7 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     m = rows * cols * bm;
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     // LOD source priority mirrors encrypt_adaptive: inline LLM regions >
     // two-pass residual / spectral DCT > Laplacian; smoothing applies to all.
@@ -1314,13 +1189,7 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     const size_t meas_bytes = (size_t)mY_written + (size_t)2 * mC;
     const int meas_pixels = (int)((meas_bytes + 2) / 3);
     const int total = next_perfect_square(meas_pixels + CS_HEADER_PIXELS + lod_pixels + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     // mode (3 or 7) with the adaptive pad layout (tile_size, lod count, base)
     // so decrypt restores the exact budgeting
@@ -1342,30 +1211,15 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), mY_written, body);
     cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + mY_written);
     cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + mY_written + mC);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // --sample-bits: lod stays raw; the three planes pack independently.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        const size_t y0 = (size_t)CS_HEADER_BYTES + (size_t)lod_pixels * 3;
-        encrypted_img = cs_pack_container_body(encrypted_img, {
+    const size_t y0 = (size_t)CS_HEADER_BYTES + (size_t)lod_pixels * 3;
+    finish_container(total, sample_bits, chroma_bits,
+        {
             { y0, (size_t)mY_written, sample_bits, 0, false },
             { y0 + (size_t)mY_written, (size_t)mC, chroma_bits, 0, false },
             { y0 + (size_t)mY_written + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
     sampling_mode = mode;
 }
 
@@ -1964,13 +1818,7 @@ void encrypt_image::encrypt_segmask_ids(const float& pixel_p, const std::string&
     }
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     returnSegMaskIndices(ri_x, ri_y, rows, cols, ids, q, cs_key, seg_blend, true);
     const int m_written = (int)ri_x.size();
@@ -2005,13 +1853,7 @@ void encrypt_image::encrypt_segmask_ids(const float& pixel_p, const std::string&
     const int pre_pixels = (int)((prefix.size() + png.size() + 2) / 3);
 
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + pre_pixels + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     buf[CS_OFF_PAD] = CS_MODE_SEGMASK;
     std::memcpy(buf + CS_HEADER_BYTES, prefix.data(), prefix.size());
@@ -2028,28 +1870,12 @@ void encrypt_image::encrypt_segmask_ids(const float& pixel_p, const std::string&
     const int meas0 = CS_HEADER_PIXELS + pre_pixels;
     cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m_written,
                   encrypted_img.data + (size_t)meas0 * 3);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // --sample-bits: prefix + label PNG stay raw; the flat BGR measurement
     // section packs.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        encrypted_img = cs_pack_container_body(encrypted_img,
-            { { (size_t)meas0 * 3, (size_t)3 * (size_t)m_written, sample_bits, chroma_bits, true } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    finish_container(total, sample_bits, chroma_bits,
+        { { (size_t)meas0 * 3, (size_t)3 * (size_t)m_written, sample_bits, chroma_bits, true } });
     sampling_mode = CS_MODE_SEGMASK;
 }
 
@@ -2097,13 +1923,7 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     }
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     // luma follows the segment budget; chroma stays uniform on the mode's
     // coarse grids (same helper as the uniform/LOD-luma split paths)
@@ -2156,13 +1976,7 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     const int meas_pixels = (int)((meas_bytes + 2) / 3);
     const int pre_pixels = (int)((pre_bytes + 2) / 3);
     const int total = next_perfect_square(meas_pixels + CS_HEADER_PIXELS + pre_pixels + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     buf[CS_OFF_PAD] = (uint8_t)mode;
     std::memcpy(buf + CS_HEADER_BYTES, prefix.data(), prefix.size());
@@ -2177,31 +1991,16 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), mY_written, body);
     cs_gather_u8(cr_small.data, cr_small.step, ri_cx1.data(), ri_cy1.data(), mC, body + mY_written);
     cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + mY_written + mC);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // --sample-bits: prefix + label PNG stay raw; the three planes pack
     // independently.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        const size_t y0 = (size_t)CS_HEADER_BYTES + pre_bytes;
-        encrypted_img = cs_pack_container_body(encrypted_img, {
+    const size_t y0 = (size_t)CS_HEADER_BYTES + pre_bytes;
+    finish_container(total, sample_bits, chroma_bits,
+        {
             { y0, (size_t)mY_written, sample_bits, 0, false },
             { y0 + (size_t)mY_written, (size_t)mC, chroma_bits, 0, false },
             { y0 + (size_t)mY_written + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
     sampling_mode = mode;
 }
 
@@ -2421,13 +2220,7 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     m = rows * cols * bm;
 
     uint8_t salt[CS_SALT_BYTES];
-    if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
-        throw std::runtime_error("cryptographic RNG unavailable");
-    }
-    if (!cs_derive_key(password, salt, cs_key)) {
-        throw std::runtime_error("key derivation (PBKDF2) failed");
-    }
-    cs_key_valid = true;
+    derive_container_key(password, salt);
 
     // LOD source priority: inline LLM regions (blended over the base) >
     // two-pass residual / spectral DCT > Laplacian. All reuse the identical
@@ -2481,15 +2274,9 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     }
 
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + lod_pixels + 8);
-    encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-
     // metadata carries the budget m (count-input), not m_written: capacity
     // clamping can drop a few samples but both sides recompute counts from m
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
-    uint8_t* buf = encrypted_img.data;
-    if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
-        throw std::runtime_error("failed to write authenticated header");
-    }
+    uint8_t* buf = alloc_container(total, salt);
 
     // mode=2, tile_size LE, lod_bytes LE (sanity), weight_base LE in the
     // authenticated pad — decrypt restores the exact aggression setting
@@ -2513,27 +2300,11 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     const int meas0 = CS_HEADER_PIXELS + lod_pixels;
     cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m_written,
                   encrypted_img.data + (size_t)meas0 * 3);
-    if (chroma_bits == 0) chroma_bits = sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS] = (uint8_t)sample_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] = (uint8_t)chroma_bits;
-    buf[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_MARKER] = CS_SAMPLE_BITS_MARKER;
+    stamp_sample_bits(buf, sample_bits, chroma_bits);
 
     // --sample-bits: lod stays raw; the flat measurement section packs.
-    size_t sealed_bytes = (size_t)total * 3;
-    if (sample_bits != 8 || chroma_bits != 8) {
-        encrypted_img = cs_pack_container_body(encrypted_img,
-            { { (size_t)meas0 * 3, (size_t)3 * (size_t)m_written, sample_bits, chroma_bits, true } });
-        buf = encrypted_img.data;
-        sealed_bytes = encrypted_img.total() * encrypted_img.elemSize();
-    }
-
-    if (!cs_seal_header(buf, sealed_bytes, cs_key)) {
-        throw std::runtime_error("failed to seal header (HMAC)");
-    }
-
-    cs_key_valid = false;
-    cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    finish_container(total, sample_bits, chroma_bits,
+        { { (size_t)meas0 * 3, (size_t)3 * (size_t)m_written, sample_bits, chroma_bits, true } });
 }
 
 /** @brief tile re-encryption used in decrypt_image_tiled: v1 plaintext header.

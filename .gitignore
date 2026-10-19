@@ -375,3 +375,6 @@ third_party/
 
 # downloaded research datasets (SIDD, DIV2K, ...) - large, not for version control
 _dl/
+
+# Generated experiment output (sweeps, smoke runs)
+out/

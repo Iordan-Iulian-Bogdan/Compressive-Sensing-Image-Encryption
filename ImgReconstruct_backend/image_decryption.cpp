@@ -191,6 +191,50 @@ cv::Mat decrypt_image::get_mat() {
     return decrypted_img.clone();
 }
 
+// Opens the sealed seg-mask body prefix [nclasses][rates][seglen][label PNG],
+// caches the rates/labels and regenerates the sample indices into ri_x/ri_y.
+CsSegPrefix decrypt_image::open_segmask_prefix() {
+    const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+    const uint32_t pre_bytes =
+        (uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN] |
+        ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 1] << 8) |
+        ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 2] << 16) |
+        ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 3] << 24);
+    if (pre_bytes == 0 || CS_HEADER_BYTES + (size_t)pre_bytes > total_bytes) {
+        throw std::runtime_error("seg-mask container: corrupt prefix length");
+    }
+    std::vector<uint8_t> prefix(encrypted_img.data + CS_HEADER_BYTES,
+                                encrypted_img.data + CS_HEADER_BYTES + pre_bytes);
+    if (!cs_blob_seal_xor(prefix.data(), prefix.size(), cs_key,
+                          encrypted_img.data + CS_OFF_IV, CS_SEG_TAG)) {
+        throw std::runtime_error("seg-mask container: prefix decryption failed");
+    }
+    CsSegPrefix pre;
+    if (!cs_segmask_parse_prefix(prefix.data(), prefix.size(), pre) ||
+        pre.total != pre_bytes) {
+        cs_wipe(prefix.data(), prefix.size());
+        throw std::runtime_error("seg-mask container: corrupt prefix");
+    }
+    std::vector<uint8_t> png(prefix.data() + (pre.total - pre.seglen),
+                             prefix.data() + pre.total);
+    cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
+    cs_wipe(prefix.data(), prefix.size());
+    cs_wipe(png.data(), png.size());
+    if (labels.empty()) {
+        throw std::runtime_error("seg-mask container: label decode failed");
+    }
+    if (labels.rows != rows || labels.cols != cols) {
+        cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
+    }
+    seg_rates_q = pre.rates_q;
+    seg_ids = labels;
+    returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
+    if ((int)ri_x.size() != m) {
+        throw std::runtime_error("seg-mask container: count mismatch");
+    }
+    return pre;
+}
+
 void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
     if (!cs_key_valid) {
         throw std::runtime_error("derived key not available: header must be parsed with the password first");
@@ -212,45 +256,8 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
         // [label PNG] carries everything the sampler needs; v3 seals it with
         // CS_SEG_TAG, with the byte length in the MAC-covered pad. Measurements
         // follow at the first whole pixel after the prefix.
-        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
-        const uint32_t pre_bytes =
-            (uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN] |
-            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 1] << 8) |
-            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 2] << 16) |
-            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 3] << 24);
-        if (pre_bytes == 0 || CS_HEADER_BYTES + (size_t)pre_bytes > total_bytes) {
-            throw std::runtime_error("seg-mask container: corrupt prefix length");
-        }
-        std::vector<uint8_t> prefix(encrypted_img.data + CS_HEADER_BYTES,
-                                    encrypted_img.data + CS_HEADER_BYTES + pre_bytes);
-        if (!cs_blob_seal_xor(prefix.data(), prefix.size(), cs_key,
-                              encrypted_img.data + CS_OFF_IV, CS_SEG_TAG)) {
-            throw std::runtime_error("seg-mask container: prefix decryption failed");
-        }
-        CsSegPrefix pre;
-        if (!cs_segmask_parse_prefix(prefix.data(), prefix.size(), pre) ||
-            pre.total != pre_bytes) {
-            cs_wipe(prefix.data(), prefix.size());
-            throw std::runtime_error("seg-mask container: corrupt prefix");
-        }
-        meas0 = CS_HEADER_PIXELS + (int)((pre_bytes + 2) / 3);
-        std::vector<uint8_t> png(prefix.data() + (pre.total - pre.seglen),
-                                 prefix.data() + pre.total);
-        cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
-        cs_wipe(prefix.data(), prefix.size());
-        cs_wipe(png.data(), png.size());
-        if (labels.empty()) {
-            throw std::runtime_error("seg-mask container: label decode failed");
-        }
-        if (labels.rows != rows || labels.cols != cols) {
-            cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
-        }
-        seg_rates_q = pre.rates_q;
-        seg_ids = labels;
-        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
-        if ((int)ri_x.size() != m) {
-            throw std::runtime_error("seg-mask container: count mismatch");
-        }
+        const CsSegPrefix pre = open_segmask_prefix();
+        meas0 = CS_HEADER_PIXELS + (int)((pre.total + 2) / 3);
     }
     else if (sampling_mode == CS_MODE_ADAPTIVE) {
         if (periodic_tile <= 0) {
@@ -464,45 +471,8 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         // [label PNG] (v3, CS_SEG_TAG) regenerates the luma draw; chroma stays
         // uniform on the base split geometry (4:2:0 vs 4:2:2).
         chroma_mode = (sampling_mode == CS_MODE_YCC422_SEG) ? CS_MODE_YCC422 : CS_MODE_YCC420;
-        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
-        const uint32_t pre_bytes =
-            (uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN] |
-            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 1] << 8) |
-            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 2] << 16) |
-            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 3] << 24);
-        if (pre_bytes == 0 || CS_HEADER_BYTES + (size_t)pre_bytes > total_bytes) {
-            throw std::runtime_error("seg-mask container: corrupt prefix length");
-        }
-        std::vector<uint8_t> prefix(encrypted_img.data + CS_HEADER_BYTES,
-                                    encrypted_img.data + CS_HEADER_BYTES + pre_bytes);
-        if (!cs_blob_seal_xor(prefix.data(), prefix.size(), cs_key,
-                              encrypted_img.data + CS_OFF_IV, CS_SEG_TAG)) {
-            throw std::runtime_error("seg-mask container: prefix decryption failed");
-        }
-        CsSegPrefix pre;
-        if (!cs_segmask_parse_prefix(prefix.data(), prefix.size(), pre) ||
-            pre.total != pre_bytes) {
-            cs_wipe(prefix.data(), prefix.size());
-            throw std::runtime_error("seg-mask container: corrupt prefix");
-        }
+        const CsSegPrefix pre = open_segmask_prefix();
         body_off = pre.total;
-        std::vector<uint8_t> png(prefix.data() + (pre.total - pre.seglen),
-                                 prefix.data() + pre.total);
-        cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
-        cs_wipe(prefix.data(), prefix.size());
-        cs_wipe(png.data(), png.size());
-        if (labels.empty()) {
-            throw std::runtime_error("seg-mask container: label decode failed");
-        }
-        if (labels.rows != rows || labels.cols != cols) {
-            cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
-        }
-        seg_rates_q = pre.rates_q;
-        seg_ids = labels;
-        returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
-        if ((int)ri_x.size() != m) {
-            throw std::runtime_error("seg-mask container: count mismatch");
-        }
         mY_written = m;
     }
     else if (cs_is_tcluster(sampling_mode) || cs_is_tmeans(sampling_mode)) {
@@ -1736,6 +1706,45 @@ static void cs_seg_apply_override(CsSegClassParams& p, const CsSegOverride& o) {
     if (o.has_wscale) p.wscale = o.wscale;
 }
 
+// Sorted class ids present in a label map.
+static std::vector<int> cs_seg_present_classes(const cv::Mat& ids) {
+    bool seen[256] = { false };
+    for (int y = 0; y < ids.rows; ++y) {
+        const uint8_t* row = ids.ptr<uint8_t>(y);
+        for (int x = 0; x < ids.cols; ++x) seen[row[x]] = true;
+    }
+    std::vector<int> classes;
+    for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
+    return classes;
+}
+
+// --seg-solve mask file -> class ids at rows x cols; fills the classes present.
+static cv::Mat cs_load_seg_solve_ids(const std::string& path, int rows, int cols, std::vector<int>& classes) {
+    cv::Mat mask_raw = cv::imread(path, cv::IMREAD_UNCHANGED);
+    if (mask_raw.empty()) {
+        throw std::runtime_error("--seg-solve: cannot load '" + path + "'");
+    }
+    cv::Mat seg_ids = cs_segmask_resolve_ids(mask_raw, rows, cols);
+    classes = cs_seg_present_classes(seg_ids);
+    if (classes.empty()) {
+        throw std::runtime_error("--seg-solve: mask holds no classes");
+    }
+    return seg_ids;
+}
+
+// Logs the resolved per-class solver parameters of a --seg-params spec.
+static void cs_seg_log_class_params(const std::map<int, CsSegOverride>& spec, const CsSegClassParams& base_p) {
+    for (const auto& kv : spec) {
+        CsSegClassParams cp = base_p;
+        cs_seg_apply_override(cp, kv.second);
+        std::cout << "seg-solve: class " << kv.first
+                  << " [iters=" << cp.iterations << " coef=" << cp.coef
+                  << " tv=" << cp.tv << " solver=" << cp.solver
+                  << " fista-iters=" << cp.fista_iters << " reweights=" << cp.reweights
+                  << " basis=" << cp.basis << " wscale=" << cp.wscale << "]" << std::endl;
+    }
+}
+
 // Single-stage segment solve: every tile is solved exactly once — pure tiles
 // with their own class's parameters, mixed tiles with the highest-rate
 // intersecting class's. No per-class solver passes, no cross-canvas blending;
@@ -2412,36 +2421,15 @@ int decrypt_image::decrypt_image_tiled(
             if (cs_is_ycc(dimgs.get_sampling_mode())) {
                 throw std::runtime_error("--seg-solve needs a BGR container; YCC-seg containers solve luma/chroma jointly");
             }
-            cv::Mat mask_raw = cv::imread(seg_solve_mask, cv::IMREAD_UNCHANGED);
-            if (mask_raw.empty()) {
-                throw std::runtime_error("--seg-solve: cannot load '" + seg_solve_mask + "'");
-            }
-            cv::Mat seg_ids = cs_segmask_resolve_ids(mask_raw, sampled_mat.rows, sampled_mat.cols);
-            bool seen[256] = { false };
-            for (int y = 0; y < seg_ids.rows; ++y) {
-                const uint8_t* row = seg_ids.ptr<uint8_t>(y);
-                for (int x = 0; x < seg_ids.cols; ++x) seen[row[x]] = true;
-            }
             std::vector<int> classes;
-            for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
-            if (classes.empty()) {
-                throw std::runtime_error("--seg-solve: mask holds no classes");
-            }
+            cv::Mat seg_ids = cs_load_seg_solve_ids(seg_solve_mask, sampled_mat.rows, sampled_mat.cols, classes);
             // Single solver stage: every tile is solved exactly once, with
             // the resolved parameters of its majority class (--seg-params
             // overrides apply per tile). Neighboring tiles meet through the
             // standard cosine-feathered tile blend, so there is no second
             // solver stage and no cross-canvas seam reconciliation.
             std::cout << "seg-solve: " << classes.size() << " classes, single stage" << std::endl;
-            for (const auto& kv : seg_spec) {
-                CsSegClassParams cp = base_p;
-                cs_seg_apply_override(cp, kv.second);
-                std::cout << "seg-solve: class " << kv.first
-                          << " [iters=" << cp.iterations << " coef=" << cp.coef
-                          << " tv=" << cp.tv << " solver=" << cp.solver
-                          << " fista-iters=" << cp.fista_iters << " reweights=" << cp.reweights
-                          << " basis=" << cp.basis << " wscale=" << cp.wscale << "]" << std::endl;
-            }
+            cs_seg_log_class_params(seg_spec, base_p);
             CsSegSinglePass segpass;
             segpass.ids = &seg_ids;
             segpass.base = base_p;
@@ -2463,14 +2451,7 @@ int decrypt_image::decrypt_image_tiled(
             // bands uncalmed (visible halo where the class coef steps).
             if (autoseg && !dimgs.get_seg_ids().empty()) {
                 const cv::Mat& sid = dimgs.get_seg_ids();
-                bool seen[256] = { false };
-                for (int y = 0; y < sid.rows; ++y) {
-                    const uint8_t* row = sid.ptr<uint8_t>(y);
-                    for (int x = 0; x < sid.cols; ++x) seen[row[x]] = true;
-                }
-                std::vector<int> classes;
-                for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
-                cs_seg_calm_boundaries(reconstructed, sid, masked_mat, classes, overlap);
+                cs_seg_calm_boundaries(reconstructed, sid, masked_mat, cs_seg_present_classes(sid), overlap);
             }
         }
 
@@ -3006,31 +2987,10 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             if (photo_up.y_dual_tv > 0.0f) {
                 throw std::runtime_error("--seg-solve cannot be combined with --y-dual-tv");
             }
-            cv::Mat mask_raw = cv::imread(seg_solve_mask, cv::IMREAD_UNCHANGED);
-            if (mask_raw.empty()) {
-                throw std::runtime_error("--seg-solve: cannot load '" + seg_solve_mask + "'");
-            }
-            cv::Mat seg_ids = cs_segmask_resolve_ids(mask_raw, Y.rows, Y.cols);
-            bool seen[256] = { false };
-            for (int y = 0; y < seg_ids.rows; ++y) {
-                const uint8_t* row = seg_ids.ptr<uint8_t>(y);
-                for (int x = 0; x < seg_ids.cols; ++x) seen[row[x]] = true;
-            }
             std::vector<int> classes;
-            for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
-            if (classes.empty()) {
-                throw std::runtime_error("--seg-solve: mask holds no classes");
-            }
+            cv::Mat seg_ids = cs_load_seg_solve_ids(seg_solve_mask, Y.rows, Y.cols, classes);
             std::cout << "seg-solve: " << classes.size() << " classes, single stage" << std::endl;
-            for (const auto& kv : seg_spec) {
-                CsSegClassParams cp = base_p;
-                cs_seg_apply_override(cp, kv.second);
-                std::cout << "seg-solve: class " << kv.first
-                          << " [iters=" << cp.iterations << " coef=" << cp.coef
-                          << " tv=" << cp.tv << " solver=" << cp.solver
-                          << " fista-iters=" << cp.fista_iters << " reweights=" << cp.reweights
-                          << " basis=" << cp.basis << " wscale=" << cp.wscale << "]" << std::endl;
-            }
+            cs_seg_log_class_params(seg_spec, base_p);
             CsSegSinglePass segpass;
             segpass.ids = &seg_ids;
             segpass.base = base_p;
@@ -3053,14 +3013,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             // boundary bands uncalmed (halo where the class coef steps).
             if (autoseg && !dimgs.get_seg_ids().empty()) {
                 const cv::Mat& sid = dimgs.get_seg_ids();
-                bool seen[256] = { false };
-                for (int y = 0; y < sid.rows; ++y) {
-                    const uint8_t* row = sid.ptr<uint8_t>(y);
-                    for (int x = 0; x < sid.cols; ++x) seen[row[x]] = true;
-                }
-                std::vector<int> classes;
-                for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
-                cs_seg_calm_boundaries(reconstructed, sid, Ym, classes, overlap);
+                cs_seg_calm_boundaries(reconstructed, sid, Ym, cs_seg_present_classes(sid), overlap);
             }
         }
 
