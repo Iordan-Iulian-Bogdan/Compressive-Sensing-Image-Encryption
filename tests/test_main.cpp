@@ -80,8 +80,8 @@ void test_crypto() {
     check(meta.size() == CS_METADATA_BYTES, "crypto: metadata is 32 bytes");
 
     std::vector<uint8_t> buf(CS_HEADER_BYTES + 900);
-    check(cs_write_header(buf.data(), buf.size(), meta, k1, salt), "crypto: v2 header write");
-    check(buf[CS_OFF_VERSION] == 2, "crypto: v2 version byte");
+    check(cs_write_header(buf.data(), buf.size(), meta, k1, salt), "crypto: v3 header write");
+    check(buf[CS_OFF_VERSION] == 3, "crypto: v3 version byte");
     check(std::memcmp(buf.data() + CS_OFF_META, meta.data(), CS_METADATA_BYTES) != 0,
         "crypto: metadata ciphertext differs from plaintext");
     check(cs_build_metadata(1234567, 2016, 1512, 3024, 4032) ==
@@ -98,9 +98,9 @@ void test_crypto() {
 
     CsHeaderInfo info;
     check(cs_parse_header(buf.data(), buf.size(), pw, info) &&
-        info.version == 2 && info.key_valid && !info.auth_failed &&
+        info.version == 3 && info.key_valid && !info.auth_failed &&
         info.m == 1234567 && info.rows == 2016 && info.cols == 1512 &&
-        info.org_h == 3024 && info.org_w == 4032, "crypto: v2 parse roundtrip with password");
+        info.org_h == 3024 && info.org_w == 4032, "crypto: v3 parse roundtrip with password");
 
     CsHeaderInfo bad;
     check(!cs_parse_header(buf.data(), buf.size(), "wrong password 12", bad) && bad.auth_failed,
@@ -3775,8 +3775,12 @@ void test_auto_reg_params() {
         "auto-reg: uniform tile-factored below 0.5");
     check(std::fabs(cs_auto_reg_coefficient(CS_MODE_RANDOM, 0.15f, 64) - 0.125f) < 0.002f,
         "auto-reg: uniform 0.15 t64 == 0.125 (extended below 0.5)");
-    check(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.3f, 64) < 0.0f,
-        "auto-reg: YCC uncovered");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.3f, 64) - 0.075f) < 0.002f,
+        "auto-reg: YCC420 covered (0.0225/r)");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.75f, 64) - 0.03f) < 0.002f,
+        "auto-reg: YCC420 covered above 0.5");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC422, 0.25f, 64) - 0.09f) < 0.002f,
+        "auto-reg: YCC422 covered (0.0225/r)");
     check(cs_auto_reg_coefficient(CS_MODE_ADAPTIVE, 0.3f, 64) < 0.0f,
         "auto-reg: adaptive uncovered");
     check(cs_auto_reg_tv(CS_MODE_SEGMASK, 0.3f) == 0.01f, "auto-reg: seg tv 0.01 below 0.5");

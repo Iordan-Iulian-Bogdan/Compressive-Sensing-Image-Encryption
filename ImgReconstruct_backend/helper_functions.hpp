@@ -295,6 +295,22 @@ struct CsHrSrCtx {
     float red_radius = 0.0f; // anchor-proximity RED radius in HR px (0 = uniform RED)
 };
 
+/** @brief Strong-prior + PnP controls for the cs-sr fused solve
+(--sr-prior-model / --sr-pnp): make the AVIR warm start/anchor a learned SR
+proposal and the RED gradient step a true PnP proximal step, so the strong
+prior proposes and the measurement model enforces. Default-constructed =
+legacy (AVIR anchor, RED blend, bit-identical). model: ONNX 2x photo-SR net
+(Real-ESRGAN/SwinIR contract); empty = AVIR. pnp_mode: 0 = legacy RED blend,
+1 = denoiser-as-prox (full replacement; NLM sigma-matched), 2 = PnP-ADMM
+(dual-variable splitting, rho penalty, pnp_iters outer passes). pnp_rho/pnp_iters
+apply only to mode 2; modes 1/2 need a selected denoiser (red_denoiser). */
+struct CsSrPrior {
+    std::string model;      // ONNX SR model path ("" = AVIR anchor, legacy)
+    int pnp_mode = 0;       // 0 off (legacy RED), 1 prox, 2 PnP-ADMM
+    float pnp_rho = 0.1f;   // ADMM penalty / prox strength (mode 2)
+    int pnp_iters = 8;      // ADMM outer iterations (mode 2)
+};
+
 /** @brief CS super-resolution 2x refinement of one solved LR tile (CPU, DCT).
 Luminance-only: a sparse DCT correction around an AVIR warm start is solved
 so the 2x2-box downsample of the HR luma fits the original LR luma samples
@@ -312,7 +328,9 @@ passes identical, <1 decays geometrically). Falls back to AVIR when the basis is
 not DCT, the sample set is empty, or the tile is degenerate. coef/tv/iterations/reweights/
 basis/wscale mirror the LR solve conventions. lr_tile is the solved CV_8UC3
 tile; hr_out is the 2x CV_8UC3 result. hr_sr carries tile-mapped HR-detail
-anchors as in-solve data terms (weight 0 = post-hoc replacement only). */
+anchors as in-solve data terms (weight 0 = post-hoc replacement only).
+sr_prior (see CsSrPrior) replaces the AVIR anchor with an ONNX SR proposal
+and/or switches the per-pass RED blend for a PnP prox / ADMM step. */
 // Default DnCNN color model (repo-vendored) for the dncnn RED denoiser.
 #define CS_DNCNN_DEFAULT_MODEL "models/dncnn/dncnn_color.onnx"
 // Default blind color models for the scunet/restormer RED denoisers (not
@@ -360,7 +378,8 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     const std::string& red_denoiser = "nlmeans",
     const std::string& dncnn_model = CS_DNCNN_DEFAULT_MODEL,
     bool sr_cascade = false, const std::string& red_model = "",
-    float red_decay = 1.0f, const CsHrSrCtx& hr_sr = CsHrSrCtx());
+    float red_decay = 1.0f, const CsHrSrCtx& hr_sr = CsHrSrCtx(),
+    const CsSrPrior& sr_prior = CsSrPrior());
 
 /** @brief single-stage SR 2x refinement of one tile (CPU, DCT): the HR luma
 is solved directly against the tile's LR samples (cs_sr_direct_luma, no
@@ -409,6 +428,18 @@ kind selects messages and tile geometry (see cs_onnx_kind). */
 bool cs_onnx_available(const std::string& model_path, int kind);
 bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     const std::string& model_path, int kind);
+
+/** @brief true when the ONNX 2x photo-SR model loads (cached per path). */
+bool cs_onnx_sr_available(const std::string& model_path);
+
+/** @brief tiled ONNX super-resolution of a BGR image: Real-ESRGAN/SwinIR
+contract (RGB planar [0,1] NCHW in, clean [0,1] NCHW out at `scale`x). Output is
+`scale`*src geometry; scale_out receives the detected integer scale. Returns
+false and leaves dst empty when the model is missing, the run fails, or the
+output size is not an integer multiple of the input in both axes. Deterministic
+on CPU. */
+bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path, int& scale_out);
 
 /** @brief single-stage HR solve for experiments (see .cpp): full
 HR-coefficient FISTA against the LR samples with no LR-solve warm start.

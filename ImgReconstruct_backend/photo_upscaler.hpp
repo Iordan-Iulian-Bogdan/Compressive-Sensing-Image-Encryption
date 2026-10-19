@@ -94,6 +94,22 @@ struct CsPhotoUpscalerOptions {
   // pass identical (legacy), <1 decays geometrically (strong early,
   // gentle late).
   float sr_red_decay = 1.0f;
+  // Strong SR prior for the cs-sr fused solve (--sr-prior-model): an ONNX
+  // 2x photo-SR net (Real-ESRGAN/SwinIR contract) whose upscale replaces
+  // the AVIR warm start/anchor, so a strong prior proposes the HR image and
+  // the LR measurements enforce it. Empty = AVIR (legacy); a missing model
+  // or a non-2x output falls back to AVIR per tile. cs-sr only.
+  std::string sr_prior_model;
+  // PnP/RED semantics for the cs-sr denoiser step (--sr-pnp): "off" (legacy
+  // RED gradient blend), "prox" (denoiser as a true proximal operator: full
+  // replacement, NLM sigma-matched), "admm" (outer PnP-ADMM: dual-variable
+  // splitting; denoiser = prox, measurement model enforces). Within "prox"/
+  // "admm" the denoiser is applied even with sr_red == 0.
+  std::string sr_pnp = "off";
+  // ADMM penalty / prox strength (--sr-pnp-rho; mode "admm" only).
+  float sr_pnp_rho = 0.1f;
+  // ADMM outer iterations (--sr-pnp-iters; mode "admm" only, clamped [1,50]).
+  int sr_pnp_iters = 8;
   // HR-anchor data-term weight for the cs-sr solve (0 = off: post-hoc
   // replacement only). Anchors are exact native luma, so 1.0 pulls each
   // anchor pixel at full weight beside the LR samples.

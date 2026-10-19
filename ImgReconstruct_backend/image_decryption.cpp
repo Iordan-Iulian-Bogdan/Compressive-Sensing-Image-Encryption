@@ -209,19 +209,36 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
 
     if (sampling_mode == CS_MODE_SEGMASK) {
         // Per-segment container: the body prefix [nclasses][rates][seglen]
-        // [label PNG] carries everything the sampler needs; measurements
+        // [label PNG] carries everything the sampler needs; v3 seals it with
+        // CS_SEG_TAG, with the byte length in the MAC-covered pad. Measurements
         // follow at the first whole pixel after the prefix.
         const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        const uint32_t pre_bytes =
+            (uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN] |
+            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 1] << 8) |
+            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 2] << 16) |
+            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 3] << 24);
+        if (pre_bytes == 0 || CS_HEADER_BYTES + (size_t)pre_bytes > total_bytes) {
+            throw std::runtime_error("seg-mask container: corrupt prefix length");
+        }
+        std::vector<uint8_t> prefix(encrypted_img.data + CS_HEADER_BYTES,
+                                    encrypted_img.data + CS_HEADER_BYTES + pre_bytes);
+        if (!cs_blob_seal_xor(prefix.data(), prefix.size(), cs_key,
+                              encrypted_img.data + CS_OFF_IV, CS_SEG_TAG)) {
+            throw std::runtime_error("seg-mask container: prefix decryption failed");
+        }
         CsSegPrefix pre;
-        if (total_bytes <= CS_HEADER_BYTES ||
-            !cs_segmask_parse_prefix(encrypted_img.data + CS_HEADER_BYTES,
-                total_bytes - CS_HEADER_BYTES, pre)) {
+        if (!cs_segmask_parse_prefix(prefix.data(), prefix.size(), pre) ||
+            pre.total != pre_bytes) {
+            cs_wipe(prefix.data(), prefix.size());
             throw std::runtime_error("seg-mask container: corrupt prefix");
         }
-        meas0 = CS_HEADER_PIXELS + (int)((pre.total + 2) / 3);
-        const uint8_t* png0 = encrypted_img.data + CS_HEADER_BYTES + (pre.total - pre.seglen);
-        std::vector<uint8_t> png(png0, png0 + pre.seglen);
+        meas0 = CS_HEADER_PIXELS + (int)((pre_bytes + 2) / 3);
+        std::vector<uint8_t> png(prefix.data() + (pre.total - pre.seglen),
+                                 prefix.data() + pre.total);
         cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
+        cs_wipe(prefix.data(), prefix.size());
+        cs_wipe(png.data(), png.size());
         if (labels.empty()) {
             throw std::runtime_error("seg-mask container: label decode failed");
         }
@@ -229,6 +246,7 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
             cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
         }
         seg_rates_q = pre.rates_q;
+        seg_ids = labels;
         returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
         if ((int)ri_x.size() != m) {
             throw std::runtime_error("seg-mask container: count mismatch");
@@ -246,6 +264,7 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
             throw std::runtime_error("adaptive container: body too short for lod region");
         }
         lod.assign(encrypted_img.data + CS_HEADER_BYTES, encrypted_img.data + CS_HEADER_BYTES + lod_bytes);
+        cs_blob_seal_xor(lod.data(), lod.size(), cs_key, encrypted_img.data + CS_OFF_IV, CS_LOD_TAG);
         if ((int)lod.size() != periodic_samples) {
             // header pad sanity field disagrees with geometry — reject
             throw std::runtime_error("adaptive container: lod length mismatch");
@@ -273,6 +292,7 @@ void decrypt_image::get_sampled_mat(cv::Mat& sampled_mat, cv::Mat& masked_mat) {
             throw std::runtime_error("hf-focus container has invalid thumbnail length");
         lod.assign(encrypted_img.data + CS_HEADER_BYTES,
                    encrypted_img.data + CS_HEADER_BYTES + periodic_samples);
+        cs_blob_seal_xor(lod.data(), lod.size(), cs_key, encrypted_img.data + CS_OFF_IV, CS_LOD_TAG);
         std::vector<uint8_t> png(encrypted_img.data + thumbnail_offset,
                                  encrypted_img.data + thumbnail_offset + thumbnail_length);
         uint8_t counter[CS_IV_BYTES];
@@ -440,21 +460,37 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         chroma_mode = cs_is_ycc422(sampling_mode) ? CS_MODE_YCC422 : CS_MODE_YCC420;
     }
     if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG) {
-        // Seg-luma variant: the body prefix [nclasses][rates][seglen][label
-        // PNG] regenerates the luma draw; chroma stays uniform on the base
-        // split geometry (4:2:0 vs 4:2:2).
+        // Seg-luma variant: the sealed body prefix [nclasses][rates][seglen]
+        // [label PNG] (v3, CS_SEG_TAG) regenerates the luma draw; chroma stays
+        // uniform on the base split geometry (4:2:0 vs 4:2:2).
         chroma_mode = (sampling_mode == CS_MODE_YCC422_SEG) ? CS_MODE_YCC422 : CS_MODE_YCC420;
         const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        const uint32_t pre_bytes =
+            (uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN] |
+            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 1] << 8) |
+            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 2] << 16) |
+            ((uint32_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 3] << 24);
+        if (pre_bytes == 0 || CS_HEADER_BYTES + (size_t)pre_bytes > total_bytes) {
+            throw std::runtime_error("seg-mask container: corrupt prefix length");
+        }
+        std::vector<uint8_t> prefix(encrypted_img.data + CS_HEADER_BYTES,
+                                    encrypted_img.data + CS_HEADER_BYTES + pre_bytes);
+        if (!cs_blob_seal_xor(prefix.data(), prefix.size(), cs_key,
+                              encrypted_img.data + CS_OFF_IV, CS_SEG_TAG)) {
+            throw std::runtime_error("seg-mask container: prefix decryption failed");
+        }
         CsSegPrefix pre;
-        if (total_bytes <= CS_HEADER_BYTES ||
-            !cs_segmask_parse_prefix(encrypted_img.data + CS_HEADER_BYTES,
-                total_bytes - CS_HEADER_BYTES, pre)) {
+        if (!cs_segmask_parse_prefix(prefix.data(), prefix.size(), pre) ||
+            pre.total != pre_bytes) {
+            cs_wipe(prefix.data(), prefix.size());
             throw std::runtime_error("seg-mask container: corrupt prefix");
         }
         body_off = pre.total;
-        const uint8_t* png0 = encrypted_img.data + CS_HEADER_BYTES + (pre.total - pre.seglen);
-        std::vector<uint8_t> png(png0, png0 + pre.seglen);
+        std::vector<uint8_t> png(prefix.data() + (pre.total - pre.seglen),
+                                 prefix.data() + pre.total);
         cv::Mat labels = cv::imdecode(png, cv::IMREAD_GRAYSCALE);
+        cs_wipe(prefix.data(), prefix.size());
+        cs_wipe(png.data(), png.size());
         if (labels.empty()) {
             throw std::runtime_error("seg-mask container: label decode failed");
         }
@@ -462,6 +498,7 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
             cv::resize(labels, labels, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
         }
         seg_rates_q = pre.rates_q;
+        seg_ids = labels;
         returnSegMaskIndices(ri_x, ri_y, rows, cols, labels, pre.rates_q, cs_key, pre.blend, pre.smooth_blend);
         if ((int)ri_x.size() != m) {
             throw std::runtime_error("seg-mask container: count mismatch");
@@ -564,6 +601,7 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         }
         std::vector<uint8_t> lod(encrypted_img.data + CS_HEADER_BYTES,
             encrypted_img.data + CS_HEADER_BYTES + lod_bytes);
+        cs_blob_seal_xor(lod.data(), lod.size(), cs_key, encrypted_img.data + CS_OFF_IV, CS_LOD_TAG);
         if ((int)lod.size() != periodic_samples) {
             throw std::runtime_error("ycc container: lod length mismatch");
         }
@@ -827,7 +865,8 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     std::vector<std::vector<cv::Mat>>& mats_out, const std::vector<std::vector<TileCoord>>& coordinates,
     int num_tiles, int overlap, int iterations, cv::Size tile_size, float coef, float tv, int solver, int fista_iters, int reweights, int basis, float wscale, const cv::Mat& thumbnail_seed, bool per_tile_coef, bool per_tile_tv, std::vector<std::vector<cv::Mat>>* hr_out, bool fuse_upscale, CsUpscalePipeline* pipe,     std::mutex* hr_grid_mutex, bool superres_2x, float sr_red, const cs_coupled_dict* sr_dict, const std::string& sr_red_denoiser, const std::string& sr_dncnn_model,     const std::string& sr_fsrcnn_model, bool sr_direct_2x, bool sr_cascade, float grain_tv, bool use_onsager,
     const std::string& red_model, float red_decay, bool sr_dip_2x, const CsHrSrCtx& hr_sr,
-    const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr) {
+    const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr,
+    const CsSrPrior& sr_prior = CsSrPrior()) {
 
     // solve-stage profiler: one reset here, one dump line at exit (env-gated)
     cs_solveprof_reset();
@@ -997,7 +1036,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                             indices[i][j].ri_x_g, indices[i][j].ri_y_g,
                             tile_coef, tile_tv, t_iterations, t_reweights, t_fista_iters,
                             t_basis, t_wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
-                            sr_cascade, red_model, red_decay, tile_hr);
+                            sr_cascade, red_model, red_decay, tile_hr, sr_prior);
                     }
                     else if (sr_dip_2x) {
                         // Untrained-prior refinement: tiny generator fit to
@@ -1074,7 +1113,8 @@ static void decrypt_tiles_ycc420(int num_threads,
     const std::string& red_model = "", float red_decay = 1.0f,
     bool sr_dip_2x = false, const CsHrSrCtx& hr_sr = CsHrSrCtx(),
     int chroma_iterations = -1, float chroma_coef = -1.0f,
-    const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr) {
+    const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr,
+    bool seg_chroma_per_class = true, const CsSrPrior& sr_prior = CsSrPrior()) {
 
     if (y_confidence > 0.0f && basis != CS_BASIS_DCT)
         std::cerr << "Note: --y-confidence requires --basis dct; ignoring for wavelet" << std::endl;
@@ -1152,7 +1192,9 @@ static void decrypt_tiles_ycc420(int num_threads,
                 // the per-class passes); otherwise the pinned/global settings.
                 const int t_chroma_it = STP ? STP->iterations : chroma_it;
                 const int t_iters_c = t_chroma_it - t_chroma_it / 2;
-                const float t_coef_c = (STP ? STP->coef : (chroma_coef >= 0.0f ? chroma_coef : coef)) * 0.5f;
+                const bool stp_chroma = STP && seg_chroma_per_class;
+                const float t_coef_c = (stp_chroma ? STP->coef
+                    : (chroma_coef >= 0.0f ? chroma_coef : coef)) * 0.5f;
 
                 cv::Mat x0[3];
                 build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, t_basis, thumbnail_seed, chroma_sub_v);
@@ -1302,7 +1344,7 @@ static void decrypt_tiles_ycc420(int num_threads,
                             y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g,
                             tile_coef_y, tile_tv_y, t_iterations, t_reweights, t_fista_iters,
                             t_basis, t_wscale, hr, sr_red, sr_red_denoiser, sr_dncnn_model,
-                            sr_cascade, red_model, red_decay, tile_hr);
+                            sr_cascade, red_model, red_decay, tile_hr, sr_prior);
                     }
                     else if (sr_dip_2x) {
                         cs_dip_upscale_tile_2x(mats_out[i][j], y_meas[i][j],
@@ -1704,6 +1746,17 @@ struct CsSegSinglePass {
     CsSegClassParams base;
     const std::map<int, CsSegOverride>* spec = nullptr;
     const std::vector<uint8_t>* rates_q = nullptr; // tie-break only (higher rate wins)
+    // Scale each tile's coef by its winning class's own sampled rate relative
+    // to the container's achieved ratio (sqrt density law, same shape as
+    // cs_per_tile_coef, clamped [0.5, 2]), instead of one global value.
+    // Spec overrides still win. Enables per-segment parameters on the
+    // automatic seg decode.
+    bool per_class_rate = false;
+    float base_ratio = 0.0f; // achieved container ratio; per-class anchor
+    // Also scale the chroma coef by the per-class factor (YCC only). Chroma
+    // is drawn uniformly, so the auto per-class decode leaves it at the
+    // global coef; explicit --seg-solve keeps the historical per-class chroma.
+    bool per_class_chroma = true;
 };
 
 // Resolve one CsSegClassParams per tile. Pure tiles use their own class.
@@ -1759,6 +1812,22 @@ static void cs_seg_resolve_tile_params(const CsSegSinglePass& sp,
             }
             winners[i * num_tiles + j] = best;
             CsSegClassParams cp = sp.base;
+            if (sp.per_class_rate && best >= 0 && cp.coef > 0.0f && sp.base_ratio > 0.0f) {
+                const double rc = (double)rate_of(best) / 255.0;
+                if (rc > 0.0) {
+                    // Scale the global coef by the class's own sampled rate vs
+                    // the container's achieved ratio: sparser classes (fewer
+                    // measurements) get a stronger prior, denser ones weaker,
+                    // clamped to [0.5x, 2x]. Same density rationale as
+                    // cs_per_tile_coef, evaluated per segment instead of per
+                    // tile. Verified: +0.2..1.8 dB / +0.004..0.028 SSIM and
+                    // lower CIEDE2000-p95 across 4 images x 3 ratios.
+                    double f = (double)sp.base_ratio / rc;
+                    if (f < 0.5) f = 0.5;
+                    if (f > 2.0) f = 2.0;
+                    cp.coef = (float)((double)cp.coef * f);
+                }
+            }
             if (sp.spec) {
                 const auto oit = sp.spec->find(best);
                 if (oit != sp.spec->end()) cs_seg_apply_override(cp, oit->second);
@@ -1876,12 +1945,14 @@ int decrypt_image::decrypt_image_tiled(
     // Automatic regularization (Params-test sweep): in AUTO_PARAM mode the
     // established contract overwrites coef unconditionally (direct API
     // callers included); the fitted laws replace the old ratio branch on
-    // covered modes (BGR random/seg). tv derives only from the -1.0f
-    // sentinel so explicit values (including the API 0.0 default) win.
-    // In manual mode -1.0f (the CLI default when --coef/--tv are absent)
-    // derives the same way, giving manual multi-tile decrypts fitted
-    // values instead of the flat 0.01/0.0 defaults. Uncovered modes keep
+    // covered modes (BGR random/seg and every YCC split mode). tv derives
+    // only from the -1.0f sentinel so explicit values (including the API
+    // 0.0 default) win. In manual mode -1.0f (the CLI default when
+    // --coef/--tv are absent) derives the same way, giving manual
+    // multi-tile decrypts fitted values instead of the flat 0.01/0.0
+    // defaults. Still-uncovered modes (adaptive/LOD, T-tetromino, ...) keep
     // legacy behavior (auto: old ratio branch; manual: 0.01/0.0).
+    const bool coef_auto = (CSencryption::params == AUTO_PARAM) || (coef == -1.0f);
     {
         const float ar = dimgs.get_compression_ratio();
         const int sm = dimgs.get_sampling_mode();
@@ -1916,7 +1987,7 @@ int decrypt_image::decrypt_image_tiled(
             iterations, nun_threads, coef, show_preview, tv,
             full_res, solver, fista_iters, reweights, basis, wscale,
             photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager,
-            hr_applied_out, seg_solve_mask, seg_params);
+            hr_applied_out, seg_solve_mask, seg_params, coef_auto);
     }
     if (photo_up.y_dual_tv > 0.0f || photo_up.y_confidence > 0.0f)
         std::cerr << "Note: --y-dual-tv/--y-confidence require a YCC container; ignoring for BGR" << std::endl;
@@ -2144,12 +2215,29 @@ int decrypt_image::decrypt_image_tiled(
     // a missing model degrades per tile inside the helper (warn-once).
     const std::string fsrcnn_model =
         (!full_res && photo_up.backend == "fsrcnn") ? photo_up.fsrcnn_model : "";
+    // Strong-prior + PnP context for the cs-sr solve (--sr-prior-model /
+    // --sr-pnp): an ONNX 2x SR proposal replacing the AVIR anchor and/or a
+    // true PnP prox step. cs-sr only; default-constructed = legacy.
+    CsSrPrior sr_prior_ctx;
+    if (is_sr && !full_res && !use_dict) {
+        sr_prior_ctx.model = photo_up.sr_prior_model;
+        sr_prior_ctx.pnp_mode = (photo_up.sr_pnp == "admm") ? 2
+            : (photo_up.sr_pnp == "prox") ? 1 : 0;
+        sr_prior_ctx.pnp_rho = photo_up.sr_pnp_rho;
+        sr_prior_ctx.pnp_iters = photo_up.sr_pnp_iters;
+    }
+    if (!sr_prior_ctx.model.empty() && !cs_onnx_sr_available(sr_prior_ctx.model)) {
+        std::cerr << "Error: SR prior model failed to load ('"
+                  << sr_prior_ctx.model << "')" << std::endl;
+        return -3;
+    }
     // ONNX RED denoiser (dncnn/scunet/restormer): model resolved once and
     // warmed here (fail fast on an explicit flag) so the fused workers only
-    // read the session cache. NLM needs no warm-up.
+    // read the session cache. NLM needs no warm-up. The prox/admm PnP modes
+    // exercise the denoiser even with sr_red == 0.
     const int red_kind = cs_onnx_kind_for(photo_up.sr_red_denoiser);
     const bool use_onnx_red = is_sr && !full_res && !use_dict &&
-        photo_up.sr_red > 0.0f && red_kind >= 0;
+        (photo_up.sr_red > 0.0f || sr_prior_ctx.pnp_mode >= 1) && red_kind >= 0;
     const std::string red_model = use_onnx_red ?
         cs_red_model_for(photo_up.sr_red_denoiser, photo_up.sr_dncnn_model,
             photo_up.sr_red_model) : std::string();
@@ -2216,7 +2304,7 @@ int decrypt_image::decrypt_image_tiled(
                 photo_up.sr_red_denoiser, photo_up.sr_dncnn_model, fsrcnn_model,
                 is_direct && !full_res && !use_dict, sr_cascade, grain_tv, use_onsager,
                 red_model, photo_up.sr_red_decay, is_dip && !full_res && !use_dict,
-                hr_sr_ctx, seg_tile_params);
+                hr_sr_ctx, seg_tile_params, sr_prior_ctx);
         });
     decrypt_tiles_thread.join();
     if (pipe_upscale) pipe.finish();
@@ -2298,6 +2386,26 @@ int decrypt_image::decrypt_image_tiled(
         if (!seg_params.empty() && seg_solve_mask.empty()) {
             throw std::runtime_error("--seg-params needs --seg-solve");
         }
+        // Automatic per-segment decode: a seg container carries its label map,
+        // so with an auto-derived coef each tile takes a coef scaled by its
+        // own class's sampled rate instead of one global value. Explicit
+        // --coef/--tv (or --seg-solve) keep the previous behavior; set
+        // CS_NO_SEG_PERCLASS=1 to force the pre-change global coef.
+        CsSegSinglePass autosegpass;
+        bool autoseg = false;
+        if (seg_solve_mask.empty() && dimgs.get_sampling_mode() == CS_MODE_SEGMASK &&
+            coef_auto && !dimgs.get_seg_ids().empty() &&
+            !std::getenv("CS_NO_SEG_PERCLASS")) {
+            autosegpass.ids = &dimgs.get_seg_ids();
+            autosegpass.base = base_p;
+            autosegpass.spec = nullptr;
+            autosegpass.rates_q = &dimgs.get_seg_rates_q();
+            autosegpass.per_class_rate = true;
+            autosegpass.base_ratio = dimgs.get_compression_ratio();
+            autoseg = true;
+            std::cout << "seg-solve: per-class auto params ("
+                      << (int)dimgs.get_seg_rates_q().size() << " classes)" << std::endl;
+        }
         if (!seg_solve_mask.empty()) {
             // Keep mixed tiles in each intersecting class's solve: a global
             // boundary solve would discard the class's regularization.
@@ -2347,8 +2455,23 @@ int decrypt_image::decrypt_image_tiled(
         }
         else {
             cv::Mat unused_weight;
-            const int grid_rc = solve_grid(sampled_mat, masked_mat, show_preview, base_p, reconstructed, {}, unused_weight);
+            const int grid_rc = solve_grid(sampled_mat, masked_mat, show_preview, base_p,
+                reconstructed, {}, unused_weight, autoseg ? &autosegpass : nullptr);
             if (grid_rc != 0) return grid_rc;
+            // Same frontier calm as the explicit --seg-solve path: the auto
+            // per-class decode otherwise leaves the low-density boundary
+            // bands uncalmed (visible halo where the class coef steps).
+            if (autoseg && !dimgs.get_seg_ids().empty()) {
+                const cv::Mat& sid = dimgs.get_seg_ids();
+                bool seen[256] = { false };
+                for (int y = 0; y < sid.rows; ++y) {
+                    const uint8_t* row = sid.ptr<uint8_t>(y);
+                    for (int x = 0; x < sid.cols; ++x) seen[row[x]] = true;
+                }
+                std::vector<int> classes;
+                for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
+                cs_seg_calm_boundaries(reconstructed, sid, masked_mat, classes, overlap);
+            }
         }
 
         // Solve geometry may differ from org_size by container padding;
@@ -2399,7 +2522,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
     bool full_res, int solver,
     int fista_iters, int reweights, int basis, float wscale,
     const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv, float grain_tv, bool use_onsager, size_t* hr_applied_out,
-    const std::string& seg_solve_mask, const std::string& seg_params) {
+    const std::string& seg_solve_mask, const std::string& seg_params, bool coef_auto) {
     if (solver == CS_SOLVER_FISTA_JOINT) {
         std::cerr << "Warning: joint solver needs one shared RGB grid; ycc split sampling degrades to per-channel FISTA" << std::endl;
     }
@@ -2600,11 +2723,27 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             }
         }
         const bool ycc_use_dict = (ycc_sr_d != nullptr);
+        // Strong-prior + PnP context for the cs-sr solve (same as the BGR
+        // pipeline): an ONNX 2x SR proposal and/or a PnP prox step.
+        CsSrPrior ycc_sr_prior_ctx;
+        if (ycc_is_sr && !full_res && !ycc_use_dict) {
+            ycc_sr_prior_ctx.model = photo_up.sr_prior_model;
+            ycc_sr_prior_ctx.pnp_mode = (photo_up.sr_pnp == "admm") ? 2
+                : (photo_up.sr_pnp == "prox") ? 1 : 0;
+            ycc_sr_prior_ctx.pnp_rho = photo_up.sr_pnp_rho;
+            ycc_sr_prior_ctx.pnp_iters = photo_up.sr_pnp_iters;
+        }
+        if (!ycc_sr_prior_ctx.model.empty() &&
+            !cs_onnx_sr_available(ycc_sr_prior_ctx.model)) {
+            std::cerr << "Error: SR prior model failed to load ('"
+                      << ycc_sr_prior_ctx.model << "')" << std::endl;
+            return -3;
+        }
         // ONNX RED denoiser: same fail-fast warm-up as the BGR pipeline so
         // the fused workers only read the session cache (NLM needs none).
         const int ycc_red_kind = cs_onnx_kind_for(photo_up.sr_red_denoiser);
         const bool ycc_use_onnx_red = ycc_is_sr && !full_res && !ycc_use_dict &&
-            photo_up.sr_red > 0.0f && ycc_red_kind >= 0;
+            (photo_up.sr_red > 0.0f || ycc_sr_prior_ctx.pnp_mode >= 1) && ycc_red_kind >= 0;
         const std::string ycc_red_model = ycc_use_onnx_red ?
             cs_red_model_for(photo_up.sr_red_denoiser, photo_up.sr_dncnn_model,
                 photo_up.sr_red_model) : std::string();
@@ -2685,7 +2824,8 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             ycc_is_direct && !full_res && !ycc_use_dict, ycc_sr_cascade,
             ycc_red_model, photo_up.sr_red_decay,
             ycc_is_dip && !full_res && !ycc_use_dict, ycc_hr_sr_ctx,
-            Pc.iterations, Pc.coef, seg_tile_params);
+            Pc.iterations, Pc.coef, seg_tile_params,
+            segpass ? segpass->per_class_chroma : true, ycc_sr_prior_ctx);
         if (ycc_pipe) ycc_upipe.finish();
 
         if (use_preview) {
@@ -2840,6 +2980,27 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         if (!seg_params.empty() && seg_solve_mask.empty()) {
             throw std::runtime_error("--seg-params needs --seg-solve");
         }
+        // Automatic per-segment decode: a YCC-seg container carries its label
+        // map, so with an auto-derived coef each tile takes a coef scaled by
+        // its own class's sampled rate (luma and chroma alike, chroma at 0.5x).
+        // Explicit --coef/--tv (or --seg-solve) keep the previous behavior;
+        // set CS_NO_SEG_PERCLASS=1 to force the pre-change global coef.
+        CsSegSinglePass autosegpass;
+        bool autoseg = false;
+        if (seg_solve_mask.empty() && cs_is_ycc(dimgs.get_sampling_mode()) &&
+            coef_auto && !dimgs.get_seg_ids().empty() &&
+            !std::getenv("CS_NO_SEG_PERCLASS")) {
+            autosegpass.ids = &dimgs.get_seg_ids();
+            autosegpass.base = base_p;
+            autosegpass.spec = nullptr;
+            autosegpass.rates_q = &dimgs.get_seg_rates_q();
+            autosegpass.per_class_rate = true;
+            autosegpass.per_class_chroma = false;
+            autosegpass.base_ratio = dimgs.get_compression_ratio();
+            autoseg = true;
+            std::cout << "seg-solve: per-class auto params ("
+                      << (int)dimgs.get_seg_rates_q().size() << " classes)" << std::endl;
+        }
         if (!seg_solve_mask.empty()) {
             // Preserve each class's solver settings even on mixed tiles.
             if (photo_up.y_dual_tv > 0.0f) {
@@ -2884,8 +3045,23 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         else {
             cv::Mat unused_weight;
             const int grid_rc = solve_ycc_grid(Y, Ym, Cr, Crm, Cb, Cbm, base_p, base_p,
-                show_preview, reconstructed, {}, unused_weight);
+                show_preview, reconstructed, {}, unused_weight,
+                autoseg ? &autosegpass : nullptr);
             if (grid_rc != 0) return grid_rc;
+            // Same frontier calm as the explicit --seg-solve path (luma mask
+            // Ym): the auto per-class decode otherwise leaves the low-density
+            // boundary bands uncalmed (halo where the class coef steps).
+            if (autoseg && !dimgs.get_seg_ids().empty()) {
+                const cv::Mat& sid = dimgs.get_seg_ids();
+                bool seen[256] = { false };
+                for (int y = 0; y < sid.rows; ++y) {
+                    const uint8_t* row = sid.ptr<uint8_t>(y);
+                    for (int x = 0; x < sid.cols; ++x) seen[row[x]] = true;
+                }
+                std::vector<int> classes;
+                for (int c = 0; c < 256; ++c) if (seen[c]) classes.push_back(c);
+                cs_seg_calm_boundaries(reconstructed, sid, Ym, classes, overlap);
+            }
         }
 
         // Final polish (--final-polish): same whole-image up-then-down pass

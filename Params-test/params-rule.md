@@ -57,6 +57,84 @@ keep legacy behavior. Applies when `--coef`/`--tv` are absent (sentinel
 (All within 0.4 dB of the per-cell optima. Fresh-container runs vary ±1 dB
 by salt draw; these checks reuse sweep containers for exactness.)
 
+## Cross-metric validation (SSIM + CIEDE2000 + LPIPS)
+
+The suite was re-run with `-Metrics`, adding SSIM (structure), CIEDE2000
+mean/p95 (perceptual color), and LPIPS-alex (deep-feature) to each cell.
+Columns `ssim,de_mean,de_p95,lpips` appended to `results.csv`; helpers
+`metrics.py` (SSIM/ΔE) and `metrics_lpips.py` (LPIPS, ~5-7 s/cell).
+
+Per-cell argmax under each metric, over the 36 suite cells (2 geom x 3
+ratios x 2 samplers x 3 tile grids):
+
+- **PSNR, SSIM and ΔE-p95 pick the SAME (coef,tv) in 33/36 cells.** The
+  three disagreements are off-by-one coef steps or tv=0 vs 0.01 ties on
+  uniform 0.5/0.15 (e.g. full 0.5 uni t64: PSNR/ΔE 0.035/0 vs SSIM
+  0.02/0.01, 0.2 dB and 0.003 SSIM apart).
+- **No metric prefers a different sampler or tile count.** The metric
+  choice does not overturn any structural conclusion in this file.
+- `seg` optima sit at the top of the default coef grid (0.08) everywhere.
+  Where the extended range was swept (half seg t64) the peak moved to
+  coef 0.12-0.2 — PSNR/ΔE at 0.2, SSIM at 0.12 — i.e. the metrics agree
+  within one step and all say the default grid under-covers `seg`.
+- `seg` prefers tv=0.01 at every ratio; `uniform` prefers tv=0 at low
+  ratio and is tv-insensitive at 0.5.
+
+The earlier PSNR-only green-cast artefact (full-res YCC seg-solve vs BGR:
+PSNR/SSIM/LPIPS favored YCC, ΔE-p95 favored BGR) is the one case where a
+single metric lies; see the metric suite only after `-Metrics` runs.
+
+## High-ratio extension (0.6 - 0.9)
+
+The suite was extended to ratios 0.6, 0.7, 0.8, 0.9 (same grid, `-Metrics`).
+Over the extended 84-cell grid (2 geom x 7 ratios x 2 samplers x 3 tiles)
+PSNR / SSIM / ΔE-p95 pick the identical (coef,tv) in 56/84 cells, and every
+disagreement is negligible: worst case ΔSSIM = 0.006 and worst ΔΔE-p95 =
+0.52 (usually <=0.25, often 0.00). The PSNR optimum coincides with the
+perceptual optimum; no metric flips the sampler, tile count or tv choice.
+
+Best coef falls monotonically with ratio, matching the 1/r law:
+
+| ratio | full uni best | full seg best | half uni best | half seg best |
+|---|---|---|---|---|
+| 0.15 | 0.08 | 0.08 | 0.08 | 0.08 |
+| 0.3  | 0.05 | 0.08 | 0.05 | 0.08 |
+| 0.5  | 0.035 | 0.08 | 0.035 | 0.08 |
+| 0.6  | 0.02 | 0.05 | 0.02 | 0.08 |
+| 0.7  | 0.02 | 0.05 | 0.02 | 0.05 |
+| 0.8  | 0.01 | 0.035 | 0.01 | 0.05 |
+| 0.9  | 0.01 | 0.035 | 0.01 | 0.035 |
+
+- At ratio >=0.8 the **uniform** optimum sits on the 0.01 grid floor, i.e.
+  the true peak is at or below 0.01 while the shipped uniform law
+  `0.01875/r` predicts ~0.021-0.023 there. The high-ratio end of the
+  uniform coef law is a touch too strong; consider a lower floor
+  (re-fit pending).
+- `seg` holds tv=0.01 across the whole high-ratio range; `uniform` holds
+  tv=0 at every ratio >=0.3.
+- **Tile sweet spot shifts upward with ratio.** Winner of {64,96,128} at
+  the totimum, and t128-t64 gain at the best coef:
+
+  | sampler | r0.15 | r0.3 | r0.5 | r0.7 | r0.9 |
+  |---|---|---|---|---|---|
+  | half seg | 64 (-0.5) | 128 (+0.2) | 128 (+0.3) | 128 (+0.2) | 128 (+0.0) |
+  | full seg | 64 (-0.5) | 64 (-0.8) | 128 (+0.4) | 128 (+0.4) | 128 (+0.3) |
+  | half uniform | 128 (+0.1) | 128 (+0.3) | 128 (+0.3) | 128 (+0.2) | 128 (+0.1) |
+  | full uniform | 64 (-0.2) | 128 (+0.4) | 128 (+0.4) | 128 (+0.3) | 128 (+0.3) |
+
+  At low ratio 64 tiles wins (fewer boundary seams); from ratio ~0.5 up,
+  128 tiles wins by +0.1 to +0.4 dB. The earlier flat "64 is the sweet
+  spot" claim came from the low-ratio sweep only.
+
+Structural reading of the added ratios (t64, best coef, PSNR):
+
+| sampler | 0.15 | 0.3 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 |
+|---|---|---|---|---|---|---|---|
+| half seg | 20.5 | 26.9 | 29.0 | 29.5 | 30.4 | 30.8 | 31.3 |
+| half uni | 26.0 | 28.4 | 30.2 | 30.9 | 31.5 | 32.1 | 32.6 |
+| full seg | 16.7 | 26.4 | 31.4 | 32.7 | 33.6 | 34.4 | 35.3 |
+| full uni | 28.8 | 32.7 | 35.9 | 37.7 | 39.3 | 41.7 | 44.4 |
+
 ## Caveats
 
 - Fit on ONE photo (bird): re-run `sweep.ps1` on new content types before

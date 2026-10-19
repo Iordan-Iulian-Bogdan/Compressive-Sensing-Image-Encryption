@@ -31,7 +31,8 @@ param(
     [double[]]$Tvs = @(0.0, 0.01, 0.03),
     [int]$Iterations = 8,
     [int]$Overlap = 24,
-    [switch]$PerTileCoef
+    [switch]$PerTileCoef,
+    [switch]$Metrics
 )
 
 $ErrorActionPreference = "Continue"
@@ -39,10 +40,37 @@ $csv = Join-Path $OutDir "results.csv"
 if (!(Test-Path $csv)) {
     "geometry,ratio,sampling,tiles,coef,tv,pertile,psnr,seconds,enc_bytes" | Out-File $csv -Encoding utf8
 }
-$done = @{}
-Import-Csv $csv | ForEach-Object { $done["$($_.geometry)|$($_.ratio)|$($_.sampling)|$($_.tiles)|$($_.coef)|$($_.tv)|$($_.pertile)"] = $true }
 $ptflag = "0"
 if ($PerTileCoef) { $ptflag = "1" }
+$done = @{}
+$allrows = @(Import-Csv $csv)
+foreach ($rw in $allrows) {
+    $k = "$($rw.geometry)|$($rw.ratio)|$($rw.sampling)|$($rw.tiles)|$($rw.coef)|$($rw.tv)|$($rw.pertile)"
+    if ($Metrics) {
+        if ($rw.ssim -ne "" -and $rw.ssim -ne $null) { $done[$k] = $true }
+    } else {
+        $done[$k] = $true
+    }
+}
+$gridkeys = @{}
+foreach ($g in $Geometries) { foreach ($r in $Ratios) { foreach ($s in $Samplings) {
+    foreach ($t in $Tiles) { foreach ($c in $Coefs) { foreach ($v in $Tvs) {
+        $gridkeys["$g|$r|$s|$t|$c|$v|$ptflag"] = $true
+    }}}
+}}}
+if ($Metrics) {
+    # drop metric-less rows INSIDE the current grid only; they get
+    # recomputed below (decrypt + all metrics). Rows outside the grid
+    # (other ratios/tiles) are preserved untouched.
+    $kept = @($allrows | Where-Object {
+        $k = "$($_.geometry)|$($_.ratio)|$($_.sampling)|$($_.tiles)|$($_.coef)|$($_.tv)|$($_.pertile)"
+        (-not $gridkeys.ContainsKey($k)) -or ($_.ssim -ne "" -and $_.ssim -ne $null)
+    })
+    $hdr = "geometry,ratio,sampling,tiles,coef,tv,pertile,psnr,seconds,enc_bytes,ssim,de_mean,de_p95,lpips"
+    @($hdr) + @($kept | ForEach-Object {
+        "$($_.geometry),$($_.ratio),$($_.sampling),$($_.tiles),$($_.coef),$($_.tv),$($_.pertile),$($_.psnr),$($_.seconds),$($_.enc_bytes),$($_.ssim),$($_.de_mean),$($_.de_p95),$($_.lpips)"
+    }) | Out-File $csv -Encoding utf8
+}
 
 $ncells = 0
 foreach ($g in $Geometries) { foreach ($r in $Ratios) { foreach ($s in $Samplings) {
@@ -84,13 +112,30 @@ foreach ($g in $Geometries) {
                         & $Exe @dargs 2>$null
                         $dt = ((Get-Date) - $t0).TotalSeconds
                         $psnr = ""
+                        $ssim = ""
+                        $demean = ""
+                        $dep95 = ""
+                        $lpips = ""
                         if (Test-Path $dec) {
                             $o = & $Exe compare $Image $dec $cmp --amp 4 2>$null | Out-String
                             $m = [regex]::Match($o, 'PSNR:\s+([0-9.]+) dB')
                             if ($m.Success) { $psnr = $m.Groups[1].Value }
+                            if ($Metrics) {
+                                $py = 'C:\Users\iorda\AppData\Local\Programs\Python\Python312\python.exe'
+                                $mo = & $py -u (Join-Path $OutDir "metrics.py") $Image $dec 2>$null | Out-String
+                                $ms = [regex]::Match($mo, 'SSIM:\s+([0-9.]+)')
+                                if ($ms.Success) { $ssim = $ms.Groups[1].Value }
+                                $md = [regex]::Match($mo, 'CIEDE2000 mean:\s+([0-9.]+)')
+                                if ($md.Success) { $demean = $md.Groups[1].Value }
+                                $mp = [regex]::Match($mo, 'p95:\s+([0-9.]+)')
+                                if ($mp.Success) { $dep95 = $mp.Groups[1].Value }
+                                $lo = & $py -u (Join-Path $OutDir "metrics_lpips.py") $Image $dec 2>$null | Out-String
+                                $ml = [regex]::Match($lo, 'LPIPS-\w+:\s+([0-9.]+)')
+                                if ($ml.Success) { $lpips = $ml.Groups[1].Value }
+                            }
                             Remove-Item $dec -ErrorAction SilentlyContinue
                         }
-                        "$g,$r,$s,$t,$c,$v,$ptflag,$psnr,$([math]::Round($dt,1)),$encBytes" | Out-File $csv -Encoding utf8 -Append
+                        "$g,$r,$s,$t,$c,$v,$ptflag,$psnr,$([math]::Round($dt,1)),$encBytes,$ssim,$demean,$dep95,$lpips" | Out-File $csv -Encoding utf8 -Append
                     }
                 }
             }

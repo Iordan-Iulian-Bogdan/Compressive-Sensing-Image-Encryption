@@ -372,3 +372,6 @@ models/
 
 # vendored ONNX Runtime binaries (see scripts/download_clip.ps1)
 third_party/
+
+# downloaded research datasets (SIDD, DIV2K, ...) - large, not for version control
+_dl/

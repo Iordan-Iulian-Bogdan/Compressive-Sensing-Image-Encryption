@@ -274,6 +274,17 @@ bool parse_metadata_fields(const uint8_t* meta, int (&vals)[5]) {
 
 } // namespace
 
+bool cs_blob_seal_xor(uint8_t* data, size_t len, const uint8_t key[32],
+                      const uint8_t iv[16], uint8_t tag) {
+    if (len == 0) return true;
+    uint8_t counter[CS_IV_BYTES];
+    std::memcpy(counter, iv, CS_IV_BYTES);
+    counter[0] ^= tag;
+    const bool ok = cs_aes256_ctr_xor(data, len, key, counter);
+    cs_wipe(counter, sizeof(counter));
+    return ok;
+}
+
 bool cs_write_header(uint8_t* buf, size_t buf_bytes, const std::string& metadata, const uint8_t key[32], const uint8_t salt[CS_SALT_BYTES]) {
     if (buf_bytes < CS_HEADER_BYTES) return false;
     if (metadata.size() != CS_METADATA_BYTES) return false;
@@ -281,7 +292,7 @@ bool cs_write_header(uint8_t* buf, size_t buf_bytes, const std::string& metadata
     uint8_t iv[CS_IV_BYTES], scratch_meta[CS_METADATA_BYTES];
     if (!cs_random_bytes(iv, CS_IV_BYTES)) return false;
 
-    buf[CS_OFF_VERSION] = 2;
+    buf[CS_OFF_VERSION] = CS_VERSION;
     std::memcpy(buf + CS_OFF_SALT, salt, CS_SALT_BYTES);
     std::memcpy(buf + CS_OFF_IV, iv, CS_IV_BYTES);
     std::memset(buf + CS_OFF_TAG, 0, CS_TAG_BYTES);
@@ -464,8 +475,8 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
         return true;
     }
 
-    // v2: authenticated container
-    if (buf[CS_OFF_VERSION] != 2) {
+    // v3: authenticated container
+    if (buf[CS_OFF_VERSION] != CS_VERSION) {
         out.legacy = true;
         return false;
     }
@@ -502,7 +513,7 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
         return false;
     }
 
-    out.version = 2;
+    out.version = CS_VERSION;
     out.m = vals[0]; out.rows = vals[1]; out.cols = vals[2];
     out.org_h = vals[3]; out.org_w = vals[4];
 

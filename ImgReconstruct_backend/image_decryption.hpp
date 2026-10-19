@@ -137,6 +137,11 @@ private:
     // mixed-tile votes toward the higher sampled class.
     std::vector<uint8_t> seg_rates_q;
 
+    // Solve-geometry label map of a seg container (empty for other modes);
+    // cached during sampling so the default BGR decode can derive per-class
+    // solver coef/tv from each class's own sampled rate without --seg-solve.
+    cv::Mat seg_ids;
+
     // Mode 14 (CS_MODE_TMEANS) global group list in container-body order:
     // tgrp_off[g]..tgrp_off[g+1] index tgrp_px (flat row-major pixel
     // indices), tgrp_w holds the unit-norm row weights (0.5f). Empty for
@@ -172,6 +177,7 @@ public:
 
     int get_sampling_mode() const { return sampling_mode; }
     const std::vector<uint8_t>& get_seg_rates_q() const { return seg_rates_q; }
+    const cv::Mat& get_seg_ids() const { return seg_ids; }
     // Mode 14 group accessors (empty unless get_sampled_mat ran on a
     // T-means container); per-tile code filters these by tile rect.
     const std::vector<int>& get_tgrp_off() const { return tgrp_off; }
@@ -225,7 +231,7 @@ public:
     each chroma plane natively on its half-resolution grid, then merges
     YCrCb -> BGR per tile. FISTA_JOINT degrades to per-channel FISTA.
     */
-    static int decrypt_image_tiled_ycc420(decrypt_image& dimgs, const std::string& output_path, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr, const std::string& seg_solve_mask = "", const std::string& seg_params = "");
+    static int decrypt_image_tiled_ycc420(decrypt_image& dimgs, const std::string& output_path, int num_tiles = 24, int overlap = 48, int iterations = 5, int nun_threads = 8, float coef = 0.01f, bool show_preview = true, float tv = 0.0f, bool full_res = false, int solver = CS_SOLVER_FISTA, int fista_iters = 0, int reweights = 2, int basis = CS_BASIS_DCT, float wscale = 2.0f, const CsPhotoUpscalerOptions& photo_up = CsPhotoUpscalerOptions(), bool per_tile_coef = false, bool per_tile_tv = false, float grain_tv = 0.0f, bool use_onsager = false, size_t* hr_applied_out = nullptr, const std::string& seg_solve_mask = "", const std::string& seg_params = "", bool coef_auto = false);
 
 };
 
@@ -240,5 +246,6 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     const std::string& sr_red_denoiser = "nlmeans", const std::string& sr_dncnn_model = "models/dncnn/dncnn_color.onnx",
     const std::string& sr_fsrcnn_model = "", bool sr_direct_2x = false, bool sr_cascade = false, float grain_tv = 0.0f, bool use_onsager = false,
     const std::string& red_model = "", float red_decay = 1.0f, bool sr_dip_2x = false,
-    const CsHrSrCtx& hr_sr = CsHrSrCtx());
+    const CsHrSrCtx& hr_sr = CsHrSrCtx(),
+    const CsSrPrior& sr_prior = CsSrPrior());
 #endif

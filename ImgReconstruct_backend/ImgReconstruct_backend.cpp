@@ -154,6 +154,20 @@ void print_usage(const char* exe) {
   "                        the solved tile) or cascade (multiscale binned-\n"
   "                        FISTA chain landing HR pixels); applies to cs-sr\n"
   "                        and sr-direct, decrypt/roundtrip only\n"
+  "  --sr-prior-model <f>  ONNX 2x photo-SR net (Real-ESRGAN/SwinIR: RGB\n"
+  "                        planar [0,1] NCHW, 2x clean output) whose upscale\n"
+  "                        replaces the AVIR anchor in the cs-sr fused solve,\n"
+  "                        so a strong prior proposes the HR image and the LR\n"
+  "                        measurements enforce it (decrypt/roundtrip only)\n"
+  "  --sr-pnp <m>          PnP step for the cs-sr denoiser: off (default,\n"
+  "                        legacy RED blend), prox (denoiser as a true\n"
+  "                        proximal operator, NLM sigma-matched) or admm\n"
+  "                        (outer PnP-ADMM; denoiser = prox, measurement\n"
+  "                        model enforces) (decrypt/roundtrip only)\n"
+  "  --sr-pnp-rho <f>      ADMM penalty for --sr-pnp admm in (0, 8]\n"
+  "                        (default 0.1)\n"
+  "  --sr-pnp-iters <n>    ADMM outer passes for --sr-pnp admm in [1, 50]\n"
+  "                        (default 8)\n"
   "  --solver <name>      tile solver: fista (default, reweighted-L1\n"
   "                        FISTA per channel), joint (SOMP-structured\n"
   "                        group-sparsity FISTA over R/G/B together +\n"
@@ -293,8 +307,10 @@ void print_usage(const char* exe) {
   "                        with detail-driven per-class rates (flat classes get\n"
   "                        ~0.08, top detail 1.0; --seg-rates overrides). No\n"
   "                        mask file needed; the label map ships in the\n"
-  "                        container, so decrypt needs no new flags. Works\n"
-  "                        with --ycc420/--ycc422 and --seg-blend.\n"
+  "                        container, so decrypt needs no new flags. Decrypt\n"
+  "                        auto-scales each class's solver coef by its own\n"
+  "                        rate (per-segment parameters). Works with\n"
+  "                        --ycc420/--ycc422 and --seg-blend.\n"
   "  --seg-blend <w>       encrypt/roundtrip only, needs --seg-mask or --seg-auto: sample\n"
   "                        a <w>-pixel band (0..128, 0 = off) on each\n"
   "                        side of every segment frontier with a smooth local\n"
@@ -865,6 +881,46 @@ int main(int argc, char* argv[])
             }
             photo_up.sr_init = s;
         }
+        else if (a == "--sr-prior-model") {
+            // ONNX 2x photo-SR prior for cs-sr: decrypt-side only, does not
+            // force manual mode (same as --red)
+            const char* v = next("ONNX SR model file");
+            if (!v) return 64;
+            photo_up.sr_prior_model = v;
+        }
+        else if (a == "--sr-pnp") {
+            // PnP/RED semantics for the cs-sr denoiser step: decrypt-side
+            // only, does not force manual mode
+            const char* v = next("off, prox or admm");
+            if (!v) return 64;
+            std::string s = v;
+            for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (s != "off" && s != "prox" && s != "admm") {
+                std::cerr << "Error: --sr-pnp must be off, prox or admm" << std::endl;
+                return 64;
+            }
+            photo_up.sr_pnp = s;
+        }
+        else if (a == "--sr-pnp-rho") {
+            const char* v = next("floating point in (0, 8]");
+            float rho = 0.1f;
+            if (!v || !parse_float(v, rho)) return 64;
+            if (!(rho > 0.0f) || rho > 8.0f) {
+                std::cerr << "Error: --sr-pnp-rho must be in (0, 8]" << std::endl;
+                return 64;
+            }
+            photo_up.sr_pnp_rho = rho;
+        }
+        else if (a == "--sr-pnp-iters") {
+            const char* v = next("integer in [1, 50]");
+            int it = 8;
+            if (!v || !parse_int(v, it)) return 64;
+            if (it < 1 || it > 50) {
+                std::cerr << "Error: --sr-pnp-iters must be in [1, 50]" << std::endl;
+                return 64;
+            }
+            photo_up.sr_pnp_iters = it;
+        }
         else if (a == "--periodic") {
             // encrypt-side only: decrypt auto-detects the mode from the
             // container header, so this must not flip decrypt into manual
@@ -1246,6 +1302,12 @@ int main(int argc, char* argv[])
     if (photo_up.sr_init != "avir" && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --sr-init is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.sr_init = "avir";
+    }
+    if ((!photo_up.sr_prior_model.empty() || photo_up.sr_pnp != "off") &&
+        mode != "decrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --sr-prior-model/--sr-pnp are decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.sr_prior_model.clear();
+        photo_up.sr_pnp = "off";
     }
     if (photo_up.y_confidence > 0.0f && mode == "encrypt") {
         std::cerr << "Warning: --y-confidence is decrypt-side only; ignoring for encrypt" << std::endl;

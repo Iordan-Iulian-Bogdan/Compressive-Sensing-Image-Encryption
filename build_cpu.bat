@@ -14,7 +14,9 @@ REM          %LOCALAPPDATA%\opencv-portable\opencv). No ROCm needed.
 REM Usage: build_cpu.bat [main]  -- 'main' builds only ImgReconstruct_backend.exe
 REM          and skips cs_tests.exe (which needs the static 4.13 contrib set).
 setlocal
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
+set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+call "%VCVARS%" >nul
 if errorlevel 1 ( echo ERROR: vcvars64 failed & exit /b 1 )
 set "LLVM_ROOT=C:\Program Files\LLVM"
 if not exist "%LLVM_ROOT%\bin\clang-cl.exe" set "LLVM_ROOT=%LOCALAPPDATA%\llvm-portable\clang+llvm-23.1.2-x86_64-pc-windows-msvc"
@@ -33,7 +35,7 @@ mkdir "%OBJT%" 2>nul
 set "CV490_INC=/I %CV490_ROOT%\build\include"
 set "CV413_INC=/I C:\Users\iorda\OneDrive\Documents\opencv\Release\include"
 set "DEFS=/DNDEBUG /D_CONSOLE /D_CRT_SECURE_NO_WARNINGS"
-set "OPTS=/c /O2 /fp:fast /arch:AVX2 /Oi /std:c++17 /EHsc /MD /openmp /Zi"
+set "OPTS=/c /O2 /fp:fast /arch:AVX512 /clang:-mavx512f /clang:-mavx512bw /clang:-mavx512dq /clang:-mavx512vl /clang:-mavx512cd /Oi /std:c++17 /EHsc /MD /openmp /Zi"
 set "BE_INC=/I %ROOT%ImgReconstruct_backend /I %ROOT%third_party\onnxruntime\include"
 
 echo ============ main objects [opencv 4.90 world] ============

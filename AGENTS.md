@@ -3,6 +3,31 @@
 ## Project
 C++ image encryption via compressive sensing with FISTA reconstruction (per-channel + SOMP-structured joint; HIP GPU offload). MSVC / Visual Studio solution `ImgReconstruct_backend.sln`, x64. Dependencies resolved via vcpkg manifest (`vcpkg.json`). Uses Windows CNG crypto (`crypto_utils`).
 
+## Working principles
+1. **Think Before Coding** — Don't assume. Don't hide confusion. Surface tradeoffs.
+   - State assumptions explicitly — if uncertain, ask rather than guess.
+   - Present multiple interpretations — don't pick silently when ambiguity exists.
+   - Push back when warranted — if a simpler approach exists, say so.
+   - Stop when confused — name what's unclear and ask for clarification.
+2. **Simplicity First** — Minimum code that solves the problem. Nothing speculative.
+   - No features beyond what was asked.
+   - No abstractions for single-use code.
+   - No "flexibility" or "configurability" that wasn't requested.
+   - No error handling for impossible scenarios.
+   - If 200 lines could be 50, rewrite it.
+   - Test: would a senior engineer say this is overcomplicated? If yes, simplify.
+3. **Surgical Changes** — Touch only what you must. Clean up only your own mess.
+   - Don't "improve" adjacent code, comments, or formatting.
+   - Don't refactor things that aren't broken.
+   - Match existing style, even if you'd do it differently.
+   - If you notice unrelated dead code, mention it — don't delete it.
+   - When your changes create orphans: remove imports/variables/functions that YOUR changes made unused; don't remove pre-existing dead code unless asked.
+   - Test: every changed line should trace directly to the user's request.
+4. **Goal-Driven Execution** — Define success criteria. Loop until verified.
+   - "Add validation" → "Write tests for invalid inputs, then make them pass."
+   - "Fix the bug" → "Write a test that reproduces it, then make it pass."
+   - "Refactor X" → "Ensure tests pass before and after."
+
 ## Layout
 - `ImgReconstruct_backend/` - main sources (`ImgReconstruct_backend.vcxproj`): `CS_encryption`, `image_encryption`, `image_decryption`, `helper_functions`, `crypto_utils`, `cs_gpu` (HIP)
 - `tests/` - test and bench programs (`test_main.cpp`, `bench_*.cpp`, `train_dictionary.cpp`)
@@ -22,7 +47,11 @@ C++ image encryption via compressive sensing with FISTA reconstruction (per-chan
 ## Conventions
 - For large logs or file analysis, use sandboxed processing (ctx tools) and only return derived summaries.
 - Test commands for the user: write ALL output files (decrypts, comparisons, error maps) to the repo root `C:\Users\iorda\OneDrive\Documents\Compressive-Sensing-Image-Encryption-CPU_Limited_memory_BFGS` using relative paths (e.g. `wavelet.dec.png`, never `$env:TEMP` or absolute temp paths).
+- Decrypt commands: default to `--manual --tiles 64 --overlap 24 --full-res --iterations 10 --per-tile-coef --y-confidence 0.3` unless the user says otherwise. Omit `--coef`/`--tv` so the auto rule derives them, unless testing explicit values.
+  - `--y-confidence 0.3` (YCC luma) is the single biggest base-decode win: it runs a FISTA refinement pass on locally sparse areas and cuts the softness/halo at segment boundaries (measured on IMG_3690 ycc420: PSNR 33.30→34.83, SSIM 0.8923→0.9207, ΔE-p95 4.51→3.97 — beats the `cs-sr` upscale path). It adds a CPU pass (slower). `--iterations 10` and `--per-tile-coef` add a little more (esp. ΔE). `--grain-tv` softens — do not use for quality.
+- Encrypt commands: always pass `--show-mask` and display the resulting `*.mask.png` view to the user (note: it pops a keypress window; headless runs continue past it).
 - NEVER delete `third_party/` (untracked local deps: onnxruntime, nunif — builds fail without it, and it is invisible to git). If a build fails on missing `onnxruntime_cxx_api.h`, restore from the `BFG2S` clone on the Desktop, never re-download.
+- Quality rule of thumb: judge **sharpness by SSIM**, **color by CIEDE2000 p95/p99**, treat **PSNR as a tiebreaker** (it is the solver's optimization target, not a perceptual verdict). LPIPS (AlexNet, `Params-test/metrics_lpips.py`) confirms structure/texture. Optimize PSNR, but promote a decode only if SSIM and ΔE-p95 agree. Helpers: `Params-test/metrics.py <orig> <dec>` (SSIM + ΔE), `Params-test/metrics_lpips.py` (LPIPS). Sweep with `Params-test/sweep.ps1 -Metrics` to log all of them.
 
 # context-mode - MANDATORY routing rules
 

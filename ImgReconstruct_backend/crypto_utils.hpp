@@ -17,7 +17,7 @@
 //   RNG. There is no secondary "seed funnel".
 //
 // Header (v2), 32 pixels = 96 bytes at the start of the encrypted container:
-//   [0]      version byte (2)
+//   [0]      version byte (3)
 //   [1..16]  salt (16, random)
 //   [17..32] AES-CTR IV (16, random)
 //   [33..64] metadata (32 bytes: "m|rows|cols|h|w" '-' padded) XOR AES-256-CTR
@@ -48,6 +48,7 @@
 #define CS_IV_BYTES 16
 #define CS_TAG_BYTES 16
 #define CS_PBKDF2_ITERATIONS 200000
+#define CS_VERSION 3                 // current container format version
 
 // Offsets inside the 96-byte v2 header
 #define CS_OFF_VERSION 0
@@ -123,6 +124,9 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 // The above is the legacy layout (including flat boosted bands). New smooth
 // blends use [0][version=1][width][nclasses][rates][u32 PNG length][PNG].
 // The zero marker is invalid to older readers, preventing silent mis-sampling.
+// v3: the whole prefix ([0] through the PNG) is AES-256-CTR sealed in place
+// with CS_SEG_TAG; its byte length rides in the MAC-covered pad at
+// CS_OFF_SEGPRE_LEN. (v2 containers left the label map in the clear.)
 #define CS_SEGBLEND_MAX 128
 struct CsSegPrefix {
     uint8_t nclasses = 0;
@@ -174,6 +178,18 @@ inline uint8_t cs_segmask_quantize_rate(float r) {
 // (body_bytes - measurement_bytes) / CS_HRDETAIL_SAMPLE_BYTES. Covered by
 // the container HMAC like the measurement body. Decrypt applies the anchors
 // as exact post-composite luma replacements.
+// v3 domain-separation tags for AES-256-CTR over the plaintext body prefixes
+// (counter = IV with counter[0] ^= tag). The seg label map and LOD maps are
+// content surrogates and must not ship in the clear; the measurement samples
+// are the CS ciphertext and stay raw.
+#define CS_SEG_TAG 0x53
+#define CS_LOD_TAG 0x4B
+
+// In-place AES-256-CTR XOR of a body blob with a domain-separated counter
+// (iv with counter[0] ^= tag). Symmetric: the same call seals and opens.
+bool cs_blob_seal_xor(uint8_t* data, size_t len, const uint8_t key[32],
+                      const uint8_t iv[16], uint8_t tag);
+
 #define CS_HRDETAIL_TAG 0x48
 #define CS_HRDETAIL_SAMPLE_BYTES 6
 #define CS_HRDETAIL_MAX_SAMPLES 65536
@@ -210,6 +226,12 @@ struct CsHrSample {
                                     // unused by adaptive-family modes (2 and
                                     // LOD-luma mode 3); honored only from
                                     // stamped (MAC-covered) headers.
+#define CS_OFF_SEGPRE_LEN 7         // offset from CS_OFF_PAD: seg prefix + label
+                                    // PNG byte length (u32 LE) for modes 10/11/
+                                    // 12. Aliases the HF-thumbnail/HR-count u32
+                                    // slot, which seg modes never read (offsets
+                                    // 1..4 must stay 0 for YCC-seg tile checks).
+                                    // MAC-covered via the sample-bits marker.
 
 // Maps --adaptive-strength in [0, 1] to the integer weight_base.
 //   0.0 -> 65535 (essentially uniform: density ratio ~1.004)
@@ -249,7 +271,9 @@ inline void cs_apply_lod_gamma(std::vector<uint8_t>& lod, int lod_min, double ga
 }
 
 // lod region: tiles_x * tiles_y bytes after the 32-pixel header, padded to a
-// whole number of container pixels so measurements stay pixel-aligned
+// whole number of container pixels so measurements stay pixel-aligned. v3
+// seals it in place with CS_LOD_TAG (the per-tile detail map is a content
+// surrogate); legacy v2 containers left it raw.
 inline int cs_lod_tile_count(int rows, int cols, int tile_size) {
     if (tile_size <= 0) return 0;
     const int tx = (cols + tile_size - 1) / tile_size;

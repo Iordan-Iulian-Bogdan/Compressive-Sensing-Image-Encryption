@@ -1335,6 +1335,8 @@ void encrypt_image::encrypt_ycc420_adaptive(const float& pixel_p, const std::str
     buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_CUTOFF] = (uint8_t)lod_cutoff;
 
     std::memcpy(buf + CS_HEADER_BYTES, lod.data(), (size_t)lod_bytes);
+    // v3: the LOD map is a per-tile detail surrogate -> seal it (CS_LOD_TAG).
+    cs_blob_seal_xor(buf + CS_HEADER_BYTES, (size_t)lod_bytes, cs_key, buf + CS_OFF_IV, CS_LOD_TAG);
 
     uint8_t* body = buf + CS_HEADER_BYTES + (size_t)lod_pixels * 3;
     cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), mY_written, body);
@@ -1822,10 +1824,60 @@ void cs_seg_auto_ids(const cv::Mat& bgr, int classes, int rows, int cols, cv::Ma
         }
     }
 
-    if (clean.rows != rows || clean.cols != cols) {
-        cv::resize(clean, ids, cv::Size(cols, rows), 0, 0, cv::INTER_NEAREST);
-    } else {
+    if (clean.rows == rows && clean.cols == cols) {
         ids = clean;
+        return;
+    }
+    // Nearest-up of the 480px map leaves an ~8x blocky, edge-UNAWARE contour.
+    // Instead guided-filter each class indicator with the full-resolution
+    // image so every boundary snaps to a real image edge. Guided filter is
+    // built from box means, so no contrib dependency.
+    {
+        cv::Mat guide;
+        {
+            cv::Mat g = bgr;
+            if (g.size() != cv::Size(cols, rows))
+                cv::resize(bgr, g, cv::Size(cols, rows), 0, 0, cv::INTER_AREA);
+            cv::cvtColor(g, guide, cv::COLOR_BGR2GRAY);
+            guide.convertTo(guide, CV_32F, 1.0 / 255.0);
+        }
+        const double factor = (double)(std::max)(rows, cols) / (double)(std::max)(clean.rows, clean.cols);
+        const int radius = (std::max)(4, (std::min)(16, (int)std::lround(factor)));
+        const float eps = 1e-3f;
+        const cv::Size k(2 * radius + 1, 2 * radius + 1);
+        cv::Mat I2, mI, mII;
+        cv::multiply(guide, guide, I2);
+        cv::boxFilter(guide, mI, CV_32F, k);
+        cv::boxFilter(I2, mII, CV_32F, k);
+        cv::Mat best(rows, cols, CV_32F, cv::Scalar(-1.0f));
+        cv::Mat out(rows, cols, CV_8U, cv::Scalar(0));
+        for (int c = 0; c < next_id; ++c) {
+            cv::Mat ind = (clean == c);
+            ind.convertTo(ind, CV_32F);
+            cv::Mat up;
+            cv::resize(ind, up, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+            cv::Mat Ip, mp, mIp;
+            cv::multiply(guide, up, Ip);
+            cv::boxFilter(up, mp, CV_32F, k);
+            cv::boxFilter(Ip, mIp, CV_32F, k);
+            cv::Mat varI = mII - mI.mul(mI);
+            cv::Mat covIp = mIp - mI.mul(mp);
+            cv::Mat a = covIp / (varI + eps);
+            cv::Mat b = mp - a.mul(mI);
+            cv::Mat ma, mb, q;
+            cv::boxFilter(a, ma, CV_32F, k);
+            cv::boxFilter(b, mb, CV_32F, k);
+            q = ma.mul(guide) + mb;
+            for (int y = 0; y < rows; ++y) {
+                const float* qr = q.ptr<float>(y);
+                float* br = best.ptr<float>(y);
+                uint8_t* orow = out.ptr<uint8_t>(y);
+                for (int x = 0; x < cols; ++x) {
+                    if (qr[x] > br[x]) { br[x] = qr[x]; orow[x] = (uint8_t)c; }
+                }
+            }
+        }
+        cv::medianBlur(out, ids, 3);
     }
 }
 
@@ -1859,6 +1911,8 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
         if (det[(size_t)c] > dmax) dmax = det[(size_t)c];
     }
     if (!(dmax > 0.0)) return rates; // flat image: uniform 1.0
+    // Bottom-anchored density law: flat classes bottom out at 0.08, the
+    // busiest at 1.0.
     for (int c = 0; c < classes; ++c) {
         const double f = det[(size_t)c] / dmax;
         rates[(size_t)c] = (float)(0.08 + 0.92 * std::pow(f, 0.75));
@@ -1962,6 +2016,14 @@ void encrypt_image::encrypt_segmask_ids(const float& pixel_p, const std::string&
     buf[CS_OFF_PAD] = CS_MODE_SEGMASK;
     std::memcpy(buf + CS_HEADER_BYTES, prefix.data(), prefix.size());
     std::memcpy(buf + CS_HEADER_BYTES + prefix.size(), png.data(), png.size());
+    // v3: the label map is a content surrogate -> seal the whole prefix with a
+    // domain-separated CTR stream; its byte length rides in the MAC-covered pad
+    // so decrypt can find it without reading the (now opaque) prefix.
+    const size_t pre_bytes = prefix.size() + png.size();
+    for (int b = 0; b < 4; ++b)
+        buf[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + b] = (uint8_t)((pre_bytes >> (b * 8)) & 0xff);
+    if (!cs_blob_seal_xor(buf + CS_HEADER_BYTES, pre_bytes, cs_key, buf + CS_OFF_IV, CS_SEG_TAG))
+        throw std::runtime_error("seg-mask: label prefix encryption failed");
 
     const int meas0 = CS_HEADER_PIXELS + pre_pixels;
     cs_gather_bgr(input_img.data, input_img.step, ri_x.data(), ri_y.data(), m_written,
@@ -2105,6 +2167,11 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     buf[CS_OFF_PAD] = (uint8_t)mode;
     std::memcpy(buf + CS_HEADER_BYTES, prefix.data(), prefix.size());
     std::memcpy(buf + CS_HEADER_BYTES + prefix.size(), png.data(), png.size());
+    // v3: seal the seg prefix + label map (see encrypt_segmask_ids).
+    for (int b = 0; b < 4; ++b)
+        buf[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + b] = (uint8_t)((pre_bytes >> (b * 8)) & 0xff);
+    if (!cs_blob_seal_xor(buf + CS_HEADER_BYTES, pre_bytes, cs_key, buf + CS_OFF_IV, CS_SEG_TAG))
+        throw std::runtime_error("seg-mask: label prefix encryption failed");
 
     uint8_t* body = buf + CS_HEADER_BYTES + pre_bytes;
     cs_gather_u8(planes[0].data, planes[0].step, ri_x.data(), ri_y.data(), mY_written, body);
@@ -2208,6 +2275,7 @@ void encrypt_image::encrypt_hf_focus(const float& pixel_p,
     for (int i = 0; i < 4; ++i)
         buffer[CS_OFF_PAD + CS_OFF_HF_THUMBLEN + i] = static_cast<uint8_t>((thumb_len >> (i * 8)) & 0xff);
     std::memcpy(buffer + CS_HEADER_BYTES, lod.data(), lod.size());
+    cs_blob_seal_xor(buffer + CS_HEADER_BYTES, lod.size(), cs_key, buffer + CS_OFF_IV, CS_LOD_TAG);
     uint8_t* thumbnail_data = buffer + CS_HEADER_BYTES + static_cast<size_t>(lod_pixels) * 3;
     std::memcpy(thumbnail_data, thumbnail_png.data(), thumb_len);
     if (thumb_padded > thumb_len) std::memset(thumbnail_data + thumb_len, 0, thumb_padded - thumb_len);
@@ -2435,9 +2503,11 @@ void encrypt_image::encrypt_adaptive(const float& pixel_p, const std::string& pa
     buf[CS_OFF_PAD + CS_OFF_LOD_FULL] = (uint8_t)lod_full;
     buf[CS_OFF_PAD + CS_OFF_ADAPTIVE_CUTOFF] = (uint8_t)lod_cutoff;
 
-    // lod region immediately after the header (raw bytes, zero-padded to a
-    // whole pixel so measurements stay pixel-aligned at CS_HEADER_PIXELS+lod_pixels)
+    // lod region immediately after the header, sealed (CS_LOD_TAG); zero-padded
+    // to a whole pixel so measurements stay pixel-aligned at
+    // CS_HEADER_PIXELS+lod_pixels
     std::memcpy(buf + CS_HEADER_BYTES, lod.data(), (size_t)lod_bytes);
+    cs_blob_seal_xor(buf + CS_HEADER_BYTES, (size_t)lod_bytes, cs_key, buf + CS_OFF_IV, CS_LOD_TAG);
 
     // write measurements at regenerated indices
     const int meas0 = CS_HEADER_PIXELS + lod_pixels;

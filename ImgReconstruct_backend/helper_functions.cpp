@@ -328,7 +328,6 @@ static float cs_tv_grad_phi(const float* pix, float* tvgrad, int rows, int cols)
 }
 
 float cs_auto_reg_coefficient(int sampling_mode, float ratio, int num_tiles) {
-    if (cs_is_ycc(sampling_mode)) return -1.0f;
     float r = ratio < 0.05f ? 0.05f : (ratio > 1.0f ? 1.0f : ratio);
     const int nt = num_tiles > 0 ? num_tiles : 1;
     float base;
@@ -338,12 +337,20 @@ float cs_auto_reg_coefficient(int sampling_mode, float ratio, int num_tiles) {
     // only when starved (ratio < 0.5), where it recovers ~1 dB at tiles=1.
     float tf = 1.0f;
     const bool segm = (sampling_mode == CS_MODE_SEGMASK);
+    const bool yccm = cs_is_ycc(sampling_mode);
     if (segm || r < 0.5f) {
         tf = std::pow((float)nt / 64.0f, 0.15f);
         if (tf < 0.5f) tf = 0.5f;
         if (tf > 1.2f) tf = 1.2f;
     }
-    if (segm) {
+    if (yccm) {
+        // Split luma/chroma path. Luma density falls with r and the legacy
+        // flat fallback (0.01, erstwhile because cs_is_ycc returned -1) made
+        // low-ratio YCC collapse its DC (green cast). 0.0225/r tracks the
+        // measured sweep optimum across r=0.25..0.75; the per-tile chroma
+        // solve then halves it (coef_c = 0.5*coef).
+        base = 0.0225f / r;
+    } else if (segm) {
         base = 0.045f * std::pow(r, -0.75f);
     } else if (sampling_mode == CS_MODE_RANDOM) {
         base = 0.01875f / r;
@@ -2035,6 +2042,140 @@ bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     return cs_onnx_denoise_tiled(src_bgr, dst_bgr, model_path, tag, tile, ov,
         kind != CS_ONNX_DNCNN);
 }
+
+// ONNX photo-SR runner (Real-ESRGAN/SwinIR contract): same session cache as
+// the denoisers, but the single output is scale-fold larger in both axes, so
+// a run returns the clean HR plane (assumed [0,1]; written back [0,255]).
+static bool cs_onnx_sr_run_tile(CsDncnnEntry* e, const float* rgb01,
+    int h, int w, std::vector<float>& out, int& out_h, int& out_w)
+{
+    int64_t shape[4] = { 1, 3, h, w };
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value in = Ort::Value::CreateTensor<float>(mem,
+        const_cast<float*>(rgb01), (size_t)3 * h * w, shape, 4);
+    const char* inn[1] = { e->in_name.c_str() };
+    const char* outn[1] = { e->out_name.c_str() };
+    std::vector<Ort::Value> res;
+    try {
+        res = e->session->Run(Ort::RunOptions{ nullptr }, inn, &in, 1, outn, 1);
+    }
+    catch (const Ort::Exception& ex) {
+        std::fprintf(stderr, "Warning: onnx-sr run failed: %s\n", ex.what());
+        return false;
+    }
+    if (res.size() != 1 || !res[0].IsTensor()) return false;
+    const std::vector<int64_t> dims = res[0].GetTensorTypeAndShapeInfo().GetShape();
+    if (dims.size() != 4 || dims[0] != 1 || dims[1] != 3) return false;
+    if (dims[2] <= 0 || dims[3] <= 0) return false;
+    out_h = (int)dims[2];
+    out_w = (int)dims[3];
+    const float* src = res[0].GetTensorData<float>();
+    out.assign(src, src + (size_t)3 * out_h * out_w);
+    return true;
+}
+
+// Tiled ONNX SR: RGB planar [0,1] tiles in, scale-fold clean RGB out, feathered
+// overlap compositing on the HR canvas (mirrors cs_onnx_denoise_tiled). The
+// scale is detected from the first run and must stay an integer multiple.
+static bool cs_onnx_sr_tiled(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path, int& scale_out)
+{
+    dst_bgr.release();
+    scale_out = 0;
+    if (src_bgr.empty() || src_bgr.type() != CV_8UC3) return false;
+    const int H = src_bgr.rows, W = src_bgr.cols;
+    const int T = 256, OV = 16;
+    if (src_bgr.total() == 0 || H < 4 || W < 4) return false;
+    CsDncnnEntry* e = cs_dncnn_entry(model_path, "SR");
+    if (!e) return false;
+    cv::Mat rgb;
+    cv::cvtColor(src_bgr, rgb, cv::COLOR_BGR2RGB);
+    std::vector<cv::Mat> chs;
+    cv::split(rgb, chs);
+    std::vector<int> ys, xs;
+    for (int y = 0; y < H; y += T - OV) ys.push_back(y);
+    for (int x = 0; x < W; x += T - OV) xs.push_back(x);
+    if (ys.back() > H - T && H > T) ys.back() = H - T;
+    if (xs.back() > W - T && W > T) xs.back() = W - T;
+    int scale = 0, OH = 0, OW = 0;
+    cv::Mat acc, weight;
+    std::vector<float> in, out;
+    for (size_t t = 0; t < ys.size() * xs.size(); ++t) {
+        const int y0 = ys[t / xs.size()], x0 = xs[t % xs.size()];
+        const int th = (std::min)(T, H - y0), tw = (std::min)(T, W - x0);
+        in.assign((size_t)3 * th * tw, 0.0f);
+        for (int c = 0; c < 3; ++c) {
+            float* d = &in[(size_t)c * th * tw];
+            const int cr = c;
+            for (int r = 0; r < th; ++r) {
+                const uint8_t* srow = chs[(size_t)cr].ptr<uint8_t>(y0 + r) + x0;
+                for (int k = 0; k < tw; ++k)
+                    d[(size_t)r * tw + k] = srow[k] * (1.0f / 255.0f);
+            }
+        }
+        int oh = 0, ow = 0;
+        if (!cs_onnx_sr_run_tile(e, in.data(), th, tw, out, oh, ow)) return false;
+        if (oh % th != 0 || ow % tw != 0 || oh / th != ow / tw) return false;
+        const int s = oh / th;
+        if (s < 1 || s > 8) return false;
+        if (scale == 0) {
+            scale = s; OH = H * scale; OW = W * scale;
+            acc = cv::Mat::zeros(OH, OW, CV_32FC3);
+            weight = cv::Mat::zeros(OH, OW, CV_32F);
+        }
+        else if (s != scale) return false;
+        for (int r = 0; r < oh; ++r) {
+            const int gy = y0 * scale + r;
+            if (gy < 0 || gy >= OH) continue;
+            cv::Vec3f* arow = acc.ptr<cv::Vec3f>(gy);
+            float* wrow = weight.ptr<float>(gy);
+            const float lr_y = (float)r / (float)scale;
+            const int dt = (y0 == 0) ? OV : (int)lr_y;
+            const int db = (y0 + th == H) ? OV : (int)((float)(th - 1) - lr_y);
+            const float wy = (std::min)(1.0f, (std::min)(dt, db) / (float)OV);
+            for (int k = 0; k < ow; ++k) {
+                const int gx = x0 * scale + k;
+                if (gx < 0 || gx >= OW) continue;
+                const float lr_x = (float)k / (float)scale;
+                const int dl = (x0 == 0) ? OV : (int)lr_x;
+                const int dr = (x0 + tw == W) ? OV : (int)((float)(tw - 1) - lr_x);
+                const float wx = (std::min)(1.0f, (std::min)(dl, dr) / (float)OV);
+                const float wt = wx * wy;
+                const size_t o = (size_t)r * ow + k;
+                arow[gx] += cv::Vec3f(out[o], out[(size_t)oh * ow + o],
+                    out[(size_t)2 * oh * ow + o]) * wt;
+                wrow[gx] += wt;
+            }
+        }
+    }
+    if (scale == 0) return false;
+    cv::Mat clean_rgb(OH, OW, CV_32FC3);
+    for (int i = 0; i < OH; ++i) {
+        const cv::Vec3f* arow = acc.ptr<cv::Vec3f>(i);
+        const float* wrow = weight.ptr<float>(i);
+        cv::Vec3f* crow = clean_rgb.ptr<cv::Vec3f>(i);
+        for (int j = 0; j < OW; ++j) {
+            const float w = wrow[j] > 0.0f ? wrow[j] : 1.0f;
+            crow[j] = arow[j] / w;
+        }
+    }
+    cv::Mat clean_bgr;
+    cv::cvtColor(clean_rgb, clean_bgr, cv::COLOR_RGB2BGR);
+    clean_bgr.convertTo(dst_bgr, CV_8U, 255.0);
+    scale_out = scale;
+    return true;
+}
+
+bool cs_onnx_sr_available(const std::string& model_path) {
+    if (model_path.empty()) return false;
+    return cs_dncnn_entry(model_path, "SR") != nullptr;
+}
+
+bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path, int& scale_out)
+{
+    return cs_onnx_sr_tiled(src_bgr, dst_bgr, model_path, scale_out);
+}
 #else
 bool cs_dncnn_available(const std::string& model_path) {
     (void)model_path;
@@ -2060,6 +2201,19 @@ bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     dst_bgr.release();
     (void)model_path;
     (void)kind;
+    return false;
+}
+bool cs_onnx_sr_available(const std::string& model_path) {
+    (void)model_path;
+    return false;
+}
+bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
+    const std::string& model_path, int& scale_out)
+{
+    (void)src_bgr;
+    dst_bgr.release();
+    (void)model_path;
+    scale_out = 0;
     return false;
 }
 #endif
@@ -2144,12 +2298,60 @@ static void cs_sr_core_single(float* x, const float* b, const float* anchor,
     std::memcpy(x, z.data(), sizeof(float) * (size_t)n_hr);
 }
 
+// PnP proximal step for one HR luma plane in PIXEL domain (CV_32F [0,1], in
+// place): replace the plane with the denoiser image D(v) — the proximal
+// operator of the implicit prior. red_kind >= 0 uses the BGR ONNX color model
+// (needs the HR chroma planes for its input); red_kind < 0 uses
+// fastNlMeansDenoising on luma with strength nlm_h (sigma-matched). Returns
+// false when an ONNX run fails (plane left untouched).
+static bool cs_sr_prox_luma_plane(cv::Mat& plane, const cv::Mat& chroma_cr,
+    const cv::Mat& chroma_cb, int red_kind, const std::string& red_path, float nlm_h)
+{
+    if (plane.empty() || plane.type() != CV_32F) return false;
+    if (red_kind >= 0) {
+        cv::Mat y8;
+        {
+            cv::Mat tmp = plane * 255.0f;
+            tmp.convertTo(y8, CV_8U);
+        }
+        std::vector<cv::Mat> bgr_ycc{ y8, chroma_cr, chroma_cb };
+        cv::Mat merged_ycc, bgr_hr, dn_hr;
+        cv::merge(bgr_ycc, merged_ycc);
+        cv::cvtColor(merged_ycc, bgr_hr, cv::COLOR_YCrCb2BGR);
+        if (!cs_onnx_denoise_bgr(bgr_hr, dn_hr, red_path, red_kind)) return false;
+        cv::Mat dn_ycc;
+        cv::cvtColor(dn_hr, dn_ycc, cv::COLOR_BGR2YCrCb);
+        std::vector<cv::Mat> dn_chs;
+        cv::split(dn_ycc, dn_chs);
+        dn_chs[0].convertTo(plane, CV_32F, 1.0 / 255.0);
+        return true;
+    }
+    cv::Mat u8, dn;
+    plane.convertTo(u8, CV_8U, 255.0);
+    cv::fastNlMeansDenoising(u8, dn, nlm_h, 7, 15);
+    dn.convertTo(plane, CV_32F, 1.0 / 255.0);
+    return true;
+}
+
+// Sigma-matched fastNlMeans strength (h) for the PnP prox modes: map the
+// tile's own Immerkaer luma noise estimate to the denoiser's noise parameter
+// (clamped to the useful range; a zero estimate falls back to a mild 3).
+static float cs_sr_prox_nlm_h(const cv::Mat& lr_tile)
+{
+    double s = cs_estimate_noise_sigma(lr_tile);
+    if (!(s > 0.0)) s = 3.0;
+    float h = (float)(1.6 * s);
+    if (h < 3.0f) h = 3.0f;
+    if (h > 30.0f) h = 30.0f;
+    return h;
+}
+
 void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
     cv::Mat& hr_out, float red, const std::string& red_denoiser, const std::string& dncnn_model,
     bool sr_cascade, const std::string& red_model, float red_decay,
-    const CsHrSrCtx& hr_sr)
+    const CsHrSrCtx& hr_sr, const CsSrPrior& sr_prior)
 {
     hr_out.release();
     if (lr_tile.empty() || lr_tile.type() != CV_8UC3) return;
@@ -2191,13 +2393,24 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     for (int k = 0; k < m; ++k) {
         b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
     }
-    // AVIR image: always needed for the final Cr/Cb planes (luminance-only
-    // solve: SR lives in Y, chroma is smooth enough to interpolate, so only
-    // one HR FISTA solve runs instead of three). It also supplies the
-    // default Y warm start; --sr-init cascade replaces the warm start below
-    // with the multiscale binned-FISTA chain (same anchor weight).
+    // Prior image. Default is the AVIR resampler (always needed for the final
+    // Cr/Cb planes — luminance-only solve: SR lives in Y, chroma is smooth
+    // enough to interpolate). --sr-prior-model instead asks a learned ONNX 2x
+    // photo-SR net to propose the HR image (luma anchor + chroma), which the
+    // LR measurements below then enforce; a missing model or a non-2x result
+    // falls back to AVIR per tile. --sr-init cascade replaces the warm start
+    // below with the multiscale binned-FISTA chain (same anchor weight).
     cv::Mat init_hr;
-    cs_upscale_2x_avir(lr_tile, init_hr);
+    if (!sr_prior.model.empty()) {
+        int sc = 0;
+        if (cs_onnx_sr_upscale_bgr(lr_tile, init_hr, sr_prior.model, sc) &&
+            sc == 2 && init_hr.rows == Hr && init_hr.cols == Wc) {
+            // strong SR proposal accepted
+        } else {
+            init_hr.release();
+        }
+    }
+    if (init_hr.empty()) cs_upscale_2x_avir(lr_tile, init_hr);
     if (init_hr.empty() || init_hr.rows != Hr || init_hr.cols != Wc) {
         cs_upscale_2x_avir(lr_tile, hr_out);
         return;
@@ -2272,6 +2485,84 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     // decayed strength multiplies it at each application.
     const cv::Mat hr_red_map = (red > 0.0f) ?
         cs_hr_red_map(Hr, Wc, tile_hr_idx, hr_sr.red_radius) : cv::Mat();
+    // Strong-prior + PnP controls (see CsSrPrior). pnp_mode 0 = legacy RED
+    // blend (bit-identical); 1 = denoiser-as-prox (per-pass replacement);
+    // 2 = PnP-ADMM (dual splitting).
+    const int pnp_mode = (sr_prior.pnp_mode >= 1 && sr_prior.pnp_mode <= 2)
+        ? sr_prior.pnp_mode : 0;
+    // Sigma-matched NLM strength for the prox modes; only computed when a prox
+    // actually runs (the legacy path stays bit-identical and cost-free).
+    const float nlm_prox_h = (pnp_mode >= 1) ? cs_sr_prox_nlm_h(lr_tile) : 5.0f;
+    if (pnp_mode == 2) {
+        // PnP-ADMM: x-update solves the data term plus rho/2||x-(z-u)||^2 in
+        // the anchor slot, then z = D(x+u) is the denoiser prox of the
+        // implicit prior and u += x - z (scaled dual). The measurement model
+        // enforces each pass; the strong prior proposes through the prox.
+        int admm = sr_prior.pnp_iters;
+        if (admm < 1) admm = 1;
+        if (admm > 50) admm = 50;
+        const float rho = sr_prior.pnp_rho > 0.0f ? sr_prior.pnp_rho : 0.1f;
+        std::vector<float> zpx((size_t)n_hr, 0.0f), upx((size_t)n_hr, 0.0f),
+            anch((size_t)n_hr, 0.0f);
+        {
+            cv::Mat zm;
+            init_ycc_chs[0].convertTo(zm, CV_32F, 1.0f / 255.0f);
+            std::memcpy(zpx.data(), zm.ptr<float>(0), sizeof(float) * (size_t)n_hr);
+        }
+        std::fill(w.begin(), w.end(), 1.0f);
+        for (int k = 0; k < admm; ++k) {
+            for (int i = 0; i < n_hr; ++i)
+                anch[(size_t)i] = zpx[(size_t)i] - upx[(size_t)i];
+            {
+                cv::Mat am(Hr, Wc, CV_32F, anch.data());
+                cs_dct_forward(am, cs_default_dct_block());
+            }
+            {
+                cv::Mat sm_(Hr, Wc, CV_32F);
+                std::memcpy(sm_.ptr<float>(0), zpx.data(), sizeof(float) * (size_t)n_hr);
+                cs_dct_forward(sm_, cs_default_dct_block());
+                std::memcpy(x, sm_.ptr<float>(0), sizeof(float) * (size_t)n_hr);
+            }
+            cs_sr_core_single(x, b.data(), anch.data(), rho,
+                ri_x.data(), ri_y.data(), m, Hr, Wc, Lr, Lc,
+                w.data(), correction_coef, tv, inner, bx,
+                y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr,
+                tile_hr_idx.data(), tile_hr_val.data(), (int)tile_hr_idx.size(),
+                hr_sr.weight);
+            cv::Mat px(Hr, Wc, CV_32F, x);
+            cs_dct_inverse(px, cs_default_dct_block());
+            cv::Mat v(Hr, Wc, CV_32F);
+            {
+                const float* p = px.ptr<float>(0);
+                float* vv = v.ptr<float>(0);
+                for (int i = 0; i < n_hr; ++i) vv[i] = p[i] + upx[(size_t)i];
+            }
+            cv::Mat zp = v.clone();
+            bool zok = true;
+            if (red_kind >= 0)
+                zok = cs_sr_prox_luma_plane(zp, init_ycc_chs[1], init_ycc_chs[2],
+                    red_kind, red_path, nlm_prox_h);
+            else
+                cs_sr_prox_luma_plane(zp, cv::Mat(), cv::Mat(), -1, std::string(),
+                    nlm_prox_h);
+            if (!zok) zp = v;
+            {
+                const float* pp = px.ptr<float>(0);
+                const float* zz = zp.ptr<float>(0);
+                for (int i = 0; i < n_hr; ++i) {
+                    zpx[(size_t)i] = zz[i];
+                    upx[(size_t)i] += pp[i] - zz[i];
+                }
+            }
+        }
+        {
+            cv::Mat zm(Hr, Wc, CV_32F);
+            std::memcpy(zm.ptr<float>(0), zpx.data(), sizeof(float) * (size_t)n_hr);
+            cs_dct_forward(zm, cs_default_dct_block());
+            std::memcpy(x, zm.ptr<float>(0), sizeof(float) * (size_t)n_hr);
+        }
+    }
+    else {
     for (int r = 0; r < reweights; ++r) {
         cs_sr_core_single(x, b.data(), anchor.data(), anchor_weight,
             ri_x.data(), ri_y.data(), m, Hr, Wc, Lr, Lc,
@@ -2288,7 +2579,24 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
         // un-denoised pass (graceful).
         const float red_r = (red_decay >= 1.0f || r == 0)
             ? red : red * std::pow(red_decay, (float)r);
-        if (red_r > 0.0f && red_kind >= 0) {
+        if (pnp_mode == 1) {
+            // PnP prox (see CsSrPrior): replace the pass estimate with the
+            // denoiser image — the proximal operator of the implicit prior,
+            // sigma-matched for NLM — with no blend. The strong prior
+            // proposes; the LR samples (enforced by the core above) hold the
+            // data term.
+            cv::Mat px(Hr, Wc, CV_32F, x);
+            cs_dct_inverse(px, cs_default_dct_block());
+            if (red_kind >= 0) {
+                cs_sr_prox_luma_plane(px, init_ycc_chs[1], init_ycc_chs[2],
+                    red_kind, red_path, nlm_prox_h);
+            } else {
+                cs_sr_prox_luma_plane(px, cv::Mat(), cv::Mat(), -1, std::string(),
+                    nlm_prox_h);
+            }
+            cs_dct_forward(px, cs_default_dct_block());
+        }
+        else if (red_r > 0.0f && red_kind >= 0) {
             cv::Mat px(Hr, Wc, CV_32F, x);
             cs_dct_inverse(px, cs_default_dct_block());
             cv::Mat y8;
@@ -2335,6 +2643,7 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
             for (int i = 0; i < n_hr; ++i)
                 w[(size_t)i] = eps / (std::fabs(x[i] - anchor[i]) + eps);
         }
+    }
     }
     cv::Mat plane(Hr, Wc, CV_32F, x);
     cs_dct_inverse(plane, cs_default_dct_block());
