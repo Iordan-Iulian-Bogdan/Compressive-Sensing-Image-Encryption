@@ -273,6 +273,9 @@ int cs_solver_from_name(const std::string& name, int& out) {
     }
     if (s == "fista" || s == "1") { out = CS_SOLVER_FISTA; return 0; }
     if (s == "joint" || s == "fista-joint" || s == "fistajoint" || s == "somp" || s == "2") { out = CS_SOLVER_FISTA_JOINT; return 0; }
+    if (s == "gaptv" || s == "gap-tv" || s == "3") { out = CS_SOLVER_GAPTV; return 0; }
+    if (s == "admmtv" || s == "admm-l1tv" || s == "4") { out = CS_SOLVER_ADMM_L1TV; return 0; }
+    if (s == "pnp" || s == "pnp-nlm" || s == "5") { out = CS_SOLVER_PNP_NLM; return 0; }
     return -1;
 }
 

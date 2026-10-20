@@ -119,7 +119,10 @@ R/G/B plus reweighting.
 */
 enum CsSolver {
     CS_SOLVER_FISTA = 1,
-    CS_SOLVER_FISTA_JOINT = 2
+    CS_SOLVER_FISTA_JOINT = 2,
+    CS_SOLVER_GAPTV = 3,
+    CS_SOLVER_ADMM_L1TV = 4,
+    CS_SOLVER_PNP_NLM = 5
 };
 
 int cs_solver_from_name(const std::string& name, int& out);

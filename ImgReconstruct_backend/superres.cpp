@@ -5,6 +5,9 @@
 #include "fista_kernels.hpp"
 #include "cs_gpu.h"
 #include "crypto_utils.hpp"
+#ifdef CS_GPU_TILES
+#include "gpu_admm_broker.hpp"
+#endif
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -585,7 +588,18 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
             std::memcpy(zpx.data(), zm.ptr<float>(0), sizeof(float) * (size_t)n_hr);
         }
         std::fill(w.begin(), w.end(), 1.0f);
-        for (int k = 0; k < admm; ++k) {
+        // GPU batch path (env CS_GPU_ADMM=1): same loop on the device for the
+        // NLM-prox, anchor-free, TV-free case; anything else runs below.
+        bool gpu_done = false;
+#ifdef CS_GPU_TILES
+        if (red_kind < 0 && tv <= 0.0f && tile_hr_idx.empty() && cs_default_dct_block() <= 0 &&
+            cs_gpu_admm_enabled()) {
+            const gpu_admm::Problem gp{ Hr, Wc, b.data(), ri_x.data(), ri_y.data(), m,
+                zpx.data(), correction_coef, nlm_prox_h };
+            gpu_done = cs_gpu_admm_run(gp, gpu_admm::Params{ admm, inner, rho, bx.lip, wscale });
+        }
+#endif
+        for (int k = 0; !gpu_done && k < admm; ++k) {
             for (int i = 0; i < n_hr; ++i)
                 anch[(size_t)i] = zpx[(size_t)i] - upx[(size_t)i];
             {

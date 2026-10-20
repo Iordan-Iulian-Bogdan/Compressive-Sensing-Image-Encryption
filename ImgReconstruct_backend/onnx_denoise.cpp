@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -22,6 +24,9 @@
 
 #ifdef _WIN32
 #include <onnxruntime_cxx_api.h>
+#ifdef CS_ONNX_DML
+#include <dml_provider_factory.h>   // DirectML ORT build (see build_gpu.bat)
+#endif
 #endif
 
 // Set before the first ONNX session is created. A multi-tile decrypt calls
@@ -42,6 +47,8 @@ struct CsDncnnEntry {
     Ort::Env env{ ORT_LOGGING_LEVEL_WARNING, "cs-dncnn" };
     std::unique_ptr<Ort::Session> session;
     std::string in_name, out_name;
+    bool dml = false;      // DirectML sessions do not allow concurrent Run()
+    std::mutex run_mu;
 };
 static std::mutex g_dncnn_mutex;
 static std::map<std::string, std::unique_ptr<CsDncnnEntry>> g_dncnn_cache;
@@ -86,6 +93,21 @@ static CsDncnnEntry* cs_dncnn_entry(const std::string& path, const char* tag) {
         Ort::SessionOptions opt;
         opt.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         if (g_tile_parallel) opt.SetIntraOpNumThreads(1);
+#ifdef CS_ONNX_DML
+        // CS_GPU_ONNX=1: run the model on the GPU through DirectML (adapter 0).
+        // DML requires sequential execution and no memory-pattern planning.
+        if (const char* gpu = std::getenv("CS_GPU_ONNX"); gpu && gpu[0] == '1') {
+            try {
+                opt.DisableMemPattern();
+                opt.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+                Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(opt, 0));
+                e->dml = true;
+            }
+            catch (const Ort::Exception& ex) {
+                std::fprintf(stderr, "Warning: DirectML unavailable (%s); %s runs on CPU\n", ex.what(), tag);
+            }
+        }
+#endif
         const std::wstring wpath(path.begin(), path.end());
         e->session = std::make_unique<Ort::Session>(e->env, wpath.c_str(), opt);
         Ort::AllocatorWithDefaultOptions alloc;
@@ -96,6 +118,7 @@ static CsDncnnEntry* cs_dncnn_entry(const std::string& path, const char* tag) {
             ti.GetDimensionsCount() != 4) {
             throw Ort::Exception("dncnn: expected float NCHW input", ORT_INVALID_ARGUMENT);
         }
+        if (e->dml) std::fprintf(stderr, "[onnx] %s: DirectML execution provider enabled\n", tag);
         auto r = g_dncnn_cache.emplace(path, std::move(e));
         return r.first->second.get();
     }
@@ -118,6 +141,8 @@ static bool cs_dncnn_run_tile(CsDncnnEntry* e, const float* rgb01, float* clean,
     const char* outn[1] = { e->out_name.c_str() };
     std::vector<Ort::Value> out;
     try {
+        std::unique_lock<std::mutex> run_lk(e->run_mu, std::defer_lock);
+        if (e->dml) run_lk.lock();
         out = e->session->Run(Ort::RunOptions{ nullptr }, inn, &in, 1, outn, 1);
     }
     catch (const Ort::Exception& ex) {
@@ -271,9 +296,97 @@ bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
 // ONNX photo-SR runner (Real-ESRGAN/SwinIR contract): same session cache as
 // the denoisers, but the single output is scale-fold larger in both axes, so
 // a run returns the clean HR plane (assumed [0,1]; written back [0,255]).
+#ifdef CS_ONNX_DML
+// DirectML runs are latency-bound and serialized per session, so concurrent
+// tile workers hand their input to a batcher: same-size tiles are stacked into
+// one N x 3 x h x w run (the Swin2SR export has a dynamic batch axis).
+namespace {
+struct SrJob {
+    const float* in; int h, w;
+    std::vector<float>* out; int* oh; int* ow;
+    bool done = false, ok = false;
+};
+std::mutex g_srb_mu;
+std::condition_variable g_srb_cv;
+std::vector<SrJob*> g_srb_queue;
+bool g_srb_busy = false;
+const int kSrBatchMax = 32;
+const int kSrBatchTarget = [] { const char* v = std::getenv("CS_GPU_ONNX_BATCH"); return v ? std::atoi(v) : 16; }();
+const int kSrBatchWaitMs = 30;
+
+void cs_sr_run_group(CsDncnnEntry* e, std::vector<SrJob*>& g) {
+    const int n = (int)g.size(), h = g[0]->h, w = g[0]->w;
+    const size_t per = (size_t)3 * h * w;
+    std::vector<float> in((size_t)n * per);
+    for (int i = 0; i < n; ++i) std::memcpy(&in[(size_t)i * per], g[(size_t)i]->in, sizeof(float) * per);
+    int64_t shape[4] = { n, 3, h, w };
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value tin = Ort::Value::CreateTensor<float>(mem, in.data(), in.size(), shape, 4);
+    const char* inn[1] = { e->in_name.c_str() };
+    const char* outn[1] = { e->out_name.c_str() };
+    try {
+        std::lock_guard<std::mutex> lk(e->run_mu);
+        std::vector<Ort::Value> res = e->session->Run(Ort::RunOptions{ nullptr }, inn, &tin, 1, outn, 1);
+        if (res.size() != 1 || !res[0].IsTensor()) return;
+        const std::vector<int64_t> d = res[0].GetTensorTypeAndShapeInfo().GetShape();
+        if (d.size() != 4 || d[0] != n || d[1] != 3 || d[2] <= 0 || d[3] <= 0) return;
+        const size_t oper = (size_t)3 * d[2] * d[3];
+        const float* src = res[0].GetTensorData<float>();
+        for (int i = 0; i < n; ++i) {
+            g[(size_t)i]->out->assign(src + (size_t)i * oper, src + (size_t)(i + 1) * oper);
+            *g[(size_t)i]->oh = (int)d[2];
+            *g[(size_t)i]->ow = (int)d[3];
+            g[(size_t)i]->ok = true;
+        }
+    }
+    catch (const Ort::Exception& ex) {
+        std::fprintf(stderr, "Warning: onnx-sr batched run failed: %s\n", ex.what());
+    }
+}
+
+bool cs_sr_run_batched(CsDncnnEntry* e, const float* rgb01, int h, int w,
+    std::vector<float>& out, int& out_h, int& out_w)
+{
+    SrJob job{ rgb01, h, w, &out, &out_h, &out_w };
+    const auto enq = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(g_srb_mu);
+    g_srb_queue.push_back(&job);
+    g_srb_cv.notify_all();
+    while (!job.done) {
+        const bool waited = std::chrono::steady_clock::now() - enq > std::chrono::milliseconds(kSrBatchWaitMs);
+        if (!g_srb_busy && !g_srb_queue.empty() && ((int)g_srb_queue.size() >= kSrBatchTarget || waited)) {
+            std::vector<SrJob*> batch;
+            batch.swap(g_srb_queue);
+            g_srb_busy = true;
+            lk.unlock();
+            std::map<std::pair<int, int>, std::vector<SrJob*>> by_size;
+            for (SrJob* j : batch) by_size[{ j->h, j->w }].push_back(j);
+            for (auto& kv : by_size)
+                for (size_t s = 0; s < kv.second.size(); s += kSrBatchMax) {
+                    std::vector<SrJob*> chunk(kv.second.begin() + s,
+                        kv.second.begin() + (std::min)(kv.second.size(), s + (size_t)kSrBatchMax));
+                    cs_sr_run_group(e, chunk);
+                }
+            lk.lock();
+            g_srb_busy = false;
+            for (SrJob* j : batch) j->done = true;
+            g_srb_cv.notify_all();
+        }
+        else {
+            g_srb_cv.wait_for(lk, std::chrono::milliseconds(2));
+        }
+    }
+    return job.ok;
+}
+}  // namespace
+#endif
+
 static bool cs_onnx_sr_run_tile(CsDncnnEntry* e, const float* rgb01,
     int h, int w, std::vector<float>& out, int& out_h, int& out_w)
 {
+#ifdef CS_ONNX_DML
+    if (e->dml) return cs_sr_run_batched(e, rgb01, h, w, out, out_h, out_w);
+#endif
     int64_t shape[4] = { 1, 3, h, w };
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     Ort::Value in = Ort::Value::CreateTensor<float>(mem,
@@ -282,6 +395,8 @@ static bool cs_onnx_sr_run_tile(CsDncnnEntry* e, const float* rgb01,
     const char* outn[1] = { e->out_name.c_str() };
     std::vector<Ort::Value> res;
     try {
+        std::unique_lock<std::mutex> run_lk(e->run_mu, std::defer_lock);
+        if (e->dml) run_lk.lock();
         res = e->session->Run(Ort::RunOptions{ nullptr }, inn, &in, 1, outn, 1);
     }
     catch (const Ort::Exception& ex) {

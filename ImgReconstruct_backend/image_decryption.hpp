@@ -179,6 +179,12 @@ public:
 
     cv::Size get_org_size();
 
+    // Tile geometry and the raw container (header + BGR samples), for the
+    // batched GPU path (gpu_decrypt.hpp).
+    int get_rows() const { return rows; }
+    int get_cols() const { return cols; }
+    const cv::Mat& get_measurements() const { return encrypted_img; }
+
     int get_sampling_mode() const { return sampling_mode; }
     const std::vector<uint8_t>& get_seg_rates_q() const { return seg_rates_q; }
     const cv::Mat& get_seg_ids() const { return seg_ids; }

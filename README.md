@@ -567,6 +567,37 @@ budget reaches 36.76 dB in 0.016 s, beating zeros + 4× budget (36.05 dB
 in 0.055 s) — the blocker was init quality, not iteration count
 (HF-focus thumbnails already ship this idea at image scale).
 
+`--sr-prior-model <f>` (decrypt/roundtrip, cs-sr backend only) folds a strong
+learned SR prior into the CS-SR solve: a 2x ONNX photo-SR net (Real-ESRGAN /
+SwinIR contract — RGB planar [0,1] NCHW in, 2x clean output) replaces the AVIR
+anchor, so the net proposes the HR image and the LR measurements enforce it.
+`--sr-pnp off|prox|admm` (default `off`) selects the denoiser step: `prox` is a
+true proximal operator (NLM sigma-matched), `admm` is an outer PnP-ADMM pass
+(`--sr-pnp-rho` in (0,8], default 0.1; `--sr-pnp-iters` in [1,50], default 8).
+Absent a model the path is inactive and legacy CS-SR is bit-identical. A
+missing/unreadable model fails fast (exit -3) rather than silently dropping the
+prior. Recommended prior: `Xenova/swin2SR-lightweight-x2-64` (Apache-2.0, 2x,
+~8 MB) — fetch with
+`hf download Xenova/swin2SR-lightweight-x2-64 onnx/model.onnx --local-dir models\swin2sr`.
+
+Reference commands (bird photo IMG_3690, seg-auto 8 + YCC 4:2:0, ratio 0.9;
+`<pw>` is the passphrase; outputs land in the working directory):
+
+```
+ImgReconstruct_backend.exe encrypt ImgReconstruct_backend\IMG_3690.png IMG_3690segycc420r90.enc.png --password <pw> --ratio 0.9 --seg-auto 8 --ycc420 --no-preview
+ImgReconstruct_backend.exe decrypt IMG_3690segycc420r90.enc.png IMG_3690segycc420r90.legacy.dec.png --password <pw> --photo-upscaler cs-sr --manual --tiles 64 --overlap 24 --iterations 10 --per-tile-coef --y-confidence 0.3 --no-preview
+ImgReconstruct_backend.exe decrypt IMG_3690segycc420r90.enc.png IMG_3690segycc420r90.srprior.dec.png --password <pw> --photo-upscaler cs-sr --sr-prior-model models\swin2sr\onnx\model.onnx --manual --tiles 64 --overlap 24 --iterations 10 --per-tile-coef --y-confidence 0.3 --no-preview
+ImgReconstruct_backend.exe decrypt IMG_3690segycc420r90.enc.png IMG_3690segycc420r90.srprior_admm.dec.png --password <pw> --photo-upscaler cs-sr --sr-prior-model models\swin2sr\onnx\model.onnx --sr-pnp admm --manual --tiles 64 --overlap 24 --iterations 10 --per-tile-coef --y-confidence 0.3 --no-preview
+python Params-test\metrics.py ImgReconstruct_backend\IMG_3690.png IMG_3690segycc420r90.srprior.dec.png
+python Params-test\metrics_lpips.py ImgReconstruct_backend\IMG_3690.png IMG_3690segycc420r90.srprior.dec.png
+```
+
+Measured on that container (SSIM / ΔE-p95 / ΔE-p99 / LPIPS / time): legacy
+0.9077 / 5.144 / 10.038 / 0.1959 / 14 s; + SR prior 0.9113 / 5.162 / 10.733 /
+0.1574 / 165 s; + SR prior + admm 0.8947 / 4.808 / 9.291 / 0.2817 / 230 s.
+`--sr-prior-model` alone is the promoted config (best SSIM and LPIPS); PnP-ADMM
+improves ΔE-p95/p99 but regresses SSIM/LPIPS — leave `--sr-pnp off`.
+
 `--photo-upscaler dip` selects the untrained-prior variant: per tile, a
 tiny Deep Decoder generator (nearest-upsample + channel mixes + ReLU,
 final sigmoid; underparameterized vs the HR pixels) is fit by Adam from a

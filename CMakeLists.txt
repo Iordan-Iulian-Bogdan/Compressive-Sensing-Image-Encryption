@@ -44,6 +44,9 @@ add_library(cs_core STATIC
     ImgReconstruct_backend/helper_functions.cpp
     ImgReconstruct_backend/onnx_denoise.cpp
     ImgReconstruct_backend/superres.cpp
+    ImgReconstruct_backend/gap_tv.cpp
+    ImgReconstruct_backend/admm_l1tv.cpp
+    ImgReconstruct_backend/pnp_nlm.cpp
     ImgReconstruct_backend/image_decryption.cpp
     ImgReconstruct_backend/image_encryption.cpp
 )

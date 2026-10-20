@@ -5,6 +5,13 @@
 #include "cs_gpu.h"
 #include "cs_dict.hpp"
 #include "cs_wavelet.hpp"
+#include "gap_tv.hpp"
+#include "admm_l1tv.hpp"
+#include "pnp_nlm.hpp"
+#ifdef CS_GPU_TILES
+#include "gpu_decrypt.hpp"
+#include "gpu_admm_broker.hpp"
+#endif
 #include "avir.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -154,6 +161,62 @@ void decrypt_image::decrypt(cv::Mat ref[3], const std::vector<int>& ri_x_g, cons
     // so the merge/convert below applies unchanged.
     int num_iterations_offset = (num_iterations / 2);
 
+    if (solver == CS_SOLVER_GAPTV) {
+        if (groups && groups->ng > 0) {
+            solver = CS_SOLVER_FISTA; // averaged (T-means) tiles: GAP-TV is point-sampling only
+        }
+        else {
+            // TEMP experiment knobs: CS_GAPTV_LAMBDA (TV weight), CS_GAPTV_ITERS.
+            const char* el = std::getenv("CS_GAPTV_LAMBDA");
+            const char* ei = std::getenv("CS_GAPTV_ITERS");
+            const float lam = el ? (float)std::atof(el) : 0.02f;
+            const int its = ei ? std::atoi(ei) : 40;
+            for (int ch = 0; ch < 3; ++ch)
+                cs_gaptv_channel(encrypted_img, ch, rows, cols, ri_x_g, ri_y_g, its, lam, ref[ch]);
+            cv::merge(ref, 3, out);
+            out.convertTo(out, CV_8UC3);
+            return;
+        }
+    }
+    if (solver == CS_SOLVER_ADMM_L1TV) {
+        if (groups && groups->ng > 0) {
+            solver = CS_SOLVER_FISTA; // averaged (T-means) tiles: point-sampling only
+        }
+        else {
+            // TEMP experiment knobs: CS_ADMM_L1, CS_ADMM_TV, CS_ADMM_ITERS.
+            const char* e1 = std::getenv("CS_ADMM_L1");
+            const char* e2 = std::getenv("CS_ADMM_TV");
+            const char* ei = std::getenv("CS_ADMM_ITERS");
+            const float l1 = e1 ? (float)std::atof(e1) : 0.005f;
+            const float ltv = e2 ? (float)std::atof(e2) : 0.01f;
+            const int its = ei ? std::atoi(ei) : 60;
+            for (int ch = 0; ch < 3; ++ch)
+                cs_admm_l1tv_channel(encrypted_img, ch, rows, cols, ri_x_g, ri_y_g, its, l1, ltv, ref[ch]);
+            cv::merge(ref, 3, out);
+            out.convertTo(out, CV_8UC3);
+            return;
+        }
+    }
+    if (solver == CS_SOLVER_PNP_NLM) {
+        if (groups && groups->ng > 0) {
+            solver = CS_SOLVER_FISTA; // averaged (T-means) tiles: point-sampling only
+        }
+        else {
+            // TEMP experiment knobs: CS_PNP_H (NLM strength, gray levels),
+            // CS_PNP_L1 (DCT-L1 weight, 0 = off), CS_PNP_ITERS.
+            const char* eh = std::getenv("CS_PNP_H");
+            const char* e1 = std::getenv("CS_PNP_L1");
+            const char* ei = std::getenv("CS_PNP_ITERS");
+            const float hh = eh ? (float)std::atof(eh) : 4.0f;
+            const float l1 = e1 ? (float)std::atof(e1) : 0.0f;
+            const int its = ei ? std::atoi(ei) : 30;
+            for (int ch = 0; ch < 3; ++ch)
+                cs_pnp_nlm_channel(encrypted_img, ch, rows, cols, ri_x_g, ri_y_g, its, hh, l1, ref[ch]);
+            cv::merge(ref, 3, out);
+            out.convertTo(out, CV_8UC3);
+            return;
+        }
+    }
     if (solver == CS_SOLVER_FISTA) {
         // The three channels are independent solves: each warm-starts from
         // the neighbor field built before decrypt(). Submit all three first,
@@ -867,6 +930,9 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
             num_threads = want;
         }
     }
+#ifdef CS_GPU_TILES
+    num_threads = cs_gpu_admm_threads(num_tiles, num_threads);
+#endif
 
     // per-tile coef (--per-tile-coef): mean sample count over non-empty
     // tiles, fixed before the wavefront (indices are all known upfront)
@@ -885,6 +951,62 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     // we use a reference image as the initial solution for tiles without
     // neighbors (first wave); this helps speed up convergence
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
+
+#ifdef CS_GPU_TILES
+    // GPU pre-pass (env CS_GPU_TILES=1): solve every eligible tile's LR image in
+    // one batch, without neighbour warm starts, before the wavefront. Tiles it
+    // finishes skip the CPU warm start + solve below; the post-solve stages
+    // (grain TV, upscale) still run per tile as usual.
+    std::vector<std::vector<char>> gpu_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
+    if (std::getenv("CS_GPU_TILES")) {
+        int skip_tv = 0, skip_other = 0;
+        std::vector<decrypt_image> keep;
+        keep.reserve((size_t)num_tiles * num_tiles);
+        std::vector<GpuTileJob> jobs;
+        std::vector<std::pair<int, int>> where;
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j) {
+                if (mats_in[i][j].empty()) continue;
+                const CsSegClassParams* STP = seg_tile_params ? &(*seg_tile_params)[i][j] : nullptr;
+                const float t_coef_base = STP ? STP->coef : coef;
+                const float t_tv_base = STP ? STP->tv : tv;
+                const struct indices& t_idx = indices[i][j];
+                const int t_count = cs_tile_meas_count(t_idx);
+                const float tile_tv = per_tile_tv ? cs_per_tile_coef(t_tv_base, t_count, coef_mean_m) : t_tv_base;
+                const int t_solver = STP ? STP->solver : solver;
+                const int t_basis = STP ? STP->basis : basis;
+                if (t_solver != CS_SOLVER_FISTA || t_basis != CS_BASIS_DCT || use_onsager ||
+                    cs_default_dct_block() > 0 || tile_tv != 0.0f || !t_idx.rg_off.empty()) {
+                    if (tile_tv != 0.0f) ++skip_tv; else ++skip_other;
+                    continue;
+                }
+                keep.emplace_back(mats_in[i][j]);
+                const decrypt_image& di = keep.back();
+                GpuTileJob jb{};
+                jb.measurements = &di.get_measurements();
+                jb.rows = di.get_rows(); jb.cols = di.get_cols();
+                jb.rix = &t_idx.ri_x_g; jb.riy = &t_idx.ri_y_g;
+                jb.iterations = STP ? STP->iterations : iterations;
+                jb.fista_iters = STP ? STP->fista_iters : fista_iters;
+                jb.reweights = STP ? STP->reweights : reweights;
+                jb.coef = per_tile_coef ? cs_per_tile_coef(t_coef_base, t_count, coef_mean_m) : t_coef_base;
+                jb.wscale = STP ? STP->wscale : wscale;
+                jb.out = &mats_out[i][j];
+                jobs.push_back(jb);
+                where.push_back({ i, j });
+            }
+        std::vector<char> solved;
+        const auto g0 = std::chrono::steady_clock::now();
+        cs_gpu_solve_tiles(jobs, solved);
+        int n_ok = 0;
+        for (size_t k = 0; k < jobs.size(); ++k)
+            if (solved[k]) { gpu_done[(size_t)where[k].first][(size_t)where[k].second] = 1; ++n_ok; }
+        std::cout << "[gpu-tiles] solved " << n_ok << " of " << (size_t)num_tiles * num_tiles << " tiles on the GPU in "
+                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count()
+                  << " ms (no neighbour warm start); " << jobs.size() << " eligible, skipped for tv "
+                  << skip_tv << ", other " << skip_other << "; grid " << num_tiles << "x" << num_tiles << std::endl;
+    }
+#endif
 
     // wavefront over the tile grid: wave w = i + j. Tiles on the same
     // anti-diagonal share no west or north neighbors, so every tile of a
@@ -917,7 +1039,12 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 const float t_wscale = STP ? STP->wscale : wscale;
                 auto sp_a = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, false, false, t_basis, thumbnail_seed);
+#ifdef CS_GPU_TILES
+                const bool gpu_pre = gpu_done[(size_t)i][(size_t)j] != 0;
+#else
+                const bool gpu_pre = false;
+#endif
+                if (!gpu_pre) build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, false, false, t_basis, thumbnail_seed);
                 auto sp_b = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                 if (sp) g_solveprof.warm_ns += cs_solveprof_ns_since(sp_a);
 
@@ -945,7 +1072,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                     grps.ng = (int)t_idx.rg_off.size() - 1;
                     pgrps = &grps;
                 }
-                dimgs.decrypt(x0, t_idx.ri_x_g, t_idx.ri_y_g, t_iterations, tile_coef, mats_out[i][j], tile_tv, t_solver, t_fista_iters, t_reweights, t_basis, t_wscale, use_onsager, pgrps);
+                if (!gpu_pre) dimgs.decrypt(x0, t_idx.ri_x_g, t_idx.ri_y_g, t_iterations, tile_coef, mats_out[i][j], tile_tv, t_solver, t_fista_iters, t_reweights, t_basis, t_wscale, use_onsager, pgrps);
                 if (sp) { g_solveprof.call_ns += cs_solveprof_ns_since(sp_c); g_solveprof.tiles += 1; }
                 // grain-adaptive per-tile TV (--grain-tv): tiles whose
                 // measured noise exceeds the reference get a luma ROF
@@ -1114,6 +1241,9 @@ static void decrypt_tiles_ycc420(int num_threads,
             num_threads = want;
         }
     }
+#ifdef CS_GPU_TILES
+    num_threads = cs_gpu_admm_threads(num_tiles, num_threads);
+#endif
 
     // per-tile coef (--per-tile-coef): mean luma sample count over non-empty
     // tiles; only the luma draw varies per tile (chroma stays uniform)
@@ -1873,8 +2003,9 @@ int decrypt_image::decrypt_image_tiled(
     const std::string& seg_params
 ) {
     PhaseLog prof;
-    if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT) {
-        std::cerr << "Error: unknown solver id " << solver << " (1=fista, 2=joint)" << std::endl;
+    if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT && solver != CS_SOLVER_GAPTV &&
+        solver != CS_SOLVER_ADMM_L1TV && solver != CS_SOLVER_PNP_NLM) {
+        std::cerr << "Error: unknown solver id " << solver << " (1=fista, 2=joint, 3=gaptv, 4=admmtv, 5=pnp)" << std::endl;
         return -1;
     }
     if (basis != CS_BASIS_DCT && basis != CS_BASIS_CDF97) {

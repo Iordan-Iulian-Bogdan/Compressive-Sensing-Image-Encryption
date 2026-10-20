@@ -128,6 +128,9 @@
     <ClCompile Include="helper_functions.cpp" />
     <ClCompile Include="onnx_denoise.cpp" />
     <ClCompile Include="superres.cpp" />
+    <ClCompile Include="gap_tv.cpp" />
+    <ClCompile Include="admm_l1tv.cpp" />
+    <ClCompile Include="pnp_nlm.cpp" />
     <ClCompile Include="image_decryption.cpp" />
     <ClCompile Include="image_encryption.cpp" />
     <ClCompile Include="image_tiles.cpp" />
