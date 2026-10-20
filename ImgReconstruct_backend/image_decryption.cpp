@@ -1946,7 +1946,14 @@ int decrypt_image::decrypt_image_tiled(
             iterations = 8;
         }
 
-        num_tiles = 1;
+        // Tile grid of ~32-px tiles (about 64x64 on a 2000 px image), the
+        // regime cs_auto_reg_coefficient was fitted for. One whole-image tile
+        // measured up to ~4 dB worse on some images (flat on others) and was
+        // several times slower.
+        {
+            const int edge = (std::max)(org_size.width, org_size.height) / (full_res ? 1 : 2);
+            num_tiles = (std::min)(96, (std::max)(1, (edge + 16) / 32));
+        }
         overlap = 24;
         nun_threads = omp_get_max_threads();
     }
