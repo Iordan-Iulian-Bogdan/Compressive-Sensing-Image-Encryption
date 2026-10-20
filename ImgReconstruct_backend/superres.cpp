@@ -439,8 +439,46 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     // below with the multiscale binned-FISTA chain (same anchor weight).
     cv::Mat init_hr;
     if (!sr_prior.model.empty()) {
+        // Segment gate: crop the container's LR-grid labels to this tile. Any
+        // size or origin mismatch leaves seg_roi empty, so the prior runs
+        // everywhere (the legacy behavior).
+        cv::Mat seg_roi;
+        if (sr_prior.seg_lr && !sr_prior.seg_lr->empty()) {
+            const int lx = hr_sr.ox / 2, ly = hr_sr.oy / 2;
+            const cv::Mat& sl = *sr_prior.seg_lr;
+            if (sl.channels() == 1 && lx >= 0 && ly >= 0 &&
+                lx + lr_tile.cols <= sl.cols && ly + lr_tile.rows <= sl.rows)
+                seg_roi = sl(cv::Rect(lx, ly, lr_tile.cols, lr_tile.rows));
+        }
+        // Single-segment sub-tiles start from cs-sr on their own samples (prior
+        // off) instead of AVIR. Samples are picked by LR position and shifted
+        // to the sub-tile origin; the nested call has no prior, so it cannot
+        // recurse. Without samples the nested call falls back to AVIR itself.
+        const auto single_patch = [&](int y0, int x0, int th, int tw, cv::Mat& hr_bgr) -> bool {
+            std::vector<int> sx, sy, keep;
+            for (int k = 0; k < m; ++k) {
+                const int r = ri_x[(size_t)k], c = ri_y[(size_t)k];
+                if (r >= y0 && r < y0 + th && c >= x0 && c < x0 + tw) {
+                    keep.push_back(k);
+                    sx.push_back(r - y0);
+                    sy.push_back(c - x0);
+                }
+            }
+            const int ms = (int)keep.size();
+            cv::Mat sub_meas(1, CS_HEADER_PIXELS + ms, CV_8UC3);
+            for (int i = 0; i < CS_HEADER_PIXELS; ++i)
+                sub_meas.at<cv::Vec3b>(i) = pixel_measurements.at<cv::Vec3b>(i);
+            for (int j = 0; j < ms; ++j)
+                sub_meas.at<cv::Vec3b>(CS_HEADER_PIXELS + j) =
+                    pixel_measurements.at<cv::Vec3b>(CS_HEADER_PIXELS + keep[(size_t)j]);
+            const cv::Mat sub_lr = lr_tile(cv::Rect(x0, y0, tw, th)).clone();
+            cs_sr_upscale_tile_2x(sub_lr, sub_meas, sx, sy, coef, tv, iterations, reweights,
+                fista_iters, basis, wscale, hr_bgr, red, red_denoiser, dncnn_model,
+                sr_cascade, red_model, red_decay, CsHrSrCtx(), CsSrPrior());
+            return !hr_bgr.empty();
+        };
         int sc = 0;
-        if (cs_onnx_sr_upscale_bgr(lr_tile, init_hr, sr_prior.model, sc) &&
+        if (cs_onnx_sr_upscale_bgr(lr_tile, init_hr, sr_prior.model, sc, seg_roi, single_patch) &&
             sc == 2 && init_hr.rows == Hr && init_hr.cols == Wc) {
             // strong SR proposal accepted
         } else {

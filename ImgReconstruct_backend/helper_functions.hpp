@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -309,6 +310,10 @@ struct CsSrPrior {
     int pnp_mode = 0;       // 0 off (legacy RED), 1 prox, 2 PnP-ADMM
     float pnp_rho = 0.1f;   // ADMM penalty / prox strength (mode 2)
     int pnp_iters = 8;      // ADMM outer iterations (mode 2)
+    // LR-grid segment labels from the container (seg mode). When set, the ONNX
+    // prior runs only on 256-px sub-tiles that contain two or more labels; the
+    // rest use AVIR. Null = prior runs everywhere (legacy).
+    const cv::Mat* seg_lr = nullptr;
 };
 
 /** @brief CS super-resolution 2x refinement of one solved LR tile (CPU, DCT).
@@ -431,6 +436,11 @@ bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
 
 /** @brief true when the ONNX 2x photo-SR model loads (cached per path). */
 bool cs_onnx_sr_available(const std::string& model_path);
+/** @brief Tell the ONNX layer that tile workers will call it concurrently
+(multi-tile decrypt). Call before the first session is created: sessions then
+use one intra-op thread per run. Default false (single large calls keep ONNX's
+full thread pool). */
+void cs_onnx_set_tile_parallel(bool on);
 
 /** @brief tiled ONNX super-resolution of a BGR image: Real-ESRGAN/SwinIR
 contract (RGB planar [0,1] NCHW in, clean [0,1] NCHW out at `scale`x). Output is
@@ -439,7 +449,8 @@ false and leaves dst empty when the model is missing, the run fails, or the
 output size is not an integer multiple of the input in both axes. Deterministic
 on CPU. */
 bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
-    const std::string& model_path, int& scale_out);
+    const std::string& model_path, int& scale_out, const cv::Mat& seg_roi,
+    const std::function<bool(int y0, int x0, int th, int tw, cv::Mat& hr_bgr)>& single_patch);
 
 /** @brief single-stage HR solve for experiments (see .cpp): full
 HR-coefficient FISTA against the LR samples with no LR-solve warm start.

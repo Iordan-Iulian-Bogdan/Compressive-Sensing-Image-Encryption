@@ -2227,6 +2227,7 @@ int decrypt_image::decrypt_image_tiled(
     // Strong-prior + PnP context for the cs-sr solve (--sr-prior-model /
     // --sr-pnp): an ONNX 2x SR proposal replacing the AVIR anchor and/or a
     // true PnP prox step. cs-sr only; default-constructed = legacy.
+    cs_onnx_set_tile_parallel(num_tiles > 1);
     CsSrPrior sr_prior_ctx;
     if (is_sr && !full_res && !use_dict) {
         sr_prior_ctx.model = photo_up.sr_prior_model;
@@ -2234,6 +2235,9 @@ int decrypt_image::decrypt_image_tiled(
             : (photo_up.sr_pnp == "prox") ? 1 : 0;
         sr_prior_ctx.pnp_rho = photo_up.sr_pnp_rho;
         sr_prior_ctx.pnp_iters = photo_up.sr_pnp_iters;
+        // Seg containers: the labels gate the prior to multi-segment sub-tiles
+        // (see CsSrPrior::seg_lr). Non-seg containers keep the legacy path.
+        if (!dimgs.get_seg_ids().empty()) sr_prior_ctx.seg_lr = &dimgs.get_seg_ids();
     }
     if (!sr_prior_ctx.model.empty() && !cs_onnx_sr_available(sr_prior_ctx.model)) {
         std::cerr << "Error: SR prior model failed to load ('"
@@ -2706,6 +2710,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         const bool ycc_use_dict = (ycc_sr_d != nullptr);
         // Strong-prior + PnP context for the cs-sr solve (same as the BGR
         // pipeline): an ONNX 2x SR proposal and/or a PnP prox step.
+        cs_onnx_set_tile_parallel(num_tiles > 1);
         CsSrPrior ycc_sr_prior_ctx;
         if (ycc_is_sr && !full_res && !ycc_use_dict) {
             ycc_sr_prior_ctx.model = photo_up.sr_prior_model;

@@ -2,6 +2,7 @@
 // Restormer denoisers plus the ONNX 2x SR prior. Moved out of helper_functions.cpp;
 // the public entry points are declared in helper_functions.hpp.
 #include "helper_functions.hpp"
+#include "image_tiles.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -21,6 +23,12 @@
 #ifdef _WIN32
 #include <onnxruntime_cxx_api.h>
 #endif
+
+// Set before the first ONNX session is created. A multi-tile decrypt calls
+// Run() from many OpenMP threads at once, so each run then uses one intra-op
+// thread instead of all of them competing for the session's shared pool.
+static std::atomic<bool> g_tile_parallel{ false };
+void cs_onnx_set_tile_parallel(bool on) { g_tile_parallel = on; }
 
 #ifdef _WIN32
 // In-process DnCNN color denoiser (repo-vendored ONNX model) for the dncnn
@@ -77,6 +85,7 @@ static CsDncnnEntry* cs_dncnn_entry(const std::string& path, const char* tag) {
         auto e = std::make_unique<CsDncnnEntry>();
         Ort::SessionOptions opt;
         opt.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        if (g_tile_parallel) opt.SetIntraOpNumThreads(1);
         const std::wstring wpath(path.begin(), path.end());
         e->session = std::make_unique<Ort::Session>(e->env, wpath.c_str(), opt);
         Ort::AllocatorWithDefaultOptions alloc;
@@ -293,8 +302,18 @@ static bool cs_onnx_sr_run_tile(CsDncnnEntry* e, const float* rgb01,
 // Tiled ONNX SR: RGB planar [0,1] tiles in, scale-fold clean RGB out, feathered
 // overlap compositing on the HR canvas (mirrors cs_onnx_denoise_tiled). The
 // scale is detected from the first run and must stay an integer multiple.
+// True when the LR sub-tile lies in one segment (min label == max label). An
+// empty seg_roi disables the gate, so the prior always runs.
+static bool cs_seg_single_label(const cv::Mat& seg_roi, int y0, int x0, int th, int tw) {
+    if (seg_roi.empty()) return false;
+    double mn = 0.0, mx = 0.0;
+    cv::minMaxLoc(seg_roi(cv::Rect(x0, y0, tw, th)), &mn, &mx);
+    return mn == mx;
+}
+
 static bool cs_onnx_sr_tiled(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
-    const std::string& model_path, int& scale_out)
+    const std::string& model_path, int& scale_out, const cv::Mat& seg_roi,
+    const std::function<bool(int, int, int, int, cv::Mat&)>& single_patch)
 {
     dst_bgr.release();
     scale_out = 0;
@@ -314,23 +333,49 @@ static bool cs_onnx_sr_tiled(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     if (ys.back() > H - T && H > T) ys.back() = H - T;
     if (xs.back() > W - T && W > T) xs.back() = W - T;
     int scale = 0, OH = 0, OW = 0;
+    size_t n_avir = 0;
     cv::Mat acc, weight;
     std::vector<float> in, out;
     for (size_t t = 0; t < ys.size() * xs.size(); ++t) {
         const int y0 = ys[t / xs.size()], x0 = xs[t % xs.size()];
         const int th = (std::min)(T, H - y0), tw = (std::min)(T, W - x0);
-        in.assign((size_t)3 * th * tw, 0.0f);
-        for (int c = 0; c < 3; ++c) {
-            float* d = &in[(size_t)c * th * tw];
-            const int cr = c;
-            for (int r = 0; r < th; ++r) {
-                const uint8_t* srow = chs[(size_t)cr].ptr<uint8_t>(y0 + r) + x0;
-                for (int k = 0; k < tw; ++k)
-                    d[(size_t)r * tw + k] = srow[k] * (1.0f / 255.0f);
-            }
-        }
         int oh = 0, ow = 0;
-        if (!cs_onnx_sr_run_tile(e, in.data(), th, tw, out, oh, ow)) return false;
+        if (cs_seg_single_label(seg_roi, y0, x0, th, tw)) {
+            ++n_avir;
+            // Single-segment sub-tile: AVIR patch in place of the ONNX prior,
+            // as planar RGB [0,1] like the model output.
+            cv::Mat hr_bgr;
+            // Caller's patch (cs-sr on the sub-tile) when given; AVIR otherwise.
+            // clone(): AVIR reads rows as packed, a ROI view is not packed.
+            const bool got = single_patch &&
+                single_patch(y0, x0, th, tw, hr_bgr) &&
+                hr_bgr.rows == 2 * th && hr_bgr.cols == 2 * tw;
+            if (!got) cs_upscale_2x_avir(src_bgr(cv::Rect(x0, y0, tw, th)).clone(), hr_bgr);
+            if (hr_bgr.rows != 2 * th || hr_bgr.cols != 2 * tw) return false;
+            cv::Mat hr_rgb, hr_f;
+            cv::cvtColor(hr_bgr, hr_rgb, cv::COLOR_BGR2RGB);
+            hr_rgb.convertTo(hr_f, CV_32FC3, 1.0 / 255.0);
+            std::vector<cv::Mat> planes;
+            cv::split(hr_f, planes);
+            oh = 2 * th; ow = 2 * tw;
+            out.resize((size_t)3 * oh * ow);
+            for (int c = 0; c < 3; ++c)
+                std::memcpy(&out[(size_t)c * oh * ow], planes[(size_t)c].ptr<float>(0),
+                    sizeof(float) * (size_t)oh * ow);
+        }
+        else {
+            in.assign((size_t)3 * th * tw, 0.0f);
+            for (int c = 0; c < 3; ++c) {
+                float* d = &in[(size_t)c * th * tw];
+                const int cr = c;
+                for (int r = 0; r < th; ++r) {
+                    const uint8_t* srow = chs[(size_t)cr].ptr<uint8_t>(y0 + r) + x0;
+                    for (int k = 0; k < tw; ++k)
+                        d[(size_t)r * tw + k] = srow[k] * (1.0f / 255.0f);
+                }
+            }
+            if (!cs_onnx_sr_run_tile(e, in.data(), th, tw, out, oh, ow)) return false;
+        }
         if (oh % th != 0 || ow % tw != 0 || oh / th != ow / tw) return false;
         const int s = oh / th;
         if (s < 1 || s > 8) return false;
@@ -365,6 +410,9 @@ static bool cs_onnx_sr_tiled(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
         }
     }
     if (scale == 0) return false;
+    if (!seg_roi.empty())
+        std::cout << "seg-gate: prior on " << (ys.size() * xs.size() - n_avir) << " of "
+                  << (ys.size() * xs.size()) << " sub-tiles" << std::endl;
     cv::Mat clean_rgb(OH, OW, CV_32FC3);
     for (int i = 0; i < OH; ++i) {
         const cv::Vec3f* arow = acc.ptr<cv::Vec3f>(i);
@@ -388,9 +436,10 @@ bool cs_onnx_sr_available(const std::string& model_path) {
 }
 
 bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
-    const std::string& model_path, int& scale_out)
+    const std::string& model_path, int& scale_out, const cv::Mat& seg_roi,
+    const std::function<bool(int, int, int, int, cv::Mat&)>& single_patch)
 {
-    return cs_onnx_sr_tiled(src_bgr, dst_bgr, model_path, scale_out);
+    return cs_onnx_sr_tiled(src_bgr, dst_bgr, model_path, scale_out, seg_roi, single_patch);
 }
 #else
 bool cs_dncnn_available(const std::string& model_path) {
@@ -424,11 +473,14 @@ bool cs_onnx_sr_available(const std::string& model_path) {
     return false;
 }
 bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
-    const std::string& model_path, int& scale_out)
+    const std::string& model_path, int& scale_out, const cv::Mat& seg_roi,
+    const std::function<bool(int, int, int, int, cv::Mat&)>& single_patch)
 {
     (void)src_bgr;
     dst_bgr.release();
     (void)model_path;
+    (void)seg_roi;
+    (void)single_patch;
     scale_out = 0;
     return false;
 }
