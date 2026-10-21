@@ -671,3 +671,21 @@ Encrypted image :
 Decrypting the image :
 
 ![unknown_2025 04 04-22 37_1-ezgif com-cut](https://github.com/user-attachments/assets/37cdb048-2e94-4be1-9b65-555813523fde)
+
+## GPU build (experimental, Windows + ROCm 7.2 + DirectML)
+
+`build_gpu.bat main` builds `x64\GpuBuild\ImgReconstruct_backend.exe` with the HIP
+tile solvers and a DirectML ONNX Runtime (1.22.1, `third_party\onnxruntime_dml`).
+All GPU stages are opt-in through environment variables; the CPU build and the
+default behaviour are unchanged.
+
+| Variable | Effect |
+| --- | --- |
+| `CS_GPU_TILES=1` | LR tile solve on the GPU (no neighbour warm start; with every tile solved the wavefront becomes one flat loop, `CS_GPU_WAVES=1` keeps the wavefront) |
+| `CS_GPU_ADMM=1` | PnP-ADMM super-resolution stage (cs-sr core + NLM prox) on the GPU, batched across tiles |
+| `CS_GPU_ONNX=1` | `--sr-prior-model` runs on DirectML through a shape-folded session per tile size; `CS_GPU_ONNX_FOLD=0` disables the folding, `CS_GPU_ONNX_FOLD_N` sets its batch (default 2) |
+| `CS_GPU_ONNX_PRECISION=fp16` | use `<model>_fp16.onnx` (build it with `python scripts/make_swin2sr_fp16.py`); the fp32 model stays the default and is kept. fp16 matches fp32 at ~59 dB but was not faster in the full pipeline |
+| `CS_GPU_PROF=1` | per-kernel GPU timings and prior batch statistics at exit |
+
+SR prior + ADMM decrypt of the 12 MP IMG_3690 test image (`--manual --tiles 64`):
+168 s on the CPU, ~19 s with all three GPU switches on (output within 56 dB PSNR of the CPU result).

@@ -344,6 +344,9 @@ struct SrBatchStats {
 // so the DML session is built from that folded graph, one per tile size.
 // CS_GPU_ONNX_FOLD=0 disables it (dynamic-shape session, batches up to 32).
 const int kFoldBatch = [] { const char* v = std::getenv("CS_GPU_ONNX_FOLD_N"); return v ? std::atoi(v) : 2; }();
+// CS_GPU_ONNX_PRECISION=fp16 uses the sibling "<model>_fp16.onnx" (scripts/make_swin2sr_fp16.py)
+// for the folded DML sessions; the fp32 model stays the default.
+const bool kFp16 = [] { const char* v = std::getenv("CS_GPU_ONNX_PRECISION"); return v && std::string(v) == "fp16"; }();
 const bool kFoldOn = [] { const char* v = std::getenv("CS_GPU_ONNX_FOLD"); return !(v && v[0] == '0'); }();
 
 Ort::Session* cs_dml_folded_session(CsDncnnEntry* e, int h, int w) {
@@ -352,8 +355,9 @@ Ort::Session* cs_dml_folded_session(CsDncnnEntry* e, int h, int w) {
     auto it = e->folded.find(key);
     if (it != e->folded.end()) return it->second.get();
     std::unique_ptr<Ort::Session> made;
+    const char* precision = "fp32";
+    std::error_code ec;
     try {
-        std::error_code ec;
         const std::filesystem::path tmp = std::filesystem::temp_directory_path(ec) /
             ("cs_fold_" + std::to_string((long long)reinterpret_cast<intptr_t>(e)) + "_" + std::to_string(h) + "x" + std::to_string(w) + ".onnx");
         {
@@ -365,7 +369,15 @@ Ort::Session* cs_dml_folded_session(CsDncnnEntry* e, int h, int w) {
             Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "num_channels", 3));
             Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "height", h));
             Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "width", w));
-            const std::wstring wpath(e->path.begin(), e->path.end());
+            std::string src_path = e->path;
+            if (kFp16) {
+                const std::filesystem::path p(e->path);
+                const std::filesystem::path q = p.parent_path() / (p.stem().string() + "_fp16" + p.extension().string());
+                if (std::filesystem::exists(q, ec)) src_path = q.string();
+                else std::fprintf(stderr, "Warning: %s not found; using the fp32 model\n", q.string().c_str());
+            }
+            precision = (src_path == e->path) ? "fp32" : "fp16";
+            const std::wstring wpath(src_path.begin(), src_path.end());
             Ort::Session cpu(e->env, wpath.c_str(), fo);   // writes the folded model
         }
         Ort::SessionOptions dopt;
@@ -381,7 +393,7 @@ Ort::Session* cs_dml_folded_session(CsDncnnEntry* e, int h, int w) {
         std::fprintf(stderr, "Warning: folded DML session for %dx%d failed (%s); using the dynamic one\n", h, w, ex.what());
         made.reset();
     }
-    if (made) std::fprintf(stderr, "[onnx] SR %dx%d: folded DirectML session, batch %d\n", h, w, kFoldBatch);
+    if (made) std::fprintf(stderr, "[onnx] SR %dx%d: folded DirectML session (%s), batch %d\n", h, w, precision, kFoldBatch);
     return (e->folded[key] = std::move(made)).get();
 }
 
