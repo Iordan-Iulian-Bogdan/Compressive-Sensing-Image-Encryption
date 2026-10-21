@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -49,6 +50,8 @@ struct CsDncnnEntry {
     std::string in_name, out_name;
     bool dml = false;      // DirectML sessions do not allow concurrent Run()
     std::mutex run_mu;
+    std::string path;      // model file (for the shape-folded DML sessions)
+    std::map<std::pair<int, int>, std::unique_ptr<Ort::Session>> folded;   // tile size -> folded session
 };
 static std::mutex g_dncnn_mutex;
 static std::map<std::string, std::unique_ptr<CsDncnnEntry>> g_dncnn_cache;
@@ -108,6 +111,7 @@ static CsDncnnEntry* cs_dncnn_entry(const std::string& path, const char* tag) {
             }
         }
 #endif
+        e->path = path;
         const std::wstring wpath(path.begin(), path.end());
         e->session = std::make_unique<Ort::Session>(e->env, wpath.c_str(), opt);
         Ort::AllocatorWithDefaultOptions alloc;
@@ -314,34 +318,119 @@ const int kSrBatchMax = 32;
 const int kSrBatchTarget = [] { const char* v = std::getenv("CS_GPU_ONNX_BATCH"); return v ? std::atoi(v) : 16; }();
 const int kSrBatchWaitMs = 30;
 
-void cs_sr_run_group(CsDncnnEntry* e, std::vector<SrJob*>& g) {
-    const int n = (int)g.size(), h = g[0]->h, w = g[0]->w;
+// Opt-in (CS_GPU_PROF=1) totals of the batched DirectML runs, printed at exit.
+struct SrBatchStats {
+    std::atomic<long long> runs{0}, tiles{0}, ns{0};
+    std::map<int, long long> hist;   // batch size -> count (guarded by g_srb_mu)
+    std::map<std::pair<int, int>, long long> sizes;   // tile h,w -> tiles
+    ~SrBatchStats() {
+        const char* p = std::getenv("CS_GPU_PROF");
+        if (!p || p[0] != '1' || runs.load() == 0) return;
+        std::fprintf(stderr, "[gpu-prof] onnx-dml: %lld runs, %lld tiles (%.1f avg), run time %.1f s (%.1f ms/run, %.1f ms/tile)\n",
+            (long long)runs.load(), (long long)tiles.load(), (double)tiles.load() / runs.load(),
+            ns.load() * 1e-9, ns.load() * 1e-6 / runs.load(), ns.load() * 1e-6 / (double)tiles.load());
+        std::fprintf(stderr, "[gpu-prof]   batch-size histogram:");
+        for (auto& kv : hist) std::fprintf(stderr, " %d:%lld", kv.first, kv.second);
+        std::fprintf(stderr, "\n[gpu-prof]   tile sizes (h x w: tiles):");
+        for (auto& kv : sizes) std::fprintf(stderr, " %dx%d:%lld", kv.first.first, kv.first.second, kv.second);
+        std::fprintf(stderr, "\n");
+    }
+} g_srb_stats;
+
+// The Swin2SR export recomputes its shape/attention-mask bookkeeping (thousands
+// of Shape/Range/Expand/Slice/Where nodes) on every run, and DirectML does not
+// constant-fold them. Fixing batch/height/width and optimizing once on the CPU
+// provider folds them away (19k -> 2k nodes, ~2.6x faster, outputs identical),
+// so the DML session is built from that folded graph, one per tile size.
+// CS_GPU_ONNX_FOLD=0 disables it (dynamic-shape session, batches up to 32).
+const int kFoldBatch = [] { const char* v = std::getenv("CS_GPU_ONNX_FOLD_N"); return v ? std::atoi(v) : 2; }();
+const bool kFoldOn = [] { const char* v = std::getenv("CS_GPU_ONNX_FOLD"); return !(v && v[0] == '0'); }();
+
+Ort::Session* cs_dml_folded_session(CsDncnnEntry* e, int h, int w) {
+    if (!kFoldOn || kFoldBatch < 1) return nullptr;
+    const std::pair<int, int> key{ h, w };
+    auto it = e->folded.find(key);
+    if (it != e->folded.end()) return it->second.get();
+    std::unique_ptr<Ort::Session> made;
+    try {
+        std::error_code ec;
+        const std::filesystem::path tmp = std::filesystem::temp_directory_path(ec) /
+            ("cs_fold_" + std::to_string((long long)reinterpret_cast<intptr_t>(e)) + "_" + std::to_string(h) + "x" + std::to_string(w) + ".onnx");
+        {
+            Ort::SessionOptions fo;
+            fo.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+            fo.SetIntraOpNumThreads(1);
+            fo.SetOptimizedModelFilePath(tmp.wstring().c_str());
+            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "batch_size", kFoldBatch));
+            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "num_channels", 3));
+            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "height", h));
+            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "width", w));
+            const std::wstring wpath(e->path.begin(), e->path.end());
+            Ort::Session cpu(e->env, wpath.c_str(), fo);   // writes the folded model
+        }
+        Ort::SessionOptions dopt;
+        dopt.DisableMemPattern();
+        dopt.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(dopt, 0));
+        made = std::make_unique<Ort::Session>(e->env, tmp.wstring().c_str(), dopt);
+        std::filesystem::remove(tmp, ec);
+        const auto shp = made->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+        if (shp.size() != 4 || shp[0] != kFoldBatch || shp[1] != 3 || shp[2] != h || shp[3] != w) made.reset();   // not folded as expected
+    }
+    catch (const Ort::Exception& ex) {
+        std::fprintf(stderr, "Warning: folded DML session for %dx%d failed (%s); using the dynamic one\n", h, w, ex.what());
+        made.reset();
+    }
+    if (made) std::fprintf(stderr, "[onnx] SR %dx%d: folded DirectML session, batch %d\n", h, w, kFoldBatch);
+    return (e->folded[key] = std::move(made)).get();
+}
+
+// One N-sample run of a (possibly folded) session; fills the jobs' outputs.
+bool cs_sr_run_chunk(CsDncnnEntry* e, Ort::Session* sess, int n_batch, std::vector<SrJob*>& g, size_t first, int m) {
+    const int h = g[0]->h, w = g[0]->w;
     const size_t per = (size_t)3 * h * w;
-    std::vector<float> in((size_t)n * per);
-    for (int i = 0; i < n; ++i) std::memcpy(&in[(size_t)i * per], g[(size_t)i]->in, sizeof(float) * per);
-    int64_t shape[4] = { n, 3, h, w };
+    std::vector<float> in((size_t)n_batch * per);
+    for (int i = 0; i < n_batch; ++i)   // pad a short final chunk by repeating its last sample
+        std::memcpy(&in[(size_t)i * per], g[first + (size_t)(std::min)(i, m - 1)]->in, sizeof(float) * per);
+    int64_t shape[4] = { n_batch, 3, h, w };
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     Ort::Value tin = Ort::Value::CreateTensor<float>(mem, in.data(), in.size(), shape, 4);
     const char* inn[1] = { e->in_name.c_str() };
     const char* outn[1] = { e->out_name.c_str() };
     try {
-        std::lock_guard<std::mutex> lk(e->run_mu);
-        std::vector<Ort::Value> res = e->session->Run(Ort::RunOptions{ nullptr }, inn, &tin, 1, outn, 1);
-        if (res.size() != 1 || !res[0].IsTensor()) return;
+        const auto prof_t0 = std::chrono::steady_clock::now();
+        std::vector<Ort::Value> res = sess->Run(Ort::RunOptions{ nullptr }, inn, &tin, 1, outn, 1);
+        g_srb_stats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_t0).count();
+        ++g_srb_stats.runs; g_srb_stats.tiles += (long long)m; ++g_srb_stats.hist[m]; g_srb_stats.sizes[{ h, w }] += (long long)m;
+        if (res.size() != 1 || !res[0].IsTensor()) return false;
         const std::vector<int64_t> d = res[0].GetTensorTypeAndShapeInfo().GetShape();
-        if (d.size() != 4 || d[0] != n || d[1] != 3 || d[2] <= 0 || d[3] <= 0) return;
+        if (d.size() != 4 || d[0] != n_batch || d[1] != 3 || d[2] <= 0 || d[3] <= 0) return false;
         const size_t oper = (size_t)3 * d[2] * d[3];
         const float* src = res[0].GetTensorData<float>();
-        for (int i = 0; i < n; ++i) {
-            g[(size_t)i]->out->assign(src + (size_t)i * oper, src + (size_t)(i + 1) * oper);
-            *g[(size_t)i]->oh = (int)d[2];
-            *g[(size_t)i]->ow = (int)d[3];
-            g[(size_t)i]->ok = true;
+        for (int i = 0; i < m; ++i) {
+            SrJob* j = g[first + (size_t)i];
+            j->out->assign(src + (size_t)i * oper, src + (size_t)(i + 1) * oper);
+            *j->oh = (int)d[2];
+            *j->ow = (int)d[3];
+            j->ok = true;
         }
+        return true;
     }
     catch (const Ort::Exception& ex) {
         std::fprintf(stderr, "Warning: onnx-sr batched run failed: %s\n", ex.what());
+        return false;
     }
+}
+
+void cs_sr_run_group(CsDncnnEntry* e, std::vector<SrJob*>& g) {
+    std::lock_guard<std::mutex> lk(e->run_mu);
+    const int n = (int)g.size();
+    if (Ort::Session* fs = cs_dml_folded_session(e, g[0]->h, g[0]->w)) {
+        for (int s = 0; s < n; s += kFoldBatch)
+            cs_sr_run_chunk(e, fs, kFoldBatch, g, (size_t)s, (std::min)(kFoldBatch, n - s));
+        return;
+    }
+    cs_sr_run_chunk(e, e->session.get(), n, g, 0, n);
 }
 
 bool cs_sr_run_batched(CsDncnnEntry* e, const float* rgb01, int h, int w,

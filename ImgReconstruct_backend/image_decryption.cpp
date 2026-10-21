@@ -958,6 +958,10 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     // finishes skip the CPU warm start + solve below; the post-solve stages
     // (grain TV, upscale) still run per tile as usual.
     std::vector<std::vector<char>> gpu_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
+    // True when every non-empty tile was solved by the pre-pass: tiles then no
+    // longer depend on their neighbours, so the wavefront below collapses into
+    // one flat parallel loop (GPU stages of different tiles can overlap).
+    bool flat_tiles = false;
     if (std::getenv("CS_GPU_TILES")) {
         int skip_tv = 0, skip_other = 0;
         std::vector<decrypt_image> keep;
@@ -1005,6 +1009,10 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count()
                   << " ms (no neighbour warm start); " << jobs.size() << " eligible, skipped for tv "
                   << skip_tv << ", other " << skip_other << "; grid " << num_tiles << "x" << num_tiles << std::endl;
+        flat_tiles = std::getenv("CS_GPU_WAVES") == nullptr;   // CS_GPU_WAVES=1 keeps the wavefront (A/B)
+        for (int i = 0; i < num_tiles && flat_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j)
+                if (!mats_in[i][j].empty() && !gpu_done[(size_t)i][(size_t)j]) { flat_tiles = false; break; }
     }
 #endif
 
@@ -1012,18 +1020,20 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     // anti-diagonal share no west or north neighbors, so every tile of a
     // wave runs in parallel while warm-starting from tiles of earlier
     // waves only -- no ordering races, and roughly 2N-1 waves instead of
-    // num_tiles^2 independent solves.
-    for (int w = 0; w <= 2 * (num_tiles - 1); ++w) {
-        const int i_lo = (std::max)(0, w - (num_tiles - 1));
-        const int i_hi = (std::min)(num_tiles - 1, w);
-        const int wave_count = i_hi - i_lo + 1;
+    // num_tiles^2 independent solves. With flat_tiles there is a single
+    // "wave" holding every tile.
+    const int n_waves = flat_tiles ? 1 : 2 * (num_tiles - 1) + 1;
+    for (int w = 0; w < n_waves; ++w) {
+        const int i_lo = flat_tiles ? 0 : (std::max)(0, w - (num_tiles - 1));
+        const int i_hi = flat_tiles ? num_tiles - 1 : (std::min)(num_tiles - 1, w);
+        const int wave_count = flat_tiles ? num_tiles * num_tiles : i_hi - i_lo + 1;
         auto sp_w0 = sp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
         #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
         for (int t = 0; t < wave_count; ++t) {
             try {
-                const int i = i_lo + t;
-                const int j = w - i;
+                const int i = flat_tiles ? t / num_tiles : i_lo + t;
+                const int j = flat_tiles ? t % num_tiles : w - i;
 
                 if (mats_in[i][j].empty()) continue;
                 // Single-stage segment solve: this tile's class params win;

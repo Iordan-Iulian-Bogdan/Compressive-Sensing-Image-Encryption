@@ -202,6 +202,17 @@ int main() {
             sum_ref += psnr(r, cases[i].truth);
             sum_z0 += psnr(cases[i].z0, cases[i].truth);
         }
+        // Batch-size scaling of the whole ADMM call (latency vs throughput).
+        for (int n : { 1, 2, 4, 8, 16, 32, 48 }) {
+            std::vector<gpu_admm::Problem> sub(probs.begin(), probs.begin() + n);
+            double best = 1e30;
+            for (int rep = 0; rep < 3; ++rep) {
+                const auto t0 = std::chrono::steady_clock::now();
+                gpu_admm::solve_pnp_admm(sub, prm);
+                best = std::min(best, ms_since(t0));
+            }
+            std::printf("  batch %2d tiles: %7.1f ms  (%.2f ms/tile)\n", n, best, best / n);
+        }
         std::printf("checked %d tiles against the CPU reference:\n", NT);
         std::printf("  min PSNR(gpu vs reference) = %.1f dB\n", min_psnr);
         std::printf("  mean PSNR vs ground truth: start %.2f dB, gpu %.2f dB, reference %.2f dB\n",

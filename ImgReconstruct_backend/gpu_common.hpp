@@ -125,7 +125,7 @@ struct TileLayout {
     std::vector<float> table;
     std::map<int, int> table_off;
     long long total = 0;
-    int max_n = 0;
+    int max_n = 0, max_rows = 0, max_cols = 0;
 
     int table_for(int N) {
         auto it = table_off.find(N);
@@ -145,6 +145,8 @@ struct TileLayout {
         td.push_back(d);
         total += (long long)rows * cols;
         max_n = std::max(max_n, rows * cols);
+        max_rows = std::max(max_rows, rows);
+        max_cols = std::max(max_cols, cols);
     }
 };
 
