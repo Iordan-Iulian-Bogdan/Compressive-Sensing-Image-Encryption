@@ -79,7 +79,9 @@ int cs_gpu_admm_threads(int num_tiles, int num_threads) {
     // Also raised for the batched DirectML prior (CS_GPU_ONNX=1): its workers wait too.
     const char* onnx = std::getenv("CS_GPU_ONNX");
     if (!cs_gpu_admm_enabled() && !(onnx && onnx[0] == '1')) return num_threads;
-    const int want = (std::max)(num_threads, (std::min)(num_tiles, 64));
+    int cap = 64;
+    if (const char* w = std::getenv("CS_GPU_WORKERS")) cap = std::atoi(w);   // tuning override
+    const int want = (std::max)(num_threads, (std::min)(num_tiles, cap));
     g_target = want;
     return want;
 }

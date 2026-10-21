@@ -24,6 +24,7 @@
 #include <chrono>
 #include <iostream>
 #include <map>
+#include <set>
 #include <utility>
 #include <algorithm>
 #include <thread>
@@ -967,6 +968,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
         std::vector<decrypt_image> keep;
         keep.reserve((size_t)num_tiles * num_tiles);
         std::vector<GpuTileJob> jobs;
+        std::set<std::pair<int, int>> prefetched;
         std::vector<std::pair<int, int>> where;
         for (int i = 0; i < num_tiles; ++i)
             for (int j = 0; j < num_tiles; ++j) {
@@ -996,6 +998,11 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 jb.coef = per_tile_coef ? cs_per_tile_coef(t_coef_base, t_count, coef_mean_m) : t_coef_base;
                 jb.wscale = STP ? STP->wscale : wscale;
                 jb.out = &mats_out[i][j];
+                // The SR prior's folded DirectML session for each tile size is
+                // built in the background from the moment the size is first
+                // seen, overlapping the rest of the setup and the LR solve.
+                if (!sr_prior.model.empty() && prefetched.insert({ jb.rows, jb.cols }).second)
+                    cs_onnx_sr_prefetch(sr_prior.model, jb.rows, jb.cols);
                 jobs.push_back(jb);
                 where.push_back({ i, j });
             }

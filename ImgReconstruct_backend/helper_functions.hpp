@@ -439,6 +439,10 @@ bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
 
 /** @brief true when the ONNX 2x photo-SR model loads (cached per path). */
 bool cs_onnx_sr_available(const std::string& model_path);
+/** @brief Starts building, on a background thread, whatever the ONNX SR runner
+needs for h x w tiles (the shape-folded DirectML session of the GPU build), so
+the first tile does not wait for it. No-op elsewhere; safe to call repeatedly. */
+void cs_onnx_sr_prefetch(const std::string& model_path, int h, int w);
 /** @brief Tell the ONNX layer that tile workers will call it concurrently
 (multi-tile decrypt). Call before the first session is created: sessions then
 use one intra-op thread per run. Default false (single large calls keep ONNX's

@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -52,7 +53,15 @@ struct CsDncnnEntry {
     std::mutex run_mu;
     std::string path;      // model file (for the shape-folded DML sessions)
     std::map<std::pair<int, int>, std::unique_ptr<Ort::Session>> folded;   // tile size -> folded session
+    std::mutex fold_mu;    // guards 'folded' and 'dml_dyn' (a prefetch thread builds sessions too)
+    // SR prior on DirectML with shape folding: 'session' is then only a cheap CPU
+    // session used to validate the model and read its I/O names; the dynamic
+    // DirectML session ('dml_dyn') is built lazily, only if folding fails.
+    bool meta_only = false;
+    std::unique_ptr<Ort::Session> dml_dyn;
 };
+// CS_GPU_ONNX_FOLD=0 turns the shape-folded DirectML sessions off.
+static bool cs_fold_env_on() { const char* v = std::getenv("CS_GPU_ONNX_FOLD"); return !(v && v[0] == '0'); }
 static std::mutex g_dncnn_mutex;
 static std::map<std::string, std::unique_ptr<CsDncnnEntry>> g_dncnn_cache;
 static std::map<std::string, bool> g_dncnn_failed;
@@ -99,7 +108,12 @@ static CsDncnnEntry* cs_dncnn_entry(const std::string& path, const char* tag) {
 #ifdef CS_ONNX_DML
         // CS_GPU_ONNX=1: run the model on the GPU through DirectML (adapter 0).
         // DML requires sequential execution and no memory-pattern planning.
-        if (const char* gpu = std::getenv("CS_GPU_ONNX"); gpu && gpu[0] == '1') {
+        const bool want_dml = [] { const char* g = std::getenv("CS_GPU_ONNX"); return g && g[0] == '1'; }();
+        if (want_dml && cs_fold_env_on() && std::strcmp(tag, "SR") == 0) {
+            e->dml = true;   // no session here at all: see meta_only
+            e->meta_only = true;
+        }
+        else if (want_dml) {
             try {
                 opt.DisableMemPattern();
                 opt.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
@@ -112,15 +126,27 @@ static CsDncnnEntry* cs_dncnn_entry(const std::string& path, const char* tag) {
         }
 #endif
         e->path = path;
-        const std::wstring wpath(path.begin(), path.end());
-        e->session = std::make_unique<Ort::Session>(e->env, wpath.c_str(), opt);
-        Ort::AllocatorWithDefaultOptions alloc;
-        e->in_name = e->session->GetInputNameAllocated(0, alloc).get();
-        e->out_name = e->session->GetOutputNameAllocated(0, alloc).get();
-        auto ti = e->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-        if (ti.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-            ti.GetDimensionsCount() != 4) {
-            throw Ort::Exception("dncnn: expected float NCHW input", ORT_INVALID_ARGUMENT);
+        if (e->meta_only) {
+            // Creating even a bare CPU session for this 19k-node graph takes ~4.7 s, so none
+            // is made: only check the file is readable (keeps the fail-fast contract) and let
+            // the folded / dynamic DirectML session supply the I/O names when it is built.
+            std::ifstream probe(path, std::ios::binary);
+            if (!probe) throw Ort::Exception("cannot open the model file", ORT_NO_SUCHFILE);
+        }
+        else {
+            const std::wstring wpath(path.begin(), path.end());
+            const auto t_sess0 = std::chrono::steady_clock::now();
+            e->session = std::make_unique<Ort::Session>(e->env, wpath.c_str(), opt);
+            if (const char* pr = std::getenv("CS_GPU_PROF"); pr && pr[0] == '1')
+                std::fprintf(stderr, "[gpu-prof] %s session create: %.0f ms%s\n", tag, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sess0).count(), e->dml ? " (DirectML)" : "");
+            Ort::AllocatorWithDefaultOptions alloc;
+            e->in_name = e->session->GetInputNameAllocated(0, alloc).get();
+            e->out_name = e->session->GetOutputNameAllocated(0, alloc).get();
+            auto ti = e->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+            if (ti.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+                ti.GetDimensionsCount() != 4) {
+                throw Ort::Exception("dncnn: expected float NCHW input", ORT_INVALID_ARGUMENT);
+            }
         }
         if (e->dml) std::fprintf(stderr, "[onnx] %s: DirectML execution provider enabled\n", tag);
         auto r = g_dncnn_cache.emplace(path, std::move(e));
@@ -347,54 +373,104 @@ const int kFoldBatch = [] { const char* v = std::getenv("CS_GPU_ONNX_FOLD_N"); r
 // CS_GPU_ONNX_PRECISION=fp16 uses the sibling "<model>_fp16.onnx" (scripts/make_swin2sr_fp16.py)
 // for the folded DML sessions; the fp32 model stays the default.
 const bool kFp16 = [] { const char* v = std::getenv("CS_GPU_ONNX_PRECISION"); return v && std::string(v) == "fp16"; }();
-const bool kFoldOn = [] { const char* v = std::getenv("CS_GPU_ONNX_FOLD"); return !(v && v[0] == '0'); }();
 
 Ort::Session* cs_dml_folded_session(CsDncnnEntry* e, int h, int w) {
-    if (!kFoldOn || kFoldBatch < 1) return nullptr;
+    if (!cs_fold_env_on() || kFoldBatch < 1) return nullptr;
+    std::lock_guard<std::mutex> lk(e->fold_mu);   // a concurrent prefetch may be building this size
     const std::pair<int, int> key{ h, w };
     auto it = e->folded.find(key);
     if (it != e->folded.end()) return it->second.get();
+    const auto t_fold0 = std::chrono::steady_clock::now();
     std::unique_ptr<Ort::Session> made;
     const char* precision = "fp32";
+    bool cached = false;
     std::error_code ec;
     try {
-        const std::filesystem::path tmp = std::filesystem::temp_directory_path(ec) /
-            ("cs_fold_" + std::to_string((long long)reinterpret_cast<intptr_t>(e)) + "_" + std::to_string(h) + "x" + std::to_string(w) + ".onnx");
-        {
-            Ort::SessionOptions fo;
-            fo.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
-            fo.SetIntraOpNumThreads(1);
-            fo.SetOptimizedModelFilePath(tmp.wstring().c_str());
-            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "batch_size", kFoldBatch));
-            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "num_channels", 3));
-            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "height", h));
-            Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "width", w));
-            std::string src_path = e->path;
-            if (kFp16) {
-                const std::filesystem::path p(e->path);
-                const std::filesystem::path q = p.parent_path() / (p.stem().string() + "_fp16" + p.extension().string());
-                if (std::filesystem::exists(q, ec)) src_path = q.string();
-                else std::fprintf(stderr, "Warning: %s not found; using the fp32 model\n", q.string().c_str());
+        // The folded graph of a given model/size/precision never changes, so it is
+        // cached on disk (temp dir); a hit skips the ~1.5 s CPU folding pass.
+        std::string src_path = e->path;
+        if (kFp16) {
+            const std::filesystem::path p(e->path);
+            const std::filesystem::path q = p.parent_path() / (p.stem().string() + "_fp16" + p.extension().string());
+            if (std::filesystem::exists(q, ec)) src_path = q.string();
+            else std::fprintf(stderr, "Warning: %s not found; using the fp32 model\n", q.string().c_str());
+        }
+        precision = (src_path == e->path) ? "fp32" : "fp16";
+        const auto src_size = std::filesystem::file_size(src_path, ec);
+        const auto src_time = std::filesystem::last_write_time(src_path, ec).time_since_epoch().count();
+        const size_t tag_hash = std::hash<std::string>()(src_path + "|" + std::to_string((long long)src_size) + "|" +
+            std::to_string((long long)src_time) + "|" + Ort::GetVersionString() + "|" + std::to_string(kFoldBatch) + "|" +
+            std::to_string(h) + "x" + std::to_string(w));
+        const std::filesystem::path cache_dir = std::filesystem::temp_directory_path(ec) / "cs_fold_cache";
+        std::filesystem::create_directories(cache_dir, ec);
+        const std::filesystem::path folded_path = cache_dir / ("swin_" + std::to_string(tag_hash) + ".onnx");
+        bool hit = std::filesystem::exists(folded_path, ec);
+        if (!hit) {
+            const std::filesystem::path part = cache_dir / ("swin_" + std::to_string(tag_hash) + "." +
+                std::to_string((long long)reinterpret_cast<intptr_t>(e)) + ".part");
+            {
+                Ort::SessionOptions fo;
+                fo.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+                fo.SetIntraOpNumThreads(1);
+                fo.SetOptimizedModelFilePath(part.wstring().c_str());
+                Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "batch_size", kFoldBatch));
+                Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "num_channels", 3));
+                Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "height", h));
+                Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(fo, "width", w));
+                const std::wstring wpath(src_path.begin(), src_path.end());
+                Ort::Session cpu(e->env, wpath.c_str(), fo);   // writes the folded model
             }
-            precision = (src_path == e->path) ? "fp32" : "fp16";
-            const std::wstring wpath(src_path.begin(), src_path.end());
-            Ort::Session cpu(e->env, wpath.c_str(), fo);   // writes the folded model
+            std::filesystem::rename(part, folded_path, ec);   // atomic publish; a lost race is harmless
+            if (ec) { std::filesystem::remove(part, ec); }
         }
         Ort::SessionOptions dopt;
         dopt.DisableMemPattern();
         dopt.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
         Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(dopt, 0));
-        made = std::make_unique<Ort::Session>(e->env, tmp.wstring().c_str(), dopt);
-        std::filesystem::remove(tmp, ec);
+        made = std::make_unique<Ort::Session>(e->env, folded_path.wstring().c_str(), dopt);
         const auto shp = made->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
         if (shp.size() != 4 || shp[0] != kFoldBatch || shp[1] != 3 || shp[2] != h || shp[3] != w) made.reset();   // not folded as expected
+        else if (e->in_name.empty()) {
+            Ort::AllocatorWithDefaultOptions alloc;
+            e->in_name = made->GetInputNameAllocated(0, alloc).get();
+            e->out_name = made->GetOutputNameAllocated(0, alloc).get();
+        }
+        if (hit) cached = true;
     }
     catch (const Ort::Exception& ex) {
         std::fprintf(stderr, "Warning: folded DML session for %dx%d failed (%s); using the dynamic one\n", h, w, ex.what());
         made.reset();
     }
+    if (const char* pr = std::getenv("CS_GPU_PROF"); pr && pr[0] == '1')
+        std::fprintf(stderr, "[gpu-prof] folded session create (%s): %.0f ms\n", cached ? "cached folded graph + DML load" : "fold + DML load", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fold0).count());
     if (made) std::fprintf(stderr, "[onnx] SR %dx%d: folded DirectML session (%s), batch %d\n", h, w, precision, kFoldBatch);
     return (e->folded[key] = std::move(made)).get();
+}
+
+// The dynamic-shape DirectML session: the entry's own session normally, or (when
+// the entry only holds a metadata session) one built here on first use.
+Ort::Session* cs_dml_dynamic_session(CsDncnnEntry* e) {
+    if (!e->meta_only) return e->session.get();
+    std::lock_guard<std::mutex> lk(e->fold_mu);
+    if (!e->dml_dyn) {
+        try {
+            Ort::SessionOptions dopt;
+            dopt.DisableMemPattern();
+            dopt.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+            Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(dopt, 0));
+            const std::wstring wpath(e->path.begin(), e->path.end());
+            e->dml_dyn = std::make_unique<Ort::Session>(e->env, wpath.c_str(), dopt);
+            if (e->in_name.empty()) {
+                Ort::AllocatorWithDefaultOptions alloc;
+                e->in_name = e->dml_dyn->GetInputNameAllocated(0, alloc).get();
+                e->out_name = e->dml_dyn->GetOutputNameAllocated(0, alloc).get();
+            }
+        }
+        catch (const Ort::Exception& ex) {
+            std::fprintf(stderr, "Warning: dynamic DirectML session failed: %s\n", ex.what());
+        }
+    }
+    return e->dml_dyn.get();
 }
 
 // One N-sample run of a (possibly folded) session; fills the jobs' outputs.
@@ -442,7 +518,7 @@ void cs_sr_run_group(CsDncnnEntry* e, std::vector<SrJob*>& g) {
             cs_sr_run_chunk(e, fs, kFoldBatch, g, (size_t)s, (std::min)(kFoldBatch, n - s));
         return;
     }
-    cs_sr_run_chunk(e, e->session.get(), n, g, 0, n);
+    if (Ort::Session* dyn = cs_dml_dynamic_session(e)) cs_sr_run_chunk(e, dyn, n, g, 0, n);
 }
 
 bool cs_sr_run_batched(CsDncnnEntry* e, const float* rgb01, int h, int w,
@@ -651,6 +727,21 @@ bool cs_onnx_sr_available(const std::string& model_path) {
     return cs_dncnn_entry(model_path, "SR") != nullptr;
 }
 
+void cs_onnx_sr_prefetch(const std::string& model_path, int h, int w) {
+#ifdef CS_ONNX_DML
+    CsDncnnEntry* e = model_path.empty() ? nullptr : cs_dncnn_entry(model_path, "SR");
+    if (!e || !e->meta_only) return;
+    // Futures of std::async block in their destructor, so a prefetch that is
+    // still running at exit is joined, never abandoned.
+    static std::mutex m;
+    static std::vector<std::future<void>> pending;
+    std::lock_guard<std::mutex> lk(m);
+    pending.push_back(std::async(std::launch::async, [e, h, w] { cs_dml_folded_session(e, h, w); }));
+#else
+    (void)model_path; (void)h; (void)w;
+#endif
+}
+
 bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     const std::string& model_path, int& scale_out, const cv::Mat& seg_roi,
     const std::function<bool(int, int, int, int, cv::Mat&)>& single_patch)
@@ -687,6 +778,9 @@ bool cs_onnx_denoise_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
 bool cs_onnx_sr_available(const std::string& model_path) {
     (void)model_path;
     return false;
+}
+void cs_onnx_sr_prefetch(const std::string& model_path, int h, int w) {
+    (void)model_path; (void)h; (void)w;
 }
 bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
     const std::string& model_path, int& scale_out, const cv::Mat& seg_roi,
