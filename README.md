@@ -688,4 +688,6 @@ default behaviour are unchanged.
 | `CS_GPU_PROF=1` | per-kernel GPU timings and prior batch statistics at exit |
 
 SR prior + ADMM decrypt of the 12 MP IMG_3690 test image (`--manual --tiles 64`):
-168 s on the CPU, ~19 s with all three GPU switches on (output within 56 dB PSNR of the CPU result).
+168 s on the CPU, ~14 s with all three GPU switches on (output within 56 dB PSNR of the CPU result).
+The design, every optimization with its measurements, the failed experiments and the remaining
+bottlenecks are documented in [`docs/gpu-optimizations.md`](docs/gpu-optimizations.md).
