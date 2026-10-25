@@ -97,6 +97,7 @@ void test_y_dual_tv_blend();
 void test_y_dual_tv_color_segment();
 void test_dual_tv_split();
 void test_seg_auto();
+void test_seg_edge();
 void test_encoder_geometry();
 void test_auto_reg_params();
 void test_per_tile_coef();

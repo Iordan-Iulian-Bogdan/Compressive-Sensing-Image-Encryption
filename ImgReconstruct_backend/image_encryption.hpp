@@ -142,7 +142,7 @@ public:
     static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const
 std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string&
 seg_mask = "", const std::string& seg_rates = "", int seg_blend = 0,
-    const std::string& sampling = "points", int seg_auto = 0);
+    const std::string& sampling = "points", int seg_auto = 0, bool seg_edge = false);
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at
@@ -171,6 +171,15 @@ void cs_seg_auto_ids(const cv::Mat& bgr, int classes, int rows, int cols, cv::Ma
 // r = 0.08 + 0.92*(d/dmax)^0.75 over the classes present in ids; flat
 // images (dmax == 0) get uniform 1.0.
 std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int classes);
+// Within-class edge refinement (--seg-edge): the sharpest `top` share of each
+// class's block x block blocks (mean gradient, majority class) becomes class
+// s + K at boost x the class rate; the rest of the class is lowered so the
+// class keeps its sample budget. ids and rates (K -> 2K entries) in place.
+// pixel_p (> 0) is the global ratio: where boost x rate x pixel_p > 1 the
+// edge set grows into the class's next-sharpest blocks instead of losing
+// the excess to the cap (CS_SEG_EDGE_NOSPILL=1 disables, for comparison).
+void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
+    float pixel_p = 0.0f, int block = 16, float top = 0.5f, float boost = 1.5f);
 
 // Per-tile spectral LOD bytes (free function for test access): each tile's
 // gray DCT energy whitened by the image's global radial spectral decay,

@@ -312,6 +312,10 @@ void print_usage(const char* exe) {
   "                        auto-scales each class's solver coef by its own\n"
   "                        rate (per-segment parameters). Works with\n"
   "                        --ycc420/--ycc422 and --seg-blend.\n"
+  "  --seg-edge            encrypt/roundtrip only, needs --seg-auto <= 127:\n"
+  "                        within-class edge refinement: the sharpest half of\n"
+  "                        each class's 16x16 blocks is sampled at 1.5x the\n"
+  "                        class rate, the rest lowered (same class budget).\n"
   "  --seg-blend <w>       encrypt/roundtrip only, needs --seg-mask or --seg-auto: sample\n"
   "                        a <w>-pixel band (0..128, 0 = off) on each\n"
   "                        side of every segment frontier with a smooth local\n"
@@ -642,6 +646,7 @@ int main(int argc, char* argv[])
 
     // One row per flag. `hint` names the value in the missing-value error
     // (null for switches); `manual` switches decrypt to manual parameters
+    bool seg_edge = false;
     // when the flag parses; `apply` returns false on a bad value (exit 64).
     struct Opt {
         const char* name;
@@ -821,6 +826,7 @@ int main(int argc, char* argv[])
                     std::cerr << "Error: --sample-bits takes L or L,C" << std::endl;
                     return false;
                 }
+        {"--seg-edge", nullptr, false, [&](const char*) { seg_edge = true; return true; }},
                 const std::string chroma = arg.substr(comma + 1);
                 if (!parse_int(chroma.c_str(), chroma_sample_bits)) return false;
             }
@@ -955,6 +961,10 @@ int main(int argc, char* argv[])
     }
     if (!seg_solve.empty() && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --seg-solve is decrypt-side only; ignoring for encrypt" << std::endl;
+    if (seg_edge && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --seg-edge is encrypt-side only; ignoring for decrypt" << std::endl;
+        seg_edge = false;
+    }
         seg_solve.clear();
     }
     if (!seg_params.empty() && mode != "decrypt" && mode != "roundtrip") {
@@ -1091,7 +1101,7 @@ int main(int argc, char* argv[])
 output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
 full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
-seg_rates, seg_blend, sampling, seg_auto);
+seg_rates, seg_blend, sampling, seg_auto, seg_edge);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
@@ -1103,7 +1113,7 @@ seg_rates, seg_blend, sampling, seg_auto);
 output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
 full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
-seg_rates, seg_blend, sampling, seg_auto);
+seg_rates, seg_blend, sampling, seg_auto, seg_edge);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params);

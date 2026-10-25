@@ -62,6 +62,7 @@ int main(int argc, char* argv[]) {
     test_y_dual_tv_color_segment();
     test_dual_tv_split();
     test_seg_auto();
+    test_seg_edge();
     test_encoder_geometry();
     test_auto_reg_params();
     test_per_tile_coef();

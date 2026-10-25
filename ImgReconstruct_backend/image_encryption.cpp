@@ -1777,6 +1777,124 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
 }
 
 /** @brief Per-segment encryption: each class id of the mask draws its own
+void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
+    float pixel_p, int block, float top, float boost) {
+    if (classes < 1 || 2 * classes > 255) {
+        throw std::runtime_error("--seg-edge needs --seg-auto <= 127 classes");
+    }
+    if (bgr.empty() || ids.empty() || bgr.size() != ids.size() || (int)rates.size() < classes) {
+        throw std::runtime_error("--seg-edge: geometry/rates mismatch (internal error)");
+    }
+    const int H = ids.rows, W = ids.cols;
+    // Central-difference gradient magnitude of the luma (borders 0).
+    cv::Mat gray, S;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    gray.convertTo(S, CV_32F);
+    cv::Mat mag = cv::Mat::zeros(H, W, CV_32F);
+    for (int y = 1; y < H - 1; ++y) {
+        const float* up = S.ptr<float>(y - 1);
+        const float* mid = S.ptr<float>(y);
+        const float* dn = S.ptr<float>(y + 1);
+        float* m = mag.ptr<float>(y);
+        for (int x = 1; x < W - 1; ++x) m[x] = std::hypot(mid[x + 1] - mid[x - 1], dn[x] - up[x]);
+    }
+    // Per whole block: mean gradient and majority class.
+    const int bh = H / block, bw = W / block;
+    if (bh == 0 || bw == 0) return;
+    std::vector<float> bm((size_t)bh * bw, 0.0f);
+    std::vector<int> maj((size_t)bh * bw, 0);
+    std::vector<int> bcnt((size_t)bh * bw * classes, 0);   // per-block class pixel counts
+    for (int by = 0; by < bh; ++by)
+        for (int bx = 0; bx < bw; ++bx) {
+            int* cnt = &bcnt[((size_t)by * bw + bx) * classes];
+            double sum = 0.0;
+            for (int y = by * block; y < (by + 1) * block; ++y) {
+                const float* m = mag.ptr<float>(y);
+                const uint8_t* id = ids.ptr<uint8_t>(y);
+                for (int x = bx * block; x < (bx + 1) * block; ++x) {
+                    sum += m[x];
+                    if (id[x] < classes) cnt[id[x]]++;
+                }
+            }
+            bm[(size_t)by * bw + bx] = (float)(sum / (block * block));
+            maj[(size_t)by * bw + bx] = (int)(std::max_element(cnt, cnt + classes) - cnt);
+        }
+    // Flag the sharpest `top` share of each class's majority blocks
+    // (linear-interpolated quantile, numpy's default).
+    std::vector<uint8_t> flag((size_t)bh * bw, 0);
+    for (int s = 0; s < classes; ++s) {
+        std::vector<float> v;
+        for (size_t i = 0; i < bm.size(); ++i) if (maj[i] == s) v.push_back(bm[i]);
+        if (v.empty()) continue;
+        std::sort(v.begin(), v.end());
+        const double pos = (1.0 - top) * (double)(v.size() - 1);
+        const size_t lo = (size_t)pos, hi = (std::min)(lo + 1, v.size() - 1);
+        const float q = (float)(v[lo] + (pos - lo) * (v[hi] - v[lo]));
+        for (size_t i = 0; i < bm.size(); ++i) if (maj[i] == s && bm[i] >= q) flag[i] = 1;
+    }
+    // Spill: where boost x rate exceeds 1 after the global scale, the edge
+    // blocks saturate at 1 and the excess would be lost. Grow the edge set
+    // with the class's next-sharpest blocks (also at 1) until the rest of
+    // the class is back at its uncapped-plan rate. pixel_p <= 0 or
+    // CS_SEG_EDGE_NOSPILL=1 keeps the plain refinement.
+    std::vector<uint8_t> spilled((size_t)classes, 0);
+    if (pixel_p > 0.0f && !std::getenv("CS_SEG_EDGE_NOSPILL")) {
+        std::vector<long long> A((size_t)classes, 0);
+        for (size_t i = 0; i < bm.size(); ++i)
+            for (int c = 0; c < classes; ++c) A[c] += bcnt[i * classes + c];
+        for (int s = 0; s < classes; ++s) {
+            const double be = (std::min)(1.0, (double)rates[(size_t)s] * pixel_p), fe = boost * be;
+            if (fe <= 1.0 || A[s] == 0) continue;
+            long long E = 0;
+            std::vector<size_t> cand;
+            for (size_t i = 0; i < bm.size(); ++i) {
+                if (flag[i]) E += bcnt[i * classes + s];
+                else if (maj[i] == s) cand.push_back(i);
+            }
+            if (E >= A[s]) continue;
+            const double rest0 = (be * A[s] - fe * E) / (double)(A[s] - E);   // rest rate of the uncapped plan
+            std::sort(cand.begin(), cand.end(), [&](size_t a, size_t b) { return bm[a] > bm[b]; });
+            for (size_t i : cand) {
+                if ((be * A[s] - (double)E) / (double)(std::max)(1LL, A[s] - E) <= rest0) break;
+                flag[i] = 1;
+                E += bcnt[i * classes + s];
+            }
+            spilled[(size_t)s] = 1;
+        }
+    }
+    // Edge classes: flagged pixels move to class s + K (partial border
+    // blocks take the flag of the nearest whole block).
+    std::vector<long long> area((size_t)classes, 0), edge((size_t)classes, 0);
+    for (int y = 0; y < H; ++y) {
+        uint8_t* id = ids.ptr<uint8_t>(y);
+        const int by = (std::min)(y / block, bh - 1);
+        for (int x = 0; x < W; ++x) {
+            const int c = id[x];
+            if (c >= classes) continue;
+            area[c]++;
+            if (flag[(size_t)by * bw + (std::min)(x / block, bw - 1)]) { edge[c]++; id[x] = (uint8_t)(c + classes); }
+        }
+    }
+    // Same per-class sample budget: edge part at boost x rate, the rest lowered.
+    std::vector<float> r2((size_t)2 * classes, 0.0f);
+    for (int s = 0; s < classes; ++s) {
+        // spilled classes: edge part exactly saturated (1 after the scale)
+        const double base = rates[(size_t)s];
+        double fe = spilled[(size_t)s] ? 1.0 / pixel_p : boost * base;
+        const double rest_px = (double)(std::max)(1LL, area[s] - edge[s]);
+        double rest = (base * area[s] - fe * edge[s]) / rest_px;
+        if (rest < 0.02 && edge[s] > 0) {
+            // Most of a small class sits in edge blocks: the rest cannot go below the rate
+            // floor, so lower the edge rate instead of exceeding the class budget.
+            rest = 0.02;
+            fe = (std::max)((base * area[s] - rest * rest_px) / (double)edge[s], rest);
+        }
+        r2[(size_t)s] = (float)(std::max)(rest, 0.02);
+        r2[(size_t)classes + s] = (float)fe;
+    }
+    rates = r2;
+}
+
  * budgeted share (count_c = round(pix_c * q_c / 255) with q the quantized
  * rate AFTER the global pixel_p scale), then one global shuffle fixes the
  * measurement order. The body prefix [nclasses][rates][seglen][label PNG]
@@ -2388,7 +2506,8 @@ int encrypt_image::encrypt_image_tiled(
     const std::string& seg_rates,
     int seg_blend,
     const std::string& sampling,
-    int seg_auto
+    int seg_auto,
+    bool seg_edge
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -2460,6 +2579,9 @@ int encrypt_image::encrypt_image_tiled(
             throw std::runtime_error("--seg-auto and --seg-mask are mutually exclusive (two label sources)");
         }
         const bool seg_mode = !seg_mask.empty() || !seg_rates.empty() || seg_auto > 0;
+        if (seg_edge && (seg_auto == 0 || seg_auto > 127)) {
+            throw std::runtime_error("--seg-edge needs --seg-auto with 2..127 classes");
+        }
         if (seg_mode && !seg_auto && (seg_mask.empty() || seg_rates.empty())) {
             throw std::runtime_error("--seg-mask and --seg-rates must be given together");
         }
@@ -2545,9 +2667,7 @@ int encrypt_image::encrypt_image_tiled(
             // detail-driven rates (or the --seg-rates override, whose short
             // lists leave trailing classes at 0). Same containers/modes as
             // --seg-mask, so decrypt needs no new flags.
-            // Segment at the sampling geometry (rows x cols members, which
-            // the ctor leaves unstretched; the mult-8 stretch applies to
-            // input_img pixels only and sampling never addresses it).
+            // Segment at the sampling geometry (rows x cols members).
             cv::Mat auto_ids;
             cs_seg_auto_ids(input_img, seg_auto, input_img.rows, input_img.cols, auto_ids);
             std::vector<float> auto_rates = seg_rates.empty()
@@ -2571,6 +2691,16 @@ int encrypt_image::encrypt_image_tiled(
                 std::cout << (seg_rates.empty() ? " (auto rates)" : " (--seg-rates override)") << std::endl;
             }
             if (ycc420 || ycc422) {
+            if (seg_edge) {
+                // Class rates cannot see detail inside a class (a roof in the
+                // sky's class): move each class's sharpest blocks to an edge
+                // class at a higher rate, same per-class budget.
+                auto_rates.resize((size_t)seg_auto, 0.0f);
+                cs_seg_edge_refine(input_img, auto_ids, auto_rates, seg_auto, compression_ratio);
+                std::cout << "seg-edge: " << 2 * seg_auto << " classes, rates";
+                for (float r : auto_rates) std::printf(" %.2f", r);
+                std::cout << std::endl;
+            }
                 const int seg_mode = ycc422 ? CS_MODE_YCC422_SEG : CS_MODE_YCC420_SEG;
                 encrypt_img.encrypt_ycc420_segmask_ids(compression_ratio, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
             }

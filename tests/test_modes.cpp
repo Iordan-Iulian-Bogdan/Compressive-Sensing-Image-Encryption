@@ -413,6 +413,151 @@ void test_seg_auto() {
     std::remove(tmp_in.c_str());
 }
 
+// A textured band (high gradient) and flat areas, so classes differ in detail and in size.
+static cv::Mat make_seg_edge_image(int w, int h) {
+    cv::Mat img(h, w, CV_8UC3, cv::Scalar(120, 130, 140));
+    cv::RNG rng(5);
+    cv::Mat band = img(cv::Rect(0, 0, w, h / 3));
+    rng.fill(band, cv::RNG::UNIFORM, cv::Scalar(0, 0, 0), cv::Scalar(255, 255, 255));
+    cv::rectangle(img, cv::Rect(w / 2, h / 2, w / 4, h / 4), cv::Scalar(30, 200, 90), cv::FILLED);
+    return img;
+}
+
+static long long class_px(const cv::Mat& ids, int c) { return cv::countNonZero(ids == c); }
+
+void test_seg_edge() {
+    // cs_seg_edge_refine: the sharpest blocks of every class become an edge class (s + K) at a
+    // higher rate, the rest of the class is lowered so the class keeps its sample budget.
+    const cv::Mat img = make_seg_edge_image(192, 144);
+    const int K = 3;
+    cv::Mat ids0;
+    cs_seg_auto_ids(img, K, 144, 192, ids0);
+    const std::vector<float> base = cs_seg_auto_rates(img, ids0, K);
+
+    // pixel_p 0 = plain refinement, 0.5 = spill-over enabled (no class saturates at 0.5)
+    for (const float pixel_p : { 0.0f, 0.5f }) {
+        const std::string tag = pixel_p > 0.0f ? " (spill)" : "";
+        cv::Mat ids = ids0.clone();
+        std::vector<float> rates = base;
+        cs_seg_edge_refine(img, ids, rates, K, pixel_p);
+        check(rates.size() == (size_t)2 * K, ("seg-edge: 2K rates" + tag).c_str());
+        check(ids.size() == ids0.size() && ids.type() == CV_8U, ("seg-edge: ids geometry/type kept" + tag).c_str());
+        double mx = 0;
+        cv::minMaxLoc(ids, nullptr, &mx);
+        check(mx < 2 * K, ("seg-edge: ids < 2K" + tag).c_str());
+        // every pixel keeps its class modulo K, and some pixels moved to an edge class
+        cv::Mat low = ids.clone();
+        low.forEach<uint8_t>([&](uint8_t& v, const int*) { v = (uint8_t)(v % K); });
+        check(cv::countNonZero(low != ids0) == 0, ("seg-edge: class identity kept (id % K)" + tag).c_str());
+        long long n_edge = 0;
+        for (int c = K; c < 2 * K; ++c) n_edge += class_px(ids, c);
+        check(n_edge > 0, ("seg-edge: some pixels moved to edge classes" + tag).c_str());
+        // class budget: sum(rate * px) over (class, edge class) equals the original class budget
+        bool budget = true, edge_hotter = true;
+        for (int s = 0; s < K; ++s) {
+            const double want = (double)base[s] * class_px(ids0, s);
+            const double got = (double)rates[s] * class_px(ids, s) + (double)rates[K + s] * class_px(ids, K + s);
+            if (std::fabs(got - want) > 0.01 * want + 1.0) budget = false;
+            if (class_px(ids, K + s) > 0 && !(rates[K + s] >= rates[s])) edge_hotter = false;
+        }
+        check(budget, ("seg-edge: per-class sample budget kept" + tag).c_str());
+        check(edge_hotter, ("seg-edge: edge class rate >= rest of its class" + tag).c_str());
+    }
+    {
+        // plain refinement: edge rate is exactly boost x the class rate
+        cv::Mat ids = ids0.clone();
+        std::vector<float> rates = base;
+        cs_seg_edge_refine(img, ids, rates, K, 0.0f);
+        bool exact = true;
+        for (int s = 0; s < K; ++s) {
+            // the boost is only exact where the rest of the class stays above the rate floor
+            const double share = (double)class_px(ids, K + s) / (double)class_px(ids0, s);
+            if (share < 0.6) exact = exact && std::fabs(rates[K + s] - 1.5f * base[s]) < 1e-5f;
+        }
+        check(exact, "seg-edge: edge rate = 1.5 x class rate without spill (floor not binding)");
+    }
+    {
+        // spill-over: for a busy class, boost x rate x pixel_p exceeds 1 after the global scale;
+        // the edge set grows so the class budget is kept with the edge rate saturated
+        const float pp = 0.9f;
+        cv::Mat ids = ids0.clone();
+        std::vector<float> rates = base;
+        cs_seg_edge_refine(img, ids, rates, K, pp);
+        cv::Mat ids_ns = ids0.clone();
+        std::vector<float> rates_ns = base;
+        _putenv_s("CS_SEG_EDGE_NOSPILL", "1");
+        cs_seg_edge_refine(img, ids_ns, rates_ns, K, pp);
+        _putenv_s("CS_SEG_EDGE_NOSPILL", "");
+        int spilled = 0;
+        bool saturated = true, more_edge = true, budget = true;
+        for (int s = 0; s < K; ++s) {
+            if (base[s] * pp * 1.5f <= 1.0f) continue;   // this class does not saturate
+            ++spilled;
+            // never above 1 after the scale; exactly 1 unless the rest of the class sits on the rate floor
+            const bool floor_binds = std::fabs(rates[s] - 0.02f) < 1e-6f;
+            saturated = saturated && rates[K + s] * pp <= 1.0f + 1e-4f &&
+                (floor_binds || std::fabs(rates[K + s] * pp - 1.0f) < 1e-4f);
+            more_edge = more_edge && class_px(ids, K + s) >= class_px(ids_ns, K + s);
+            const double want = (double)base[s] * class_px(ids0, s);
+            const double got = (double)rates[s] * class_px(ids, s) + (double)rates[K + s] * class_px(ids, K + s);
+            budget = budget && std::fabs(got - want) <= 0.01 * want + 1.0;
+        }
+        check(spilled > 0, "seg-edge spill: a class saturates in the test image");
+        check(saturated, "seg-edge spill: edge rate capped at 1 after the global scale");
+        check(more_edge, "seg-edge spill: edge set grows into the next-sharpest blocks");
+        check(budget, "seg-edge spill: class budget kept");
+    }
+    {
+        // validation
+        cv::Mat ids = ids0.clone();
+        std::vector<float> rates = base;
+        bool threw = false;
+        try { cs_seg_edge_refine(img, ids, rates, 128, 0.5f); } catch (...) { threw = true; }
+        check(threw, "seg-edge: more than 127 classes rejected");
+        threw = false;
+        cv::Mat small(10, 10, CV_8U, cv::Scalar(0));
+        try { cs_seg_edge_refine(img, small, rates, K, 0.5f); } catch (...) { threw = true; }
+        check(threw, "seg-edge: geometry mismatch rejected");
+    }
+    // End to end: --seg-auto --seg-edge container, decode, header mode, validation.
+    const std::string password = "seg-edge-test-password";
+    const std::string tmp_in = ".cs_test_segedge_in.png";
+    cv::imwrite(tmp_in, img);
+    {
+        cv::Mat encrypted;
+        check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &encrypted,
+            false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+            8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 4, true) == 0,
+            "seg-edge roundtrip: encrypt");
+        const cv::Mat flat = encrypted.reshape(0, (int)encrypted.total());
+        check(!encrypted.empty() && flat.data[CS_OFF_PAD] == CS_MODE_SEGMASK, "seg-edge roundtrip: header mode=10");
+        const std::string tmp_out = ".cs_test_segedge_out.png";
+        check(decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
+            "seg-edge roundtrip: decrypt succeeds");
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        if (!dec.empty()) {
+            cv::Mat sized;
+            cv::resize(dec, sized, img.size());
+            const double p = cs_quality::psnr(img, sized);
+            std::printf("       seg-edge roundtrip PSNR (ratio 0.5): %.2f dB\n", p);
+            check(p > 9.0, "seg-edge roundtrip: PSNR sane");
+        }
+        else {
+            check(false, "seg-edge roundtrip: output readable");
+        }
+        std::remove(tmp_out.c_str());
+    }
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, nullptr,
+        false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+        8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 0, true) != 0,
+        "seg-edge: needs --seg-auto");
+    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, nullptr,
+        false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
+        8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 128, true) != 0,
+        "seg-edge: --seg-auto above 127 classes rejected");
+    std::remove(tmp_in.c_str());
+}
+
 // Encoder geometry: the container's samples must come from the image at the positions the
 // decoder puts them. Sizes not divisible by 8 used to be stretched to a multiple of 8 for the
 // sampling pixels while the sample positions stayed on the unstretched grid, shifting content
