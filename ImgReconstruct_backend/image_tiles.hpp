@@ -25,6 +25,12 @@ cv::Mat blendTilesWithImage(
     const std::vector<std::vector<cv::Mat>>& tiles,
     const std::vector<std::vector<TileCoord>>& coordinates,
     const cv::Mat& target_image, float alpha, int feather = 0);
+// Cosine feather weights (CV_32FC1, clipped_height x clipped_width) of one tile placement in
+// blendTilesWithImage: full weight on sides touching the image border, otherwise
+// 0.5*(1 - cos(pi*d/feather)) of the distance d to the nearest interior edge (capped at feather).
+cv::Mat cs_feather_weights(int tile_width, int tile_height, int ox, int oy,
+    int clipped_width, int clipped_height, bool touch_l, bool touch_t, bool touch_r, bool touch_b,
+    int feather);
 
 void shuffle(std::vector<int>& data, unsigned seed);
 void reverseShuffle(std::vector<int>& data, unsigned seed);

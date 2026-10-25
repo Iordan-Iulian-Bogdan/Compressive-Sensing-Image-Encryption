@@ -603,6 +603,7 @@ void encrypt_image::present_sampling_mask(const std::string& output_path) const 
             std::cout << "Sampling mask written to " << mask_path << std::endl;
         }
     }
+    if (std::getenv("CS_MASK_NO_WINDOW")) return;   // scripted runs: file only, no blocking window
 
     try {
         const char* win = "sampling mask";
@@ -1776,7 +1777,6 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
     return rates;
 }
 
-/** @brief Per-segment encryption: each class id of the mask draws its own
 void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
     float pixel_p, int block, float top, float boost) {
     if (classes < 1 || 2 * classes > 255) {
@@ -1895,6 +1895,7 @@ void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& ra
     rates = r2;
 }
 
+/** @brief Per-segment encryption: each class id of the mask draws its own
  * budgeted share (count_c = round(pix_c * q_c / 255) with q the quantized
  * rate AFTER the global pixel_p scale), then one global shuffle fixes the
  * measurement order. The body prefix [nclasses][rates][seglen][label PNG]
@@ -2578,10 +2579,10 @@ int encrypt_image::encrypt_image_tiled(
         if (seg_auto > 0 && !seg_mask.empty()) {
             throw std::runtime_error("--seg-auto and --seg-mask are mutually exclusive (two label sources)");
         }
-        const bool seg_mode = !seg_mask.empty() || !seg_rates.empty() || seg_auto > 0;
         if (seg_edge && (seg_auto == 0 || seg_auto > 127)) {
             throw std::runtime_error("--seg-edge needs --seg-auto with 2..127 classes");
         }
+        const bool seg_mode = !seg_mask.empty() || !seg_rates.empty() || seg_auto > 0;
         if (seg_mode && !seg_auto && (seg_mask.empty() || seg_rates.empty())) {
             throw std::runtime_error("--seg-mask and --seg-rates must be given together");
         }
@@ -2690,7 +2691,6 @@ int encrypt_image::encrypt_image_tiled(
                 }
                 std::cout << (seg_rates.empty() ? " (auto rates)" : " (--seg-rates override)") << std::endl;
             }
-            if (ycc420 || ycc422) {
             if (seg_edge) {
                 // Class rates cannot see detail inside a class (a roof in the
                 // sky's class): move each class's sharpest blocks to an edge
@@ -2701,6 +2701,7 @@ int encrypt_image::encrypt_image_tiled(
                 for (float r : auto_rates) std::printf(" %.2f", r);
                 std::cout << std::endl;
             }
+            if (ycc420 || ycc422) {
                 const int seg_mode = ycc422 ? CS_MODE_YCC422_SEG : CS_MODE_YCC420_SEG;
                 encrypt_img.encrypt_ycc420_segmask_ids(compression_ratio, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
             }

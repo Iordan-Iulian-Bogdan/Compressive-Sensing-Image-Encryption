@@ -501,8 +501,26 @@ bool set_choice(const char* v, std::string& out, std::initializer_list<const cha
 
 } // namespace
 
+#ifdef CS_GPU_TILES
+// GPU build: the GPU stages are the default. CS_GPU_TILES (LR tile solve, batched cs-sr tile
+// stage, compositing), CS_GPU_ADMM (PnP-ADMM) and CS_GPU_ONNX (DirectML prior/denoiser) default
+// to on; set one to 0 to run that stage on the CPU. Any other explicit value is kept as given.
+static void cs_gpu_env_defaults()
+{
+    for (const char* name : { "CS_GPU_TILES", "CS_GPU_ADMM", "CS_GPU_ONNX" }) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) _putenv_s(name, "1");
+        else if (v[0] == '0' && v[1] == '\0' && std::strcmp(name, "CS_GPU_TILES") == 0)
+            _putenv_s(name, "");   // CS_GPU_TILES is tested for presence, so "0" must unset it
+    }
+}
+#endif
+
 int main(int argc, char* argv[])
 {
+#ifdef CS_GPU_TILES
+    cs_gpu_env_defaults();
+#endif
     if (argc < 2) {
         print_usage(argv[0]);
         return 64; // usage error
@@ -628,6 +646,7 @@ int main(int argc, char* argv[])
     int seg_blend = 0;
     std::string sampling = "points";
     int seg_auto = 0;
+    bool seg_edge = false;
     std::string seg_solve;
     std::string seg_params;
     bool show_mask = false;
@@ -646,7 +665,6 @@ int main(int argc, char* argv[])
 
     // One row per flag. `hint` names the value in the missing-value error
     // (null for switches); `manual` switches decrypt to manual parameters
-    bool seg_edge = false;
     // when the flag parses; `apply` returns false on a bad value (exit 64).
     struct Opt {
         const char* name;
@@ -808,6 +826,7 @@ int main(int argc, char* argv[])
         {"--seg-auto", "class count 2..255", false, [&](const char* v) {
             return set_int_strict(v, seg_auto, "Error: --seg-auto needs an integer in [2, 255]");
         }},
+        {"--seg-edge", nullptr, false, [&](const char*) { seg_edge = true; return true; }},
         {"--sampling", "points|tcluster|tmeans", false, [&](const char* v) {
             return set_choice(v, sampling, {"points", "tcluster", "tmeans"},
                               "Error: --sampling must be points|tcluster|tmeans");
@@ -826,7 +845,6 @@ int main(int argc, char* argv[])
                     std::cerr << "Error: --sample-bits takes L or L,C" << std::endl;
                     return false;
                 }
-        {"--seg-edge", nullptr, false, [&](const char*) { seg_edge = true; return true; }},
                 const std::string chroma = arg.substr(comma + 1);
                 if (!parse_int(chroma.c_str(), chroma_sample_bits)) return false;
             }
@@ -943,6 +961,10 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --seg-auto is encrypt-side only; ignoring for decrypt" << std::endl;
         seg_auto = 0;
     }
+    if (seg_edge && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --seg-edge is encrypt-side only; ignoring for decrypt" << std::endl;
+        seg_edge = false;
+    }
     if (seg_blend != 0 && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --seg-blend is encrypt-side only; ignoring for decrypt" << std::endl;
         seg_blend = 0;
@@ -961,10 +983,6 @@ int main(int argc, char* argv[])
     }
     if (!seg_solve.empty() && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --seg-solve is decrypt-side only; ignoring for encrypt" << std::endl;
-    if (seg_edge && mode != "encrypt" && mode != "roundtrip") {
-        std::cerr << "Warning: --seg-edge is encrypt-side only; ignoring for decrypt" << std::endl;
-        seg_edge = false;
-    }
         seg_solve.clear();
     }
     if (!seg_params.empty() && mode != "decrypt" && mode != "roundtrip") {

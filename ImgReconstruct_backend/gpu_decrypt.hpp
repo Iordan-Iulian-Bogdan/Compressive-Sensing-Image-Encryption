@@ -13,10 +13,11 @@ struct GpuTileJob {
     int fista_iters, reweights;
     float coef, wscale;
     cv::Mat* out;                  // receives the solved CV_8UC3 tile
+    float tv = 0.0f;               // smoothed-TV weight (> 0: backtracking branch, as the CPU core)
 };
 
 /** @brief Solves the three colour channels of every job with reweighted-L1
-FISTA (DCT, tv = 0) on the GPU, in batches that share (steps, reweights,
+FISTA (DCT, any tv) on the GPU, in batches that share (steps, reweights,
 wscale). Unlike the CPU path there is no neighbour warm start: each tile starts
 from a smooth fill of its own samples (transformed to DCT coefficients), so all
 tiles can be solved at once. solved[k] = 1 when job k finished (its out is set);

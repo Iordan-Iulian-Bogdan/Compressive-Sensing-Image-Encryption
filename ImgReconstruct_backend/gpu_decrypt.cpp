@@ -67,7 +67,7 @@ void cs_gpu_solve_tiles(std::vector<GpuTileJob>& jobs, std::vector<char>& solved
             const GpuTileJob& J = jobs[(size_t)jc.first];
             Channel& C = st[(size_t)jc.first][(size_t)jc.second];
             probs.push_back({ J.rows, J.cols, C.b.data(), J.rix->data(), J.riy->data(),
-                (int)J.rix->size(), C.x.data(), J.coef });
+                (int)J.rix->size(), C.x.data(), J.coef, J.tv });
         }
         const gpu_tiles::Params prm{ std::get<0>(g.first), std::get<1>(g.first), std::get<2>(g.first) };
         if (!gpu_tiles::solve_fista_dct(probs, prm)) continue;

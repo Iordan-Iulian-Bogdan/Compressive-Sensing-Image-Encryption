@@ -7,6 +7,7 @@
 #include "crypto_utils.hpp"
 #ifdef CS_GPU_TILES
 #include "gpu_admm_broker.hpp"
+#include "gpu_sr.h"
 #endif
 
 #include <opencv2/imgproc.hpp>
@@ -19,6 +20,8 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <tuple>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -386,6 +389,61 @@ static float cs_sr_prox_nlm_h(const cv::Mat& lr_tile)
     return h;
 }
 
+// Per-round schedule of the PnP-ADMM penalty rho and NLM strength (DPIR-style
+// continuation). rho goes geometrically from the base rho to CS_SR_RHO_END and the
+// NLM strength is multiplied by a factor going geometrically from CS_SR_H0 to
+// CS_SR_H1 over the rounds; CS_SR_URESCALE=1 rescales the scaled dual u by
+// rho_old/rho_new when rho changes. Defaults (unset) keep the constant behaviour.
+struct CsSrAdmmSched { float rho_end = 0.0f, h0 = 1.0f, h1 = 1.0f; bool rescale_u = false; };
+static const CsSrAdmmSched& cs_sr_admm_sched() {
+    static const CsSrAdmmSched s = [] {
+        CsSrAdmmSched r;
+        if (const char* v = std::getenv("CS_SR_RHO_END")) r.rho_end = (float)std::atof(v);
+        if (const char* v = std::getenv("CS_SR_H0")) r.h0 = (float)std::atof(v);
+        if (const char* v = std::getenv("CS_SR_H1")) r.h1 = (float)std::atof(v);
+        if (const char* v = std::getenv("CS_SR_URESCALE")) r.rescale_u = v[0] == '1';
+        if (!(r.h0 > 0.0f)) r.h0 = 1.0f;
+        if (!(r.h1 > 0.0f)) r.h1 = 1.0f;
+        return r;
+    }();
+    return s;
+}
+static float cs_sr_geo(float a, float b, int k, int n) {
+    if (n <= 1 || a == b) return a;
+    return a * std::pow(b / a, (float)k / (float)(n - 1));
+}
+
+// Y measurements: OpenCV BGR2YCrCb luma weights over the sampled BGR triplets (same weights
+// the Y plane of the warm start is built with).
+static void cs_sr_luma_samples(const cv::Mat& pixel_measurements, int m, std::vector<float>& b)
+{
+    std::vector<float> bB, bG, bR;
+    cs_extract_channel_measurements(pixel_measurements, 0, m, bB);
+    cs_extract_channel_measurements(pixel_measurements, 1, m, bG);
+    cs_extract_channel_measurements(pixel_measurements, 2, m, bR);
+    b.resize((size_t)m);
+    for (int k = 0; k < m; ++k)
+        b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
+}
+
+// HR-detail anchors as in-solve data terms: global output-geometry indices map to tile-local
+// HR pixels via the tile origin; anchors outside this tile are skipped (neighbor tiles own them).
+static void cs_sr_tile_anchors(const CsHrSrCtx& hr_sr, int Hr, int Wc,
+    std::vector<int>& idx, std::vector<float>& val)
+{
+    if (!hr_sr.anchors || hr_sr.anchors->empty() || hr_sr.stride <= 0) return;
+    idx.reserve(hr_sr.anchors->size());
+    val.reserve(hr_sr.anchors->size());
+    for (const CsHrSample& s : *hr_sr.anchors) {
+        const int gx = (int)(s.idx % (uint32_t)hr_sr.stride);
+        const int gy = (int)(s.idx / (uint32_t)hr_sr.stride);
+        const int lx = gx - hr_sr.ox, ly = gy - hr_sr.oy;
+        if (lx < 0 || ly < 0 || lx >= Wc || ly >= Hr) continue;
+        idx.push_back(ly * Wc + lx);
+        val.push_back(s.y * (1.0f / 255.0f));
+    }
+}
+
 void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurements,
     const std::vector<int>& ri_x, const std::vector<int>& ri_y,
     float coef, float tv, int iterations, int reweights, int fista_iters, int basis, float wscale,
@@ -397,6 +455,27 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     if (lr_tile.empty() || lr_tile.type() != CV_8UC3) return;
     const int Lr = lr_tile.rows, Lc = lr_tile.cols;
     if (Lr < 8 || Lc < 8) { cs_upscale_2x_avir(lr_tile, hr_out); return; }
+    // Diagnostic (opt-in): CS_DUMP_LRTILES=<file> appends a sample of the solved LR tiles that
+    // feed the 2x prior/AVIR as records [int32 ox, oy, rows, cols][BGR bytes], ox/oy being the
+    // tile origin in the 2x output geometry. CS_DUMP_LR_EVERY=<n> (default 20) keeps ~1 in n
+    // tiles, picked by a hash of the origin so the choice is the same on every run.
+    if (const char* dump_path = std::getenv("CS_DUMP_LRTILES"); dump_path && *dump_path) {
+        static std::mutex dump_mu;
+        int every = 20;
+        if (const char* e = std::getenv("CS_DUMP_LR_EVERY")) every = (std::max)(1, std::atoi(e));
+        const unsigned long long key = ((unsigned long long)(unsigned)hr_sr.ox * 73856093ULL) ^
+            ((unsigned long long)(unsigned)hr_sr.oy * 19349663ULL);
+        if (every <= 1 || ((key >> 4) % (unsigned long long)every) == 0ULL) {
+            const cv::Mat c = lr_tile.isContinuous() ? lr_tile : lr_tile.clone();
+            const int32_t hdr[4] = { hr_sr.ox, hr_sr.oy, c.rows, c.cols };
+            std::lock_guard<std::mutex> lk(dump_mu);
+            if (FILE* f = std::fopen(dump_path, "ab")) {
+                std::fwrite(hdr, sizeof(int32_t), 4, f);
+                std::fwrite(c.data, 1, c.total() * c.elemSize(), f);
+                std::fclose(f);
+            }
+        }
+    }
     if (basis != CS_BASIS_DCT || ri_x.size() != ri_y.size() || ri_x.empty()) {
         cs_upscale_2x_avir(lr_tile, hr_out);
         return;
@@ -424,15 +503,8 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     const int inner = cs_fista_inner_iters(iterations, fista_iters);
     const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, wscale);
 
-    // Y measurements: OpenCV BGR2YCrCb luma weights over the sampled BGR
-    // triplets (same weights the Y plane below was built with).
-    std::vector<float> bB, bG, bR, b((size_t)m);
-    cs_extract_channel_measurements(pixel_measurements, 0, m, bB);
-    cs_extract_channel_measurements(pixel_measurements, 1, m, bG);
-    cs_extract_channel_measurements(pixel_measurements, 2, m, bR);
-    for (int k = 0; k < m; ++k) {
-        b[(size_t)k] = 0.114f * bB[(size_t)k] + 0.587f * bG[(size_t)k] + 0.299f * bR[(size_t)k];
-    }
+    std::vector<float> b;
+    cs_sr_luma_samples(pixel_measurements, m, b);
     // Prior image. Default is the AVIR resampler (always needed for the final
     // Cr/Cb planes — luminance-only solve: SR lives in Y, chroma is smooth
     // enough to interpolate). --sr-prior-model instead asks a learned ONNX 2x
@@ -546,18 +618,7 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     // and the map builder guards the RED radius independently.
     std::vector<int> tile_hr_idx;
     std::vector<float> tile_hr_val;
-    if (hr_sr.anchors && !hr_sr.anchors->empty() && hr_sr.stride > 0) {
-        tile_hr_idx.reserve(hr_sr.anchors->size());
-        tile_hr_val.reserve(hr_sr.anchors->size());
-        for (const CsHrSample& s : *hr_sr.anchors) {
-            const int gx = (int)(s.idx % (uint32_t)hr_sr.stride);
-            const int gy = (int)(s.idx / (uint32_t)hr_sr.stride);
-            const int lx = gx - hr_sr.ox, ly = gy - hr_sr.oy;
-            if (lx < 0 || ly < 0 || lx >= Wc || ly >= Hr) continue;
-            tile_hr_idx.push_back(ly * Wc + lx);
-            tile_hr_val.push_back(s.y * (1.0f / 255.0f));
-        }
-    }
+    cs_sr_tile_anchors(hr_sr, Hr, Wc, tile_hr_idx, tile_hr_val);
     // Anchor-weighted RED: per-pixel blend map from the same tile-local
     // anchors (empty = legacy uniform RED). Built once; the per-pass
     // decayed strength multiplies it at each application.
@@ -589,17 +650,39 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
         }
         std::fill(w.begin(), w.end(), 1.0f);
         // GPU batch path (env CS_GPU_ADMM=1): same loop on the device for the
-        // NLM-prox, anchor-free, TV-free case; anything else runs below.
+        // NLM-prox case (exact-HR anchors and tv > 0 included); anything else runs below.
         bool gpu_done = false;
 #ifdef CS_GPU_TILES
-        if (red_kind < 0 && tv <= 0.0f && tile_hr_idx.empty() && cs_default_dct_block() <= 0 &&
-            cs_gpu_admm_enabled()) {
-            const gpu_admm::Problem gp{ Hr, Wc, b.data(), ri_x.data(), ri_y.data(), m,
+        if (red_kind < 0 && tv >= 0.0f && cs_default_dct_block() <= 0 && cs_gpu_admm_enabled()) {
+            const bool hr_on = !tile_hr_idx.empty() && hr_sr.weight > 0.0f;
+            std::vector<float> hr_map;
+            if (hr_on) {
+                hr_map.assign((size_t)n_hr, -1e30f);
+                for (size_t k = 0; k < tile_hr_idx.size(); ++k) hr_map[(size_t)tile_hr_idx[k]] = tile_hr_val[k];
+            }
+            gpu_admm::Problem gp{ Hr, Wc, b.data(), ri_x.data(), ri_y.data(), m,
                 zpx.data(), correction_coef, nlm_prox_h };
-            gpu_done = cs_gpu_admm_run(gp, gpu_admm::Params{ admm, inner, rho, bx.lip, wscale });
+            gp.hr_val = hr_on ? hr_map.data() : nullptr;
+            gp.tv = tv;
+            const CsSrAdmmSched& sc = cs_sr_admm_sched();
+            gpu_admm::Params gprm{ admm, inner, rho, bx.lip, wscale,
+                sc.rho_end, sc.h0, sc.h1, sc.rescale_u ? 1 : 0 };
+            gprm.hr_weight = hr_on ? hr_sr.weight : 0.0f;
+            gprm.bt = tv > 0.0f ? 1 : 0;
+            gpu_done = cs_gpu_admm_run(gp, gprm);
         }
 #endif
+        const CsSrAdmmSched& sched = cs_sr_admm_sched();
+        const float rho_end = sched.rho_end > 0.0f ? sched.rho_end : rho;
+        float rho_prev = rho;
         for (int k = 0; !gpu_done && k < admm; ++k) {
+            const float rho_k = cs_sr_geo(rho, rho_end, k, admm);
+            const float h_k = nlm_prox_h * cs_sr_geo(sched.h0, sched.h1, k, admm);
+            if (sched.rescale_u && rho_k != rho_prev) {
+                const float f = rho_prev / rho_k;
+                for (float& uu : upx) uu *= f;
+            }
+            rho_prev = rho_k;
             for (int i = 0; i < n_hr; ++i)
                 anch[(size_t)i] = zpx[(size_t)i] - upx[(size_t)i];
             {
@@ -612,7 +695,7 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
                 cs_dct_forward(sm_, cs_default_dct_block());
                 std::memcpy(x, sm_.ptr<float>(0), sizeof(float) * (size_t)n_hr);
             }
-            cs_sr_core_single(x, b.data(), anch.data(), rho,
+            cs_sr_core_single(x, b.data(), anch.data(), rho_k,
                 ri_x.data(), ri_y.data(), m, Hr, Wc, Lr, Lc,
                 w.data(), correction_coef, tv, inner, bx,
                 y, x_prev, grad, pix_hr, lr_buf, sc_lr, up_hr,
@@ -630,10 +713,10 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
             bool zok = true;
             if (red_kind >= 0)
                 zok = cs_sr_prox_luma_plane(zp, init_ycc_chs[1], init_ycc_chs[2],
-                    red_kind, red_path, nlm_prox_h);
+                    red_kind, red_path, h_k);
             else
                 cs_sr_prox_luma_plane(zp, cv::Mat(), cv::Mat(), -1, std::string(),
-                    nlm_prox_h);
+                    h_k);
             if (!zok) zp = v;
             {
                 const float* pp = px.ptr<float>(0);
@@ -1410,3 +1493,115 @@ void cs_sr_cascade_init(const float* b, const int* rix, const int* riy, int m,
         std::memset(hr_init, 0, sizeof(float) * (size_t)n_hr);
     }
 }
+
+#ifdef CS_GPU_TILES
+void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_denoiser,
+    bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done)
+{
+    done.assign(tiles.size(), 0);
+    // Same gate as the per-tile GPU ADMM path of cs_sr_upscale_tile_2x (pnp_mode 2, NLM prox).
+    if (tiles.empty() || !sr_prior.model.empty() || sr_prior.pnp_mode != 2 || sr_cascade ||
+        cs_onnx_kind_for(red_denoiser) >= 0 || cs_default_dct_block() > 0 || !cs_gpu_admm_enabled())
+        return;
+    const int admm = (std::min)(50, (std::max)(1, sr_prior.pnp_iters));
+    const float rho = sr_prior.pnp_rho > 0.0f ? sr_prior.pnp_rho : 0.1f;
+    const CsSrAdmmSched& sc = cs_sr_admm_sched();
+    int verify_every = 0;
+    if (const char* v = std::getenv("CS_GPU_SR_VERIFY")) verify_every = (std::max)(0, std::atoi(v));
+
+    // Per-tile host data (kept alive until the GPU pass returns) and ADMM parameter groups.
+    struct Prep {
+        cv::Mat lr; std::vector<float> b, hr_map; gpu_admm::Params prm; bool ok = false;
+        std::vector<std::uint8_t> dbg_avir; float dbg_h = 0.0f;
+    };
+    std::vector<Prep> pp(tiles.size());
+    using Key = std::tuple<int, int, float, float, float, float, float, float, int, float, int>;
+    std::map<Key, std::vector<size_t>> groups;
+    for (size_t k = 0; k < tiles.size(); ++k) {
+        const CsSrBatchTile& T = tiles[k];
+        Prep& P = pp[k];
+        if (!T.lr_tile || T.lr_tile->empty() || T.lr_tile->type() != CV_8UC3) continue;
+        const int Lr = T.lr_tile->rows, Lc = T.lr_tile->cols, Hr = 2 * Lr, Wc = 2 * Lc;
+        const int m = (int)T.ri_x->size();
+        if (Lr < 8 || Lc < 8 || !(T.tv >= 0.0f) || !gpu_admm::supported(Hr, Wc) ||
+            T.meas->total() < (size_t)CS_HEADER_PIXELS + (size_t)m)
+            continue;
+        P.lr = T.lr_tile->isContinuous() ? *T.lr_tile : T.lr_tile->clone();
+        cs_sr_luma_samples(*T.meas, m, P.b);
+        std::vector<int> hidx; std::vector<float> hval;
+        cs_sr_tile_anchors(T.hr_sr, Hr, Wc, hidx, hval);
+        const bool hr_on = !hidx.empty() && T.hr_sr.weight > 0.0f;
+        if (hr_on) {
+            P.hr_map.assign((size_t)Hr * Wc, -1e30f);
+            for (size_t q = 0; q < hidx.size(); ++q) P.hr_map[(size_t)hidx[q]] = hval[q];
+        }
+        const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, T.wscale);
+        P.prm = gpu_admm::Params{ admm, cs_fista_inner_iters(T.iterations, T.fista_iters), rho, bx.lip, T.wscale,
+            sc.rho_end, sc.h0, sc.h1, sc.rescale_u ? 1 : 0 };
+        P.prm.hr_weight = hr_on ? T.hr_sr.weight : 0.0f;
+        P.prm.bt = T.tv > 0.0f ? 1 : 0;
+        P.ok = true;
+        groups[Key(P.prm.admm, P.prm.inner, P.prm.rho, P.prm.lip, P.prm.wscale, P.prm.rho_end, P.prm.h_start,
+            P.prm.h_end, P.prm.rescale_u, P.prm.hr_weight, P.prm.bt)].push_back(k);
+    }
+
+    for (auto& g : groups) {
+        std::vector<gpu_sr::Tile> jobs;
+        jobs.reserve(g.second.size());
+        for (size_t k : g.second) {
+            const CsSrBatchTile& T = tiles[k];
+            Prep& P = pp[k];
+            T.hr_out->create(2 * P.lr.rows, 2 * P.lr.cols, CV_8UC3);
+            gpu_sr::Tile J{ P.lr.rows, P.lr.cols, P.lr.data, P.b.data(), T.ri_x->data(), T.ri_y->data(),
+                (int)T.ri_x->size(), T.coef * 0.1f, T.tv, P.hr_map.empty() ? nullptr : P.hr_map.data(), T.hr_out->data };
+            if (verify_every > 0 && k % (size_t)verify_every == 0) {
+                P.dbg_avir.resize((size_t)12 * P.lr.rows * P.lr.cols);
+                J.dbg_avir = P.dbg_avir.data();
+                J.dbg_nlm_h = &P.dbg_h;
+            }
+            jobs.push_back(J);
+        }
+        if (!gpu_sr::run(jobs, g.second.empty() ? gpu_admm::Params{} : pp[g.second.front()].prm)) {
+            for (size_t k : g.second) tiles[k].hr_out->release();
+            continue;
+        }
+        for (size_t k : g.second) done[k] = 1;
+    }
+
+    if (verify_every > 0) {
+        // GPU vs CPU: AVIR warm start, NLM strength, and the whole tile (CPU cs_sr_upscale_tile_2x,
+        // whose ADMM runs on the GPU broker, so the difference isolates the batched pipeline).
+        long long n = 0, a1 = 0, a2 = 0, f2 = 0; int amax = 0; double hmax = 0.0, fsum = 0.0; long long fn = 0; int nt = 0;
+        for (size_t k = 0; k < tiles.size(); ++k) {
+            if (!done[k] || pp[k].dbg_avir.empty()) continue;
+            const CsSrBatchTile& T = tiles[k];
+            cv::Mat cpu_avir;
+            cs_upscale_2x_avir(pp[k].lr, cpu_avir);
+            for (size_t q = 0; q < pp[k].dbg_avir.size(); ++q) {
+                const int d = std::abs((int)cpu_avir.data[q] - (int)pp[k].dbg_avir[q]);
+                ++n; a1 += d >= 1; a2 += d >= 2; amax = (std::max)(amax, d);
+            }
+            hmax = (std::max)(hmax, (double)std::fabs(cs_sr_prox_nlm_h(pp[k].lr) - pp[k].dbg_h));
+            cv::Mat cpu_hr;
+            cs_sr_upscale_tile_2x(pp[k].lr, *T.meas, *T.ri_x, *T.ri_y, T.coef, T.tv, T.iterations, 1, T.fista_iters,
+                CS_BASIS_DCT, T.wscale, cpu_hr, 0.0f, red_denoiser, CS_DNCNN_DEFAULT_MODEL, false, "", 1.0f, T.hr_sr, sr_prior);
+            if (cpu_hr.size() == T.hr_out->size()) {
+                for (size_t q = 0; q < cpu_hr.total() * 3; ++q) {
+                    const int d = std::abs((int)cpu_hr.data[q] - (int)T.hr_out->data[q]);
+                    fsum += d; ++fn; f2 += d > 2;
+                }
+            }
+            ++nt;
+        }
+        std::fprintf(stderr, "[gpu-sr verify] %d tiles: AVIR warm start %.3f%% values differ by 1, %.4f%% by >=2 (max %d); "
+            "NLM h max diff %.4f; final tile vs CPU path mean |diff| %.3f, %.3f%% > 2 levels\n",
+            nt, n ? 100.0 * a1 / n : 0.0, n ? 100.0 * a2 / n : 0.0, amax, hmax, fn ? fsum / fn : 0.0, fn ? 100.0 * f2 / fn : 0.0);
+    }
+}
+#else
+void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string&, bool, const CsSrPrior&,
+    std::vector<char>& done)
+{
+    done.assign(tiles.size(), 0);
+}
+#endif

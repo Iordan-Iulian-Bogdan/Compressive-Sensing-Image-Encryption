@@ -161,6 +161,32 @@ static bool clipTileToImage(int x, int y, int tile_width, int tile_height,
   return clipped_width > 0 && clipped_height > 0;
 }
 
+// Kept out of line so blendTilesWithImage and the GPU compositor get the very same weights
+// (an inlined copy could be vectorised with a different cos under /fp:fast).
+__declspec(noinline) cv::Mat cs_feather_weights(int tile_width, int tile_height, int ox, int oy,
+    int clipped_width, int clipped_height, bool touch_l, bool touch_t, bool touch_r, bool touch_b,
+    int feather) {
+  cv::Mat weights(clipped_height, clipped_width, CV_32FC1);
+  for (int r = 0; r < clipped_height; ++r) {
+    const int rr = r + oy;
+    const int dt = touch_t ? feather : rr;
+    const int db = touch_b ? feather : tile_height - 1 - rr;
+    const int dy = (std::min)(dt, db);
+    for (int c = 0; c < clipped_width; ++c) {
+      const int cc = c + ox;
+      const int dl = touch_l ? feather : cc;
+      const int dr = touch_r ? feather : tile_width - 1 - cc;
+      int distance = (std::min)(dl, dr);
+      distance = (std::min)(distance, dy);
+      distance = (std::min)(distance, feather);
+      distance = (std::max)(distance, 0);
+      weights.at<float>(r, c) = static_cast<float>(
+          0.5 * (1.0 - std::cos(CV_PI * distance / feather)));
+    }
+  }
+  return weights;
+}
+
 cv::Mat blendTilesWithImage(
     const std::vector<std::vector<cv::Mat>>& tiles,
     const std::vector<std::vector<TileCoord>>& coordinates,
@@ -200,26 +226,8 @@ cv::Mat blendTilesWithImage(
         const bool touch_t = y <= 0;
         const bool touch_r = x + tile_width >= max_x;
         const bool touch_b = y + tile_height >= max_y;
-        const int ox = clipped_x - x;
-        const int oy = clipped_y - y;
-        cv::Mat weights(clipped_height, clipped_width, CV_32FC1);
-        for (int r = 0; r < clipped_height; ++r) {
-          const int rr = r + oy;
-          const int dt = touch_t ? feather : rr;
-          const int db = touch_b ? feather : tile_height - 1 - rr;
-          const int dy = (std::min)(dt, db);
-          for (int c = 0; c < clipped_width; ++c) {
-            const int cc = c + ox;
-            const int dl = touch_l ? feather : cc;
-            const int dr = touch_r ? feather : tile_width - 1 - cc;
-            int distance = (std::min)(dl, dr);
-            distance = (std::min)(distance, dy);
-            distance = (std::min)(distance, feather);
-            distance = (std::max)(distance, 0);
-            weights.at<float>(r, c) = static_cast<float>(
-                0.5 * (1.0 - std::cos(CV_PI * distance / feather)));
-          }
-        }
+        const cv::Mat weights = cs_feather_weights(tile_width, tile_height, clipped_x - x, clipped_y - y,
+            clipped_width, clipped_height, touch_l, touch_t, touch_r, touch_b, feather);
 
         cv::Mat tile_float;
         tile_roi.convertTo(tile_float, CV_32FC3);

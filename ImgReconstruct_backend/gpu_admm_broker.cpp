@@ -46,10 +46,11 @@ struct Stats {
 } g_stats;
 
 void run_batch(const std::vector<Job*>& batch) {
-    using Key = std::tuple<int, int, float, float, float>;
+    using Key = std::tuple<int, int, float, float, float, float, float, float, int, float, int>;
     std::map<Key, std::vector<Job*>> groups;
     for (Job* j : batch)
-        groups[Key(j->prm.admm, j->prm.inner, j->prm.rho, j->prm.lip, j->prm.wscale)].push_back(j);
+        groups[Key(j->prm.admm, j->prm.inner, j->prm.rho, j->prm.lip, j->prm.wscale,
+            j->prm.rho_end, j->prm.h_start, j->prm.h_end, j->prm.rescale_u, j->prm.hr_weight, j->prm.bt)].push_back(j);
     for (auto& g : groups) {
         std::vector<gpu_admm::Problem> probs;
         probs.reserve(g.second.size());

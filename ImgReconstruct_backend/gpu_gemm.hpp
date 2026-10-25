@@ -28,6 +28,8 @@ enum Epilogue {
 
 struct Epi {
     const float* blr;     // EPI_RESID: LR sample grid per tile (rows/2 x cols/2), < -1e29 = no sample
+    const float* hav;     // EPI_RESID: exact-HR anchor values (tile layout, < -1e29 = none), or null
+    float hw;             // EPI_RESID: anchor data-term weight
     const float* anch;    // EPI_STEP
     const float* ws;
     const float* lam;     // per-tile L1 weight
@@ -147,6 +149,15 @@ __global__ void __launch_bounds__(kGemmThreads) k_gemm(const TileDev* td, const 
                     const float v = bs > -1e29f ? 0.25f * (avg - bs) : 0.0f;
                     float* o = out + T.off + m * N + n;
                     o[0] = v; o[1] = v; o[N] = v; o[N + 1] = v;
+                    if (ep.hav) {
+                        // exact-HR anchors: hw * (pix - value) joins the same forward DCT
+                        // (CPU: 2*hw*DCT(scatter(pix[a] - v_a)) added to the gradient)
+                        const float* h = ep.hav + T.off + m * N + n;
+                        if (h[0] > -1e29f) o[0] += ep.hw * (acc[ii][jj] - h[0]);
+                        if (h[1] > -1e29f) o[1] += ep.hw * (acc[ii][jj + 1] - h[1]);
+                        if (h[N] > -1e29f) o[N] += ep.hw * (acc[ii + 1][jj] - h[N]);
+                        if (h[N + 1] > -1e29f) o[N + 1] += ep.hw * (acc[ii + 1][jj + 1] - h[N + 1]);
+                    }
                 }
             }
     } else {

@@ -101,6 +101,93 @@ __global__ void k_ws(const TileDev* td, float* WS, float logw) {
     WS[T.off + i] = expf(logw * 0.5f * (fr + fc));
 }
 
+// ---- shared by the tv > 0 (backtracking) branches of gpu_tiles and gpu_admm ----
+
+// Smoothed-TV gradient and per-pixel TV energy (d0 - eps) of a tile, as the CPU
+// cs_tv_grad_phi (eps = 1e-2; keep in sync with helper_functions.cpp).
+__global__ void k_tv(const TileDev* td, const float* PIX, float* TVG, float* PHI) {
+    const TileDev T = td[blockIdx.y];
+    const int t = blockIdx.x * kThreads + threadIdx.x;
+    if (t >= T.rows * T.cols) return;
+    const int rows = T.rows, cols = T.cols, i = t / cols, j = t % cols;
+    const float* pix = PIX + T.off;
+    const float eps = 1e-2f;
+    const bool has_down = i + 1 < rows;
+    const float c = pix[t];
+    const float a0 = has_down ? pix[t + cols] - c : 0.0f;
+    const float b0 = (j + 1 < cols) ? pix[t + 1] - c : 0.0f;
+    const float d0 = sqrtf(a0 * a0 + b0 * b0 + eps * eps);
+    float acc = -(a0 / d0 + b0 / d0);
+    if (i > 0) {
+        const float up = pix[t - cols];
+        const float aT = c - up;
+        const float bT = (j + 1 < cols) ? pix[t - cols + 1] - up : 0.0f;
+        acc += aT / sqrtf(aT * aT + bT * bT + eps * eps);
+    }
+    if (j > 0) {
+        const float lf = pix[t - 1];
+        const float aL = has_down ? pix[t - 1 + cols] - lf : 0.0f;
+        const float bL = c - lf;
+        acc += bL / sqrtf(aL * aL + bL * bL + eps * eps);
+    }
+    TVG[T.off + t] = acc;
+    PHI[T.off + t] = d0 - eps;
+}
+
+// Sum of v over a block of kThreads threads (double; every thread gets the result).
+__device__ double block_sum(double v) {
+    __shared__ double sh[kThreads];
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    const double r = sh[0];
+    __syncthreads();
+    return r;
+}
+
+// Backtracking test terms per tile (one block per tile): dot = sum g*(z - y),
+// dz2 = sum (z - y)^2, in double as the CPU.
+__global__ void k_dots(const TileDev* td, const float* G, const float* Z, const float* Y, double* D2) {
+    const TileDev T = td[blockIdx.x];
+    const int n = T.rows * T.cols;
+    double dot = 0.0, dz2 = 0.0;
+    for (int i = threadIdx.x; i < n; i += kThreads) {
+        const double dz = (double)Z[T.off + i] - (double)Y[T.off + i];
+        dot += (double)G[T.off + i] * dz;
+        dz2 += dz * dz;
+    }
+    const double a = block_sum(dot), b = block_sum(dz2);
+    if (threadIdx.x == 0) { D2[2 * blockIdx.x] = a; D2[2 * blockIdx.x + 1] = b; }
+}
+
+// FISTA momentum after an accepted step: y = z + mom*(z - xp), xp = z.
+__global__ void k_mom(const TileDev* td, const float* Z, float* Y, float* XP, float mom) {
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    const int o = T.off + i;
+    Y[o] = Z[o] + mom * (Z[o] - XP[o]);
+    XP[o] = Z[o];
+}
+
+// Host side of one backtracking step for a batch: given f(y), f(z), dot and dz2
+// per tile, accept (act = 0) or double L, exactly the CPU rule; returns how many
+// tiles still search.
+inline int bt_accept(int nt, const std::vector<double>& fy, const std::vector<double>& fz,
+    const std::vector<double>& d2, std::vector<float>& L, std::vector<int>& act, int trial) {
+    int left = 0;
+    for (int t = 0; t < nt; ++t) {
+        if (!act[(size_t)t]) continue;
+        const double Q = fy[(size_t)t] + d2[2 * (size_t)t] + 0.5 * (double)L[(size_t)t] * d2[2 * (size_t)t + 1];
+        if (fz[(size_t)t] <= Q + 1e-7 * (1.0 + std::fabs(fy[(size_t)t])) || trial >= 24) act[(size_t)t] = 0;
+        else { L[(size_t)t] *= 2.0f; ++left; }
+    }
+    return left;
+}
+
 // Orthonormal DCT-II table C[k][n] = a_k cos(pi (2n+1) k / 2N), N x N.
 void fill_dct_table(float* C, int N) {
     for (int k = 0; k < N; ++k) {

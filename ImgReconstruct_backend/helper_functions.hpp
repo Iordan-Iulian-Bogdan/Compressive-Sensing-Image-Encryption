@@ -389,6 +389,28 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
     float red_decay = 1.0f, const CsHrSrCtx& hr_sr = CsHrSrCtx(),
     const CsSrPrior& sr_prior = CsSrPrior());
 
+/** @brief One tile for cs_sr_gpu_batch: the inputs cs_sr_upscale_tile_2x takes. */
+struct CsSrBatchTile {
+    const cv::Mat* lr_tile;              // solved LR tile, CV_8UC3
+    const cv::Mat* meas;                 // tile container (header + BGR samples)
+    const std::vector<int>* ri_x;
+    const std::vector<int>* ri_y;
+    float coef, tv;
+    int iterations, fista_iters;
+    float wscale;
+    CsHrSrCtx hr_sr;                     // anchors + this tile's origin (ox, oy) in output geometry
+    cv::Mat* hr_out;                     // receives the HR tile
+};
+
+/** @brief Batched GPU form of cs_sr_upscale_tile_2x's PnP-ADMM path (--sr-pnp admm, NLM
+prox, no learned prior, no cascade): AVIR warm start, YCrCb, luma ADMM and the BGR merge for
+every eligible tile in one GPU pass (gpu_sr.h), grouped by ADMM parameters. done[k] = 1 when
+tile k's hr_out was produced; the rest are left to the per-tile path. Without the GPU build or
+with CS_GPU_ADMM off nothing is done. CS_GPU_SR_VERIFY=<n> compares every n-th tile's AVIR,
+NLM strength and final tile with the CPU functions and prints the differences. */
+void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_denoiser,
+    bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done);
+
 /** @brief single-stage SR 2x refinement of one tile (CPU, DCT): the HR luma
 is solved directly against the tile's LR samples (cs_sr_direct_luma, no
 LR-solve warm start) and merged with the AVIR chroma, so one HR solve runs

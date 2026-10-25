@@ -71,7 +71,7 @@ __global__ void k_pad_u8(const TileDev* td, const int* qoff, const std::uint8_t*
 
 // fastNlMeansDenoising(h, 7, 15), 8-bit. One thread per output pixel; the
 // padded tile is staged in LDS. DN has the unpadded layout (offset T.off).
-__global__ void k_nlm(const TileDev* td, const int* qoff, const float* HH,
+__global__ void k_nlm(const TileDev* td, const int* qoff, const float* HH, float hmul,
     const std::uint8_t* Q, std::uint8_t* DN) {
     extern __shared__ std::uint8_t s[];
     const TileDev T = td[blockIdx.y];
@@ -82,7 +82,7 @@ __global__ void k_nlm(const TileDev* td, const int* qoff, const float* HH,
     const int gi = blockIdx.x * kThreads + threadIdx.x;
     if (gi >= T.rows * T.cols) return;
     const int y = gi / T.cols, x = gi % T.cols;
-    const float h = HH[blockIdx.y];
+    const float h = HH[blockIdx.y] * hmul;
     const float h2 = h * h;
     int est = 0, wsum = 0;
     const int cy = y + kBorder, cx = x + kBorder;
@@ -108,6 +108,14 @@ __global__ void k_nlm(const TileDev* td, const int* qoff, const float* HH,
     DN[T.off + gi] = (std::uint8_t)(((unsigned)est + (unsigned)(wsum / 2)) / (unsigned)wsum);
 }
 
+// u *= f (dual rescaling when rho changes).
+__global__ void k_scale(const TileDev* td, float* U, float f) {
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    U[T.off + i] *= f;
+}
+
 // z = NLM output / 255; u += px - z.
 __global__ void k_dual(const TileDev* td, const float* PIX, const std::uint8_t* DN, float* U, float* Z) {
     const TileDev T = td[blockIdx.y];
@@ -117,6 +125,82 @@ __global__ void k_dual(const TileDev* td, const float* PIX, const std::uint8_t* 
     const float zp = (float)DN[o] * 0.003921569f;   // (float)(1.0 / 255.0), as convertTo
     U[o] += PIX[o] - zp;
     Z[o] = zp;
+}
+
+// ---- tv > 0 (backtracking) inner loop: mirrors cs_sr_fista_grad / cs_sr_smooth_fx /
+// cs_sr_core_single (bt branch) of superres.cpp ----
+
+// Data residual of the 2x2 average at the samples (0.25*(avg - b) on each child)
+// plus the exact-HR anchor term hw*(pix - v), one thread per HR pixel.
+__global__ void k_resid_hr(const TileDev* td, const float* PIX, const float* BLR, const float* HAV, float hw, float* SC) {
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    const int N = T.cols, m = i / N, n = i % N, m0 = m & ~1, n0 = n & ~1;
+    const float* p = PIX + T.off;
+    const float bs = BLR[T.off / 4 + (m / 2) * (N / 2) + n / 2];
+    float v = 0.0f;
+    if (bs > -1e29f && m0 + 1 < T.rows && n0 + 1 < N)
+        v = 0.25f * (0.25f * (p[m0 * N + n0] + p[m0 * N + n0 + 1] + p[(m0 + 1) * N + n0] + p[(m0 + 1) * N + n0 + 1]) - bs);
+    if (HAV) { const float h = HAV[T.off + i]; if (h > -1e29f) v += hw * (p[i] - h); }
+    SC[T.off + i] = v;
+}
+
+// Smooth objective per tile (one block per tile): ||avg - b||^2 over the samples
+// + hw*||pix - v||^2 over the anchors + tv*sum phi + aw*||y - anch||^2.
+__global__ void k_obj_hr(const TileDev* td, const float* PIX, const float* BLR, const float* HAV, float hw,
+    const float* PHI, const float* TV, const float* Y, const float* ANCH, float aw, double* F) {
+    const TileDev T = td[blockIdx.x];
+    const int N = T.cols, n = T.rows * N, nl = (T.rows / 2) * (N / 2);
+    const float* p = PIX + T.off;
+    double dat = 0.0, hr = 0.0, phi = 0.0, an = 0.0;
+    for (int c = threadIdx.x; c < nl; c += kThreads) {
+        const float bs = BLR[T.off / 4 + c];
+        if (bs <= -1e29f) continue;
+        const int m0 = (c / (N / 2)) * 2, n0 = (c % (N / 2)) * 2;
+        const float d = 0.25f * (p[m0 * N + n0] + p[m0 * N + n0 + 1] + p[(m0 + 1) * N + n0] + p[(m0 + 1) * N + n0 + 1]) - bs;
+        dat += (double)(d * d);
+    }
+    for (int i = threadIdx.x; i < n; i += kThreads) {
+        if (HAV) { const float h = HAV[T.off + i]; if (h > -1e29f) { const float d = p[i] - h; hr += (double)(d * d); } }
+        phi += (double)PHI[T.off + i];
+        const float d = Y[T.off + i] - ANCH[T.off + i];
+        an += (double)(d * d);
+    }
+    const double a = block_sum(dat), b = block_sum(hr), c2 = block_sum(phi), e = block_sum(an);
+    if (threadIdx.x == 0) F[blockIdx.x] = (double)((float)a + hw * (float)b + TV[blockIdx.x] * (float)c2 + aw * (float)e);
+}
+
+// S = 2*SC + tv*TVG (one forward DCT then gives the data + anchor + TV gradient).
+__global__ void k_comb_hr(const TileDev* td, const float* SC, const float* TVG, const float* TV, float* S) {
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    S[T.off + i] = 2.0f * SC[T.off + i] + TV[blockIdx.y] * TVG[T.off + i];
+}
+
+// G += 2*aw*(y - anch): the ADMM coupling term (coefficient domain).
+__global__ void k_gcouple(const TileDev* td, const float* Y, const float* ANCH, float aw, float* G) {
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    const int o = T.off + i;
+    G[o] += 2.0f * aw * (Y[o] - ANCH[o]);
+}
+
+// Candidate z = anch + soft(y - g/L - anch, lambda/L * ws) for tiles still searching.
+__global__ void k_trial_hr(const TileDev* td, const float* Y, const float* G, const float* WS, const float* LAM,
+    const float* LT, const int* ACT, const float* ANCH, float* Z) {
+    if (!ACT[blockIdx.y]) return;
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    const int o = T.off + i;
+    const float step = 1.0f / LT[blockIdx.y];
+    const float v = Y[o] - step * G[o] - ANCH[o];
+    const float thr = LAM[blockIdx.y] * step * WS[o];
+    const float av = fabsf(v);
+    Z[o] = ANCH[o] + ((av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f);
 }
 
 int padded_size(int rows, int cols) { return (rows + 2 * kBorder) * (cols + 2 * kBorder); }
@@ -173,7 +257,7 @@ bool nlm_denoise_u8(const std::vector<NlmPlane>& planes) {
     const dim3 blk(kThreads);
     k_pad_u8<<<dim3((unsigned)((max_pad + kThreads - 1) / kThreads), (unsigned)nt), blk>>>(dtd.p, dq.p, dsrc.p, dQ.p);
     k_nlm<<<dim3((unsigned)((L.max_n + kThreads - 1) / kThreads), (unsigned)nt), blk, (size_t)max_pad>>>(
-        dtd.p, dq.p, dh.p, dQ.p, dDN.p);
+        dtd.p, dq.p, dh.p, 1.0f, dQ.p, dDN.p);
     HIP_TRY(hipGetLastError());
     HIP_TRY(hipDeviceSynchronize());
     std::vector<std::uint8_t> hdn((size_t)L.total);
@@ -234,7 +318,9 @@ void Prof::end_all(long long tiles, long long px) {
 }
 #define TIMED(name, ...) do { prof.b(name); __VA_ARGS__; prof.e(); } while (0)
 
-bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
+// The whole ADMM loop. dZext: device z in TileLayout order (add(rows, cols) per tile, in order),
+// updated in place; null = take z from / return it to the host Problem::z arrays.
+static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float* dZext) {
     if (tiles.empty()) return true;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
@@ -254,11 +340,11 @@ bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
 
     // Samples live on a per-tile LR grid (offset off/4, rows/2 x cols/2): the
     // sample value, or a large negative sentinel where there is none.
-    std::vector<float> hZ((size_t)L.total), hblr((size_t)L.total / 4, -1e30f), hlam((size_t)nt), hh((size_t)nt);
+    std::vector<float> hZ(dZext ? 0 : (size_t)L.total), hblr((size_t)L.total / 4, -1e30f), hlam((size_t)nt), hh((size_t)nt);
     {
         for (int t = 0; t < nt; ++t) {
             const Problem& P = tiles[(size_t)t];
-            std::copy(P.z, P.z + (size_t)P.rows * P.cols, hZ.begin() + L.td[(size_t)t].off);
+            if (!dZext) std::copy(P.z, P.z + (size_t)P.rows * P.cols, hZ.begin() + L.td[(size_t)t].off);
             float* blr = hblr.data() + L.td[(size_t)t].off / 4;
             for (int k = 0; k < P.m; ++k) {
                 if (P.rix[k] < 0 || P.riy[k] < 0 || P.rix[k] >= P.rows / 2 || P.riy[k] >= P.cols / 2) continue;
@@ -269,22 +355,51 @@ bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
         }
     }
 
+    // Exact-HR anchors (tile layout, sentinel where none), only when the batch carries a weight.
+    const bool use_hr = prm.hr_weight > 0.0f;
+    std::vector<float> hhav;
+    if (use_hr) {
+        hhav.assign((size_t)L.total, -1e30f);
+        for (int t = 0; t < nt; ++t) {
+            const Problem& P = tiles[(size_t)t];
+            if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, hhav.begin() + L.td[(size_t)t].off);
+        }
+    }
+
     DevBuf<TileDev> dtd; DevBuf<int> dq;
-    DevBuf<float> dtab, dZ, dU, dANCH, dX, dY, dXP, dZC, dTMP, dPIX, dSC, dWS, dLAM, dH, dBLR;
+    DevBuf<float> dtab, dZ, dU, dANCH, dX, dY, dXP, dZC, dTMP, dPIX, dSC, dWS, dLAM, dH, dBLR, dHAV;
     DevBuf<std::uint8_t> dQ, dDN;
     const size_t N = (size_t)L.total;
-    if (!dtd.alloc((size_t)nt) || !dq.alloc((size_t)nt) || !dtab.alloc(L.table.size()) || !dZ.alloc(N) ||
+    if (!dtd.alloc((size_t)nt) || !dq.alloc((size_t)nt) || !dtab.alloc(L.table.size()) || (!dZext && !dZ.alloc(N)) ||
         !dU.alloc(N) || !dANCH.alloc(N) || !dX.alloc(N) || !dY.alloc(N) || !dXP.alloc(N) || !dZC.alloc(N) ||
         !dTMP.alloc(N) || !dPIX.alloc(N) || !dSC.alloc(N) || !dWS.alloc(N) ||
         !dLAM.alloc((size_t)nt) || !dH.alloc((size_t)nt) || !dBLR.alloc(N / 4) ||
-        !dQ.alloc((size_t)qtot) || !dDN.alloc(N)) {
+        !dQ.alloc((size_t)qtot) || !dDN.alloc(N) || (use_hr && !dHAV.alloc(N))) {
         std::fprintf(stderr, "gpu_admm: device allocation failed\n");
         return false;
+    }
+    float* const Zp = dZext ? dZext : dZ.p;   // z lives here for the whole loop
+    if (use_hr) HIP_TRY(hipMemcpy(dHAV.p, hhav.data(), N * sizeof(float), hipMemcpyHostToDevice));
+
+    // tv > 0 batches: explicit gradient, smooth objective and per-tile backtracking state.
+    const bool bt = prm.bt != 0;
+    DevBuf<float> dTVA, dTVG, dPHI, dS, dG, dLT; DevBuf<double> dF, dD2; DevBuf<int> dACT;
+    std::vector<float> tva((size_t)nt), Lt((size_t)nt);
+    std::vector<double> fy((size_t)nt), fz((size_t)nt), d2(2 * (size_t)nt);
+    std::vector<int> act((size_t)nt);
+    if (bt) {
+        for (int t = 0; t < nt; ++t) tva[(size_t)t] = tiles[(size_t)t].tv;
+        if (!dTVA.alloc((size_t)nt) || !dTVG.alloc(N) || !dPHI.alloc(N) || !dS.alloc(N) || !dG.alloc(N) ||
+            !dLT.alloc((size_t)nt) || !dF.alloc((size_t)nt) || !dD2.alloc(2 * (size_t)nt) || !dACT.alloc((size_t)nt)) {
+            std::fprintf(stderr, "gpu_admm: device allocation failed\n");
+            return false;
+        }
+        HIP_TRY(hipMemcpy(dTVA.p, tva.data(), (size_t)nt * sizeof(float), hipMemcpyHostToDevice));
     }
     HIP_TRY(hipMemcpy(dtd.p, L.td.data(), (size_t)nt * sizeof(TileDev), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dq.p, qoff.data(), (size_t)nt * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dtab.p, L.table.data(), L.table.size() * sizeof(float), hipMemcpyHostToDevice));
-    HIP_TRY(hipMemcpy(dZ.p, hZ.data(), N * sizeof(float), hipMemcpyHostToDevice));
+    if (!dZext) HIP_TRY(hipMemcpy(dZ.p, hZ.data(), N * sizeof(float), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dLAM.p, hlam.data(), (size_t)nt * sizeof(float), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dH.p, hh.data(), (size_t)nt * sizeof(float), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dBLR.p, hblr.data(), (N / 4) * sizeof(float), hipMemcpyHostToDevice));
@@ -299,31 +414,74 @@ bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
     const Epi none{};
     const size_t bytes = N * sizeof(float);
     const float logw = prm.wscale > 1.0f ? std::log(prm.wscale) : 0.0f;
-    const float Lc = 0.25f * prm.lip + 2.0f * prm.rho;
-    const float step = 1.0f / Lc;
+    const float rho_end = prm.rho_end > 0.0f ? prm.rho_end : prm.rho;
+    float rho_prev = prm.rho;
     Prof prof;
     prof.begin_all();
 #define FWD_DCT(src, dst) do {         TIMED("gemm_fwd_a", k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, (src), dTMP.p, nbn, none));         TIMED("gemm_fwd_b", k_gemm<OP_TAB, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, (dst), nbn, none));     } while (0)
     k_ws<<<grid, blk>>>(dtd.p, dWS.p, logw);
 
     for (int it = 0; it < prm.admm; ++it) {
+        // per-round schedule of rho and of the NLM strength
+        const float frac = prm.admm > 1 ? (float)it / (float)(prm.admm - 1) : 0.0f;
+        const float rho_k = prm.rho == rho_end ? prm.rho : prm.rho * std::pow(rho_end / prm.rho, frac);
+        const float hmul_k = prm.h_start == prm.h_end ? prm.h_start : prm.h_start * std::pow(prm.h_end / prm.h_start, frac);
+        const float Lc = 0.25f * prm.lip + 2.0f * rho_k + (use_hr ? 2.0f * prm.hr_weight : 0.0f);   // fixed-step branch
+        const float step = 1.0f / Lc;
+        if (prm.rescale_u && rho_k != rho_prev) TIMED("k_scale", k_scale<<<grid, blk>>>(dtd.p, dU.p, rho_prev / rho_k));
+        rho_prev = rho_k;
         // anch = DCT(z - u); x = DCT(z)
-        TIMED("k_sub", k_sub<<<grid, blk>>>(dtd.p, dZ.p, dU.p, dSC.p));
+        TIMED("k_sub", k_sub<<<grid, blk>>>(dtd.p, Zp, dU.p, dSC.p));
         FWD_DCT(dSC.p, dANCH.p);
-        FWD_DCT(dZ.p, dX.p);
+        FWD_DCT(Zp, dX.p);
         HIP_TRY(hipMemcpyAsync(dY.p, dX.p, bytes, hipMemcpyDeviceToDevice));
         HIP_TRY(hipMemcpyAsync(dXP.p, dX.p, bytes, hipMemcpyDeviceToDevice));
         float t = 1.0f;
-        for (int k = 0; k < prm.inner; ++k) {
+        if (bt) {
+            // smooth objective of coefficients C (PIX = IDCT(C), SC/TVG/PHI refreshed), into dF
+            auto smooth = [&](const float* C) {
+                k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, C, dTMP.p, nbn, none);
+                k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none);
+                k_resid_hr<<<grid, blk>>>(dtd.p, dPIX.p, dBLR.p, use_hr ? dHAV.p : nullptr, prm.hr_weight, dSC.p);
+                k_tv<<<grid, blk>>>(dtd.p, dPIX.p, dTVG.p, dPHI.p);
+                k_obj_hr<<<dim3((unsigned)nt), blk>>>(dtd.p, dPIX.p, dBLR.p, use_hr ? dHAV.p : nullptr, prm.hr_weight,
+                    dPHI.p, dTVA.p, C, dANCH.p, rho_k, dF.p);
+            };
+            for (int q = 0; q < nt; ++q)   // per core call, as the CPU: 0.25*lip + 2*rho + 8*tv + 2*hw
+                Lt[(size_t)q] = 0.25f * prm.lip + 2.0f * rho_k + 8.0f * tva[(size_t)q] + (use_hr ? 2.0f * prm.hr_weight : 0.0f);
+            for (int k = 0; k < prm.inner; ++k) {
+                smooth(dY.p);
+                k_comb_hr<<<grid, blk>>>(dtd.p, dSC.p, dTVG.p, dTVA.p, dS.p);
+                FWD_DCT(dS.p, dG.p);
+                k_gcouple<<<grid, blk>>>(dtd.p, dY.p, dANCH.p, rho_k, dG.p);
+                HIP_TRY(hipMemcpy(fy.data(), dF.p, (size_t)nt * sizeof(double), hipMemcpyDeviceToHost));
+                std::fill(act.begin(), act.end(), 1);
+                for (int trial = 0; trial < 25; ++trial) {
+                    HIP_TRY(hipMemcpy(dLT.p, Lt.data(), (size_t)nt * sizeof(float), hipMemcpyHostToDevice));
+                    HIP_TRY(hipMemcpy(dACT.p, act.data(), (size_t)nt * sizeof(int), hipMemcpyHostToDevice));
+                    k_trial_hr<<<grid, blk>>>(dtd.p, dY.p, dG.p, dWS.p, dLAM.p, dLT.p, dACT.p, dANCH.p, dZC.p);
+                    smooth(dZC.p);
+                    k_dots<<<dim3((unsigned)nt), blk>>>(dtd.p, dG.p, dZC.p, dY.p, dD2.p);
+                    HIP_TRY(hipMemcpy(fz.data(), dF.p, (size_t)nt * sizeof(double), hipMemcpyDeviceToHost));
+                    HIP_TRY(hipMemcpy(d2.data(), dD2.p, 2 * (size_t)nt * sizeof(double), hipMemcpyDeviceToHost));
+                    if (bt_accept(nt, fy, fz, d2, Lt, act, trial) == 0) break;
+                }
+                const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
+                k_mom<<<grid, blk>>>(dtd.p, dZC.p, dY.p, dXP.p, (t - 1.0f) / t_new);
+                t = t_new;
+            }
+        }
+        for (int k = 0; !bt && k < prm.inner; ++k) {
             // PIX = IDCT(y); SC = residual of the 2x2 average at the samples (fused epilogue)
             TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dY.p, dTMP.p, nbn, none));
             Epi er{}; er.blr = dBLR.p;
+            if (use_hr) { er.hav = dHAV.p; er.hw = prm.hr_weight; }
             TIMED("gemm_inv_b+resid", k_gemm<OP_TABT, OP_DATA, EPI_RESID><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dSC.p, nbn, er));
             // gradient = 2 DCT(SC); soft threshold + momentum (fused epilogue)
             TIMED("gemm_fwd_a", k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dSC.p, dTMP.p, nbn, none));
             const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
             Epi es{}; es.anch = dANCH.p; es.ws = dWS.p; es.lam = dLAM.p; es.y = dY.p; es.xp = dXP.p; es.zc = dZC.p;
-            es.aw = prm.rho; es.step = step; es.mom = (t - 1.0f) / t_new;
+            es.aw = rho_k; es.step = step; es.mom = (t - 1.0f) / t_new;
             TIMED("gemm_fwd_b+step", k_gemm<OP_TAB, OP_DATA, EPI_STEP><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, es));
             t = t_new;
         }
@@ -331,18 +489,27 @@ bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
         TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dZC.p, dTMP.p, nbn, none));
         TIMED("gemm_inv_b", k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none));
         TIMED("k_quant", k_quant<<<pgrid, blk>>>(dtd.p, dq.p, dPIX.p, dU.p, dQ.p));
-        TIMED("k_nlm", k_nlm<<<grid, blk, (size_t)max_pad>>>(dtd.p, dq.p, dH.p, dQ.p, dDN.p));
-        TIMED("k_dual", k_dual<<<grid, blk>>>(dtd.p, dPIX.p, dDN.p, dU.p, dZ.p));
+        TIMED("k_nlm", k_nlm<<<grid, blk, (size_t)max_pad>>>(dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
+        TIMED("k_dual", k_dual<<<grid, blk>>>(dtd.p, dPIX.p, dDN.p, dU.p, Zp));
     }
     HIP_TRY(hipGetLastError());
     HIP_TRY(hipDeviceSynchronize());
     prof.end_all(nt, L.total);
+    if (dZext) return true;
     HIP_TRY(hipMemcpy(hZ.data(), dZ.p, bytes, hipMemcpyDeviceToHost));
     for (int t = 0; t < nt; ++t) {
         const Problem& P = tiles[(size_t)t];
         std::copy(hZ.begin() + L.td[(size_t)t].off, hZ.begin() + L.td[(size_t)t].off + (size_t)P.rows * P.cols, P.z);
     }
     return true;
+}
+
+bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
+    return run_admm(tiles, prm, nullptr);
+}
+
+bool solve_pnp_admm_device(const std::vector<Problem>& tiles, const Params& prm, float* dZ) {
+    return dZ != nullptr && run_admm(tiles, prm, dZ);
 }
 
 }  // namespace gpu_admm

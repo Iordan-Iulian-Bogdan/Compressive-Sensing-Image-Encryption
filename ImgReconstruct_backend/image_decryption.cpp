@@ -11,6 +11,7 @@
 #ifdef CS_GPU_TILES
 #include "gpu_decrypt.hpp"
 #include "gpu_admm_broker.hpp"
+#include "gpu_composite.h"
 #endif
 #include "avir.h"
 
@@ -24,6 +25,7 @@
 #include <chrono>
 #include <iostream>
 #include <map>
+#include <tuple>
 #include <set>
 #include <utility>
 #include <algorithm>
@@ -953,16 +955,17 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
     // neighbors (first wave); this helps speed up convergence
     const std::vector<cv::Mat> ref = createRefSolutions(tile_size.width, tile_size.height);
 
+    // True when every non-empty tile was solved by the GPU pre-pass: tiles then no
+    // longer depend on their neighbours, so the wavefront below collapses into
+    // one flat parallel loop (GPU stages of different tiles can overlap). Always
+    // false in the CPU build, which has no pre-pass.
+    bool flat_tiles = false;
 #ifdef CS_GPU_TILES
     // GPU pre-pass (env CS_GPU_TILES=1): solve every eligible tile's LR image in
     // one batch, without neighbour warm starts, before the wavefront. Tiles it
     // finishes skip the CPU warm start + solve below; the post-solve stages
     // (grain TV, upscale) still run per tile as usual.
     std::vector<std::vector<char>> gpu_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
-    // True when every non-empty tile was solved by the pre-pass: tiles then no
-    // longer depend on their neighbours, so the wavefront below collapses into
-    // one flat parallel loop (GPU stages of different tiles can overlap).
-    bool flat_tiles = false;
     if (std::getenv("CS_GPU_TILES")) {
         int skip_tv = 0, skip_other = 0;
         std::vector<decrypt_image> keep;
@@ -982,8 +985,8 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 const int t_solver = STP ? STP->solver : solver;
                 const int t_basis = STP ? STP->basis : basis;
                 if (t_solver != CS_SOLVER_FISTA || t_basis != CS_BASIS_DCT || use_onsager ||
-                    cs_default_dct_block() > 0 || tile_tv != 0.0f || !t_idx.rg_off.empty()) {
-                    if (tile_tv != 0.0f) ++skip_tv; else ++skip_other;
+                    cs_default_dct_block() > 0 || tile_tv < 0.0f || !t_idx.rg_off.empty()) {
+                    if (tile_tv < 0.0f) ++skip_tv; else ++skip_other;
                     continue;
                 }
                 keep.emplace_back(mats_in[i][j]);
@@ -997,6 +1000,7 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                 jb.reweights = STP ? STP->reweights : reweights;
                 jb.coef = per_tile_coef ? cs_per_tile_coef(t_coef_base, t_count, coef_mean_m) : t_coef_base;
                 jb.wscale = STP ? STP->wscale : wscale;
+                jb.tv = tile_tv;
                 jb.out = &mats_out[i][j];
                 // The SR prior's folded DirectML session for each tile size is
                 // built in the background from the moment the size is first
@@ -1020,6 +1024,53 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
         for (int i = 0; i < num_tiles && flat_tiles; ++i)
             for (int j = 0; j < num_tiles; ++j)
                 if (!mats_in[i][j].empty() && !gpu_done[(size_t)i][(size_t)j]) { flat_tiles = false; break; }
+    }
+#endif
+
+    // Batched GPU cs-sr stage: when every LR tile came from the GPU pre-pass, the fused cs-sr
+    // upscale of all tiles runs as one GPU pass (AVIR, YCrCb, ADMM, merge; cs_sr_gpu_batch)
+    // instead of one tile per worker; tiles it cannot take keep the per-tile path below.
+    std::vector<std::vector<cv::Mat>> sr_hr((size_t)num_tiles, std::vector<cv::Mat>((size_t)num_tiles));
+    std::vector<std::vector<char>> sr_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
+#ifdef CS_GPU_TILES
+    if (flat_tiles && fuse_upscale && hr_out && superres_2x && !sr_dict && sr_fsrcnn_model.empty() &&
+        !sr_direct_2x && !sr_dip_2x && !pipe && !(grain_tv > 0.0f)) {
+        std::vector<CsSrBatchTile> bt;
+        std::vector<std::pair<int, int>> where;
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j) {
+                if (mats_in[i][j].empty() || mats_out[i][j].empty()) continue;
+                const CsSegClassParams* STP = seg_tile_params ? &(*seg_tile_params)[i][j] : nullptr;
+                const int t_count = cs_tile_meas_count(indices[i][j]);
+                const float t_coef_base = STP ? STP->coef : coef;
+                const float t_tv_base = STP ? STP->tv : tv;
+                CsSrBatchTile T{};
+                T.lr_tile = &mats_out[i][j];
+                T.meas = &mats_in[i][j];
+                T.ri_x = &indices[i][j].ri_x_g;
+                T.ri_y = &indices[i][j].ri_y_g;
+                T.coef = per_tile_coef ? cs_per_tile_coef(t_coef_base, t_count, coef_mean_m) : t_coef_base;
+                T.tv = per_tile_tv ? cs_per_tile_coef(t_tv_base, t_count, coef_mean_m) : t_tv_base;
+                T.iterations = STP ? STP->iterations : iterations;
+                T.fista_iters = STP ? STP->fista_iters : fista_iters;
+                T.wscale = STP ? STP->wscale : wscale;
+                T.hr_sr = hr_sr;
+                T.hr_sr.ox = coordinates[i][j].x * 2;
+                T.hr_sr.oy = coordinates[i][j].y * 2;
+                T.hr_out = &sr_hr[(size_t)i][(size_t)j];
+                bt.push_back(T);
+                where.push_back({ i, j });
+            }
+        std::vector<char> done;
+        const auto s0 = std::chrono::steady_clock::now();
+        cs_sr_gpu_batch(bt, sr_red_denoiser, sr_cascade, sr_prior, done);
+        int n_ok = 0;
+        for (size_t k = 0; k < done.size(); ++k)
+            if (done[k]) { sr_done[(size_t)where[k].first][(size_t)where[k].second] = 1; ++n_ok; }
+        if (!bt.empty())
+            std::cout << "[gpu-sr] " << n_ok << " of " << bt.size() << " tiles upscaled in one GPU pass in "
+                      << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count()
+                      << " ms" << std::endl;
     }
 #endif
 
@@ -1138,6 +1189,9 @@ void decrypt_tiles(int num_threads, std::vector<std::vector<cv::Mat>>& mats_in, 
                             indices[i][j].ri_x_g, indices[i][j].ri_y_g,
                             tile_coef, tile_tv, t_iterations, t_reweights, t_fista_iters,
                             t_basis, t_wscale, hr, sr_cascade);
+                    }
+                    else if (superres_2x && sr_done[(size_t)i][(size_t)j]) {
+                        hr = sr_hr[(size_t)i][(size_t)j];   // batched GPU pass above
                     }
                     else if (superres_2x) {
                         // Tile-mapped HR anchors join the solve (neighborhood
@@ -1785,6 +1839,7 @@ struct CsSegmentComposite {
 static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
     const cv::Mat& sample_mask, const std::vector<int>& classes, int overlap) {
     if (overlap <= 0 || img.empty() || seg_ids.empty() || sample_mask.empty()) return;
+    if (std::getenv("CS_NO_SEG_CALM")) return;   // diagnostic: skip the calm pass
     cv::Mat ids = seg_ids, mask = sample_mask;
     if (ids.size() != img.size())
         cv::resize(ids, ids, img.size(), 0, 0, cv::INTER_NEAREST);
@@ -1851,6 +1906,64 @@ static void cs_seg_apply_override(CsSegClassParams& p, const CsSegOverride& o) {
     if (o.has_reweights) p.reweights = o.reweights;
     if (o.has_basis) p.basis = o.basis;
     if (o.has_wscale) p.wscale = o.wscale;
+}
+
+// Tile paste + cosine-feathered blend of the solved tiles. zero_canvas: segment solves blend
+// against a zeros canvas of zero_size (released tiles contribute nothing); otherwise the canvas
+// is the plain tile paste. The GPU build (CS_GPU_TILES) runs the feathered blend on the device
+// (gpu_composite, bit-identical); CS_GPU_COMPOSITE_VERIFY=1 also runs the CPU blend and
+// reports any difference. Anything else uses blendTilesWithImage.
+static cv::Mat cs_composite_tiles(const std::vector<std::vector<cv::Mat>>& tiles,
+    const std::vector<std::vector<TileCoord>>& coords, bool zero_canvas, cv::Size zero_size, int feather)
+{
+#ifdef CS_GPU_TILES
+    if (feather > 0 && std::getenv("CS_GPU_TILES")) {
+        cv::Size sz = zero_canvas ? zero_size : cv::Size(0, 0);
+        bool ok = true;
+        for (size_t i = 0; i < tiles.size() && ok; ++i)
+            for (size_t j = 0; j < tiles[i].size(); ++j) {
+                const cv::Mat& t = tiles[i][j];
+                if (t.empty()) continue;
+                if (t.type() != CV_8UC3) { ok = false; break; }
+                if (!zero_canvas) sz = cv::Size((std::max)(sz.width, coords[i][j].x + t.cols), (std::max)(sz.height, coords[i][j].y + t.rows));
+            }
+        if (ok && sz.width > 0 && sz.height > 0) {
+            // Weight maps from the CPU's own cs_feather_weights, one per distinct placement geometry.
+            std::map<std::tuple<int, int, int>, cv::Mat> wmaps;
+            std::vector<gpu_composite::TileRef> refs;
+            std::vector<cv::Mat> keep;
+            keep.reserve(tiles.size() * (tiles.empty() ? 0 : tiles[0].size()));
+            for (size_t i = 0; i < tiles.size() && ok; ++i)
+                for (size_t j = 0; j < tiles[i].size(); ++j) {
+                    const cv::Mat& t = tiles[i][j];
+                    if (t.empty()) continue;
+                    const int x = coords[i][j].x, y = coords[i][j].y;
+                    if (x < 0 || y < 0 || x + t.cols > sz.width || y + t.rows > sz.height) { ok = false; break; }
+                    const int touch = (x <= 0 ? 1 : 0) | (y <= 0 ? 2 : 0) | (x + t.cols >= sz.width ? 4 : 0) | (y + t.rows >= sz.height ? 8 : 0);
+                    cv::Mat& wm = wmaps[std::make_tuple(t.cols, t.rows, touch)];
+                    if (wm.empty())
+                        wm = cs_feather_weights(t.cols, t.rows, 0, 0, t.cols, t.rows, touch & 1, touch & 2, touch & 4, touch & 8, feather);
+                    keep.push_back(t.isContinuous() ? t : t.clone());
+                    refs.push_back({ (int)i, (int)j, x, y, t.cols, t.rows, keep.back().data, wm.ptr<float>(0) });
+                }
+            cv::Mat out(sz, CV_8UC3);
+            if (ok && !refs.empty() && gpu_composite::blend_tiles(refs, sz.width, sz.height, out.data)) {
+                if (std::getenv("CS_GPU_COMPOSITE_VERIFY")) {
+                    cv::Mat base = zero_canvas ? cv::Mat::zeros(zero_size, CV_8UC3) : reconstructImage(tiles, coords);
+                    cv::Mat d;
+                    cv::absdiff(blendTilesWithImage(tiles, coords, base, 0.5f, feather), out, d);
+                    double mx = 0;
+                    cv::minMaxLoc(d.reshape(1), nullptr, &mx);
+                    std::cout << "[gpu-composite verify] " << cv::countNonZero(d.reshape(1)) << " of " << d.total() * 3
+                              << " values differ from blendTilesWithImage (max " << mx << ")" << std::endl;
+                }
+                return out;
+            }
+        }
+    }
+#endif
+    cv::Mat base = zero_canvas ? cv::Mat::zeros(zero_size, CV_8UC3) : reconstructImage(tiles, coords);
+    return blendTilesWithImage(tiles, coords, base, 0.5f, feather);
 }
 
 // Sorted class ids present in a label map.
@@ -2395,6 +2508,10 @@ int decrypt_image::decrypt_image_tiled(
         // (see CsSrPrior::seg_lr). Non-seg containers keep the legacy path.
         if (!dimgs.get_seg_ids().empty()) sr_prior_ctx.seg_lr = &dimgs.get_seg_ids();
     }
+    // Diagnostic (opt-in): CS_DUMP_SEG=<png> writes the container's LR-grid
+    // segment labels (8-bit, one value per class).
+    if (const char* dump = std::getenv("CS_DUMP_SEG"); dump && !dimgs.get_seg_ids().empty())
+        cv::imwrite(dump, dimgs.get_seg_ids());
     if (!sr_prior_ctx.model.empty() && !cs_onnx_sr_available(sr_prior_ctx.model)) {
         std::cerr << "Error: SR prior model failed to load ('"
                   << sr_prior_ctx.model << "')" << std::endl;
@@ -2447,6 +2564,23 @@ int decrypt_image::decrypt_image_tiled(
     CsUpscalePipeline pipe;
     if (pipe_upscale)
         pipe.start(photo_up, decrypted_image_tiles, hr_tiles, &hr_grid_mutex);
+    // Diagnostic (opt-in): CS_HR_SIDECAR=<file> loads HR anchors from a side file ([u32 n] then n x {u32 idx, u8 y};
+    // idx in output geometry) when the container carries none. Used to test anchors that enter the cs-sr solve.
+    if (const char* sc = std::getenv("CS_HR_SIDECAR"); sc && *sc && dimgs.hr_samples.empty()) {
+        if (FILE* f = std::fopen(sc, "rb")) {
+            uint32_t n = 0;
+            if (std::fread(&n, 4, 1, f) == 1 && n < (1u << 26)) {
+                dimgs.hr_samples.resize(n);
+                for (uint32_t k = 0; k < n; ++k) {
+                    uint32_t idx = 0; uint8_t y = 0;
+                    if (std::fread(&idx, 4, 1, f) != 1 || std::fread(&y, 1, 1, f) != 1) { dimgs.hr_samples.resize(k); break; }
+                    dimgs.hr_samples[k].idx = idx; dimgs.hr_samples[k].y = y;
+                }
+            }
+            std::fclose(f);
+            std::cout << "HR sidecar: " << dimgs.hr_samples.size() << " anchors" << std::endl;
+        }
+    }
     // HR anchors for the fused cs-sr solve: global output-geometry list +
     // output stride; each worker maps its own tile origin (see decrypt_tiles).
     CsHrSrCtx hr_sr_ctx;
@@ -2520,18 +2654,12 @@ int decrypt_image::decrypt_image_tiled(
         // zero-overlap alpha blend composites tiles against it, so zeros
         // would halve every pixel). Segment solves keep the zeros canvas:
         // released (inactive-class) tiles must contribute nothing.
-        if (segpass) {
-            reconstructed = cv::Mat::zeros(sm.rows * (full_res ? 1 : 2),
-                sm.cols * (full_res ? 1 : 2), CV_8UC3);
-        } else {
-            reconstructed = reconstructImage(decrypted_image_tiles, coordinates);
-        }
-
         // cosine-feathered compositing across the overlapping tile borders:
         // ramp width == scaled overlap means non-overlapped interiors keep
         // full weight and the overlap zones sum to a smooth transition
         // (fewer visible seams than the legacy 0.5 alpha blend)
-        reconstructed = blendTilesWithImage(decrypted_image_tiles, coordinates, reconstructed, 0.5f, blend_feather);
+        reconstructed = cs_composite_tiles(decrypted_image_tiles, coordinates, segpass != nullptr,
+            cv::Size(sm.cols * (full_res ? 1 : 2), sm.rows * (full_res ? 1 : 2)), blend_feather);
             grid_out = reconstructed;
             blend_weight = active.weights(grid_out.size(), overlap);
             return 0;
@@ -2636,7 +2764,7 @@ int decrypt_image::decrypt_image_tiled(
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
         // the final composite, applied last so smoothing passes cannot move
         // them. Out-of-range anchors (geometry mismatch) are skipped.
-        if (!dimgs.hr_samples.empty() && !reconstructed.empty()) {
+        if (!dimgs.hr_samples.empty() && !reconstructed.empty() && !std::getenv("CS_HR_NO_POSTHOC")) {
             const size_t applied = cs_apply_hr_detail(reconstructed, dimgs.hr_samples);
             dimgs.hr_applied = applied;
             if (hr_applied_out) *hr_applied_out = applied;
