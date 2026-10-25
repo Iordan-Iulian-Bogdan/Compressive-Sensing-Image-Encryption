@@ -460,9 +460,11 @@ encrypt_image::encrypt_image(const cv::Mat& input, bool global_image) {
     cols = input_img.cols;
     org_size.width = cols;
     org_size.height = rows;
-    if (global_image) {
-        cv::resize(input_img, input_img, cv::Size(nextClosestDivisible(input_img.cols, 8), nextClosestDivisible(input_img.rows, 8)));
-    }
+    // No mult-8 stretch of global images: every sampler draws indices on the
+    // rows x cols grid and gathers pixels from input_img, so a stretched
+    // input_img shifted content by up to 4 output px on sizes not divisible
+    // by 8 (cropping, not undoing, the stretch). Tilers handle partial tiles.
+    (void)global_image;
 }
 
 // ---- container build steps shared by every encrypt_* mode ----

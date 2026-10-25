@@ -413,3 +413,55 @@ void test_seg_auto() {
     std::remove(tmp_in.c_str());
 }
 
+// Encoder geometry: the container's samples must come from the image at the positions the
+// decoder puts them. Sizes not divisible by 8 used to be stretched to a multiple of 8 for the
+// sampling pixels while the sample positions stayed on the unstretched grid, shifting content
+// by up to 4 px (5-9 dB lower decode PSNR on real photos).
+void test_encoder_geometry() {
+    // Sharp-edged content makes any shift cost PSNR. Full-res keeps the solve small.
+    const std::string password = "geometry-test-password";
+    // 100x76 and 98x74 are not multiples of 8; 96x72 is the control
+    for (const cv::Size sz : { cv::Size(100, 76), cv::Size(98, 74), cv::Size(96, 72) }) {
+        cv::Mat img(sz, CV_8UC3, cv::Scalar(90, 100, 110));
+        cv::rectangle(img, cv::Rect(sz.width / 5, sz.height / 5, sz.width / 2, sz.height / 2), cv::Scalar(30, 40, 230), cv::FILLED);
+        cv::rectangle(img, cv::Rect(sz.width * 3 / 5, sz.height * 3 / 5, sz.width / 4, sz.height / 4), cv::Scalar(230, 220, 40), cv::FILLED);
+        cv::circle(img, cv::Point(sz.width * 3 / 4, sz.height / 4), sz.height / 8, cv::Scalar(20, 230, 20), cv::FILLED);
+        const std::string tmp_in = ".cs_test_geom_in.png", tmp_out = ".cs_test_geom_out.png";
+        cv::imwrite(tmp_in, img);
+        cv::Mat encrypted;
+        const int rc = encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &encrypted,
+            false, 32, 0.5f, false, /*full_res*/ true, false, 0.05f, "", 0.5f, 0.0f, false, false,
+            8, 0, 0, false, false, "", 0, 1.0f, 0, "", "", 0, "points", 0);
+        char name[96];
+        std::snprintf(name, sizeof(name), "geometry %dx%d: encrypt", sz.width, sz.height);
+        check(rc == 0 && !encrypted.empty(), name);
+        const int rd = decrypt_image::decrypt_image_tiled(encrypted, tmp_out, password, 2, 8, 5, 4, 0.0005f, false, 0.0f, /*full_res*/ true);
+        std::snprintf(name, sizeof(name), "geometry %dx%d: decrypt", sz.width, sz.height);
+        check(rd == 0, name);
+        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        std::snprintf(name, sizeof(name), "geometry %dx%d: output has the input size", sz.width, sz.height);
+        check(dec.size() == img.size(), name);
+        if (dec.size() == img.size()) {
+            // every pixel is sampled at ratio 1.0: the decode is the input up to the solver's smoothing
+            const double p = cs_quality::psnr(img, dec);
+            // the decode must not be closer to the input shifted by 1..4 px than to the input itself
+            double best_shift = 1e9, aligned = 1e9;
+            for (int dy = -4; dy <= 4; ++dy)
+                for (int dx = -4; dx <= 4; ++dx) {
+                    const cv::Rect a(std::max(0, dx), std::max(0, dy), sz.width - std::abs(dx), sz.height - std::abs(dy));
+                    const cv::Rect b(std::max(0, -dx), std::max(0, -dy), a.width, a.height);
+                    const double e = cv::norm(img(a), dec(b), cv::NORM_L1) / ((double)a.area() * 3);
+                    if (dx == 0 && dy == 0) aligned = e;
+                    else best_shift = std::min(best_shift, e);
+                }
+            std::printf("       geometry %dx%d: PSNR %.2f dB, error aligned %.3f vs best shifted %.3f\n",
+                sz.width, sz.height, p, aligned, best_shift);
+            std::snprintf(name, sizeof(name), "geometry %dx%d: decode aligned with the input (PSNR > 30)", sz.width, sz.height);
+            check(p > 30.0, name);
+            std::snprintf(name, sizeof(name), "geometry %dx%d: no shifted copy matches better", sz.width, sz.height);
+            check(aligned <= best_shift, name);
+        }
+        std::remove(tmp_in.c_str());
+        std::remove(tmp_out.c_str());
+    }
+}
