@@ -2918,6 +2918,19 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // per-plane sampled images + 0/1 masks (luma full-res, chroma coarse)
         cv::Mat Y, Ym, Cr, Crm, Cb, Cbm;
         dimgs.get_sampled_ycc420(Y, Ym, Cr, Crm, Cb, Cbm);
+        // Diagnostic (opt-in): CS_DUMP_YMASK=<png> writes the luma sample mask (LR grid, 0 / 255).
+        if (const char* dump = std::getenv("CS_DUMP_YMASK"); dump && !Ym.empty()) {
+            cv::Mat m = Ym, out;
+            if (m.channels() > 1) cv::extractChannel(m, m, 0);
+            double mx = 0.0;
+            cv::minMaxLoc(m, nullptr, &mx);
+            m.convertTo(out, CV_8U, mx > 0.0 ? 255.0 / mx : 1.0);
+            cv::imwrite(dump, out);
+        }
+        // Diagnostic (opt-in): CS_DUMP_YSAMP=<png> writes the luma sample values (LR grid, 8 bit, 0 where unsampled).
+        if (const char* dump = std::getenv("CS_DUMP_YSAMP"); dump && !Y.empty())
+            cv::imwrite(dump, Y);
+
         // Luma/chroma split + per-plane solve + merge as one reusable unit:
         // the standard path runs it once; --seg-solve runs it once with
         // per-tile class parameters (majority vote, no per-class passes).
