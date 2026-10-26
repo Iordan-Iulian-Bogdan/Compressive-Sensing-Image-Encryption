@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 int CSencryption::params = AUTO_PARAM;
 
@@ -481,16 +483,36 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
 
     // Narrow boundary bands per class (W > 0 only): own-label pixels within
     // W px of any frontier. Same label map both sides => identical bands.
+    // Bands, and the adjacent-class boost below, are independent per class: computed in parallel.
+    const int nclass = (int)rates_q.size();
     std::vector<cv::Mat> band;
+    std::vector<uint8_t> boost(rates_q);
     if (seg_blend > 0) {
         band.assign(rates_q.size(), cv::Mat());
-        for (size_t c = 0; c < rates_q.size(); ++c) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int c = 0; c < nclass; ++c) {
             cv::Mat is_c = (labels == (uint8_t)c);
             if (cv::countNonZero(is_c) == 0) continue;
             cv::Mat dist;
             cv::distanceTransform(is_c, dist, cv::DIST_L2, 3);
             cv::Mat near = (dist <= (double)seg_blend) & (dist > 0.0);
-            if (cv::countNonZero(near) != 0) band[c] = near;
+            if (cv::countNonZero(near) == 0) continue;
+            band[(size_t)c] = near;
+            // Adjacent-class boost: classes sharing a frontier with c (3x3 dilation
+            // touch). Flat within the band by design — the band is narrow, and a
+            // ramp would need inexact per-pixel draws on both sides.
+            cv::Mat dilated;
+            cv::dilate(is_c, dilated, cv::Mat());
+            uint8_t qb = rates_q[(size_t)c];
+            for (int r = 0; r < xm; ++r) {
+                const uint8_t* lrow = labels.ptr<uint8_t>(r);
+                const uint8_t* drow = dilated.ptr<uint8_t>(r);
+                for (int col = 0; col < ym; ++col) {
+                    if (drow[col] && lrow[col] != (uint8_t)c && lrow[col] < rates_q.size())
+                        qb = (std::max)(qb, rates_q[lrow[col]]);
+                }
+            }
+            boost[(size_t)c] = qb;
         }
     }
 
@@ -509,44 +531,30 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
         }
     };
 
-    std::vector<int> pool, bpool;
-    pool.reserve(1024);
-    // Adjacent-class boost: classes sharing a frontier with c (3x3 dilation
-    // touch). Flat within the band by design — the band is narrow, and a
-    // ramp would need inexact per-pixel draws on both sides.
-    cv::Mat dilated;
+    // Interior / band pools of every class in one raster pass (each pool keeps raster order),
+    // then the draws in ascending class order from the shared stream.
+    std::vector<std::vector<int>> pools((size_t)nclass), bpools((size_t)nclass);
+    for (int r = 0; r < xm; ++r) {
+        const uint8_t* lrow = labels.ptr<uint8_t>(r);
+        for (int col = 0; col < ym; ++col) {
+            const int c = lrow[col];
+            if (c >= nclass) continue;
+            const bool in_band = seg_blend > 0 && !band[(size_t)c].empty() && band[(size_t)c].ptr<uint8_t>(r)[col];
+            (in_band ? bpools : pools)[(size_t)c].push_back(r * ym + col);
+        }
+    }
     for (size_t c = 0; c < rates_q.size(); ++c) {
         uint8_t qc = rates_q[c];
         const bool has_band = seg_blend > 0 && c < band.size() && !band[c].empty();
         if (qc == 0 && !has_band) continue;
-        pool.clear();
-        bpool.clear();
-        uint8_t qb = qc;
-        if (has_band) {
-            cv::dilate(labels == (uint8_t)c, dilated, cv::Mat());
-            for (int r = 0; r < xm; ++r) {
-                const uint8_t* lrow = labels.ptr<uint8_t>(r);
-                const uint8_t* drow = dilated.ptr<uint8_t>(r);
-                for (int col = 0; col < ym; ++col) {
-                    if (drow[col] && lrow[col] != (uint8_t)c && lrow[col] < rates_q.size())
-                        qb = (std::max)(qb, rates_q[lrow[col]]);
-                }
-            }
-        }
-        for (int r = 0; r < xm; ++r) {
-            const uint8_t* lrow = labels.ptr<uint8_t>(r);
-            const uint8_t* brow = has_band ? band[c].ptr<uint8_t>(r) : nullptr;
-            for (int col = 0; col < ym; ++col) {
-                if (lrow[col] != (uint8_t)c) continue;
-                (brow && brow[col] ? bpool : pool).push_back(r * ym + col);
-            }
-        }
-        draw_pool(pool, qc);
-        if (has_band) draw_pool(bpool, qb);
+        draw_pool(pools[c], qc);
+        if (has_band) draw_pool(bpools[c], boost[c]);
     }
 
+    // the same keyed permutation on both lists, one per thread
+    std::thread shuffle_y([&] { shuffle(ri_y, shuffle_seed); });
     shuffle(ri_x, shuffle_seed);
-    shuffle(ri_y, shuffle_seed);
+    shuffle_y.join();
 }
 
 // YCC 4:2:0 index generation (mode 3; mode 7 = 4:2:2): m_luma full-res luma
@@ -577,8 +585,16 @@ void CSencryption::returnYcc420ChromaIndices(int xm, int ym, int m_luma, const u
     cs_ycc420_channel_key(key, CS_YCC420_TAG_CR, key_cr);
     cs_ycc420_channel_key(key, CS_YCC420_TAG_CB, key_cb);
 
-    returnRandomIndices(ri_cx1, ri_cy1, crows, ccols, m_chroma, key_cr);
-    returnRandomIndices(ri_cx2, ri_cy2, crows, ccols, m_chroma, key_cb);
+    // the two planes draw from independent keys: Cb on a second thread
+    std::exception_ptr cb_error;
+    std::thread cb([&] {
+        try { returnRandomIndices(ri_cx2, ri_cy2, crows, ccols, m_chroma, key_cb); }
+        catch (...) { cb_error = std::current_exception(); }
+    });
+    try { returnRandomIndices(ri_cx1, ri_cy1, crows, ccols, m_chroma, key_cr); }
+    catch (...) { cb.join(); throw; }
+    cb.join();
+    if (cb_error) std::rethrow_exception(cb_error);
 
     cs_wipe(key_cr, sizeof(key_cr));
     cs_wipe(key_cb, sizeof(key_cb));

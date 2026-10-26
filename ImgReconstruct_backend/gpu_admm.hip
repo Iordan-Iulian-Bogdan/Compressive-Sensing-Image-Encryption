@@ -26,7 +26,7 @@ constexpr int kTplHalf = kTpl / 2, kSearchHalf = kSearch / 2;
 constexpr int kBorder = kTplHalf + kSearchHalf;         // 10
 constexpr int kFixedMult = 37426;                       // INT_MAX / (15*15*255), as OpenCV
 constexpr float kAlmostMul = 64.0f / 49.0f;             // 2^6 / template area
-constexpr int kLdsBytes = 49152;                        // dynamic LDS budget of the NLM kernel
+constexpr int kLdsBytes = 49152;                        // largest padded tile (supported() limit)
 
 __device__ inline int reflect101(int i, int n) {
     if (n == 1) return 0;
@@ -69,43 +69,133 @@ __global__ void k_pad_u8(const TileDev* td, const int* qoff, const std::uint8_t*
     Q[qoff[blockIdx.y] + p] = SRC[T.off + sy * T.cols + sx];
 }
 
-// fastNlMeansDenoising(h, 7, 15), 8-bit. One thread per output pixel; the
-// padded tile is staged in LDS. DN has the unpadded layout (offset T.off).
-__global__ void k_nlm(const TileDev* td, const int* qoff, const float* HH, float hmul,
-    const std::uint8_t* Q, std::uint8_t* DN) {
-    extern __shared__ std::uint8_t s[];
+// NLM weight of a quantized distance index (ssd >> 6), as OpenCV's fixed-point table.
+__device__ inline int nlm_weight(int idx, float h2) {
+    const float dist = (float)idx * kAlmostMul;
+    const int w = __float2int_rn((float)kFixedMult * expf(-dist / h2));
+    return w < 38 ? 0 : w;   // weight < 0.001 * fixed-point multiplier (37.4) is dropped
+}
+
+// fastNlMeansDenoising(h, 7, 15), 8-bit. A block covers kNlmSeg output rows x kNlmCols columns
+// of one tile (blockIdx.x = row band * nbx + column block); a thread owns one column of the band.
+// Per search offset the 7x7 SSD of each output row is a sliding sum of 7-wide row sums, each
+// computed as sum a^2 + sum b^2 - 2 sum a*b (exact integers, equal to the direct sum of squared
+// differences) with v_dot4_u32_u8 on packed bytes: the template row's 7 bytes and their sum of
+// squares stay in registers, the shifted row's 7 bytes are three LDS dwords. The centre pixel of an
+// offset is byte 3 of a shifted row fetched three steps earlier (kept in a ring). The weight comes
+// from a per-block table of nlm_weight indexed by ssd >> 6 (every index past it has weight 0:
+// exp(-6.95) * 37426 < 37.5), sized by the host from the batch's largest h; a tile whose table
+// would not fit computes the weights directly. LDS: [table u16][band]. DN has the unpadded layout
+// (offset T.off).
+constexpr int kNlmSeg = 16, kNlmCols = 128, kNlmLutMax = 8192;
+constexpr int kNlmBandRows = kNlmSeg + 2 * kBorder;
+// Band row stride in bytes: the padded width rounded up to whole dwords.
+__host__ __device__ inline int nlm_stride(int cols) { return (cols + 2 * kBorder + 3) & ~3; }
+__host__ __device__ inline int nlm_lut_need(float h2) { return (int)(6.95f * h2 / kAlmostMul) + 4; }
+size_t nlm_lds_bytes(int lut_cap, int max_cols) {
+    const int bs = nlm_stride(max_cols);
+    return (size_t)((2 * lut_cap + 3) & ~3) + (size_t)kNlmBandRows * bs + 16;
+}
+
+// Bytes p .. p+7 of the band as two little-endian dwords (byte p in the low byte of lo).
+__device__ inline void nlm_fetch8(const std::uint32_t* w, int p, std::uint32_t& lo, std::uint32_t& hi) {
+    const int i = p >> 2, sh = p & 3;
+    const std::uint32_t w0 = w[i], w1 = w[i + 1], w2 = w[i + 2];
+    lo = __builtin_amdgcn_alignbyte(w1, w0, sh);
+    hi = __builtin_amdgcn_alignbyte(w2, w1, sh);
+}
+
+__global__ void __launch_bounds__(kNlmCols) k_nlm(const TileDev* td, const int* qoff, const float* HH, float hmul,
+    const std::uint8_t* Q, std::uint8_t* DN, int nbx, int lut_cap) {
+    extern __shared__ std::uint32_t s_words[];
+    std::uint8_t* s = (std::uint8_t*)s_words;
     const TileDev T = td[blockIdx.y];
-    const int PW = T.cols + 2 * kBorder, PH = T.rows + 2 * kBorder;
-    const std::uint8_t* q = Q + qoff[blockIdx.y];
-    for (int p = threadIdx.x; p < PW * PH; p += kThreads) s[p] = q[p];
-    __syncthreads();
-    const int gi = blockIdx.x * kThreads + threadIdx.x;
-    if (gi >= T.rows * T.cols) return;
-    const int y = gi / T.cols, x = gi % T.cols;
+    const int y0 = (blockIdx.x / nbx) * kNlmSeg, x = (blockIdx.x % nbx) * kNlmCols + threadIdx.x;
+    if (y0 >= T.rows || (blockIdx.x % nbx) * kNlmCols >= T.cols) return;   // uniform per block
+    const int PW = T.cols + 2 * kBorder, PH = T.rows + 2 * kBorder, BS = nlm_stride(T.cols);
+    std::uint16_t* lut = (std::uint16_t*)s;
+    std::uint8_t* band = s + ((2 * lut_cap + 3) & ~3);
+    const std::uint32_t* bandw = (const std::uint32_t*)band;
+    const std::uint8_t* q = Q + qoff[blockIdx.y] + (size_t)y0 * PW;
+    const int nrows = min(kNlmBandRows, PH - y0);
+    for (int p = threadIdx.x; p < nrows * BS; p += kNlmCols) {
+        const int r = p / BS, c = p % BS;
+        band[p] = c < PW ? q[r * PW + c] : 0;
+    }
     const float h = HH[blockIdx.y] * hmul;
     const float h2 = h * h;
-    int est = 0, wsum = 0;
-    const int cy = y + kBorder, cx = x + kBorder;
+    const int need = nlm_lut_need(h2);
+    const bool use_lut = need <= lut_cap;
+    const int nlut = use_lut ? need : 0;
+    for (int i = threadIdx.x; i < nlut; i += kNlmCols) lut[i] = (std::uint16_t)nlm_weight(i, h2);
+    __syncthreads();
+    if (x >= T.cols) return;
+
+    constexpr int kRows = kNlmSeg + kTpl - 1;   // template rows feeding the kNlmSeg windows
+    const int cx = x + kBorder;
+    // this column's template rows (band rows kSearchHalf + r), packed with byte 7 cleared so the
+    // shifted row's 8th byte drops out of the cross term, and their sums of squares
+    std::uint32_t alo[kRows], ahi[kRows];
+    int asq[kRows];
+    #pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        nlm_fetch8(bandw, (kSearchHalf + r) * BS + cx - kTplHalf, alo[r], ahi[r]);
+        ahi[r] &= 0x00FFFFFFu;
+        asq[r] = (int)__builtin_amdgcn_udot4(ahi[r], ahi[r], __builtin_amdgcn_udot4(alo[r], alo[r], 0u, false), false);
+    }
+    int est[kNlmSeg], wsum[kNlmSeg];
+    #pragma unroll
+    for (int k = 0; k < kNlmSeg; ++k) { est[k] = 0; wsum[k] = 0; }
     for (int dy = -kSearchHalf; dy <= kSearchHalf; ++dy) {
         for (int dx = -kSearchHalf; dx <= kSearchHalf; ++dx) {
-            int ssd = 0;
-            for (int ty = -kTplHalf; ty <= kTplHalf; ++ty) {
-                const std::uint8_t* a = s + (cy + ty) * PW + (cx - kTplHalf);
-                const std::uint8_t* c = s + (cy + dy + ty) * PW + (cx + dx - kTplHalf);
+            // sum over the 7 columns of (a - b)^2 for template row r and its shifted row; blo
+            // returns the shifted row's first 4 bytes
+            auto row_ssd = [&](int r, std::uint32_t& blo) {
+                std::uint32_t bhi;
+                nlm_fetch8(bandw, (kSearchHalf + r + dy) * BS + cx - kTplHalf + dx, blo, bhi);
+                const std::uint32_t bh = bhi & 0x00FFFFFFu;
+                const int bsq = (int)__builtin_amdgcn_udot4(bh, bh, __builtin_amdgcn_udot4(blo, blo, 0u, false), false);
+                const int dot = (int)__builtin_amdgcn_udot4(ahi[r], bhi, __builtin_amdgcn_udot4(alo[r], blo, 0u, false), false);
+                return asq[r] + bsq - 2 * dot;
+            };
+            // rings of the last 7 row sums and shifted-row heads (index 0 oldest); after step k they
+            // hold rows k .. k+6, output k's window, and row k+3's head carries its centre pixel
+            int hr[kTpl], win = 0;
+            std::uint32_t hd[kTpl];
+            hr[0] = 0; hd[0] = 0;
+            #pragma unroll
+            for (int r = 0; r < kTpl - 1; ++r) { hr[r + 1] = row_ssd(r, hd[r + 1]); win += hr[r + 1]; }
+            #pragma unroll
+            for (int k = 0; k < kNlmSeg; ++k) {
+                std::uint32_t nh;
+                const int nr = row_ssd(k + kTpl - 1, nh);
+                win += nr - hr[0];
                 #pragma unroll
-                for (int tx = 0; tx < kTpl; ++tx) {
-                    const int d = (int)a[tx] - (int)c[tx];
-                    ssd += d * d;
-                }
+                for (int r = 0; r < kTpl - 1; ++r) { hr[r] = hr[r + 1]; hd[r] = hd[r + 1]; }
+                hr[kTpl - 1] = nr; hd[kTpl - 1] = nh;
+                const int idx = win >> 6;
+                const int w = use_lut ? (idx < nlut ? (int)lut[idx] : 0) : nlm_weight(idx, h2);
+                est[k] += w * (int)(hd[kTplHalf] >> 24);   // band[(kBorder + k + dy) * BS + cx + dx]
+                wsum[k] += w;
+                if ((k & 3) == 3) __builtin_amdgcn_sched_barrier(0);   // keep the row loads from being hoisted (VGPR spills)
             }
-            const float dist = (float)(ssd >> 6) * kAlmostMul;
-            int w = __float2int_rn((float)kFixedMult * expf(-dist / h2));
-            if (w < 38) w = 0;   // weight < 0.001 * fixed-point multiplier (37.4) is dropped
-            est += w * (int)s[(cy + dy) * PW + (cx + dx)];
-            wsum += w;
         }
     }
-    DN[T.off + gi] = (std::uint8_t)(((unsigned)est + (unsigned)(wsum / 2)) / (unsigned)wsum);
+    #pragma unroll
+    for (int k = 0; k < kNlmSeg; ++k)
+        if (y0 + k < T.rows)
+            DN[T.off + (y0 + k) * T.cols + x] = (std::uint8_t)(((unsigned)est[k] + (unsigned)(wsum[k] / 2)) / (unsigned)wsum[k]);
+}
+
+// Launch of k_nlm over a batch (max_rows / max_cols: largest tile dimensions; hmax: largest
+// per-tile strength in HH, which sizes the weight table).
+void launch_nlm(int nt, int max_rows, int max_cols, float hmax, const TileDev* td, const int* qoff, const float* HH,
+    float hmul, const std::uint8_t* Q, std::uint8_t* DN) {
+    const int nbx = (max_cols + kNlmCols - 1) / kNlmCols, nby = (max_rows + kNlmSeg - 1) / kNlmSeg;
+    const float h = hmax * hmul;
+    const int lut_cap = std::min(kNlmLutMax, nlm_lut_need(h * h) + 64);
+    k_nlm<<<dim3((unsigned)(nbx * nby), (unsigned)nt), dim3(kNlmCols), nlm_lds_bytes(lut_cap, max_cols)>>>(
+        td, qoff, HH, hmul, Q, DN, nbx, lut_cap);
 }
 
 // u *= f (dual rescaling when rho changes).
@@ -225,7 +315,7 @@ bool available() {
 
 bool supported(int rows, int cols) {
     return rows >= 12 && cols >= 12 && rows % 2 == 0 && cols % 2 == 0 &&
-        padded_size(rows, cols) <= kLdsBytes;
+        padded_size(rows, cols) <= kLdsBytes && nlm_lds_bytes(kNlmLutMax, cols) <= 65536;
 }
 
 bool nlm_denoise_u8(const std::vector<NlmPlane>& planes) {
@@ -256,8 +346,7 @@ bool nlm_denoise_u8(const std::vector<NlmPlane>& planes) {
     HIP_TRY(hipMemcpy(dsrc.p, hsrc.data(), (size_t)L.total, hipMemcpyHostToDevice));
     const dim3 blk(kThreads);
     k_pad_u8<<<dim3((unsigned)((max_pad + kThreads - 1) / kThreads), (unsigned)nt), blk>>>(dtd.p, dq.p, dsrc.p, dQ.p);
-    k_nlm<<<dim3((unsigned)((L.max_n + kThreads - 1) / kThreads), (unsigned)nt), blk, (size_t)max_pad>>>(
-        dtd.p, dq.p, dh.p, 1.0f, dQ.p, dDN.p);
+    launch_nlm(nt, L.max_rows, L.max_cols, *std::max_element(hh.begin(), hh.end()), dtd.p, dq.p, dh.p, 1.0f, dQ.p, dDN.p);
     HIP_TRY(hipGetLastError());
     HIP_TRY(hipDeviceSynchronize());
     std::vector<std::uint8_t> hdn((size_t)L.total);
@@ -270,19 +359,30 @@ bool nlm_denoise_u8(const std::vector<NlmPlane>& planes) {
 
 // Opt-in per-kernel timing (env CS_GPU_PROF=1): hipEvent pairs around every
 // launch of solve_pnp_admm, accumulated per kernel name and printed at exit.
+// Without it every launch is still bracketed by a marker event (no timing): measured on
+// ROCm 7.2 / Windows, the ADMM loop then runs ~8% faster (454 -> 419 ms on a 12 MP decode),
+// apparently because the back-to-back dependent launches otherwise reach the GPU later.
 struct Prof {
     bool on = false;
     std::vector<std::pair<const char*, std::pair<hipEvent_t, hipEvent_t>>> ev;
-    hipEvent_t t_begin{}, t_end{};
-    Prof() { const char* e = std::getenv("CS_GPU_PROF"); on = e && e[0] == '1'; }
+    hipEvent_t t_begin{}, t_end{}, marker{};
+    Prof() {
+        const char* e = std::getenv("CS_GPU_PROF");
+        on = e && e[0] == '1';
+        if (!on) (void)hipEventCreateWithFlags(&marker, hipEventDisableTiming);
+    }
+    ~Prof() { if (marker) (void)hipEventDestroy(marker); }
     void begin_all() { if (!on) return; hipEventCreate(&t_begin); hipEventRecord(t_begin); }
     void b(const char* n) {
-        if (!on) return;
+        if (!on) { if (marker) (void)hipEventRecord(marker); return; }
         hipEvent_t a, c; hipEventCreate(&a); hipEventCreate(&c);
         hipEventRecord(a);
         ev.push_back({ n, { a, c } });
     }
-    void e() { if (on) hipEventRecord(ev.back().second.second); }
+    void e() {
+        if (!on) { if (marker) (void)hipEventRecord(marker); return; }
+        hipEventRecord(ev.back().second.second);
+    }
     void end_all(long long tiles, long long px);
 };
 struct ProfAgg {
@@ -342,7 +442,7 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     // sample value, or a large negative sentinel where there is none.
     std::vector<float> hZ(dZext ? 0 : (size_t)L.total), hblr((size_t)L.total / 4, -1e30f), hlam((size_t)nt), hh((size_t)nt);
     {
-        for (int t = 0; t < nt; ++t) {
+        parallel_for(nt, [&](int t) {
             const Problem& P = tiles[(size_t)t];
             if (!dZext) std::copy(P.z, P.z + (size_t)P.rows * P.cols, hZ.begin() + L.td[(size_t)t].off);
             float* blr = hblr.data() + L.td[(size_t)t].off / 4;
@@ -352,34 +452,42 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
             }
             hlam[(size_t)t] = P.lambda;
             hh[(size_t)t] = P.nlm_h;
-        }
+        });
     }
 
     // Exact-HR anchors (tile layout, sentinel where none), only when the batch carries a weight.
     const bool use_hr = prm.hr_weight > 0.0f;
     std::vector<float> hhav;
+    std::vector<int> hrt((size_t)nt, 0);   // fixed-step batches: per-tile "has anchors" (step choice)
     if (use_hr) {
-        hhav.assign((size_t)L.total, -1e30f);
-        for (int t = 0; t < nt; ++t) {
+        hhav.resize((size_t)L.total);
+        parallel_for(nt, [&](int t) {
             const Problem& P = tiles[(size_t)t];
-            if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, hhav.begin() + L.td[(size_t)t].off);
-        }
+            const auto o = hhav.begin() + L.td[(size_t)t].off;
+            if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, o);
+            else std::fill(o, o + (size_t)P.rows * P.cols, -1e30f);
+            hrt[(size_t)t] = P.hr_val != nullptr;
+        });
     }
 
-    DevBuf<TileDev> dtd; DevBuf<int> dq;
-    DevBuf<float> dtab, dZ, dU, dANCH, dX, dY, dXP, dZC, dTMP, dPIX, dSC, dWS, dLAM, dH, dBLR, dHAV;
+    DevBuf<TileDev> dtd; DevBuf<int> dq, dHRT;
+    DevBuf<float> dtab, dZ, dU, dANCH, dY, dXP, dZC, dTMP, dPIX, dSC, dWS, dLAM, dH, dBLR, dHAV;
     DevBuf<std::uint8_t> dQ, dDN;
     const size_t N = (size_t)L.total;
     if (!dtd.alloc((size_t)nt) || !dq.alloc((size_t)nt) || !dtab.alloc(L.table.size()) || (!dZext && !dZ.alloc(N)) ||
-        !dU.alloc(N) || !dANCH.alloc(N) || !dX.alloc(N) || !dY.alloc(N) || !dXP.alloc(N) || !dZC.alloc(N) ||
-        !dTMP.alloc(N) || !dPIX.alloc(N) || !dSC.alloc(N) || !dWS.alloc(N) ||
+        !dU.alloc(N) || !dANCH.alloc(N) || !dY.alloc(N) || !dXP.alloc(N) ||
+        !dTMP.alloc(N) || !dPIX.alloc(N) || !dSC.alloc(N) ||
         !dLAM.alloc((size_t)nt) || !dH.alloc((size_t)nt) || !dBLR.alloc(N / 4) ||
         !dQ.alloc((size_t)qtot) || !dDN.alloc(N) || (use_hr && !dHAV.alloc(N))) {
         std::fprintf(stderr, "gpu_admm: device allocation failed\n");
         return false;
     }
     float* const Zp = dZext ? dZext : dZ.p;   // z lives here for the whole loop
-    if (use_hr) HIP_TRY(hipMemcpy(dHAV.p, hhav.data(), N * sizeof(float), hipMemcpyHostToDevice));
+    if (use_hr) {
+        if (!dHRT.alloc((size_t)nt)) return false;
+        HIP_TRY(hipMemcpy(dHAV.p, hhav.data(), N * sizeof(float), hipMemcpyHostToDevice));
+        HIP_TRY(hipMemcpy(dHRT.p, hrt.data(), (size_t)nt * sizeof(int), hipMemcpyHostToDevice));
+    }
 
     // tv > 0 batches: explicit gradient, smooth objective and per-tile backtracking state.
     const bool bt = prm.bt != 0;
@@ -389,7 +497,9 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     std::vector<int> act((size_t)nt);
     if (bt) {
         for (int t = 0; t < nt; ++t) tva[(size_t)t] = tiles[(size_t)t].tv;
-        if (!dTVA.alloc((size_t)nt) || !dTVG.alloc(N) || !dPHI.alloc(N) || !dS.alloc(N) || !dG.alloc(N) ||
+        // (the fixed-step epilogue keeps the iterate in XP and computes the frequency weights in place)
+        if (!dZC.alloc(N) || !dWS.alloc(N) ||
+            !dTVA.alloc((size_t)nt) || !dTVG.alloc(N) || !dPHI.alloc(N) || !dS.alloc(N) || !dG.alloc(N) ||
             !dLT.alloc((size_t)nt) || !dF.alloc((size_t)nt) || !dD2.alloc(2 * (size_t)nt) || !dACT.alloc((size_t)nt)) {
             std::fprintf(stderr, "gpu_admm: device allocation failed\n");
             return false;
@@ -414,28 +524,29 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     const Epi none{};
     const size_t bytes = N * sizeof(float);
     const float logw = prm.wscale > 1.0f ? std::log(prm.wscale) : 0.0f;
+    const float hmax = *std::max_element(hh.begin(), hh.end());   // sizes the NLM weight table
     const float rho_end = prm.rho_end > 0.0f ? prm.rho_end : prm.rho;
     float rho_prev = prm.rho;
     Prof prof;
     prof.begin_all();
 #define FWD_DCT(src, dst) do {         TIMED("gemm_fwd_a", k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, (src), dTMP.p, nbn, none));         TIMED("gemm_fwd_b", k_gemm<OP_TAB, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, (dst), nbn, none));     } while (0)
-    k_ws<<<grid, blk>>>(dtd.p, dWS.p, logw);
+    if (bt) k_ws<<<grid, blk>>>(dtd.p, dWS.p, logw);
 
     for (int it = 0; it < prm.admm; ++it) {
         // per-round schedule of rho and of the NLM strength
         const float frac = prm.admm > 1 ? (float)it / (float)(prm.admm - 1) : 0.0f;
         const float rho_k = prm.rho == rho_end ? prm.rho : prm.rho * std::pow(rho_end / prm.rho, frac);
         const float hmul_k = prm.h_start == prm.h_end ? prm.h_start : prm.h_start * std::pow(prm.h_end / prm.h_start, frac);
-        const float Lc = 0.25f * prm.lip + 2.0f * rho_k + (use_hr ? 2.0f * prm.hr_weight : 0.0f);   // fixed-step branch
-        const float step = 1.0f / Lc;
+        // fixed-step branch; tiles without anchors take the anchor-free step (as their own batch would)
+        const float Lc = 0.25f * prm.lip + 2.0f * rho_k + (use_hr ? 2.0f * prm.hr_weight : 0.0f);
+        const float step = 1.0f / (0.25f * prm.lip + 2.0f * rho_k + 0.0f), step_hr = 1.0f / Lc;
         if (prm.rescale_u && rho_k != rho_prev) TIMED("k_scale", k_scale<<<grid, blk>>>(dtd.p, dU.p, rho_prev / rho_k));
         rho_prev = rho_k;
         // anch = DCT(z - u); x = DCT(z)
         TIMED("k_sub", k_sub<<<grid, blk>>>(dtd.p, Zp, dU.p, dSC.p));
         FWD_DCT(dSC.p, dANCH.p);
-        FWD_DCT(Zp, dX.p);
-        HIP_TRY(hipMemcpyAsync(dY.p, dX.p, bytes, hipMemcpyDeviceToDevice));
-        HIP_TRY(hipMemcpyAsync(dXP.p, dX.p, bytes, hipMemcpyDeviceToDevice));
+        FWD_DCT(Zp, dY.p);
+        HIP_TRY(hipMemcpyAsync(dXP.p, dY.p, bytes, hipMemcpyDeviceToDevice));
         float t = 1.0f;
         if (bt) {
             // smooth objective of coefficients C (PIX = IDCT(C), SC/TVG/PHI refreshed), into dF
@@ -471,7 +582,27 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
                 t = t_new;
             }
         }
-        for (int k = 0; !bt && k < prm.inner; ++k) {
+        // Fused fixed-step loop (k_gemm2): inverse pass B + residual + forward pass A, then forward
+        // pass B + step + the next inverse pass A; the last step feeds z, so TMP ends as IDCT pass A
+        // of the final iterate. Bit-identical to the four-launch loop below.
+        const bool fused = !bt && prm.inner > 0 && L.max_cols <= kFN;
+        if (fused) {
+            const dim3 fgrid((unsigned)((L.max_rows + kFM - 1) / kFM), (unsigned)nt), fblk(kFThreads);
+            TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dY.p, dTMP.p, nbn, none));
+            for (int k = 0; k < prm.inner; ++k) {
+                Epi er{}; er.blr = dBLR.p;
+                if (use_hr) { er.hav = dHAV.p; er.hw = prm.hr_weight; }
+                TIMED("gemm2_resid", k_gemm2<OP_TABT, EPI_RESID, OP_TABT><<<fgrid, fblk>>>(dtd.p, dtab.p, dTMP.p, dSC.p, er, 0));
+                const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
+                Epi es{}; es.anch = dANCH.p; es.logw = logw; es.lam = dLAM.p; es.y = dY.p; es.xp = dXP.p;
+                es.aw = rho_k; es.step = step; es.mom = (t - 1.0f) / t_new;
+                if (use_hr) { es.hrt = dHRT.p; es.step_hr = step_hr; }
+                TIMED("gemm2_step", k_gemm2<OP_TAB, EPI_STEP, OP_TAB><<<fgrid, fblk>>>(dtd.p, dtab.p, dSC.p, dTMP.p, es,
+                    k + 1 == prm.inner));
+                t = t_new;
+            }
+        }
+        for (int k = 0; !bt && !fused && k < prm.inner; ++k) {
             // PIX = IDCT(y); SC = residual of the 2x2 average at the samples (fused epilogue)
             TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dY.p, dTMP.p, nbn, none));
             Epi er{}; er.blr = dBLR.p;
@@ -480,16 +611,18 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
             // gradient = 2 DCT(SC); soft threshold + momentum (fused epilogue)
             TIMED("gemm_fwd_a", k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dSC.p, dTMP.p, nbn, none));
             const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
-            Epi es{}; es.anch = dANCH.p; es.ws = dWS.p; es.lam = dLAM.p; es.y = dY.p; es.xp = dXP.p; es.zc = dZC.p;
+            Epi es{}; es.anch = dANCH.p; es.logw = logw; es.lam = dLAM.p; es.y = dY.p; es.xp = dXP.p;
             es.aw = rho_k; es.step = step; es.mom = (t - 1.0f) / t_new;
+            if (use_hr) { es.hrt = dHRT.p; es.step_hr = step_hr; }
             TIMED("gemm_fwd_b+step", k_gemm<OP_TAB, OP_DATA, EPI_STEP><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, es));
             t = t_new;
         }
         // px = IDCT(x); v = px + u -> 8-bit; z = NLM(v); u += px - z
-        TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dZC.p, dTMP.p, nbn, none));
+        if (!fused)
+            TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, bt ? dZC.p : dXP.p, dTMP.p, nbn, none));
         TIMED("gemm_inv_b", k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none));
         TIMED("k_quant", k_quant<<<pgrid, blk>>>(dtd.p, dq.p, dPIX.p, dU.p, dQ.p));
-        TIMED("k_nlm", k_nlm<<<grid, blk, (size_t)max_pad>>>(dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
+        TIMED("k_nlm", launch_nlm(nt, L.max_rows, L.max_cols, hmax, dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
         TIMED("k_dual", k_dual<<<grid, blk>>>(dtd.p, dPIX.p, dDN.p, dU.p, Zp));
     }
     HIP_TRY(hipGetLastError());

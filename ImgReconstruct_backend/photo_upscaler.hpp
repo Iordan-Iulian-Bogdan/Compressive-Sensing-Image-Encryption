@@ -77,6 +77,8 @@ inline std::string cs_env_or(const char* var, const std::string& fallback) {
 
 struct CsPhotoUpscalerOptions {
   std::string backend = "avir";
+  // Tile overlap of the automatic decrypt grid (auto mode only; --fast: 8).
+  int auto_overlap = 24;
   // RED-lite NLM strength for the cs-sr backend (0 = off): blends each
   // outer FISTA pass toward its fastNlMeans-denoised self. Ignored by all
   // other backends (including AVIR fallback tiles).

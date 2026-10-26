@@ -39,6 +39,9 @@ void print_usage(const char* exe) {
         "  --overlap <n>         decrypt tile overlap in [0, 96] (manual mode only;\n"
   "                        0 disables overlap: tiles solve independently and\n"
   "                        composite without feathering)\n"
+        "  --fast                decrypt preset: tile overlap 8 and 12 FISTA steps per\n"
+        "                        pass (explicit --overlap/--fista-iters win); about 2x\n"
+        "                        faster for a small quality cost\n"
         "  --iterations <n>      decrypt solver iterations (manual mode only)\n"
         "  --threads <n>         decrypt worker threads (manual mode only)\n"
         "  --coef <f>            decrypt solver coefficient (>0; higher = sparser,\n"
@@ -657,6 +660,7 @@ int main(int argc, char* argv[])
     std::string solver_name = "fista";
     int solver = CS_SOLVER_FISTA;
     int fista_iters = 0;
+    bool fast = false, overlap_set = false, fista_iters_set = false;
     int reweights = 2;
     std::string basis_name = "dct";
     int basis = CS_BASIS_DCT;
@@ -676,7 +680,7 @@ int main(int argc, char* argv[])
         {"--password", "passphrase text", false, [&](const char* v) { password = v; have_password = true; return true; }},
         {"--ratio", "floating point", false, [&](const char* v) { return set_float(v, ratio, nullptr, nullptr); }},
         {"--tiles", "integer", true, [&](const char* v) { return set_int(v, tiles, nullptr, nullptr); }},
-        {"--overlap", "integer", true, [&](const char* v) { return set_int(v, overlap, nullptr, nullptr); }},
+        {"--overlap", "integer", true, [&](const char* v) { overlap_set = true; return set_int(v, overlap, nullptr, nullptr); }},
         {"--iterations", "integer", true, [&](const char* v) { return set_int(v, iterations, nullptr, nullptr); }},
         {"--threads", "integer", true, [&](const char* v) { return set_int(v, threads, nullptr, nullptr); }},
         {"--coef", "floating point", true, [&](const char* v) { return set_float(v, coef, nullptr, nullptr); }},
@@ -698,6 +702,7 @@ int main(int argc, char* argv[])
         {"--dual-tv-split", "output prefix", false, [&](const char* v) { photo_up.dual_tv_split = v; return true; }},
         {"--dual-tv-cutouts", "output prefix", false, [&](const char* v) { photo_up.dual_tv_cutouts = v; return true; }},
         {"--manual", nullptr, true, [&](const char*) { return true; }},
+        {"--fast", nullptr, false, [&](const char*) { fast = true; return true; }},
         {"--no-preview", nullptr, false, [&](const char*) { show_preview = false; return true; }},
         {"--photo-upscaler", "avir, cs-sr, sr-direct, dip, fsrcnn, waifu2x, waifu2x-ncnn or realcugan", false, [&](const char* v) {
             return set_choice(v, photo_up.backend,
@@ -864,6 +869,7 @@ int main(int argc, char* argv[])
             return true;
         }},
         {"--fista-iters", "integer", false, [&](const char* v) {
+            fista_iters_set = true;
             return set_int(v, fista_iters, [](int x) { return x < 0 || x > 500; }, "Error: --fista-iters must be in [0, 500]");
         }},
         {"--reweights", "integer", false, [&](const char* v) {
@@ -921,6 +927,13 @@ int main(int argc, char* argv[])
         }
         if (!opt->apply(v)) return 64;
         if (opt->manual) manual = true;
+    }
+
+    // --fast decode preset: tile overlap 8 and 12 FISTA steps per pass, unless given explicitly
+    // (IMG_3690 ycc420 + anchors: 2.1 s -> 0.96 s, -0.12 dB PSNR, SSIM 0.9285 -> 0.9283).
+    if (fast) {
+        if (!overlap_set) { overlap = 8; photo_up.auto_overlap = 8; }
+        if (!fista_iters_set) fista_iters = 12;
     }
 
     if (!have_password) {

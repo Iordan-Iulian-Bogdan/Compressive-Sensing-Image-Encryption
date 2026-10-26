@@ -48,6 +48,8 @@ set "OPTS=/c /O2 /fp:fast /arch:AVX512 /clang:-mavx512f /clang:-mavx512bw /clang
 REM DirectML build of ONNX Runtime 1.22.1 (NuGet Microsoft.ML.OnnxRuntime.DirectML) in third_party\onnxruntime_dml
 set "ORT_DML=%ROOT%third_party\onnxruntime_dml"
 set "BE_INC=/I %ROOT%ImgReconstruct_backend /I %ORT_DML%\include"
+REM zlib for the parallel PNG writer (png_fast.cpp): AOCL-Compression's
+set "AOCL_COMP=C:\Program Files\AMD\AOCL-Windows\amd-compression"
 
 echo ============ main objects [opencv 4.90 world] ============
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\CS_encryption.cpp" /Fo"%OBJ%\CS_encryption.obj"
@@ -70,7 +72,7 @@ clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\admm_l
 if errorlevel 1 ( echo ERROR admm_l1tv & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\pnp_nlm.cpp" /Fo"%OBJ%\pnp_nlm.obj"
 if errorlevel 1 ( echo ERROR pnp_nlm & exit /b 1 )
-clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\image_decryption.cpp" /Fo"%OBJ%\image_decryption.obj"
+clang-cl %OPTS% %DEFS% /DCS_FAST_PNG %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\image_decryption.cpp" /Fo"%OBJ%\image_decryption.obj"
 if errorlevel 1 ( echo ERROR image_decryption & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\image_encryption.cpp" /Fo"%OBJ%\image_encryption.obj"
 if errorlevel 1 ( echo ERROR image_encryption & exit /b 1 )
@@ -92,6 +94,8 @@ clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\gpu_ad
 if errorlevel 1 ( echo ERROR gpu_admm_broker & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV490_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\gpu_avir_tables.cpp" /Fo"%OBJ%\gpu_avir_tables.obj"
 if errorlevel 1 ( echo ERROR gpu_avir_tables & exit /b 1 )
+clang-cl %OPTS% %DEFS% /D_WINDOWS %CV490_INC% %BE_INC% /I "%AOCL_COMP%\include" "%ROOT%ImgReconstruct_backend\png_fast.cpp" /Fo"%OBJ%\png_fast.obj"
+if errorlevel 1 ( echo ERROR png_fast & exit /b 1 )
 if "%~1"=="main" goto :linkmain
 echo ============ test objects [opencv 4.13 static + contrib] ============
 clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\CS_encryption.cpp" /Fo"%OBJT%\CS_encryption.obj"
@@ -137,7 +141,7 @@ for %%T in (%TEST_UNITS%) do (
 set "SYSLIBS=bcrypt.lib libomp.lib user32.lib gdi32.lib kernel32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib shell32.lib winspool.lib comdlg32.lib onnxruntime.lib delayimp.lib"
 
 echo [link] ImgReconstruct_backend.exe
-link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:%CV490_ROOT%\build\x64\vc16\lib /LIBPATH:%ORT_DML%\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_dict.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\onnx_denoise.obj" "%OBJ%\superres.obj" "%OBJ%\gap_tv.obj" "%OBJ%\admm_l1tv.obj" "%OBJ%\pnp_nlm.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" "%OBJ%\gpu_decrypt.obj" "%OBJ%\gpu_admm_broker.obj" "%OBJ%\gpu_avir_tables.obj" "%OBJ%\gpu_tiles.obj" "%OBJ%\gpu_admm.obj" "%OBJ%\gpu_sr.obj" "%OBJ%\gpu_composite.obj" opencv_world490.lib amdhip64.lib %SYSLIBS%
+link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:%CV490_ROOT%\build\x64\vc16\lib /LIBPATH:%ORT_DML%\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_dict.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\onnx_denoise.obj" "%OBJ%\superres.obj" "%OBJ%\gap_tv.obj" "%OBJ%\admm_l1tv.obj" "%OBJ%\pnp_nlm.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" "%OBJ%\gpu_decrypt.obj" "%OBJ%\gpu_admm_broker.obj" "%OBJ%\gpu_avir_tables.obj" "%OBJ%\gpu_tiles.obj" "%OBJ%\gpu_admm.obj" "%OBJ%\gpu_sr.obj" "%OBJ%\gpu_composite.obj" "%OBJ%\png_fast.obj" "%AOCL_COMP%\lib\static\aocl_compression.lib" opencv_world490.lib amdhip64.lib %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking exe & exit /b 1 )
 if "%~1"=="main" goto :finish
 

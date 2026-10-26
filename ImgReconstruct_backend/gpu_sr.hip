@@ -138,6 +138,45 @@ __global__ void k_dither(const SrDev* sd, int nt, float* F, float* DBUF, int dst
     }
 }
 
+// k_dither on an anti-diagonal wavefront: one block per tile and channel, one thread per row; row
+// i handles column s - 2i on step s, so a pixel's carries from the row above (columns j-1..j+1)
+// are complete before it runs. Each row has its own carry row in LDS (slot 0 = column -1), and a
+// pixel adds (F + carry from above) + carry from the left, the order of the serial scan, so the
+// output is bit-identical to k_dither.
+__global__ void k_dither_wave(const SrDev* sd, float* F, std::uint8_t* HR8) {
+    extern __shared__ float dsh[];
+    const SrDev T = sd[blockIdx.x / 3];
+    const int c = blockIdx.x % 3, H2 = 2 * T.R, W2 = 2 * T.C, n = H2 * W2, ds = W2 + 2;
+    const int i = threadIdx.x;
+    for (int e = threadIdx.x; e < H2 * ds; e += blockDim.x) dsh[e] = 0.f;
+    __syncthreads();
+    const float* line = F + (size_t)3 * T.hr_off + (size_t)c * n + (size_t)i * W2;
+    std::uint8_t* out = HR8 + (size_t)3 * T.hr_off + c + (size_t)3 * i * W2;
+    const float* d = dsh + (size_t)i * ds + 1;
+    float* dn = (i + 1 < H2) ? dsh + (size_t)(i + 1) * ds + 1 : nullptr;   // the last row's carries are dropped
+    float left = 0.f;   // the left pixel's noise
+    const int steps = W2 + 2 * (H2 - 1);
+    for (int s = 0; s < steps; ++s) {
+        const int j = s - 2 * i;
+        if (i < H2 && j >= 0 && j < W2) {
+            // fused like k_dither, where the carry's multiply and add sit in one iteration
+            float L = line[j] + d[j];
+            if (j > 0) L = __fmaf_rn(left, 0.364842f, L);
+            const float z0 = avir_round(L);
+            const float noise = L - z0;
+            const float v = fminf(fmaxf(z0, 0.f), 255.f);
+            out[3 * j] = (std::uint8_t)(int)v;
+            left = noise;
+            if (dn) {
+                dn[j - 1] = __fmaf_rn(noise, 0.207305f, dn[j - 1]);
+                dn[j] = __fmaf_rn(noise, 0.364842f, dn[j]);
+                if (j < W2 - 1) dn[j + 1] = __fmaf_rn(noise, 0.063011f, dn[j + 1]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // BGR -> YCrCb (OpenCV 8-bit fixed point); Z = Y * (1/255) is the ADMM start (as
 // init_ycc_chs[0].convertTo(CV_32F, 1/255)); Cr/Cb kept for the output merge.
 __global__ void k_bgr2ycc(const SrDev* sd, const std::uint8_t* HR8, float* Z, std::uint8_t* CR, std::uint8_t* CB) {
@@ -181,7 +220,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
     std::vector<float> table;
     std::map<std::pair<int, int>, std::pair<int, int>> tab_off;   // (R, C) -> (ar, ac)
     long long lr_total = 0, hr_total = 0;
-    int max_hr = 0, max_tmp = 0, max_c = 0;
+    int max_hr = 0, max_tmp = 0, max_c = 0, max_r = 0;
     for (int t = 0; t < nt; ++t) {
         const Tile& P = tiles[(size_t)t];
         auto key = std::make_pair(P.lr_rows, P.lr_cols);
@@ -203,12 +242,14 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
         max_hr = std::max(max_hr, 4 * P.lr_rows * P.lr_cols);
         max_tmp = std::max(max_tmp, 2 * P.lr_rows * P.lr_cols);
         max_c = std::max(max_c, P.lr_cols);
+        max_r = std::max(max_r, P.lr_rows);
     }
     if (3 * hr_total > 2000000000LL) return false;
     std::vector<std::uint8_t> hlr((size_t)3 * lr_total);
-    for (int t = 0; t < nt; ++t)
+    parallel_for(nt, [&](int t) {
         std::copy(tiles[(size_t)t].lr_bgr, tiles[(size_t)t].lr_bgr + (size_t)3 * tiles[(size_t)t].lr_rows * tiles[(size_t)t].lr_cols,
             hlr.begin() + (size_t)3 * sd[(size_t)t].lr_off);
+    });
     const int dstride = 2 * max_c + 2;
 
     DevBuf<SrDev> dsd; DevBuf<float> dtab, dTMP, dF, dD, dZ, dH; DevBuf<std::uint8_t> dLR, dHR8, dCR, dCB, dOUT;
@@ -229,7 +270,12 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
     // AVIR 2x: two separable passes, then the scan-order dither into 8-bit BGR
     k_avir_h<<<dim3((unsigned)((max_tmp + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dLR.p, dTMP.p);
     k_avir_v<<<dim3((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dTMP.p, dF.p);
-    k_dither<<<dim3((unsigned)((3 * nt + 63) / 64)), dim3(64)>>>(dsd.p, nt, dF.p, dD.p, dstride, dHR8.p);
+    const int wave_threads = (2 * max_r + 31) / 32 * 32;
+    const size_t wave_lds = (size_t)2 * max_r * (2 * max_c + 2) * sizeof(float);
+    if (wave_threads <= 1024 && wave_lds <= 65536)
+        k_dither_wave<<<dim3((unsigned)(3 * nt)), dim3((unsigned)wave_threads), wave_lds>>>(dsd.p, dF.p, dHR8.p);
+    else
+        k_dither<<<dim3((unsigned)((3 * nt + 63) / 64)), dim3(64)>>>(dsd.p, nt, dF.p, dD.p, dstride, dHR8.p);
     // YCrCb; the luma becomes the ADMM start
     const dim3 hgrid((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)nt);
     k_bgr2ycc<<<hgrid, blk>>>(dsd.p, dHR8.p, dZ.p, dCR.p, dCB.p);
@@ -265,13 +311,20 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
     // 8-bit luma + AVIR chroma -> BGR, back to the host tiles
     k_finish<<<hgrid, blk>>>(dsd.p, dZ.p, dCR.p, dCB.p, dOUT.p);
     HIP_TRY(hipGetLastError());
+    // Output tiles laid out back to back in one buffer (the batched caller's pool) take one copy.
+    bool packed = true;
+    for (int t = 0; t < nt && packed; ++t) packed = tiles[(size_t)t].hr_bgr == tiles[0].hr_bgr + (size_t)3 * sd[(size_t)t].hr_off;
+    if (packed) {
+        HIP_TRY(hipMemcpy(tiles[0].hr_bgr, dOUT.p, (size_t)3 * hr_total, hipMemcpyDeviceToHost));
+        return true;
+    }
     std::vector<std::uint8_t> hout((size_t)3 * hr_total);
     HIP_TRY(hipMemcpy(hout.data(), dOUT.p, hout.size(), hipMemcpyDeviceToHost));
-    for (int t = 0; t < nt; ++t) {
+    parallel_for(nt, [&](int t) {
         Tile& P = tiles[(size_t)t];
         std::copy(hout.begin() + (size_t)3 * sd[(size_t)t].hr_off,
             hout.begin() + (size_t)3 * (sd[(size_t)t].hr_off + 4 * P.lr_rows * P.lr_cols), P.hr_bgr);
-    }
+    });
     return true;
 }
 

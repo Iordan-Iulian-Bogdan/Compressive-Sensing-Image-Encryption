@@ -18,7 +18,8 @@ constexpr int kMaxCover = 4;     // tiles covering one column / row of the canva
 
 struct BlendTile {
     int x, y, w, h;
-    long long off;               // pixel offset of the tile (BGR bytes at 3*off, weights at off)
+    long long off;               // pixel offset of the tile (BGR bytes at 3*off)
+    long long woff;              // offset of its weight map (shared by tiles with the same map)
 };
 
 // Per output pixel: sum over the covering tiles (rows ascending, then columns ascending, the
@@ -42,9 +43,9 @@ __global__ void k_blend(const BlendTile* T, const int* tile_of, int ncol_grid, c
             const BlendTile B = T[t];
             const int rr = py - B.y, cc = px - B.x;
             if (rr < 0 || cc < 0 || rr >= B.h || cc >= B.w) continue;
-            const long long q = B.off + (long long)rr * B.w + cc;
-            const float w = WT[q];
-            const std::uint8_t* s = SRC + 3 * q;
+            const long long q = (long long)rr * B.w + cc;
+            const float w = WT[B.woff + q];
+            const std::uint8_t* s = SRC + 3 * (B.off + q);
             a0 = __fadd_rn(a0, __fmul_rn((float)s[0], w));
             a1 = __fadd_rn(a1, __fmul_rn((float)s[1], w));
             a2 = __fadd_rn(a2, __fmul_rn((float)s[2], w));
@@ -93,26 +94,38 @@ bool blend_tiles(const std::vector<TileRef>& tiles, int W, int H, std::uint8_t* 
             rowi[(size_t)r * kMaxCover + s] = i;
         }
     }
+    // Each distinct weight map is uploaded once; tiles that already sit back to back in one
+    // buffer (the batched SR output) are uploaded from it without repacking.
     std::vector<BlendTile> bt(tiles.size());
+    std::map<const float*, long long> wmap;
+    std::vector<float> wt;
     long long total = 0;
+    bool packed = true;
     for (size_t k = 0; k < tiles.size(); ++k) {
         const TileRef& t = tiles[k];
         BlendTile b{};
         b.x = t.x; b.y = t.y; b.w = t.w; b.h = t.h; b.off = total;
+        auto it = wmap.find(t.weights);
+        if (it == wmap.end()) {
+            it = wmap.emplace(t.weights, (long long)wt.size()).first;
+            wt.insert(wt.end(), t.weights, t.weights + (size_t)t.w * t.h);
+        }
+        b.woff = it->second;
         bt[k] = b;
+        packed = packed && t.bgr == tiles[0].bgr + 3 * total;
         total += (long long)t.w * t.h;
     }
-    std::vector<std::uint8_t> src((size_t)(3 * total));
-    std::vector<float> wt((size_t)total);
-    for (size_t k = 0; k < tiles.size(); ++k) {
-        const size_t n = (size_t)tiles[k].w * tiles[k].h;
-        std::copy(tiles[k].bgr, tiles[k].bgr + 3 * n, src.begin() + 3 * bt[k].off);
-        std::copy(tiles[k].weights, tiles[k].weights + n, wt.begin() + bt[k].off);
+    std::vector<std::uint8_t> src;
+    if (!packed) {
+        src.resize((size_t)(3 * total));
+        for (size_t k = 0; k < tiles.size(); ++k)
+            std::copy(tiles[k].bgr, tiles[k].bgr + (size_t)3 * tiles[k].w * tiles[k].h, src.begin() + 3 * bt[k].off);
     }
+    const std::uint8_t* src_p = packed ? tiles[0].bgr : src.data();
 
     DevBuf<BlendTile> dT; DevBuf<int> dTO, dC, dR; DevBuf<float> dW; DevBuf<std::uint8_t> dS, dO;
     if (!dT.alloc(bt.size()) || !dTO.alloc(tile_of.size()) || !dC.alloc(colj.size()) || !dR.alloc(rowi.size()) ||
-        !dW.alloc(wt.size()) || !dS.alloc(src.size()) || !dO.alloc((size_t)3 * W * H)) {
+        !dW.alloc(wt.size()) || !dS.alloc((size_t)(3 * total)) || !dO.alloc((size_t)3 * W * H)) {
         std::fprintf(stderr, "gpu_composite: device allocation failed\n");
         return false;
     }
@@ -121,7 +134,7 @@ bool blend_tiles(const std::vector<TileRef>& tiles, int W, int H, std::uint8_t* 
     HIP_TRY(hipMemcpy(dC.p, colj.data(), colj.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dR.p, rowi.data(), rowi.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dW.p, wt.data(), wt.size() * sizeof(float), hipMemcpyHostToDevice));
-    HIP_TRY(hipMemcpy(dS.p, src.data(), src.size(), hipMemcpyHostToDevice));
+    HIP_TRY(hipMemcpy(dS.p, src_p, (size_t)(3 * total), hipMemcpyHostToDevice));
     k_blend<<<dim3((unsigned)(((long long)W * H + kThreads - 1) / kThreads)), dim3(kThreads)>>>(
         dT.p, dTO.p, nj, dC.p, dR.p, dW.p, dS.p, W, H, dO.p);
     HIP_TRY(hipGetLastError());

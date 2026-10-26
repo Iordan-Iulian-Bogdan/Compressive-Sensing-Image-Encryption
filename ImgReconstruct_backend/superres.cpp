@@ -14,6 +14,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/photo.hpp>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -441,6 +442,27 @@ static void cs_sr_tile_anchors(const CsHrSrCtx& hr_sr, int Hr, int Wc,
         if (lx < 0 || ly < 0 || lx >= Wc || ly >= Hr) continue;
         idx.push_back(ly * Wc + lx);
         val.push_back(s.y * (1.0f / 255.0f));
+    }
+}
+
+// cs_sr_tile_anchors over anchors stable-sorted by global index: the tile's anchors are found row
+// by row with two binary searches instead of a scan of the whole list. Same anchors, and anchors
+// sharing an index keep their list order, so the last one still wins when they are scattered.
+static void cs_sr_tile_anchors_sorted(const std::vector<CsHrSample>& sorted, const CsHrSrCtx& hr_sr,
+    int Hr, int Wc, std::vector<int>& idx, std::vector<float>& val)
+{
+    if (sorted.empty() || hr_sr.stride <= 0) return;
+    const long long S = hr_sr.stride;
+    const long long x0 = (std::max)(0, hr_sr.ox), x1 = (std::min)((long long)hr_sr.ox + Wc, S);
+    if (x0 >= x1) return;
+    auto less_idx = [](const CsHrSample& s, long long v) { return (long long)s.idx < v; };
+    for (int ly = (std::max)(0, -hr_sr.oy); ly < Hr; ++ly) {
+        const long long row = (long long)(hr_sr.oy + ly) * S;
+        auto lo = std::lower_bound(sorted.begin(), sorted.end(), row + x0, less_idx);
+        for (; lo != sorted.end() && (long long)lo->idx < row + x1; ++lo) {
+            idx.push_back(ly * Wc + (int)((long long)lo->idx - row - hr_sr.ox));
+            val.push_back(lo->y * (1.0f / 255.0f));
+        }
     }
 }
 
@@ -1517,7 +1539,17 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
     std::vector<Prep> pp(tiles.size());
     using Key = std::tuple<int, int, float, float, float, float, float, float, int, float, int>;
     std::map<Key, std::vector<size_t>> groups;
-    for (size_t k = 0; k < tiles.size(); ++k) {
+    // Anchors sorted once (every tile shares the decode's anchor list).
+    const std::vector<CsHrSample>* anchors = tiles.front().hr_sr.anchors;
+    std::vector<CsHrSample> sorted_anchors;
+    if (anchors && tiles.front().hr_sr.stride > 0) {
+        sorted_anchors = *anchors;
+        std::stable_sort(sorted_anchors.begin(), sorted_anchors.end(),
+            [](const CsHrSample& a, const CsHrSample& b) { return a.idx < b.idx; });
+    }
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (long long kk = 0; kk < (long long)tiles.size(); ++kk) {
+        const size_t k = (size_t)kk;
         const CsSrBatchTile& T = tiles[k];
         Prep& P = pp[k];
         if (!T.lr_tile || T.lr_tile->empty() || T.lr_tile->type() != CV_8UC3) continue;
@@ -1529,7 +1561,10 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
         P.lr = T.lr_tile->isContinuous() ? *T.lr_tile : T.lr_tile->clone();
         cs_sr_luma_samples(*T.meas, m, P.b);
         std::vector<int> hidx; std::vector<float> hval;
-        cs_sr_tile_anchors(T.hr_sr, Hr, Wc, hidx, hval);
+        if (T.hr_sr.anchors == anchors && !sorted_anchors.empty())
+            cs_sr_tile_anchors_sorted(sorted_anchors, T.hr_sr, Hr, Wc, hidx, hval);
+        else
+            cs_sr_tile_anchors(T.hr_sr, Hr, Wc, hidx, hval);
         const bool hr_on = !hidx.empty() && T.hr_sr.weight > 0.0f;
         if (hr_on) {
             P.hr_map.assign((size_t)Hr * Wc, -1e30f);
@@ -1538,9 +1573,15 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
         const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, T.wscale);
         P.prm = gpu_admm::Params{ admm, cs_fista_inner_iters(T.iterations, T.fista_iters), rho, bx.lip, T.wscale,
             sc.rho_end, sc.h0, sc.h1, sc.rescale_u ? 1 : 0 };
-        P.prm.hr_weight = hr_on ? T.hr_sr.weight : 0.0f;
         P.prm.bt = T.tv > 0.0f ? 1 : 0;
+        // Fixed-step batches take a per-tile anchor weight (tiles without anchors get none), so
+        // anchored and anchor-free tiles share one batch; backtracking batches keep them apart.
+        P.prm.hr_weight = (hr_on || (!P.prm.bt && T.hr_sr.weight > 0.0f)) ? T.hr_sr.weight : 0.0f;
         P.ok = true;
+    }
+    for (size_t k = 0; k < tiles.size(); ++k) {
+        const Prep& P = pp[k];
+        if (!P.ok) continue;
         groups[Key(P.prm.admm, P.prm.inner, P.prm.rho, P.prm.lip, P.prm.wscale, P.prm.rho_end, P.prm.h_start,
             P.prm.h_end, P.prm.rescale_u, P.prm.hr_weight, P.prm.bt)].push_back(k);
     }
@@ -1548,10 +1589,21 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
     for (auto& g : groups) {
         std::vector<gpu_sr::Tile> jobs;
         jobs.reserve(g.second.size());
+        // The group's output tiles are views into one buffer: one allocation (and one free)
+        // instead of thousands of mid-sized ones.
+        size_t pool_bytes = 0;
+        for (size_t k : g.second) pool_bytes += (size_t)12 * pp[k].lr.rows * pp[k].lr.cols;
+        const bool pooled = pool_bytes > 0 && pool_bytes <= (size_t)INT_MAX;
+        cv::Mat pool;
+        if (pooled) pool.create(1, (int)pool_bytes, CV_8U);
+        size_t pool_off = 0;
         for (size_t k : g.second) {
             const CsSrBatchTile& T = tiles[k];
             Prep& P = pp[k];
-            T.hr_out->create(2 * P.lr.rows, 2 * P.lr.cols, CV_8UC3);
+            const int n = 12 * P.lr.rows * P.lr.cols;
+            if (pooled) *T.hr_out = pool.colRange((int)pool_off, (int)pool_off + n).reshape(3, 2 * P.lr.rows);
+            else T.hr_out->create(2 * P.lr.rows, 2 * P.lr.cols, CV_8UC3);
+            pool_off += (size_t)n;
             gpu_sr::Tile J{ P.lr.rows, P.lr.cols, P.lr.data, P.b.data(), T.ri_x->data(), T.ri_y->data(),
                 (int)T.ri_x->size(), T.coef * 0.1f, T.tv, P.hr_map.empty() ? nullptr : P.hr_map.data(), T.hr_out->data };
             if (verify_every > 0 && k % (size_t)verify_every == 0) {

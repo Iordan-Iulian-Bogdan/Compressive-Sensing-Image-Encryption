@@ -11,6 +11,10 @@ namespace gpu_tiles {
 // True when a HIP device is present and usable.
 bool available();
 
+// Starts the HIP runtime and device context (one small allocation) so the first solve does not
+// pay for it; meant for a background thread at decode start. No-op without a device.
+void warmup();
+
 // One tile problem: orthonormal DCT basis, point sampling.
 struct TileProblem {
     int rows, cols;      // tile size (any size; the GPU does not require even dims)

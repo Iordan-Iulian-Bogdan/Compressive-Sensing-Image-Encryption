@@ -250,3 +250,47 @@ Reproduce the table in section 1: build with `build_gpu.bat main`, set the three
 (`CS_GPU_TILES`, `CS_GPU_ADMM`, `CS_GPU_ONNX` = 1), run the decrypt command above; the first run builds and
 caches the folded graph, so time the second.
 Unit checks: `tests\build_gpu_tiles_test.bat`, `tests\build_gpu_admm_test.bat run`.
+
+## 8. Second round: the ycc + anchors decode (6.1 s -> 2.1 s, bit-identical)
+
+Workload: `IMG_3690` seg8-tile r0.9 ycc420 container + 300k HR anchors (sidecar, `CS_HR_NO_POSTHOC=1`),
+`decrypt --no-preview --tv 0 --photo-upscaler cs-sr --sr-pnp admm --hr-weight 1` (auto grid: 63 x 63 tiles,
+overlap 24, 8 ADMM rounds x 24 FISTA steps on 42.7 Mpx of overlapped HR tiles). Unprofiled wall time
+including process start, median of 7. Every step was checked byte for byte against the previous output.
+
+| Step | Wall time | What changed |
+| --- | --- | --- |
+| start | 6.1 s | |
+| anchors sorted once, per-tile binary search; parallel SR prep | 4.55 s | each of 3969 tiles scanned all 300k anchors (1.6 s) |
+| one ADMM batch for anchored + anchor-free tiles | | per-tile step (`Epi::hrt`) instead of two serial batches |
+| NLM: sliding 7-row window of row sums, weight table | 3.8 s | exact integer SSD; NLM 1.13 -> 0.48 s |
+| LR solve DCTs on the tiled GEMM | 3.6 s | `gpu_tiles` still used the naive one-thread-per-output kernels |
+| seg calm: one-pass low-density test | 3.25 s | 38 classes x 4 full-frame passes for nothing (no class was low) |
+| parallel tile prep, HR tiles taken without copy | | |
+| HIP runtime warm-up thread at decode start | 3.13 s | overlaps imread / KDF / unpack |
+| fixed-step ADMM without dX/dZC/dWS (weights computed in place) | 2.99 s | -0.5 GB device memory, less epilogue traffic |
+| fused GEMM pairs (`k_gemm2`, LDS stripe) | | no gain (FMA-bound), kept: half the launches |
+| parallel PNG writer (`png_fast.cpp`, AOCL zlib) | 2.74 s | 272 -> 24 ms, same size, same pixels |
+| seg luma draw: class bands/pools in parallel, chroma draws concurrent | | 127 -> 64 ms |
+| NLM: dot4 cross term, sums of squares in registers | 2.45 s | NLM 0.48 -> 0.27 s |
+| device arena, pooled HR tiles, deduplicated blend weights, parallel host packing | 2.26 s | allocations and repacking |
+| AVIR dither as an anti-diagonal wavefront | | 35 ms -> a few ms |
+| marker event around each ADMM launch | 2.13 s | ADMM span 454 -> 419 ms (fast settings), measured, not explained |
+
+Faster settings (not bit-identical; same build, all decode-side flags, quality vs the original image):
+
+| Flags | Wall | PSNR | SSIM | dE2000 p95 |
+| --- | --- | --- | --- | --- |
+| (auto) | 2.13 s | 36.120 | 0.9285 | 3.444 |
+| `--fista-iters 12` | | 36.118 | 0.9284 | 3.445 |
+| `--fast` (= overlap 8, `--fista-iters 12`; explicit flags win) | 0.95 s | 35.996 | 0.9283 | 3.486 |
+| `--sr-pnp-iters 4` (fewer ADMM rounds) | | 35.794 | 0.9254 | 3.552 |
+
+Notes:
+- Fewer ADMM rounds cost real quality; fewer inner FISTA steps and a smaller overlap barely do.
+- The GEMMs are bound by the FMA loop (~9 TFLOP/s): fusion, fewer launches and less memory traffic did not move
+  them. Halving their work needs the even/odd DCT factorisation, which changes rounding.
+- `build_gpu.bat` now needs AOCL-Compression (`C:\Program Files\AMD\AOCL-Windows\amd-compression`) for the PNG
+  writer; only the main exe defines `CS_FAST_PNG`.
+- Where the 0.96 s goes: process start + PNG read + KDF ~80 ms, unpack + tile prep ~125 ms, LR stage ~80 ms,
+  SR setup ~70 ms, ADMM ~420 ms (GEMMs ~240, NLM ~150), composite + write ~50 ms, frees + exit ~60 ms.

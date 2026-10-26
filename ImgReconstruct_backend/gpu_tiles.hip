@@ -8,11 +8,13 @@
 #include "gpu_tiles.h"
 
 #include "gpu_common.hpp"
+#include "gpu_gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <mutex>
 #include <vector>
 
 namespace gpu_tiles {
@@ -118,7 +120,7 @@ __global__ void k_trial(const TileDev* td, const float* Y, const float* G, const
 
 // Host layout + device copies of a batch's tiles, samples and warm starts.
 struct Batch {
-    int nt = 0, max_n = 0, total_samples = 0;
+    int nt = 0, max_n = 0, max_rows = 0, max_cols = 0, total_samples = 0;
     long long total = 0;
     std::vector<TileDev> td;
     std::vector<float> table, hX;
@@ -129,23 +131,25 @@ struct Batch {
         TileLayout lay;
         for (const TileProblem& P : tiles) { lay.add(P.rows, P.cols); total_samples += P.m; }
         td = lay.td; table = lay.table; total = lay.total; max_n = lay.max_n;
+        max_rows = lay.max_rows; max_cols = lay.max_cols;
         if (total > 2000000000LL) return false;
         hX.resize((size_t)total);
         std::vector<float> hb((size_t)total_samples), lam((size_t)nt);
         std::vector<int> hrix((size_t)total_samples), hriy((size_t)total_samples), hst((size_t)total_samples);
-        int so = 0;
-        for (int t = 0; t < nt; ++t) {
+        std::vector<int> so((size_t)nt + 1, 0);
+        for (int t = 0; t < nt; ++t) so[(size_t)t + 1] = so[(size_t)t] + tiles[(size_t)t].m;
+        parallel_for(nt, [&](int t) {
             const TileProblem& P = tiles[(size_t)t];
             std::copy(P.x, P.x + (size_t)P.rows * P.cols, hX.begin() + td[(size_t)t].off);
+            const size_t o = (size_t)so[(size_t)t];
             for (int k = 0; k < P.m; ++k) {
-                hb[(size_t)so + k] = P.b[k];
-                hrix[(size_t)so + k] = P.rix[k];
-                hriy[(size_t)so + k] = P.riy[k];
-                hst[(size_t)so + k] = t;
+                hb[o + k] = P.b[k];
+                hrix[o + k] = P.rix[k];
+                hriy[o + k] = P.riy[k];
+                hst[o + k] = t;
             }
-            so += P.m;
             lam[(size_t)t] = P.lambda;
-        }
+        });
         const size_t ns = (size_t)std::max(1, total_samples);
         if (!dtd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dX.alloc((size_t)total) || !db.alloc(ns) ||
             !drix.alloc(ns) || !driy.alloc(ns) || !dst.alloc(ns) || !dLAM.alloc((size_t)nt) ||
@@ -166,12 +170,26 @@ struct Batch {
         }
         const float logw = wscale > 1.0f ? std::log(wscale) : 0.0f;
         k_ws<<<grid(), dim3(kThreads)>>>(dtd.p, dWS.p, logw);
-        std::vector<float> ones((size_t)total, 1.0f);   // W = 1 initially
-        HIP_TRY(hipMemcpy(dW.p, ones.data(), bytes, hipMemcpyHostToDevice));
+        HIP_TRY(hipMemsetD32((hipDeviceptr_t)dW.p, 0x3F800000, (size_t)total));   // W = 1.0f initially
         return true;
     }
     dim3 grid() const { return dim3((unsigned)((max_n + kThreads - 1) / kThreads), (unsigned)nt); }
     dim3 sgrid() const { return dim3((unsigned)((total_samples + kThreads - 1) / kThreads)); }
+
+    // Dense DCT passes on the LDS-tiled GEMM (same k-ordered sums as k_synth_* / k_adj_*).
+    // PIX = IDCT(Y) and G = DCT(SC); TMP is scratch.
+    void synth(const float* Y, float* TMP, float* PIX) const {
+        const int nbn = (max_cols + kBN - 1) / kBN;
+        const dim3 g((unsigned)(((max_rows + kBM - 1) / kBM) * nbn), (unsigned)nt);
+        k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<g, dim3(kGemmThreads)>>>(dtd.p, dtab.p, Y, TMP, nbn, Epi{});
+        k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<g, dim3(kGemmThreads)>>>(dtd.p, dtab.p, TMP, PIX, nbn, Epi{});
+    }
+    void adj(const float* SC, float* TMP, float* G) const {
+        const int nbn = (max_cols + kBN - 1) / kBN;
+        const dim3 g((unsigned)(((max_rows + kBM - 1) / kBM) * nbn), (unsigned)nt);
+        k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<g, dim3(kGemmThreads)>>>(dtd.p, dtab.p, SC, TMP, nbn, Epi{});
+        k_gemm<OP_TAB, OP_DATA, EPI_STORE><<<g, dim3(kGemmThreads)>>>(dtd.p, dtab.p, TMP, G, nbn, Epi{});
+    }
 
     // reweighting: W = eps / (|Z| + eps), eps from the tile's max |Z|
     void reweight(const float* dZ, float* dEPS) {
@@ -182,10 +200,10 @@ struct Batch {
         HIP_TRY(hipGetLastError());
         HIP_TRY(hipDeviceSynchronize());
         HIP_TRY(hipMemcpy(hX.data(), dX.p, (size_t)total * sizeof(float), hipMemcpyDeviceToHost));
-        for (int t = 0; t < nt; ++t) {
+        parallel_for(nt, [&](int t) {
             const TileProblem& P = tiles[(size_t)t];
             std::copy(hX.begin() + td[(size_t)t].off, hX.begin() + td[(size_t)t].off + (size_t)P.rows * P.cols, P.x);
-        }
+        });
         return true;
     }
 };
@@ -207,13 +225,11 @@ bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm) {
         HIP_TRY(hipMemcpyAsync(dXP.p, B.dX.p, bytes, hipMemcpyDeviceToDevice));
         float t = 1.0f;
         for (int k = 0; k < prm.inner; ++k) {
-            k_synth_a<<<grid, blk>>>(B.dtd.p, B.dtab.p, dY.p, dTMP.p);
-            k_synth_b<<<grid, blk>>>(B.dtd.p, B.dtab.p, dTMP.p, dPIX.p);
+            B.synth(dY.p, dTMP.p, dPIX.p);
             HIP_TRY(hipMemsetAsync(dSC.p, 0, bytes));
             if (B.total_samples > 0)
                 k_scatter<<<sgrid, blk>>>(B.dtd.p, B.dst.p, B.drix.p, B.driy.p, B.db.p, dPIX.p, dSC.p, B.total_samples);
-            k_adj_a<<<grid, blk>>>(B.dtd.p, B.dtab.p, dSC.p, dTMP.p);
-            k_adj_b<<<grid, blk>>>(B.dtd.p, B.dtab.p, dTMP.p, dG.p);
+            B.adj(dSC.p, dTMP.p, dG.p);
             const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
             const float mom = (t - 1.0f) / t_new;
             k_step<<<grid, blk>>>(B.dtd.p, dG.p, B.dW.p, B.dWS.p, dY.p, dXP.p, dZ.p, B.dLAM.p, mom);
@@ -248,8 +264,7 @@ bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
     const dim3 blk(kThreads), grid = B.grid(), sgrid = B.sgrid(), tgrid((unsigned)nt);
     // smooth objective of the pixels in PIX: residual into SC, TV gradient into TVG, f into F
     auto smooth = [&](const float* coef) {
-        k_synth_a<<<grid, blk>>>(B.dtd.p, B.dtab.p, coef, dTMP.p);
-        k_synth_b<<<grid, blk>>>(B.dtd.p, B.dtab.p, dTMP.p, dPIX.p);
+        B.synth(coef, dTMP.p, dPIX.p);
         (void)hipMemsetAsync(dSC.p, 0, bytes);
         if (B.total_samples > 0)
             k_scatter<<<sgrid, blk>>>(B.dtd.p, B.dst.p, B.drix.p, B.driy.p, B.db.p, dPIX.p, dSC.p, B.total_samples);
@@ -265,8 +280,7 @@ bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
             // gradient at y: g = 2*DCT(sc) + tv*DCT(tvgrad); fy = ||res||^2 + tv*phi
             smooth(dY.p);
             k_comb<<<grid, blk>>>(B.dtd.p, dSC.p, dTVG.p, dTV.p, dS.p);
-            k_adj_a<<<grid, blk>>>(B.dtd.p, B.dtab.p, dS.p, dTMP.p);
-            k_adj_b<<<grid, blk>>>(B.dtd.p, B.dtab.p, dTMP.p, dG.p);
+            B.adj(dS.p, dTMP.p, dG.p);
             HIP_TRY(hipMemcpy(fy.data(), dF.p, (size_t)nt * sizeof(double), hipMemcpyDeviceToHost));
             std::fill(act.begin(), act.end(), 1);
             for (int trial = 0; trial < 25; ++trial) {
@@ -292,9 +306,67 @@ bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
 
 }  // namespace
 
+}  // namespace gpu_tiles
+
+namespace gpu_common {
+namespace {
+struct Arena {
+    std::mutex mu;
+    char* base = nullptr;
+    size_t cap = 0, top = 0;
+    struct Piece { size_t off; bool live; };
+    std::vector<Piece> pieces;   // in address order
+} g_arena;
+}  // namespace
+
+void arena_reserve(size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_arena.mu);
+    if (g_arena.base || bytes == 0) return;
+    void* p = nullptr;
+    if (hipMalloc(&p, bytes) != hipSuccess) return;
+    g_arena.base = (char*)p;
+    g_arena.cap = bytes;
+}
+
+void* arena_alloc(size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_arena.mu);
+    const size_t n = (bytes + 255) & ~(size_t)255;
+    if (!g_arena.base || g_arena.cap - g_arena.top < n) return nullptr;
+    g_arena.pieces.push_back({ g_arena.top, true });
+    void* p = g_arena.base + g_arena.top;
+    g_arena.top += n;
+    return p;
+}
+
+bool arena_free(void* p) {
+    std::lock_guard<std::mutex> lk(g_arena.mu);
+    char* c = (char*)p;
+    if (!g_arena.base || c < g_arena.base || c >= g_arena.base + g_arena.cap) return false;
+    const size_t off = (size_t)(c - g_arena.base);
+    for (auto it = g_arena.pieces.rbegin(); it != g_arena.pieces.rend(); ++it)
+        if (it->off == off) { it->live = false; break; }
+    while (!g_arena.pieces.empty() && !g_arena.pieces.back().live) {
+        g_arena.top = g_arena.pieces.back().off;
+        g_arena.pieces.pop_back();
+    }
+    return true;
+}
+}  // namespace gpu_common
+
+namespace gpu_tiles {
+
 bool available() {
     int n = 0;
     return hipGetDeviceCount(&n) == hipSuccess && n > 0;
+}
+
+void warmup() {
+    if (!available()) return;
+    // The device arena: half the free memory, at most 2 GiB (reserving it must finish while the CPU
+    // still unpacks; a larger decode takes its overflow from hipMalloc).
+    size_t free_b = 0, total_b = 0;
+    if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return;
+    gpu_common::arena_reserve(std::min<size_t>(free_b / 2, (size_t)2 << 30));
 }
 
 bool solve_fista_dct(const std::vector<TileProblem>& tiles, const Params& prm) {

@@ -12,6 +12,10 @@
 #include "gpu_decrypt.hpp"
 #include "gpu_admm_broker.hpp"
 #include "gpu_composite.h"
+#include "gpu_tiles.h"
+#endif
+#ifdef CS_FAST_PNG
+#include "png_fast.hpp"
 #endif
 #include "avir.h"
 
@@ -23,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <exception>
 #include <iostream>
 #include <map>
 #include <tuple>
@@ -81,6 +86,12 @@ struct PhaseLog {
         for (const auto& p : phases) std::fprintf(stderr, " %s=%.1f", p.first, p.second);
         std::fprintf(stderr, " total=%.1f\n", total);
     }
+};
+
+// A side thread joined when its scope ends (also on exceptions).
+struct CsJoinedThread {
+    std::thread t;
+    ~CsJoinedThread() { if (t.joinable()) t.join(); }
 };
 } // namespace
 
@@ -532,6 +543,17 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     if (cs_is_tcluster(sampling_mode) || cs_is_tmeans(sampling_mode)) {
         chroma_mode = cs_is_ycc422(sampling_mode) ? CS_MODE_YCC422 : CS_MODE_YCC420;
     }
+    if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG)
+        chroma_mode = (sampling_mode == CS_MODE_YCC422_SEG) ? CS_MODE_YCC422 : CS_MODE_YCC420;
+    // Chroma draws are uniform in every variant (tagged keys); dims and counts follow the base
+    // split mode (4:2:0 halves both axes, 4:2:2 halves the width only). They do not depend on the
+    // luma draw, so they run alongside it.
+    std::exception_ptr chroma_error;
+    CsJoinedThread chroma_draw;
+    chroma_draw.t = std::thread([&] {
+        try { returnYcc420ChromaIndices(rows, cols, m, cs_key, chroma_mode); }
+        catch (...) { chroma_error = std::current_exception(); }
+    });
     if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG) {
         // Seg-luma variant: the sealed body prefix [nclasses][rates][seglen]
         // [label PNG] (v3, CS_SEG_TAG) regenerates the luma draw; chroma stays
@@ -650,10 +672,8 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         ri_y.resize((size_t)m);
         returnRandomIndices(ri_x, ri_y, rows, cols, m, cs_key);
     }
-    // chroma draws are uniform in every variant (tagged keys); dims and
-    // counts follow the base split mode (4:2:0 halves both axes, 4:2:2
-    // halves the width only)
-    returnYcc420ChromaIndices(rows, cols, m, cs_key, chroma_mode);
+    chroma_draw.t.join();
+    if (chroma_error) std::rethrow_exception(chroma_error);
     const int mC = m_chroma;
 
     int crows, ccols;
@@ -1637,13 +1657,15 @@ static void decrypt_tiles_ycc420(int num_threads,
                     if (hr.empty())
                         cs_upscale_2x_avir(mats_out[i][j], hr);
                     // Serialize the cell write under the grid mutex (see
-                    // the BGR path above).
+                    // the BGR path above). hr is this tile's own buffer
+                    // (fresh, or the batched pass's), so the cell takes it
+                    // without a copy.
                     if (!hr.empty() && hr_grid_mutex) {
                         std::lock_guard<std::mutex> lk(*hr_grid_mutex);
-                        hr.copyTo((*hr_out)[i][j]);
+                        (*hr_out)[i][j] = hr;
                     }
                     else if (!hr.empty()) {
-                        hr.copyTo((*hr_out)[i][j]);
+                        (*hr_out)[i][j] = hr;
                     }
                 }
                 else if (hr_out && hr_grid_mutex && !pipe && !fuse_upscale) {
@@ -1686,6 +1708,11 @@ int decrypt_image::decrypt_image_tiled(
     const std::string& seg_solve_mask,
     const std::string& seg_params
 ) {
+#ifdef CS_GPU_TILES
+    // HIP runtime start-up overlaps the container read, key derivation and unpacking.
+    CsJoinedThread gpu_warm;
+    if (std::getenv("CS_GPU_TILES")) gpu_warm.t = std::thread(gpu_tiles::warmup);
+#endif
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
     return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve_mask, seg_params);
 }
@@ -1953,6 +1980,37 @@ static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
     const cv::Mat& sample_mask, const std::vector<int>& classes, int overlap) {
     if (overlap <= 0 || img.empty() || seg_ids.empty() || sample_mask.empty()) return;
     if (std::getenv("CS_NO_SEG_CALM")) return;   // diagnostic: skip the calm pass
+    // Low-density test of every class in one pass (area and sampled count per class) before any
+    // full-frame work: most decodes have no low-density class and return here. On the label grid
+    // when ids and mask share it and the image is 1x or 2x of it (nearest 2x replicates each label
+    // 2x2, so both counts scale by 4 and every ratio is unchanged).
+    if (seg_ids.type() == CV_8U && sample_mask.depth() == CV_8U) {
+        const bool native = seg_ids.size() == sample_mask.size() &&
+            (img.size() == seg_ids.size() || img.size() == cv::Size(2 * seg_ids.cols, 2 * seg_ids.rows));
+        cv::Mat ids = seg_ids, chan = sample_mask;
+        if (!native) {
+            if (ids.size() != img.size()) cv::resize(ids, ids, img.size(), 0, 0, cv::INTER_NEAREST);
+            if (chan.size() != img.size()) cv::resize(chan, chan, img.size(), 0, 0, cv::INTER_NEAREST);
+        }
+        if (chan.channels() > 1) cv::extractChannel(chan, chan, 0);
+        long long area[256] = { 0 }, sampled[256] = { 0 };
+        #pragma omp parallel
+        {
+            long long a[256] = { 0 }, s[256] = { 0 };
+            #pragma omp for nowait
+            for (int y = 0; y < ids.rows; ++y) {
+                const uint8_t* ir = ids.ptr<uint8_t>(y);
+                const uint8_t* mr = chan.ptr<uint8_t>(y);
+                for (int x = 0; x < ids.cols; ++x) { ++a[ir[x]]; s[ir[x]] += mr[x] != 0; }
+            }
+            #pragma omp critical
+            for (int c = 0; c < 256; ++c) { area[c] += a[c]; sampled[c] += s[c]; }
+        }
+        bool any_low = false;
+        for (int c : classes)
+            if (c >= 0 && c < 256 && area[c] > 0 && (double)sampled[c] / (double)area[c] < 0.4) any_low = true;
+        if (!any_low) return;
+    }
     cv::Mat ids = seg_ids, mask = sample_mask;
     if (ids.size() != img.size())
         cv::resize(ids, ids, img.size(), 0, 0, cv::INTER_NEAREST);
@@ -2329,7 +2387,7 @@ int decrypt_image::decrypt_image_tiled(
             const int edge = (std::max)(org_size.width, org_size.height);
             num_tiles = (std::min)(96, (std::max)(1, (edge + 16) / 32));
         }
-        overlap = 24;
+        overlap = photo_up.auto_overlap;
         nun_threads = omp_get_max_threads();
     }
 
@@ -2886,7 +2944,11 @@ int decrypt_image::decrypt_image_tiled(
             std::cout << "HR-detail: applied " << applied << "/"
                       << dimgs.hr_samples.size() << " anchors" << std::endl;
         }
+#ifdef CS_FAST_PNG
+        cs_write_image(output_path, reconstructed);   // parallel PNG encode
+#else
         cv::imwrite(output_path, reconstructed);
+#endif
         prof.mark("write");
     }
     catch (const std::exception& e) {
@@ -2934,6 +2996,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // Luma/chroma split + per-plane solve + merge as one reusable unit:
         // the standard path runs it once; --seg-solve runs it once with
         // per-tile class parameters (majority vote, no per-class passes).
+        // The grid solve's per-tile containers (tens of thousands of small buffers) are freed on
+        // this thread while the calm pass and the write run; joined when the decode returns.
+        CsJoinedThread tile_frees;
         auto solve_ycc_grid = [&](const cv::Mat& Y0, const cv::Mat& Ym0,
                 const cv::Mat& Cr0, const cv::Mat& Crm0,
                 const cv::Mat& Cb0, const cv::Mat& Cbm0,
@@ -2982,12 +3047,24 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         if (dual_tv) low_tv_tiles.resize(num_tiles, std::vector<cv::Mat>(num_tiles));
 
         cv::Size tile_size(0, 0);
-        for (int i = 0; i < num_tiles; i++) {
+        // Segment filter first (retain() keeps counters), then the per-tile prep in parallel;
+        // tile_size is the last kept tile's, as in the serial order.
+        std::vector<char> kept_tile((size_t)num_tiles * num_tiles, 0);
+        for (int i = 0; i < num_tiles; i++)
             for (int j = 0; j < num_tiles; j++) {
                 if (y_tiles[i][j].empty() || y_mask_tiles[i][j].empty()) continue;
+                if (!active.retain(cv::Rect(coordinates[i][j].x, coordinates[i][j].y, y_tiles[i][j].cols, y_tiles[i][j].rows))) continue;
+                kept_tile[(size_t)i * num_tiles + j] = 1;
+                tile_size = y_tiles[i][j].size();
+            }
+        std::exception_ptr prep_error;
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int t = 0; t < num_tiles * num_tiles; t++) {
+            if (!kept_tile[(size_t)t]) continue;
+            const int i = t / num_tiles, j = t % num_tiles;
+            try {
                 const int x = coordinates[i][j].x, y0 = coordinates[i][j].y;
                 const int w = y_tiles[i][j].cols, h = y_tiles[i][j].rows;
-                if (!active.retain(cv::Rect(x,y0,w,h))) continue;
                 const int cx = x / 2, cy = chroma_sub_v ? y0 / 2 : y0;
                 const int cw = (x + w + 1) / 2 - x / 2;
                 const int ch = chroma_sub_v ? (y0 + h + 1) / 2 - y0 / 2 : h;
@@ -3089,11 +3166,15 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 cb_eph[i][j] = cb_img.get_mat();
                 cr_idx[i][j] = { crlx, crly };
                 cb_idx[i][j] = { cblx, cbly };
-                tile_size = y_img.get_size();
 
                 decrypted[i][j] = cv::Mat::zeros(h, w, CV_8UC3);
             }
+            catch (...) {
+                #pragma omp critical
+                if (!prep_error) prep_error = std::current_exception();
+            }
         }
+        if (prep_error) std::rethrow_exception(prep_error);
 
         cv::Mat reconstructed = cv::Mat::zeros(rows, cols, CV_8UC3);
 
@@ -3357,6 +3438,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         }
             grid_out = reconstructed;
             blend_weight = active.weights(grid_out.size(), overlap);
+            if (tile_frees.t.joinable()) tile_frees.t.join();
+            tile_frees.t = std::thread([a = std::move(y_tiles), b = std::move(y_mask_tiles), c = std::move(cr_tiles),
+                d = std::move(cr_mask_tiles), e = std::move(cb_tiles), f = std::move(cb_mask_tiles),
+                g = std::move(y_idx), h = std::move(cr_idx), i = std::move(cb_idx), j = std::move(y_eph),
+                k = std::move(cr_eph), l = std::move(cb_eph), m = std::move(decrypted), n = std::move(low_tv_tiles)] {});
             return 0;
         }; // solve_ycc_grid
 
@@ -3446,7 +3532,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                       << dimgs.hr_samples.size() << " anchors" << std::endl;
         }
 
+#ifdef CS_FAST_PNG
+        cs_write_image(output_path, reconstructed);   // parallel PNG encode
+#else
         cv::imwrite(output_path, reconstructed);
+#endif
     }
     catch (const std::exception& e) {
         std::cerr << "Error: ycc decryption pipeline failed: " << e.what() << std::endl;

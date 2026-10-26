@@ -1,18 +1,20 @@
 #pragma once
 // Pieces shared by the HIP tile backends (gpu_tiles.hip, gpu_admm.hip): the
-// per-tile layout record, dense orthonormal 2D DCT kernels over a batch of
-// tiles, and small host helpers. Include from .hip files only.
+// per-tile layout record, the orthonormal DCT tables, elementwise kernels over a
+// batch of tiles, and small host helpers. Include from .hip files only.
 //
 // Layout: every tile owns a contiguous slice [off, off + rows*cols) of each
-// state array. A 2D DCT is two small dense matrix products (cheap for tiles up
-// to ~150 px, no FFT library). Kernels use blockIdx.y as the tile index and
-// blockIdx.x * kThreads + threadIdx.x as the element index.
+// state array. A 2D DCT is two small dense matrix products (gpu_gemm.hpp; cheap
+// for tiles up to ~150 px, no FFT library). Kernels use blockIdx.y as the tile
+// index and blockIdx.x * kThreads + threadIdx.x as the element index.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <thread>
 #include <vector>
 
 namespace gpu_common {
@@ -36,59 +38,16 @@ struct TileDev {
         }                                                                          \
     } while (0)
 
+// Device arena (gpu_tiles.hip): one block reserved up front (arena_reserve, from the warm-up
+// thread) so the stages' buffers are carved from it instead of hipMalloc'd one by one. Pieces are
+// taken from the top and the top retreats over freed pieces, which fits the stack-ordered DevBuf
+// lifetimes. arena_alloc returns null when the arena is missing or full (the caller falls back to
+// hipMalloc); arena_free returns false for pointers it did not hand out.
+void arena_reserve(size_t bytes);
+void* arena_alloc(size_t bytes);
+bool arena_free(void* p);
+
 namespace {
-
-// Inverse 2D DCT, pass A: TMP[r][n] = sum_k Y[r][k] * Cc[k][n]
-__global__ void k_synth_a(const TileDev* td, const float* tab, const float* Y, float* TMP) {
-    const TileDev T = td[blockIdx.y];
-    const int i = blockIdx.x * kThreads + threadIdx.x;
-    if (i >= T.rows * T.cols) return;
-    const int r = i / T.cols, n = i % T.cols;
-    const float* Cc = tab + T.ctab;
-    const float* y = Y + T.off + r * T.cols;
-    float s = 0.0f;
-    for (int k = 0; k < T.cols; ++k) s += y[k] * Cc[k * T.cols + n];
-    TMP[T.off + i] = s;
-}
-
-// Inverse 2D DCT, pass B: PIX[m][n] = sum_r Cr[r][m] * TMP[r][n]
-__global__ void k_synth_b(const TileDev* td, const float* tab, const float* TMP, float* PIX) {
-    const TileDev T = td[blockIdx.y];
-    const int i = blockIdx.x * kThreads + threadIdx.x;
-    if (i >= T.rows * T.cols) return;
-    const int m = i / T.cols, n = i % T.cols;
-    const float* Cr = tab + T.rtab;
-    const float* tmp = TMP + T.off;
-    float s = 0.0f;
-    for (int r = 0; r < T.rows; ++r) s += Cr[r * T.rows + m] * tmp[r * T.cols + n];
-    PIX[T.off + i] = s;
-}
-
-// Forward 2D DCT, pass A: TMP[r][k] = sum_n SC[r][n] * Cc[k][n]
-__global__ void k_adj_a(const TileDev* td, const float* tab, const float* SC, float* TMP) {
-    const TileDev T = td[blockIdx.y];
-    const int i = blockIdx.x * kThreads + threadIdx.x;
-    if (i >= T.rows * T.cols) return;
-    const int r = i / T.cols, k = i % T.cols;
-    const float* Cc = tab + T.ctab;
-    const float* sc = SC + T.off + r * T.cols;
-    float s = 0.0f;
-    for (int n = 0; n < T.cols; ++n) s += sc[n] * Cc[k * T.cols + n];
-    TMP[T.off + i] = s;
-}
-
-// Forward 2D DCT, pass B: G[u][k] = sum_r Cr[u][r] * TMP[r][k]
-__global__ void k_adj_b(const TileDev* td, const float* tab, const float* TMP, float* G) {
-    const TileDev T = td[blockIdx.y];
-    const int i = blockIdx.x * kThreads + threadIdx.x;
-    if (i >= T.rows * T.cols) return;
-    const int u = i / T.cols, k = i % T.cols;
-    const float* Cr = tab + T.rtab;
-    const float* tmp = TMP + T.off;
-    float s = 0.0f;
-    for (int r = 0; r < T.rows; ++r) s += Cr[u * T.rows + r] * tmp[r * T.cols + k];
-    G[T.off + i] = s;
-}
 
 // Frequency weight ramp, identical to the CPU FillDctWeights for block <= 0.
 __global__ void k_ws(const TileDev* td, float* WS, float logw) {
@@ -200,11 +159,31 @@ void fill_dct_table(float* C, int N) {
 template <typename T>
 struct DevBuf {
     T* p = nullptr;
-    ~DevBuf() { if (p) (void)hipFree(p); }
-    bool alloc(size_t n) { return hipMalloc((void**)&p, (n ? n : 1) * sizeof(T)) == hipSuccess; }
+    ~DevBuf() { if (p && !arena_free(p)) (void)hipFree(p); }
+    bool alloc(size_t n) {
+        const size_t bytes = (n ? n : 1) * sizeof(T);
+        p = (T*)arena_alloc(bytes);
+        return p != nullptr || hipMalloc((void**)&p, bytes) == hipSuccess;
+    }
 };
 
 }  // namespace
+
+// f(i) for every i in [0, n), spread over the host's hardware threads in chunks of 64 (the
+// per-tile packing loops of the backends).
+template <class F>
+void parallel_for(int n, F f) {
+    const int nth = std::min(n / 64 + 1, (int)std::max(1u, std::thread::hardware_concurrency()));
+    if (nth <= 1) { for (int i = 0; i < n; ++i) f(i); return; }
+    std::atomic<int> next{ 0 };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nth; ++t)
+        pool.emplace_back([&] {
+            for (int i; (i = next.fetch_add(64)) < n;)
+                for (int j = i; j < std::min(n, i + 64); ++j) f(j);
+        });
+    for (std::thread& th : pool) th.join();
+}
 
 // Host-side tile layout: per-tile records plus the shared DCT table array.
 struct TileLayout {
