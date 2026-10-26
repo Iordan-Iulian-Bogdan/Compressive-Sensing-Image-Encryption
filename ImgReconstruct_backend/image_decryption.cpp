@@ -1338,129 +1338,239 @@ static void decrypt_tiles_ycc420(int num_threads,
                 }
     }
 
-    for (int w = 0; w <= 2 * (num_tiles - 1); ++w) {
-        const int i_lo = (std::max)(0, w - (num_tiles - 1));
-        const int i_hi = (std::min)(num_tiles - 1, w);
-        const int wave_count = i_hi - i_lo + 1;
+    // Per-tile solve settings (class params win; otherwise the global ones), shared by the CPU
+    // wavefront and the GPU pre-pass so both solve the same problems.
+    struct YccTileParams {
+        int iterations, fista_iters, reweights, basis, iters_c;
+        float wscale, coef_y, tv_y, coef_c;
+    };
+    auto tile_params = [&](int i, int j) {
+        const CsSegClassParams* STP = seg_tile_params ? &(*seg_tile_params)[i][j] : nullptr;
+        YccTileParams p;
+        p.iterations = STP ? STP->iterations : iterations;
+        p.fista_iters = STP ? STP->fista_iters : fista_iters;
+        p.reweights = STP ? STP->reweights : reweights;
+        p.basis = STP ? STP->basis : basis;
+        p.wscale = STP ? STP->wscale : wscale;
+        // Chroma follows the tile's class params (same convention as
+        // the per-class passes); otherwise the pinned/global settings.
+        const int t_chroma_it = STP ? STP->iterations : chroma_it;
+        p.iters_c = t_chroma_it - t_chroma_it / 2;
+        const bool stp_chroma = STP && seg_chroma_per_class;
+        p.coef_c = (stp_chroma ? STP->coef : (chroma_coef >= 0.0f ? chroma_coef : coef)) * 0.5f;
+        // luma-only per-tile scaling (chroma draws stay uniform, so
+        // coef_c is untouched; tv follows under its own flag)
+        const float t_coef_base = STP ? STP->coef : coef;
+        const float t_tv_base = STP ? STP->tv : tv;
+        const int y_count = cs_tile_meas_count(y_idx[i][j]);
+        p.coef_y = per_tile_coef ? cs_per_tile_coef(t_coef_base, y_count, coef_mean_my) : t_coef_base;
+        p.tv_y = per_tile_tv ? cs_per_tile_coef(t_tv_base, y_count, coef_mean_my) : t_tv_base;
+        return p;
+    };
+    // coarse (chroma) tile from the same halving the prep used: exact cover
+    // (4:2:2 keeps full height, halves the width only)
+    auto coarse_size = [&](int i, int j) {
+        const int Th = mats_out[i][j].rows, Tw = mats_out[i][j].cols;
+        const int xo = coordinates[i][j].x, yo = coordinates[i][j].y;
+        return cv::Size((xo + Tw + 1) / 2 - xo / 2, chroma_sub_v ? (yo + Th + 1) / 2 - yo / 2 : Th);
+    };
+
+    // True when every non-empty tile was solved by the GPU pre-pass: the wavefront then
+    // collapses into one flat parallel loop, as in decrypt_tiles.
+    bool flat_tiles = false;
+    std::vector<std::vector<char>> gpu_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
+    std::vector<std::vector<cv::Mat>> sr_hr((size_t)num_tiles, std::vector<cv::Mat>((size_t)num_tiles));
+    std::vector<std::vector<char>> sr_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
+#ifdef CS_GPU_TILES
+    // GPU pre-pass (env CS_GPU_TILES=1): Y, Cr and Cb of every eligible tile in one batch, each
+    // from a smooth fill of its own samples (no neighbour warm start). The CPU ycc solve is
+    // per-plane FISTA whatever --solver says, so only the basis/Onsager/grouping gate applies;
+    // --y-confidence and the dual-TV low solve keep the CPU wavefront.
+    if (std::getenv("CS_GPU_TILES") && !(y_confidence > 0.0f) && !(low_tv_tiles && y_dual_tv > 0.0f)) {
+        std::vector<GpuYccTileJob> jobs;
+        std::vector<std::pair<int, int>> where;
+        int skipped = 0;
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j) {
+                if (y_meas[i][j].empty()) continue;
+                const YccTileParams tp = tile_params(i, j);
+                if (tp.basis != CS_BASIS_DCT || use_onsager || cs_default_dct_block() > 0 || tp.tv_y < 0.0f ||
+                    !y_idx[i][j].rg_off.empty()) { ++skipped; continue; }
+                const cv::Size cs = coarse_size(i, j);
+                GpuYccTileJob J{};
+                J.plane[0] = { &y_meas[i][j], mats_out[i][j].rows, mats_out[i][j].cols, &y_idx[i][j].ri_x_g, &y_idx[i][j].ri_y_g,
+                    tp.iterations, tp.coef_y, tp.tv_y };
+                J.plane[1] = { &cr_meas[i][j], cs.height, cs.width, &cr_idx[i][j].ri_x_g, &cr_idx[i][j].ri_y_g, tp.iters_c, tp.coef_c, 0.0f };
+                J.plane[2] = { &cb_meas[i][j], cs.height, cs.width, &cb_idx[i][j].ri_x_g, &cb_idx[i][j].ri_y_g, tp.iters_c, tp.coef_c, 0.0f };
+                J.fista_iters = tp.fista_iters; J.reweights = tp.reweights; J.wscale = tp.wscale;
+                J.out = &mats_out[i][j];
+                jobs.push_back(J);
+                where.push_back({ i, j });
+            }
+        std::vector<char> solved;
+        const auto g0 = std::chrono::steady_clock::now();
+        cs_gpu_solve_tiles_ycc(jobs, solved);
+        int n_ok = 0;
+        for (size_t k = 0; k < solved.size(); ++k)
+            if (solved[k]) { gpu_done[(size_t)where[k].first][(size_t)where[k].second] = 1; ++n_ok; }
+        std::cout << "[gpu-tiles] ycc: solved " << n_ok << " of " << jobs.size() << " eligible tiles on the GPU in "
+                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count()
+                  << " ms (no neighbour warm start); skipped " << skipped << std::endl;
+        flat_tiles = std::getenv("CS_GPU_WAVES") == nullptr;   // CS_GPU_WAVES=1 keeps the wavefront (A/B)
+        for (int i = 0; i < num_tiles && flat_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j)
+                if (!y_meas[i][j].empty() && !gpu_done[(size_t)i][(size_t)j]) { flat_tiles = false; break; }
+    }
+
+    // Batched GPU cs-sr stage, as decrypt_tiles: the luma SR of every tile in one GPU pass. The
+    // per-tile call below takes the merged BGR tile with the luma container (gray-as-BGR, so the
+    // BGR2Y weights collapse to 1), which is exactly what a CsSrBatchTile carries.
+    if (flat_tiles && fuse_upscale && hr_out && superres_2x && !sr_dict && sr_fsrcnn_model.empty() &&
+        !sr_direct_2x && !sr_dip_2x && !pipe && !(grain_tv > 0.0f)) {
+        std::vector<CsSrBatchTile> bt;
+        std::vector<std::pair<int, int>> where;
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j) {
+                if (y_meas[i][j].empty() || mats_out[i][j].empty()) continue;
+                const YccTileParams tp = tile_params(i, j);
+                CsSrBatchTile T{};
+                T.lr_tile = &mats_out[i][j];
+                T.meas = &y_meas[i][j];
+                T.ri_x = &y_idx[i][j].ri_x_g;
+                T.ri_y = &y_idx[i][j].ri_y_g;
+                T.coef = tp.coef_y;
+                T.tv = tp.tv_y;
+                T.iterations = tp.iterations;
+                T.fista_iters = tp.fista_iters;
+                T.wscale = tp.wscale;
+                T.hr_sr = hr_sr;
+                T.hr_sr.ox = coordinates[i][j].x * 2;
+                T.hr_sr.oy = coordinates[i][j].y * 2;
+                T.hr_out = &sr_hr[(size_t)i][(size_t)j];
+                bt.push_back(T);
+                where.push_back({ i, j });
+            }
+        std::vector<char> done;
+        const auto s0 = std::chrono::steady_clock::now();
+        cs_sr_gpu_batch(bt, sr_red_denoiser, sr_cascade, sr_prior, done);
+        int n_ok = 0;
+        for (size_t k = 0; k < done.size(); ++k)
+            if (done[k]) { sr_done[(size_t)where[k].first][(size_t)where[k].second] = 1; ++n_ok; }
+        if (!bt.empty())
+            std::cout << "[gpu-sr] ycc: " << n_ok << " of " << bt.size() << " tiles upscaled in one GPU pass in "
+                      << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count()
+                      << " ms" << std::endl;
+    }
+#endif
+
+    const int n_waves = flat_tiles ? 1 : 2 * (num_tiles - 1) + 1;
+    for (int w = 0; w < n_waves; ++w) {
+        const int i_lo = flat_tiles ? 0 : (std::max)(0, w - (num_tiles - 1));
+        const int i_hi = flat_tiles ? num_tiles - 1 : (std::min)(num_tiles - 1, w);
+        const int wave_count = flat_tiles ? num_tiles * num_tiles : i_hi - i_lo + 1;
 
         #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
         for (int t = 0; t < wave_count; ++t) {
             try {
-                const int i = i_lo + t;
-                const int j = w - i;
+                const int i = flat_tiles ? t / num_tiles : i_lo + t;
+                const int j = flat_tiles ? t % num_tiles : w - i;
                 if (y_meas[i][j].empty()) continue;
 
-                const CsSegClassParams* STP = seg_tile_params ? &(*seg_tile_params)[i][j] : nullptr;
-                const int t_iterations = STP ? STP->iterations : iterations;
-                const float t_coef_base = STP ? STP->coef : coef;
-                const float t_tv_base = STP ? STP->tv : tv;
-                const int t_solver = STP ? STP->solver : solver;
-                const int t_fista_iters = STP ? STP->fista_iters : fista_iters;
-                const int t_reweights = STP ? STP->reweights : reweights;
-                const int t_basis = STP ? STP->basis : basis;
-                const float t_wscale = STP ? STP->wscale : wscale;
-                // Chroma follows the tile's class params (same convention as
-                // the per-class passes); otherwise the pinned/global settings.
-                const int t_chroma_it = STP ? STP->iterations : chroma_it;
-                const int t_iters_c = t_chroma_it - t_chroma_it / 2;
-                const bool stp_chroma = STP && seg_chroma_per_class;
-                const float t_coef_c = (stp_chroma ? STP->coef
-                    : (chroma_coef >= 0.0f ? chroma_coef : coef)) * 0.5f;
+                const YccTileParams tp = tile_params(i, j);
+                const int t_iterations = tp.iterations;
+                const int t_fista_iters = tp.fista_iters;
+                const int t_reweights = tp.reweights;
+                const int t_basis = tp.basis;
+                const float t_wscale = tp.wscale;
+                const int t_iters_c = tp.iters_c;
+                const float t_coef_c = tp.coef_c;
+                const float tile_coef_y = tp.coef_y;
+                const float tile_tv_y = tp.tv_y;
+                const struct indices& y_tidx = y_idx[i][j];
+                bool mixed = false;
+                cv::Mat y_low, cr_full, cb_full;
+                if (!gpu_done[(size_t)i][(size_t)j]) {
+                    cv::Mat x0[3];
+                    build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, t_basis, thumbnail_seed, chroma_sub_v);
 
-                cv::Mat x0[3];
-                build_neighbor_warm_start(x0, ref, mats_out, coordinates, i, j, true, true, t_basis, thumbnail_seed, chroma_sub_v);
-
-                const int Th = mats_out[i][j].rows;
-                const int Tw = mats_out[i][j].cols;
-                // coarse tile from the same halving the prep used: exact cover
-                // (4:2:2 keeps full height, halves the width only)
-                const int xo = coordinates[i][j].x, yo = coordinates[i][j].y;
-                const int cTw = (xo + Tw + 1) / 2 - xo / 2;
-                const int cTh = chroma_sub_v ? (yo + Th + 1) / 2 - yo / 2 : Th;
-                const cv::Size coarse_want(cTw, cTh);
-                // neighbor-derived chroma refs are halved t_rect; parity on
-                // edge tiles can leave them 1px off the solved grid — refit
-                // (warm start only, the solve re-converges regardless)
-                for (int c = 1; c < 3; ++c) {
-                    if (x0[c].empty() || x0[c].size() != coarse_want) {
-                        if (x0[c].empty()) {
-                            x0[c] = cv::Mat(coarse_want, CV_32F, cv::Scalar(0.5f));
-                            if (t_basis == CS_BASIS_CDF97) {
-                                cs_dwt_forward((float*)x0[c].data, cTh, cTw,
-                                    cs_dwt_levels(cTh, cTw));
+                    const int Th = mats_out[i][j].rows;
+                    const int Tw = mats_out[i][j].cols;
+                    const cv::Size coarse_want = coarse_size(i, j);
+                    const int cTw = coarse_want.width, cTh = coarse_want.height;
+                    // neighbor-derived chroma refs are halved t_rect; parity on
+                    // edge tiles can leave them 1px off the solved grid — refit
+                    // (warm start only, the solve re-converges regardless)
+                    for (int c = 1; c < 3; ++c) {
+                        if (x0[c].empty() || x0[c].size() != coarse_want) {
+                            if (x0[c].empty()) {
+                                x0[c] = cv::Mat(coarse_want, CV_32F, cv::Scalar(0.5f));
+                                if (t_basis == CS_BASIS_CDF97) {
+                                    cs_dwt_forward((float*)x0[c].data, cTh, cTw,
+                                        cs_dwt_levels(cTh, cTw));
+                                } else {
+                                    cs_dct_forward(x0[c], cs_default_dct_block());
+                                }
+                                x0[c] /= 10.0f;
                             } else {
-                                cs_dct_forward(x0[c], cs_default_dct_block());
+                                cv::resize(x0[c], x0[c], coarse_want, 0, 0, cv::INTER_LINEAR);
                             }
-                            x0[c] /= 10.0f;
-                        } else {
-                            cv::resize(x0[c], x0[c], coarse_want, 0, 0, cv::INTER_LINEAR);
                         }
                     }
-                }
 
-                cv::Mat dummy;
-                // luma-only per-tile scaling (chroma draws stay uniform, so
-                // coef_c is untouched; tv follows under its own flag)
-                const struct indices& y_tidx = y_idx[i][j];
-                const float tile_coef_y = per_tile_coef
-                    ? cs_per_tile_coef(t_coef_base, cs_tile_meas_count(y_tidx), coef_mean_my)
-                    : t_coef_base;
-                const float tile_tv_y = per_tile_tv
-                    ? cs_per_tile_coef(t_tv_base, cs_tile_meas_count(y_tidx), coef_mean_my)
-                    : t_tv_base;
-                // Grouped luma (T-means) rides the weight-aware core;
-                // chroma draws are always uniform points.
-                cs_meas_groups y_grps;
-                const cs_meas_groups* y_pgrps = nullptr;
-                if (!y_tidx.rg_off.empty() && (int)y_tidx.rg_off.size() > 1) {
-                    y_grps.off = y_tidx.rg_off.data();
-                    y_grps.px = y_tidx.rg_px.data();
-                    y_grps.w = y_tidx.rg_w.data();
-                    y_grps.ng = (int)y_tidx.rg_off.size() - 1;
-                    y_pgrps = &y_grps;
-                }
-                // FISTA-only (joint degrades to per-channel FISTA at the
-                // dispatcher): luma at full tile resolution, chroma natively
-                // on the half-resolution grid, where proximal updates are
-                // exact at the near-flat warm starts.
-                auto solve_plane = [&](const cv::Mat& meas, float c, int R, int C,
-                    const std::vector<int>& rx, const std::vector<int>& ry,
-                    int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t,
-                    const cs_meas_groups* pg = nullptr) {
-                    reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, t_reweights, t_fista_iters, t_basis, t_wscale, use_onsager, pg);
-                };
-                // Solve high-TV first as the base, then low-TV from the same
-                // neighbour warm start (independent, not a continuation).
-                const bool mixed = low_tv_tiles && y_dual_tv > 0.0f &&
-                    cs_y_mixed_density(y_tidx.ri_x_g, y_tidx.ri_y_g, Th, Tw);
-                cv::Mat y_low = mixed ? x0[0].clone() : cv::Mat();
-                if (!y_low.empty())
+                    cv::Mat dummy;
+                    // Grouped luma (T-means) rides the weight-aware core;
+                    // chroma draws are always uniform points.
+                    cs_meas_groups y_grps;
+                    const cs_meas_groups* y_pgrps = nullptr;
+                    if (!y_tidx.rg_off.empty() && (int)y_tidx.rg_off.size() > 1) {
+                        y_grps.off = y_tidx.rg_off.data();
+                        y_grps.px = y_tidx.rg_px.data();
+                        y_grps.w = y_tidx.rg_w.data();
+                        y_grps.ng = (int)y_tidx.rg_off.size() - 1;
+                        y_pgrps = &y_grps;
+                    }
+                    // FISTA-only (joint degrades to per-channel FISTA at the
+                    // dispatcher): luma at full tile resolution, chroma natively
+                    // on the half-resolution grid, where proximal updates are
+                    // exact at the near-flat warm starts.
+                    auto solve_plane = [&](const cv::Mat& meas, float c, int R, int C,
+                        const std::vector<int>& rx, const std::vector<int>& ry,
+                        int it, cv::Mat& r, bool nxt, cv::Mat& nr, float t,
+                        const cs_meas_groups* pg = nullptr) {
+                        reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, t_reweights, t_fista_iters, t_basis, t_wscale, use_onsager, pg);
+                    };
+                    // Solve high-TV first as the base, then low-TV from the same
+                    // neighbour warm start (independent, not a continuation).
+                    mixed = low_tv_tiles && y_dual_tv > 0.0f &&
+                        cs_y_mixed_density(y_tidx.ri_x_g, y_tidx.ri_y_g, Th, Tw);
+                    if (mixed) y_low = x0[0].clone();
+                    if (!y_low.empty())
+                        solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
+                            y_tidx.ri_x_g, y_tidx.ri_y_g, t_iterations,
+                            x0[0], false, dummy, y_dual_tv, y_pgrps);
+                    cv::Mat& low = y_low.empty() ? x0[0] : y_low;
                     solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                        y_tidx.ri_x_g, y_tidx.ri_y_g, t_iterations,
-                        x0[0], false, dummy, y_dual_tv, y_pgrps);
-                cv::Mat& low = y_low.empty() ? x0[0] : y_low;
-                solve_plane(y_meas[i][j], tile_coef_y, Th, Tw,
-                    y_tidx.ri_x_g, y_tidx.ri_y_g, t_iterations, low,
-                    false, dummy, tile_tv_y, y_pgrps);
-                if (y_confidence > 0.0f)
-                    cs_refine_y_confidence(y_meas[i][j], y_tidx.ri_x_g,
-                        y_tidx.ri_y_g, low, y_confidence, tile_coef_y,
-                        tile_tv_y, t_iterations, t_fista_iters, t_basis, t_wscale);
-                solve_plane(cr_meas[i][j], t_coef_c, cTh, cTw,
-                    cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, t_iters_c, x0[1],
-                    true, x0[2], 0.0f);
-                solve_plane(cb_meas[i][j], t_coef_c, cTh, cTw,
-                    cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, t_iters_c, x0[2],
-                    false, dummy, 0.0f);
+                        y_tidx.ri_x_g, y_tidx.ri_y_g, t_iterations, low,
+                        false, dummy, tile_tv_y, y_pgrps);
+                    if (y_confidence > 0.0f)
+                        cs_refine_y_confidence(y_meas[i][j], y_tidx.ri_x_g,
+                            y_tidx.ri_y_g, low, y_confidence, tile_coef_y,
+                            tile_tv_y, t_iterations, t_fista_iters, t_basis, t_wscale);
+                    solve_plane(cr_meas[i][j], t_coef_c, cTh, cTw,
+                        cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, t_iters_c, x0[1],
+                        true, x0[2], 0.0f);
+                    solve_plane(cb_meas[i][j], t_coef_c, cTh, cTw,
+                        cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, t_iters_c, x0[2],
+                        false, dummy, 0.0f);
 
-                cv::Mat cr_full, cb_full;
-                cv::resize(x0[1], cr_full, cv::Size(Tw, Th), 0, 0, cv::INTER_LINEAR);
-                cv::resize(x0[2], cb_full, cv::Size(Tw, Th), 0, 0, cv::INTER_LINEAR);
-                cv::Mat chs[3] = { x0[0], cr_full, cb_full }; // (Y, Cr, Cb)
-                cv::Mat ycc_tile;
-                cv::merge(chs, 3, ycc_tile);
-                ycc_tile.convertTo(ycc_tile, CV_8UC3);
-                cv::cvtColor(ycc_tile, mats_out[i][j], cv::COLOR_YCrCb2BGR);
+                    cv::resize(x0[1], cr_full, cv::Size(Tw, Th), 0, 0, cv::INTER_LINEAR);
+                    cv::resize(x0[2], cb_full, cv::Size(Tw, Th), 0, 0, cv::INTER_LINEAR);
+                    cv::Mat chs[3] = { x0[0], cr_full, cb_full }; // (Y, Cr, Cb)
+                    cv::Mat ycc_tile;
+                    cv::merge(chs, 3, ycc_tile);
+                    ycc_tile.convertTo(ycc_tile, CV_8UC3);
+                    cv::cvtColor(ycc_tile, mats_out[i][j], cv::COLOR_YCrCb2BGR);
+                }   // CPU solve (tiles the GPU pre-pass did not take)
                 // grain-adaptive per-tile TV (--grain-tv): same post-solve
                 // ROF smooth as the BGR path, on the merged tile.
                 if (grain_tv > 0.0f && !mats_out[i][j].empty()) {
@@ -1506,6 +1616,9 @@ static void decrypt_tiles_ycc420(int num_threads,
                             y_idx[i][j].ri_x_g, y_idx[i][j].ri_y_g,
                             tile_coef_y, tile_tv_y, t_iterations, t_reweights, t_fista_iters,
                             t_basis, t_wscale, hr, sr_cascade);
+                    }
+                    else if (superres_2x && sr_done[(size_t)i][(size_t)j]) {
+                        hr = sr_hr[(size_t)i][(size_t)j];   // batched GPU pass above
                     }
                     else if (superres_2x) {
                         CsHrSrCtx tile_hr = hr_sr;
@@ -2805,7 +2918,6 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // per-plane sampled images + 0/1 masks (luma full-res, chroma coarse)
         cv::Mat Y, Ym, Cr, Crm, Cb, Cbm;
         dimgs.get_sampled_ycc420(Y, Ym, Cr, Crm, Cb, Cbm);
-
         // Luma/chroma split + per-plane solve + merge as one reusable unit:
         // the standard path runs it once; --seg-solve runs it once with
         // per-tile class parameters (majority vote, no per-class passes).
@@ -3137,13 +3249,11 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             ycc_blend_feather = overlap * 2;
         }
 
-        // Plain tile paste as the blend canvas (zeros would halve every
-        // pixel in the zero-overlap alpha blend; see the BGR solve_grid).
-        reconstructed = reconstructImage(decrypted, coordinates);
-
         // shared tail with the BGR pipeline: feathered compositing in 2x
-        // geometry, resize to 2x the recorded size
-        reconstructed = blendTilesWithImage(decrypted, coordinates, reconstructed, 0.5f, ycc_blend_feather);
+        // geometry over a plain tile paste (zeros would halve every pixel in
+        // the zero-overlap alpha blend; see the BGR solve_grid), on the GPU
+        // when available; then resize to 2x the recorded size
+        reconstructed = cs_composite_tiles(decrypted, coordinates, false, cv::Size(), ycc_blend_feather);
 
         const cv::Size final_size(full_res ? org_size.width : org_size.width * 2,
             full_res ? org_size.height : org_size.height * 2);

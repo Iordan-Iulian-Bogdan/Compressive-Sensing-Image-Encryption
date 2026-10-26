@@ -24,3 +24,25 @@ tiles can be solved at once. solved[k] = 1 when job k finished (its out is set);
 jobs with odd dimensions, no samples, or a failed GPU call are left for the CPU
 path. */
 void cs_gpu_solve_tiles(std::vector<GpuTileJob>& jobs, std::vector<char>& solved);
+
+/** @brief One plane of a YCC tile: the arguments reconstruct_color_channel_fista takes (channel 0). */
+struct GpuPlane {
+    const cv::Mat* measurements;   // plane container: header + samples in channel 0
+    int rows, cols;
+    const std::vector<int>* rix;
+    const std::vector<int>* riy;
+    int iterations;
+    float coef, tv;
+};
+
+struct GpuYccTileJob {
+    GpuPlane plane[3];             // Y at tile resolution, Cr and Cb on the coarse grid
+    int fista_iters, reweights;
+    float wscale;
+    cv::Mat* out;                  // receives the merged CV_8UC3 BGR tile (Y's size)
+};
+
+/** @brief YCC form of cs_gpu_solve_tiles: every plane of every job is solved on the GPU (smooth-fill
+warm start, no neighbours), then each tile is merged exactly like decrypt_tiles_ycc420's CPU tail
+(chroma bilinear to the luma size, YCrCb -> BGR, 8 bit). solved[k] = 1 when job k's out is set. */
+void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved);
