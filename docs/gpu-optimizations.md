@@ -294,3 +294,74 @@ Notes:
   writer; only the main exe defines `CS_FAST_PNG`.
 - Where the 0.96 s goes: process start + PNG read + KDF ~80 ms, unpack + tile prep ~125 ms, LR stage ~80 ms,
   SR setup ~70 ms, ADMM ~420 ms (GEMMs ~240, NLM ~150), composite + write ~50 ms, frees + exit ~60 ms.
+
+### 8.1 Second-round baseline profile (6.12 s)
+
+Stage marks (temporary timestamps, each after `hipDeviceSynchronize()`), one profiled run:
+
+| Stage | Time | Runs on |
+| --- | --- | --- |
+| SR GPU pass (two serial ADMM batches 2.27 s: NLM 1,128 ms, step GEMM 460, other GEMMs 184-222 each) | 2,540 ms | GPU |
+| SR host prep (per-tile scan of all 300k anchors) | 1,620 ms | CPU |
+| LR solve (incl. ~130 ms HIP runtime start) | 707 ms | GPU |
+| Seg boundary calm (38 classes x 4 full-frame passes; no class was low, nothing changed) | 351 ms | CPU |
+| PNG write (OpenCV, one thread) | 268 ms | CPU |
+| Composite (incl. repacking and 128 MB upload) | 131 ms | GPU |
+| Tile prep (serial) | 130 ms | CPU |
+| Unpack: sample-position draws | 124 ms | CPU |
+| Process start, PNG read, exit | 123 ms | CPU |
+| Post-SR tile copies | 91 ms | CPU |
+| Key derivation (PBKDF2) | 32 ms | CPU |
+
+### 8.2 What did not work (second round)
+
+| Attempt | Measured | Lesson |
+| --- | --- | --- |
+| NLM sliding row sums, fully unrolled | 2x slower (1.13 -> 2.33 s) | 256 VGPRs, 284 B/lane spills: the compiler hoisted all 154 LDS loads. A shifting 7-entry ring + `__builtin_amdgcn_sched_barrier` per row fixed it (105 VGPRs) |
+| NLM with an LDS table of window sums of squares | no gain | LDS bandwidth/occupancy bound, not load-count bound; sums of squares in registers (dot4 of bytes with themselves) gave 0.27 s |
+| Sparser scheduling barriers in NLM | no gain | same limit |
+| Fused GEMM pairs (`k_gemm2`) | within noise (943 vs 965 ms) | GEMMs are bound by the FMA loop (~9 TFLOP/s), 178-185 VGPRs; kept for half the launches |
+| One flush event after each ADMM launch | no gain | only a marker before AND after each launch reproduces the profiled speed |
+| 4 GB device arena | first GPU stage waited ~30 ms | reservation must finish within the CPU-only window; 2 GB does |
+| First wavefront dither | 0.002% of values off by up to 3 | the serial kernel's `L[j+1] += noise*c` is contracted to one FMA; carrying the noise and `__fmaf_rn` at the use restored bit-exactness |
+
+Use `-Rpass-analysis=kernel-resource-usage` (compiled with the 14.29 MSVC env, as in `build_gpu.bat :hipobj`) before reasoning about instruction counts: two of these failures were register pressure and occupancy.
+
+### 8.3 Final-build timings per setting (median of 3, wall incl. process start)
+
+| Flags | Wall | PSNR | SSIM | dE2000 p95 |
+| --- | --- | --- | --- | --- |
+| (auto) | 2.135 s | 36.120 | 0.9285 | 3.444 |
+| `--fista-iters 12` | 1.622 s | 36.118 | 0.9284 | 3.445 |
+| `--fista-iters 8` | 1.446 s | 36.047 | 0.9282 | 3.461 |
+| `--manual --tiles 63 --iterations 6 --overlap 12` | 1.603 s | 35.987 | 0.9274 | 3.501 |
+| `--manual --tiles 63 --iterations 6 --overlap 8` | 1.234 s | 35.999 | 0.9283 | 3.486 |
+| `--fast` | 0.953 s | 35.996 | 0.9283 | 3.486 |
+| overlap 8 + `--fista-iters 8` | 0.887 s | 35.912 | 0.9281 | 3.503 |
+| overlap 4 + `--fista-iters 12` | 0.882 s | 35.930 | 0.9279 | 3.504 |
+| `--tiles 48`, overlap 8, `--fista-iters 12` | 0.894 s | 35.940 | 0.9267 | 3.534 |
+| `--sr-pnp-iters 4` | 1.503 s | 35.794 | 0.9254 | 3.552 |
+| `--sr-pnp-iters 2` | 1.192 s | 34.378 | 0.9123 | 4.045 |
+
+### 8.4 The neural prior is not in these timings
+
+The workload above runs no network: `--sr-pnp admm` without `--sr-prior-model` uses the NLM prox and the AVIR
+warm start. With the Swin2SR prior (`--sr-prior-model models\swin2sr\onnx\model.onnx`, DirectML, folded fp32
+graph) the batched SR pass declines every tile and the per-tile broker path runs instead:
+
+| Decode | Wall | PSNR | SSIM | dE2000 p95 |
+| --- | --- | --- | --- | --- |
+| default, Swin2SR prior | 18.9 s | 35.833 | 0.9284 | 3.439 |
+| `--fast`, Swin2SR prior | 10.8 s | 35.614 | 0.9281 | 3.476 |
+
+On this anchored container the prior costs ~9x the time and does not improve quality; porting it to the batched
+pass is open.
+
+### 8.5 How the second round was profiled
+
+- Stage marks: ~30 temporary `steady_clock` timestamps (`CS_PROFILE`-gated), each preceded by `hipDeviceSynchronize()`
+  in GPU code; removed before the final measurements (the syncs themselves cost ~10 ms).
+- Kernel split: `CS_GPU_PROF=1`. Note that it changes timing (it now matches the marker events, see the table above).
+- Exactness: every step compared byte for byte against the previous decode PNG (`max |diff| = 0`).
+- Timing: process wall time from PowerShell, median of 5-7 runs; drift between sessions was up to ~40 ms, so close
+  comparisons were run back to back.
