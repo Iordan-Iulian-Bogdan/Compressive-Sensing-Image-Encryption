@@ -2257,6 +2257,25 @@ int decrypt_image::decrypt_image_tiled(
         }
     }
 
+    // Diagnostic (opt-in): CS_HR_SIDECAR=<file> loads HR anchors from a side file ([u32 n] then n x {u32 idx, u8 y};
+    // idx in output geometry) when the container carries none. Used to test anchors that enter the cs-sr solve.
+    // Loaded before the YCC branch so both pipelines see it.
+    if (const char* sc = std::getenv("CS_HR_SIDECAR"); sc && *sc && dimgs.hr_samples.empty()) {
+        if (FILE* f = std::fopen(sc, "rb")) {
+            uint32_t n = 0;
+            if (std::fread(&n, 4, 1, f) == 1 && n < (1u << 26)) {
+                dimgs.hr_samples.resize(n);
+                for (uint32_t k = 0; k < n; ++k) {
+                    uint32_t idx = 0; uint8_t y = 0;
+                    if (std::fread(&idx, 4, 1, f) != 1 || std::fread(&y, 1, 1, f) != 1) { dimgs.hr_samples.resize(k); break; }
+                    dimgs.hr_samples[k].idx = idx; dimgs.hr_samples[k].y = y;
+                }
+            }
+            std::fclose(f);
+            std::cout << "HR sidecar: " << dimgs.hr_samples.size() << " anchors" << std::endl;
+        }
+    }
+
     // YCC containers take a dedicated tile pipeline: luma at
     // full resolution, chroma natively on the coarse grid. The mode travels
     // in the header so no decrypt-side flags are needed.
@@ -2564,23 +2583,6 @@ int decrypt_image::decrypt_image_tiled(
     CsUpscalePipeline pipe;
     if (pipe_upscale)
         pipe.start(photo_up, decrypted_image_tiles, hr_tiles, &hr_grid_mutex);
-    // Diagnostic (opt-in): CS_HR_SIDECAR=<file> loads HR anchors from a side file ([u32 n] then n x {u32 idx, u8 y};
-    // idx in output geometry) when the container carries none. Used to test anchors that enter the cs-sr solve.
-    if (const char* sc = std::getenv("CS_HR_SIDECAR"); sc && *sc && dimgs.hr_samples.empty()) {
-        if (FILE* f = std::fopen(sc, "rb")) {
-            uint32_t n = 0;
-            if (std::fread(&n, 4, 1, f) == 1 && n < (1u << 26)) {
-                dimgs.hr_samples.resize(n);
-                for (uint32_t k = 0; k < n; ++k) {
-                    uint32_t idx = 0; uint8_t y = 0;
-                    if (std::fread(&idx, 4, 1, f) != 1 || std::fread(&y, 1, 1, f) != 1) { dimgs.hr_samples.resize(k); break; }
-                    dimgs.hr_samples[k].idx = idx; dimgs.hr_samples[k].y = y;
-                }
-            }
-            std::fclose(f);
-            std::cout << "HR sidecar: " << dimgs.hr_samples.size() << " anchors" << std::endl;
-        }
-    }
     // HR anchors for the fused cs-sr solve: global output-geometry list +
     // output stride; each worker maps its own tile origin (see decrypt_tiles).
     CsHrSrCtx hr_sr_ctx;
@@ -3313,7 +3315,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
 
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
         // the final composite (see the BGR pipeline above).
-        if (!dimgs.hr_samples.empty() && !reconstructed.empty()) {
+        if (!dimgs.hr_samples.empty() && !reconstructed.empty() && !std::getenv("CS_HR_NO_POSTHOC")) {
             const size_t applied = cs_apply_hr_detail(reconstructed, dimgs.hr_samples);
             dimgs.hr_applied = applied;
             if (hr_applied_out) *hr_applied_out = applied;
