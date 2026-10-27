@@ -8,6 +8,7 @@
 #ifdef CS_GPU_TILES
 #include "gpu_admm_broker.hpp"
 #include "gpu_sr.h"
+#include "gpu_swin.h"
 #endif
 
 #include <opencv2/imgproc.hpp>
@@ -1522,9 +1523,22 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
 {
     done.assign(tiles.size(), 0);
     // Same gate as the per-tile GPU ADMM path of cs_sr_upscale_tile_2x (pnp_mode 2, NLM prox).
-    if (tiles.empty() || !sr_prior.model.empty() || sr_prior.pnp_mode != 2 || sr_cascade ||
+    if (tiles.empty() || sr_prior.pnp_mode != 2 || sr_cascade ||
         cs_onnx_kind_for(red_denoiser) >= 0 || cs_default_dct_block() > 0 || !cs_gpu_admm_enabled())
         return;
+    // --sr-prior-model: the HIP Swin2SR (gpu_swin) replaces ONNX Runtime when the model's exported
+    // weights are there and no segment gate is set (seg-gated tiles mix prior and cs-sr patches).
+    // A tile at most 256 px a side is one ONNX patch, so the HIP output is the same warm start.
+    const bool swin = !sr_prior.model.empty();
+    if (swin) {
+        if ((sr_prior.seg_lr && !sr_prior.seg_lr->empty()) || !cs_sr_gpu_prior_ready(sr_prior.model) ||
+            !gpu_swin::load(gpu_swin::weights_path(sr_prior.model)))
+            return;
+        for (const CsSrBatchTile& T : tiles)
+            if (!T.lr_tile || T.lr_tile->rows > 256 || T.lr_tile->cols > 256 ||
+                !gpu_swin::supported(T.lr_tile->rows, T.lr_tile->cols))
+                return;
+    }
     const int admm = (std::min)(50, (std::max)(1, sr_prior.pnp_iters));
     const float rho = sr_prior.pnp_rho > 0.0f ? sr_prior.pnp_rho : 0.1f;
     const CsSrAdmmSched& sc = cs_sr_admm_sched();
@@ -1613,7 +1627,7 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             }
             jobs.push_back(J);
         }
-        if (!gpu_sr::run(jobs, g.second.empty() ? gpu_admm::Params{} : pp[g.second.front()].prm)) {
+        if (!gpu_sr::run(jobs, g.second.empty() ? gpu_admm::Params{} : pp[g.second.front()].prm, swin)) {
             for (size_t k : g.second) tiles[k].hr_out->release();
             continue;
         }
@@ -1628,7 +1642,10 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             if (!done[k] || pp[k].dbg_avir.empty()) continue;
             const CsSrBatchTile& T = tiles[k];
             cv::Mat cpu_avir;
-            cs_upscale_2x_avir(pp[k].lr, cpu_avir);
+            int sc2 = 0;
+            if (swin) cs_onnx_sr_upscale_bgr(pp[k].lr, cpu_avir, sr_prior.model, sc2, cv::Mat(), {});
+            else cs_upscale_2x_avir(pp[k].lr, cpu_avir);
+            if (cpu_avir.total() * 3 != pp[k].dbg_avir.size()) continue;
             for (size_t q = 0; q < pp[k].dbg_avir.size(); ++q) {
                 const int d = std::abs((int)cpu_avir.data[q] - (int)pp[k].dbg_avir[q]);
                 ++n; a1 += d >= 1; a2 += d >= 2; amax = (std::max)(amax, d);
@@ -1645,10 +1662,22 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             }
             ++nt;
         }
-        std::fprintf(stderr, "[gpu-sr verify] %d tiles: AVIR warm start %.3f%% values differ by 1, %.4f%% by >=2 (max %d); "
+        std::fprintf(stderr, "[gpu-sr verify] %d tiles: %s warm start %.3f%% values differ by 1, %.4f%% by >=2 (max %d); "
             "NLM h max diff %.4f; final tile vs CPU path mean |diff| %.3f, %.3f%% > 2 levels\n",
-            nt, n ? 100.0 * a1 / n : 0.0, n ? 100.0 * a2 / n : 0.0, amax, hmax, fn ? fsum / fn : 0.0, fn ? 100.0 * f2 / fn : 0.0);
+            nt, swin ? "prior" : "AVIR", n ? 100.0 * a1 / n : 0.0, n ? 100.0 * a2 / n : 0.0, amax, hmax, fn ? fsum / fn : 0.0, fn ? 100.0 * f2 / fn : 0.0);
     }
+}
+
+bool cs_sr_gpu_prior_ready(const std::string& model)
+{
+    // Only the weight file is checked here (no HIP call, so the device warm-up keeps running in
+    // the background); cs_sr_gpu_batch loads it.
+    const char* e = std::getenv("CS_GPU_SWIN");
+    const char* a = std::getenv("CS_GPU_ADMM");   // as cs_gpu_admm_enabled, without its device query
+    if (model.empty() || (e && std::strcmp(e, "0") == 0) || !(a && a[0] == '1')) return false;
+    std::FILE* f = std::fopen(gpu_swin::weights_path(model).c_str(), "rb");
+    if (f) std::fclose(f);
+    return f != nullptr;
 }
 #else
 void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string&, bool, const CsSrPrior&,
@@ -1656,4 +1685,6 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string&, bool
 {
     done.assign(tiles.size(), 0);
 }
+
+bool cs_sr_gpu_prior_ready(const std::string&) { return false; }
 #endif

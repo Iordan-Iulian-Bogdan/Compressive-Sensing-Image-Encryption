@@ -245,6 +245,8 @@ the folded graph next to the model instead of in `%TEMP%`.
 | `CS_GPU_ADMM_WAIT_MS` | 30 | broker batch wait |
 | `CS_GPU_WORKERS` | 64 | cap of GPU worker threads |
 | `CS_GPU_PROF=1` | off | per-kernel / batch / session profiling at exit |
+| `CS_GPU_SWIN=0` | on | keep `--sr-prior-model` on ONNX Runtime instead of the HIP network (section 9) |
+| `CS_GPU_ADMM_WMMA=0` | on | fp32 `k_gemm2` FISTA loop instead of `k_fista_w` (section 10) |
 
 Reproduce the table in section 1: build with `build_gpu.bat main`, set the three switches
 (`CS_GPU_TILES`, `CS_GPU_ADMM`, `CS_GPU_ONNX` = 1), run the decrypt command above; the first run builds and
@@ -347,15 +349,14 @@ Use `-Rpass-analysis=kernel-resource-usage` (compiled with the 14.29 MSVC env, a
 
 The workload above runs no network: `--sr-pnp admm` without `--sr-prior-model` uses the NLM prox and the AVIR
 warm start. With the Swin2SR prior (`--sr-prior-model models\swin2sr\onnx\model.onnx`, DirectML, folded fp32
-graph) the batched SR pass declines every tile and the per-tile broker path runs instead:
+graph) the batched SR pass declined every tile and the per-tile broker path ran instead:
 
 | Decode | Wall | PSNR | SSIM | dE2000 p95 |
 | --- | --- | --- | --- | --- |
 | default, Swin2SR prior | 18.9 s | 35.833 | 0.9284 | 3.439 |
 | `--fast`, Swin2SR prior | 10.8 s | 35.614 | 0.9281 | 3.476 |
 
-On this anchored container the prior costs ~9x the time and does not improve quality; porting it to the batched
-pass is open.
+Section 9 moves the network into the batched pass (3.1 s / 1.42 s).
 
 ### 8.5 How the second round was profiled
 
@@ -365,3 +366,132 @@ pass is open.
 - Exactness: every step compared byte for byte against the previous decode PNG (`max |diff| = 0`).
 - Timing: process wall time from PowerShell, median of 5-7 runs; drift between sessions was up to ~40 ms, so close
   comparisons were run back to back.
+
+## 9. Third round: the Swin2SR prior on HIP (18.9 s -> 3.1 s)
+
+Same workload as section 8 plus `--sr-prior-model models\swin2sr\onnx\model.onnx` (Swin2SR-lightweight x2).
+Every LR tile (48 x 56, 3969 of them) goes through the network once to give the warm start of its ADMM solve.
+
+| Decode | Before (DirectML, per-tile path) | After (HIP, batched pass) | PSNR | SSIM | dE2000 p95 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| default | 18.9 s | 3.1 s | 35.833 (same) | 0.9284 (same) | 3.439 / 6.016 (was 6.015) |
+| `--fast` | 10.8 s | 1.42 s | 35.613 (was 35.614) | 0.9281 (same) | 3.477 (was 3.476) |
+
+The final image differs from the DirectML decode by 0.08 levels on average (0.4% of values by more than one level,
+max 7, where a rounding edge in the warm start sends ADMM elsewhere).
+
+### 9.1 Why DirectML could not be tuned
+
+DirectML ran the folded graph (2018 nodes, 2.1 MFLOP per LR pixel) at ~1.5-2.1 us per LR pixel whatever the batch,
+patch size or precision: ~1.4 TFLOP/s, about 3% of the GPU. 10.7 M LR pixels of tiles cost 17.3 s of the 18.9 s.
+The graph is many small ops on 60 channels; each round-trips memory. The fix was a hand-written network.
+
+### 9.2 Design
+
+- `scripts/export_swin2sr_weights.py` reads the ONNX graph, recovers the anonymous MatMul weights by their bias
+  consumers, precomputes the relative-position bias (`16*sigmoid(cpb MLP)`, `[6][64][64]`) and the clamped logit
+  scales, and writes `<model>.swin2sr.bin` (5.9 MB). `--check` runs its PyTorch forward of the same math against
+  ONNX Runtime (max diff 1.6e-6).
+- `gpu_swin.hip` packs the weights once into fp16 WMMA B fragments and runs the network on device-resident tiles:
+  `gpu_sr::run` hands it the LR buffer it already uploaded and gets the 8-bit HR warm start back in the buffer the
+  AVIR kernels would fill, so the rest of the batched pass (YCrCb, ADMM, merge) is unchanged.
+- Four kernels per tile batch (chunks of 2 M LR pixels): `k_stem` (first conv + patch embed + LN), `k_layer` x 24
+  (one 8 x 8 window per workgroup: q/k/v, cosine attention, projection, MLP, both post-norms), `k_conv<4,1>` x 4
+  (stage conv3x3 + conv1x1 + residual, implicit GEMM over a 10 x 10 fp16 halo) and `k_conv<4,0>` / `k_conv<1,2>`
+  (conv after body, then the 12-channel conv with pixel shuffle, mean and the 8-bit store).
+- The matrix products use `v_wmma_f32_16x16x16_f16` (fp16 in, fp32 accumulate); the residual stream, LayerNorm,
+  softmax and GELU stay fp32. Channels are padded 60 -> 64, head dims 10 -> 16, the MLP 120 -> 128.
+- Accuracy against ONNX Runtime CPU on real tiles: 0.41% of 8-bit outputs off by one, none by more. Emulating the
+  fp16 rounding in PyTorch first (`HMODE`, section 9.4) predicted this before any kernel was written.
+
+### 9.3 Steps (512 tiles, harness timing per network pass)
+
+| Step | Time | Notes |
+| --- | --- | --- |
+| fp32 VALU port (one thread per pixel / window) | 1,560 ms | 2 TFLOP/s; ~12.7 s for the image |
+| WMMA layer and convs (fp16 inputs) | 228 ms | 6.8x |
+| one head group instead of two (more LDS, fewer barriers) | 221 ms | grouping to raise occupancy was slower |
+| DPP `row_xmask` reductions instead of `__shfl_xor` (`ds_bpermute`) | 192 ms | ~900 reductions per layer |
+| hardware `rcp` / `rsq`, tanh-form GELU | 148 ms | IEEE division and `erff` dominated the VALU work |
+| fused stem (first conv + embedding, coalesced) | 133 ms | 16 -> 1.9 ms |
+
+In the decode the network then takes ~1.0 s of the 2.48 s batched SR pass (ADMM 1.24 s). Removing the
+DirectML session check at startup (`cs_sr_gpu_prior_ready`) saved another ~70 ms.
+
+### 9.4 What went wrong on the way
+
+| Symptom | Cause | Lesson |
+| --- | --- | --- |
+| warm start 96% off ORT, up to 105 levels | the loader read 24 layers then 4 stage convs; the file interleaves them per stage | a NumPy forward that reads the `.bin` with the loader's own offsets found it in one step |
+| WMMA output rows 12-15 wrong, only in the up conv | the compiler sank the last WMMA into the `if (r16 < 12)` store branch; WMMA with lanes 12-15 off drops their A rows | `pin()` (empty `asm volatile` on the accumulator) after every product loop |
+| VGPRs 227 (layer), 256 + spills (stage conv) | hoisted fragments | did not matter here: weights read from LDS instead of global memory gained only 6% |
+
+Ruled out by measurement: global weight loads (6%), the softmax VALU (14 ms of 113), smaller head groups for
+occupancy (slower), `#pragma unroll 1` on the conv taps (no change).
+
+### 9.5 Switches and files
+
+- `CS_GPU_SWIN=0` keeps the prior on ONNX Runtime; without the `.swin2sr.bin` the decode falls back to it too.
+- The HIP path covers `--sr-pnp admm` on the batched pass without a segment gate (`seg_lr`, the BGR pipeline) and
+  tiles up to 256 px a side (one ONNX patch), sides multiples of 8.
+- `CS_GPU_SR_VERIFY=<n>` compares every n-th tile's warm start with `cs_onnx_sr_upscale_bgr` and the final tile
+  with the per-tile CPU path: 0.42% of warm-start values off by one (max 1), final tiles 0.071 levels mean.
+- Export once per model: `py -3.12 scripts\export_swin2sr_weights.py [model.onnx] [--check]`.
+
+## 10. Fourth round: the ADMM FISTA loop on WMMA (prior decode 3.1 s -> 2.34 s)
+
+### 10.1 Where the 3.19 s went (temporary stage marks, device synced at each GPU mark)
+
+| Stage | Time |
+| --- | --- |
+| imread, key derivation + header, unpack, tile prep (CPU) | 211 ms |
+| LR solve (GPU) | 304 ms |
+| SR host prep, upload | 47 ms |
+| Swin2SR warm start | 1,120 ms |
+| ADMM (FISTA GEMMs ~860 ms, NLM ~260 ms) | 1,319 ms |
+| download, composite, PNG write | 67 ms |
+
+Keeping the tiles on the device between the LR solve, the SR pass and the composite would save only the
+uploads and downloads (~50 ms), so it was not done. The two GPU stages are 2.44 s of 3.19 s.
+
+### 10.2 The FISTA loop
+
+The fixed-step loop ran 2 launches per step (`k_gemm2`, four fp32 DCT products with fused epilogues) over
+192 steps. What was tried:
+
+| Attempt | ADMM GEMM time | Notes |
+| --- | --- | --- |
+| fp32 `k_gemm2` (before) | ~860 ms | |
+| WMMA form of `k_gemm2`, operands split into hi + lo fp16 (3 products) | 1,250 ms | slower |
+| same, plain fp16 operands | 748 ms | quality unchanged: 35.832 dB vs 35.833 |
+| run all steps on chunks of 128-512 tiles (cache-sized state) | slower at every size | not memory bound; smaller grids underfill the GPU |
+| one block per tile for the whole round (`k_fista_w`) | 879 ms | 256 VGPRs, 848 B/lane of spills |
+| same, 2 column tiles per wave, 768-thread bound, no runtime-selected register arrays | **184 ms** | 226-240 VGPRs, no spills |
+
+`k_fista_w` (gpu_gemm.hpp) keeps y, x_prev, the ADMM anchor DCT, the HR anchors and the frequency weights in
+registers in WMMA output layout; each step is four fp16 products (DCT tables pre-packed as fragments) through
+46 KB of LDS, with 4 barriers. The residual's 2x2 average is a DPP lane ^ 1 plus a lane ^ 16 exchange. It writes
+the round's pixel image directly, replacing the per-round inverse DCT too. ADMM 1,319 -> 557 ms; NLM (256 ms)
+is now its largest part. `CS_GPU_ADMM_WMMA=0` restores the fp32 loop (bit-identical to earlier builds).
+
+The same register-pressure lesson as section 9.4: a lambda called with `last ? xp : y` (an array chosen at run
+time) forced the state arrays to scratch; copying z into y before the last pass removed most of the spills.
+
+### 10.3 The network
+
+q | k | v now come out of one 12-tile product (64 columns each) instead of 18 per-head padded tiles, with the
+q / k norms computed once from LDS and applied to the scores; accuracy unchanged (0.41% of outputs off by one
+level vs ONNX Runtime), time within noise (~1.06-1.12 s in the decode). The layer kernel holds 2 workgroups
+per WGP (56 KB LDS); with WMMA at ~25% of peak, it is latency bound.
+
+### 10.4 Results (median of 3, wall incl. process start)
+
+| Decode | Before | After | PSNR | SSIM | dE2000 p95 |
+| --- | --- | --- | --- | --- | --- |
+| Swin2SR prior | 3.10 s | 2.34 s | 35.834 (was 35.833) | 0.9284 | 3.439 |
+| Swin2SR prior, `--fast` | 1.42 s | 1.27 s | 35.612 (was 35.613) | 0.9280 (was 0.9281) | 3.476 (was 3.477) |
+| no prior | 2.13 s | 1.35 s | 36.121 (was 36.120) | 0.9285 | 3.445 (was 3.444) |
+| no prior, `--fast` | 0.95 s | 0.76 s | 35.994 (was 35.996) | 0.9283 | 3.486 |
+
+The decode is no longer bit-identical to the fp32 build (fp16 products in FISTA); the difference is ~0.1
+level on average.

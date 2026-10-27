@@ -3211,7 +3211,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             ycc_sr_prior_ctx.pnp_rho = photo_up.sr_pnp_rho;
             ycc_sr_prior_ctx.pnp_iters = photo_up.sr_pnp_iters;
         }
-        if (!ycc_sr_prior_ctx.model.empty() &&
+        // The HIP network (cs_sr_gpu_prior_ready) needs no ONNX Runtime session; tiles it does
+        // not take open one on demand.
+        if (!ycc_sr_prior_ctx.model.empty() && !cs_sr_gpu_prior_ready(ycc_sr_prior_ctx.model) &&
             !cs_onnx_sr_available(ycc_sr_prior_ctx.model)) {
             std::cerr << "Error: SR prior model failed to load ('"
                       << ycc_sr_prior_ctx.model << "')" << std::endl;

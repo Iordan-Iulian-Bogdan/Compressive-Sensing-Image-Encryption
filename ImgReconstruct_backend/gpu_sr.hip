@@ -2,6 +2,7 @@
 #include "gpu_sr.h"
 #include "gpu_avir_tables.hpp"
 #include "gpu_common.hpp"
+#include "gpu_swin.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -209,13 +210,14 @@ __global__ void k_finish(const SrDev* sd, const float* Z, const std::uint8_t* CR
 
 }  // namespace
 
-bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
+bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior) {
     if (tiles.empty()) return true;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
     const int nt = (int)tiles.size();
 
-    // Layout: LR bytes, HR planes (same order/offsets as gpu_admm's TileLayout), AVIR tables.
+    // Layout: LR bytes, HR planes (same order/offsets as gpu_admm's TileLayout), AVIR tables
+    // (none with the Swin2SR prior, which needs no AVIR buffers either).
     std::vector<SrDev> sd((size_t)nt);
     std::vector<float> table;
     std::map<std::pair<int, int>, std::pair<int, int>> tab_off;   // (R, C) -> (ar, ac)
@@ -225,7 +227,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
         const Tile& P = tiles[(size_t)t];
         auto key = std::make_pair(P.lr_rows, P.lr_cols);
         auto it = tab_off.find(key);
-        if (it == tab_off.end()) {
+        if (it == tab_off.end() && !swin_prior) {
             const std::vector<float>* Ar = nullptr; const std::vector<float>* Ac = nullptr;
             if (!cs_avir_2x_tables(P.lr_rows, P.lr_cols, Ar, Ac)) return false;
             const int ar = (int)table.size(); table.insert(table.end(), Ar->begin(), Ar->end());
@@ -235,7 +237,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
         SrDev d{};
         d.R = P.lr_rows; d.C = P.lr_cols;
         d.lr_off = (int)lr_total; d.hr_off = (int)hr_total;
-        d.ar = it->second.first; d.ac = it->second.second;
+        if (!swin_prior) { d.ar = it->second.first; d.ac = it->second.second; }
         sd[(size_t)t] = d;
         lr_total += (long long)P.lr_rows * P.lr_cols;
         hr_total += 4LL * P.lr_rows * P.lr_cols;
@@ -253,29 +255,36 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
     const int dstride = 2 * max_c + 2;
 
     DevBuf<SrDev> dsd; DevBuf<float> dtab, dTMP, dF, dD, dZ, dH; DevBuf<std::uint8_t> dLR, dHR8, dCR, dCB, dOUT;
-    if (!dsd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dTMP.alloc((size_t)6 * lr_total) ||
-        !dF.alloc((size_t)3 * hr_total) || !dD.alloc((size_t)3 * nt * dstride) || !dZ.alloc((size_t)hr_total) ||
+    if (!dsd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dTMP.alloc(swin_prior ? 0 : (size_t)6 * lr_total) ||
+        !dF.alloc(swin_prior ? 0 : (size_t)3 * hr_total) || !dD.alloc(swin_prior ? 0 : (size_t)3 * nt * dstride) || !dZ.alloc((size_t)hr_total) ||
         !dH.alloc((size_t)nt) || !dLR.alloc((size_t)3 * lr_total) || !dHR8.alloc((size_t)3 * hr_total) ||
         !dCR.alloc((size_t)hr_total) || !dCB.alloc((size_t)hr_total) || !dOUT.alloc((size_t)3 * hr_total)) {
         std::fprintf(stderr, "gpu_sr: device allocation failed\n");
         return false;
     }
     HIP_TRY(hipMemcpy(dsd.p, sd.data(), (size_t)nt * sizeof(SrDev), hipMemcpyHostToDevice));
-    HIP_TRY(hipMemcpy(dtab.p, table.data(), table.size() * sizeof(float), hipMemcpyHostToDevice));
+    if (!table.empty()) HIP_TRY(hipMemcpy(dtab.p, table.data(), table.size() * sizeof(float), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dLR.p, hlr.data(), hlr.size(), hipMemcpyHostToDevice));
 
     const dim3 blk(kThreads);
     // NLM strength per tile (needed on the host for the ADMM problems)
     k_nlm_h<<<dim3((unsigned)nt), blk>>>(dsd.p, dLR.p, dH.p);
-    // AVIR 2x: two separable passes, then the scan-order dither into 8-bit BGR
-    k_avir_h<<<dim3((unsigned)((max_tmp + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dLR.p, dTMP.p);
-    k_avir_v<<<dim3((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dTMP.p, dF.p);
-    const int wave_threads = (2 * max_r + 31) / 32 * 32;
-    const size_t wave_lds = (size_t)2 * max_r * (2 * max_c + 2) * sizeof(float);
-    if (wave_threads <= 1024 && wave_lds <= 65536)
-        k_dither_wave<<<dim3((unsigned)(3 * nt)), dim3((unsigned)wave_threads), wave_lds>>>(dsd.p, dF.p, dHR8.p);
-    else
-        k_dither<<<dim3((unsigned)((3 * nt + 63) / 64)), dim3(64)>>>(dsd.p, nt, dF.p, dD.p, dstride, dHR8.p);
+    if (swin_prior) {
+        // Swin2SR 2x of every tile, straight into the 8-bit BGR warm start
+        std::vector<gpu_swin::Image> ims((size_t)nt);
+        for (int t = 0; t < nt; ++t) ims[(size_t)t] = { sd[(size_t)t].R, sd[(size_t)t].C, sd[(size_t)t].lr_off, sd[(size_t)t].hr_off };
+        if (!gpu_swin::run(ims, dLR.p, dHR8.p)) return false;
+    } else {
+        // AVIR 2x: two separable passes, then the scan-order dither into 8-bit BGR
+        k_avir_h<<<dim3((unsigned)((max_tmp + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dLR.p, dTMP.p);
+        k_avir_v<<<dim3((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dTMP.p, dF.p);
+        const int wave_threads = (2 * max_r + 31) / 32 * 32;
+        const size_t wave_lds = (size_t)2 * max_r * (2 * max_c + 2) * sizeof(float);
+        if (wave_threads <= 1024 && wave_lds <= 65536)
+            k_dither_wave<<<dim3((unsigned)(3 * nt)), dim3((unsigned)wave_threads), wave_lds>>>(dsd.p, dF.p, dHR8.p);
+        else
+            k_dither<<<dim3((unsigned)((3 * nt + 63) / 64)), dim3(64)>>>(dsd.p, nt, dF.p, dD.p, dstride, dHR8.p);
+    }
     // YCrCb; the luma becomes the ADMM start
     const dim3 hgrid((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)nt);
     k_bgr2ycc<<<hgrid, blk>>>(dsd.p, dHR8.p, dZ.p, dCR.p, dCB.p);

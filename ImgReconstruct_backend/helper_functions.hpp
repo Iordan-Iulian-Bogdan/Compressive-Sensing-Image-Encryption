@@ -403,13 +403,19 @@ struct CsSrBatchTile {
 };
 
 /** @brief Batched GPU form of cs_sr_upscale_tile_2x's PnP-ADMM path (--sr-pnp admm, NLM
-prox, no learned prior, no cascade): AVIR warm start, YCrCb, luma ADMM and the BGR merge for
+prox, no cascade): AVIR warm start, or the Swin2SR prior on HIP (gpu_swin.h) when
+--sr-prior-model is set and cs_sr_gpu_prior_ready, then YCrCb, luma ADMM and the BGR merge for
 every eligible tile in one GPU pass (gpu_sr.h), grouped by ADMM parameters. done[k] = 1 when
 tile k's hr_out was produced; the rest are left to the per-tile path. Without the GPU build or
-with CS_GPU_ADMM off nothing is done. CS_GPU_SR_VERIFY=<n> compares every n-th tile's AVIR,
-NLM strength and final tile with the CPU functions and prints the differences. */
+with CS_GPU_ADMM off nothing is done. CS_GPU_SR_VERIFY=<n> compares every n-th tile's warm
+start, NLM strength and final tile with the CPU functions and prints the differences. */
 void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_denoiser,
     bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done);
+
+/** @brief True when cs_sr_gpu_batch can run the --sr-prior-model network itself: GPU build,
+CS_GPU_ADMM=1, CS_GPU_SWIN not "0", and the model's exported weights
+(<model>.swin2sr.bin, scripts/export_swin2sr_weights.py) exist. No device call. */
+bool cs_sr_gpu_prior_ready(const std::string& model);
 
 /** @brief single-stage SR 2x refinement of one tile (CPU, DCT): the HR luma
 is solved directly against the tile's LR samples (cs_sr_direct_luma, no

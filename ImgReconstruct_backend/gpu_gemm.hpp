@@ -15,6 +15,11 @@
 // neighbourhood of the output never straddles two threads; the epilogues use
 // that to fuse the neighbouring elementwise steps of the FISTA iteration.
 #include "gpu_common.hpp"
+#include "gpu_wmma.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <vector>
 
 namespace gpu_common {
 namespace {
@@ -396,6 +401,194 @@ __global__ void __launch_bounds__(kFThreads) k_gemm2(const TileDev* td, const fl
             const int m = m0 + rb + i, n = cb + j;
             if (m < M && n < N) out[T.off + m * N + n] = acc[i][j];
         }
+}
+
+// ---- one ADMM round's FISTA loop per tile, on the WMMA units ----
+// k_fista_w runs every fixed-step FISTA iteration of one tile in one block and writes the pixel
+// image of the final iterate (what the fused k_gemm2 loop + gemm_inv_b produce), so nothing but
+// the round's inputs and that image touches memory. Per step:
+//   P1 = y Cc, P2 = Cr^T P1 (pixels), residual r (2x2 average vs the samples, + anchors),
+//   P3 = r Cc^T, P4 = Cr P3 (gradient DCT), soft threshold + momentum (epi_step).
+// The products take fp16 operands (tables pre-packed by pack_gemm_frags, data rounded when it is
+// staged in LDS) and accumulate in fp32; y, xp, the anchor term and the HR anchors stay in
+// registers in WMMA output layout. Wave w owns rows 16 (w / kWPR) .. +15 and column tiles
+// kTPW (w % kWPR) .. +kTPW-1, the same elements in every product, so the epilogues need no data movement
+// but the 2x2 neighbour exchange (lane ^ 1, lane ^ 16).
+enum FragVariant { FR_A_TAB, FR_A_TABT, FR_B_TAB, FR_B_TABT };
+constexpr int kFragSets = 4;
+constexpr int kTPW = 2, kWPR = 4;   // column tiles per wave, waves per 16-row block (Np <= 128)
+constexpr int kFistaThreads = 768;   // 32 * kWPR * Mp / 16 for Mp <= 96 (more threads would cap the registers)
+
+__host__ __device__ inline int pad16(int n) { return (n + 15) & ~15; }
+// LDS bytes of k_fista_w for padded tile sizes Mp x Np: rows (A operand) + columns (B operand).
+inline size_t fista_w_lds(int Mp, int Np) { return (size_t)(Mp * (Np + 8) + Np * (Mp + 8)) * sizeof(std::uint16_t); }
+
+// Appends the WMMA fragments of the N x N DCT table C to out (fp16 bits) and returns their
+// offset: A fragments [mt][kt][row][k] of C (TAB) and C^T (TABT), then B fragments
+// [nt][kt][col][k] of C (TAB) and C^T (TABT), Np x Np halves each.
+inline size_t pack_gemm_frags(std::vector<std::uint16_t>& out, const float* C, int N) {
+    const int Np = pad16(N), KT = Np / 16;
+    const size_t at = out.size();
+    out.resize(at + (size_t)kFragSets * Np * Np);
+    for (int t = 0; t < KT; ++t)
+        for (int kt = 0; kt < KT; ++kt)
+            for (int l = 0; l < 16; ++l)
+                for (int e = 0; e < 16; ++e) {
+                    const int r = t * 16 + l, k = kt * 16 + e;   // A: row r, column k; B: row k, column r
+                    const bool in = r < N && k < N;
+                    const size_t i = at + ((size_t)(t * KT + kt) * 16 + l) * 16 + e, v = (size_t)Np * Np;
+                    out[i + FR_A_TAB * v] = gpu_wmma::to_half(in ? C[r * N + k] : 0.0f);
+                    out[i + FR_A_TABT * v] = gpu_wmma::to_half(in ? C[k * N + r] : 0.0f);
+                    out[i + FR_B_TAB * v] = gpu_wmma::to_half(in ? C[k * N + r] : 0.0f);
+                    out[i + FR_B_TABT * v] = gpu_wmma::to_half(in ? C[r * N + k] : 0.0f);
+                }
+    return at;
+}
+
+struct FistaW {
+    const float *y, *anch, *blr, *hav, *lam;   // round start (y = DCT(z)), samples, anchors (or null), L1 weights
+    const int* hrt;                            // per tile: takes step_hr (or null)
+    float hw, aw, step, step_hr, logw;
+    int inner;
+};
+
+template <bool HR>
+__global__ void __launch_bounds__(kFistaThreads) k_fista_w(const TileDev* td, const gpu_wmma::half_t* frag, FistaW p, float* pix_out) {
+    using namespace gpu_wmma;
+    extern __shared__ __attribute__((aligned(16))) half_t lds[];
+    const TileDev T = td[blockIdx.x];
+    const int M = T.rows, N = T.cols, Mp = pad16(M), Np = pad16(N), MT = Mp / 16, NT = Np / 16;
+    const int SA = Np + 8, SB = Mp + 8;
+    half_t* Ra = lds;             // rows: A operand of P1 / P3 (m, k)
+    half_t* Bt = lds + Mp * SA;   // columns: B operand of P2 / P4 (n, k)
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, r16 = lane & 15, hi = lane >> 4;
+    const int mt = w / kWPR, t0 = (w % kWPR) * kTPW, t1 = min(NT, t0 + kTPW);
+    const bool active = mt < MT;   // wave-uniform
+    const half_t* fCc = frag + T.pad[1] + (size_t)FR_B_TAB * Np * Np;
+    const half_t* fCcT = frag + T.pad[1] + (size_t)FR_B_TABT * Np * Np;
+    const half_t* fCr = frag + T.pad[0] + (size_t)FR_A_TAB * Mp * Mp;
+    const half_t* fCrT = frag + T.pad[0] + (size_t)FR_A_TABT * Mp * Mp;
+    const float lam = p.lam[blockIdx.x];
+    const float step = (p.hrt && p.hrt[blockIdx.x]) ? p.step_hr : p.step;
+    const float* blr = p.blr + T.off / 4;
+
+    // element (j, i) of this lane: m = 16 mt + 2 i + hi, n = 16 (t0 + j) + r16
+    float y[kTPW][8], xp[kTPW][8], an[kTPW][8], hv[kTPW][8], ws[kTPW][8];
+    #pragma unroll
+    for (int j = 0; j < kTPW; ++j)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int m = mt * 16 + 2 * i + hi, n = (t0 + j) * 16 + r16;
+            const bool in = active && t0 + j < t1 && m < M && n < N;
+            const int o = T.off + m * N + n;
+            y[j][i] = in ? p.y[o] : 0.0f;
+            xp[j][i] = y[j][i];
+            an[j][i] = in ? p.anch[o] : 0.0f;
+            hv[j][i] = (HR && in) ? p.hav[o] : -1e30f;
+            ws[j][i] = epi_ws(m, n, M, N, p.logw);
+        }
+    auto put_rows = [&](const float (&v)[kTPW][8]) {
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j)
+            if (t0 + j < t1)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) Ra[(mt * 16 + 2 * i + hi) * SA + (t0 + j) * 16 + r16] = (half_t)v[j][i];
+    };
+    auto put_cols = [&](const f8 (&a)[kTPW]) {
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j)
+            if (t0 + j < t1)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) Bt[((t0 + j) * 16 + r16) * SB + mt * 16 + 2 * i + hi] = (half_t)a[j][i];
+    };
+    // acc = (own rows of Ra) * B fragments, K = N
+    auto prod_rows = [&](const half_t* fB, f8 (&a)[kTPW]) {
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j) a[j] = splat(0.0f);
+        for (int kt = 0; kt < NT; ++kt) {
+            const h16 av = ld16(Ra + (mt * 16 + r16) * SA + kt * 16);
+            #pragma unroll
+            for (int j = 0; j < kTPW; ++j)
+                if (t0 + j < t1) a[j] = mma(av, ld16(fB + ((size_t)((t0 + j) * NT + kt) * 16 + r16) * 16), a[j]);
+        }
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j) pin(a[j]);
+    };
+    // acc = A fragments (row tile mt) * Bt, K = M
+    auto prod_cols = [&](const half_t* fA, f8 (&a)[kTPW]) {
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j) a[j] = splat(0.0f);
+        for (int kt = 0; kt < MT; ++kt) {
+            const h16 av = ld16(fA + ((size_t)(mt * MT + kt) * 16 + r16) * 16);
+            #pragma unroll
+            for (int j = 0; j < kTPW; ++j)
+                if (t0 + j < t1) a[j] = mma(av, ld16(Bt + ((t0 + j) * 16 + r16) * SB + kt * 16), a[j]);
+        }
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j) pin(a[j]);
+    };
+
+    f8 acc[kTPW];
+    float t = 1.0f;   // FISTA momentum sequence, as the host loop
+    for (int k = 0; k <= p.inner; ++k) {
+        const bool last = k == p.inner;   // last pass: the pixels of the final iterate (z = xp) only
+        if (last)
+            #pragma unroll
+            for (int j = 0; j < kTPW; ++j)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) y[j][i] = xp[j][i];
+        if (active) put_rows(y);
+        __syncthreads();
+        if (active) { prod_rows(fCc, acc); put_cols(acc); }
+        __syncthreads();
+        if (active) prod_cols(fCrT, acc);   // pixels
+        if (last) break;
+        if (active) {
+            #pragma unroll
+            for (int j = 0; j < kTPW; ++j) {
+                if (t0 + j >= t1) continue;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    // the pixel's 2x2 block: column neighbour in lane ^ 1, row neighbour in lane ^ 16
+                    const float px = acc[j][i], pc = dpp_xor<1>(px);
+                    const float pr = __shfl_xor(px, 16, 32), prc = __shfl_xor(pc, 16, 32);
+                    const bool co = r16 & 1;
+                    const float e0 = hi ? pr : px, e1 = hi ? prc : pc, o0 = hi ? px : pr, o1 = hi ? pc : prc;
+                    const int m = mt * 16 + 2 * i + hi, n = (t0 + j) * 16 + r16;
+                    float v = 0.0f;
+                    if (m < M && n < N) {
+                        v = epi_resid(co ? e1 : e0, co ? e0 : e1, co ? o1 : o0, co ? o0 : o1, blr[(m / 2) * (N / 2) + n / 2]);
+                        if (HR) v = epi_anchor(v, px, hv[j][i], p.hw);
+                    }
+                    Ra[m * SA + n] = (half_t)v;
+                }
+            }
+        }
+        __syncthreads();
+        if (active) { prod_rows(fCcT, acc); put_cols(acc); }
+        __syncthreads();
+        const float t_new = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t * t)), mom = (t - 1.0f) / t_new;
+        t = t_new;
+        if (active) {
+            prod_cols(fCr, acc);   // gradient DCT
+            #pragma unroll
+            for (int j = 0; j < kTPW; ++j)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int m = mt * 16 + 2 * i + hi, n = (t0 + j) * 16 + r16;
+                    if (t0 + j < t1 && m < M && n < N)
+                        epi_step(acc[j][i], y[j][i], xp[j][i], an[j][i], p.aw, step, lam, ws[j][i], mom);
+                }
+        }
+    }
+    if (active)
+        #pragma unroll
+        for (int j = 0; j < kTPW; ++j)
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int m = mt * 16 + 2 * i + hi, n = (t0 + j) * 16 + r16;
+                if (t0 + j < t1 && m < M && n < N) pix_out[T.off + m * N + n] = acc[j][i];
+            }
 }
 
 }  // namespace

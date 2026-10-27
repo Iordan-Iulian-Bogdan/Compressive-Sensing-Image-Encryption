@@ -141,7 +141,7 @@ for %%T in (%TEST_UNITS%) do (
 set "SYSLIBS=bcrypt.lib libomp.lib user32.lib gdi32.lib kernel32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib shell32.lib winspool.lib comdlg32.lib onnxruntime.lib delayimp.lib"
 
 echo [link] ImgReconstruct_backend.exe
-link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:%CV490_ROOT%\build\x64\vc16\lib /LIBPATH:%ORT_DML%\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_dict.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\onnx_denoise.obj" "%OBJ%\superres.obj" "%OBJ%\gap_tv.obj" "%OBJ%\admm_l1tv.obj" "%OBJ%\pnp_nlm.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" "%OBJ%\gpu_decrypt.obj" "%OBJ%\gpu_admm_broker.obj" "%OBJ%\gpu_avir_tables.obj" "%OBJ%\gpu_tiles.obj" "%OBJ%\gpu_admm.obj" "%OBJ%\gpu_sr.obj" "%OBJ%\gpu_composite.obj" "%OBJ%\png_fast.obj" "%AOCL_COMP%\lib\static\aocl_compression.lib" opencv_world490.lib amdhip64.lib %SYSLIBS%
+link /OUT:"%OUT%\ImgReconstruct_backend.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll /LIBPATH:%CV490_ROOT%\build\x64\vc16\lib /LIBPATH:%ORT_DML%\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "%OBJ%\main.obj" "%OBJ%\CS_encryption.obj" "%OBJ%\crypto_utils.obj" "%OBJ%\cs_dict.obj" "%OBJ%\cs_wavelet.obj" "%OBJ%\helper_functions.obj" "%OBJ%\onnx_denoise.obj" "%OBJ%\superres.obj" "%OBJ%\gap_tv.obj" "%OBJ%\admm_l1tv.obj" "%OBJ%\pnp_nlm.obj" "%OBJ%\image_decryption.obj" "%OBJ%\image_encryption.obj" "%OBJ%\image_tiles.obj" "%OBJ%\image_preview.obj" "%OBJ%\photo_upscaler.obj" "%OBJ%\cs_gpu.obj" "%OBJ%\gpu_decrypt.obj" "%OBJ%\gpu_admm_broker.obj" "%OBJ%\gpu_avir_tables.obj" "%OBJ%\gpu_tiles.obj" "%OBJ%\gpu_admm.obj" "%OBJ%\gpu_sr.obj" "%OBJ%\gpu_swin.obj" "%OBJ%\gpu_composite.obj" "%OBJ%\png_fast.obj" "%AOCL_COMP%\lib\static\aocl_compression.lib" opencv_world490.lib amdhip64.lib %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking exe & exit /b 1 )
 if "%~1"=="main" goto :finish
 
@@ -168,6 +168,8 @@ if errorlevel 1 ( endlocal & exit /b 1 )
 call "C:\Program Files\AMD\ROCm\7.2\bin\hipcc.bat" --offload-arch=gfx1100 -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS -fms-runtime-lib=dll -I "%ROOT%ImgReconstruct_backend" -c "%ROOT%ImgReconstruct_backend\gpu_admm.hip" -o "%OBJ%\gpu_admm.obj"
 if errorlevel 1 ( endlocal & exit /b 1 )
 call "C:\Program Files\AMD\ROCm\7.2\bin\hipcc.bat" --offload-arch=gfx1100 -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS -fms-runtime-lib=dll -I "%ROOT%ImgReconstruct_backend" -c "%ROOT%ImgReconstruct_backend\gpu_sr.hip" -o "%OBJ%\gpu_sr.obj"
+if errorlevel 1 ( endlocal & exit /b 1 )
+call "C:\Program Files\AMD\ROCm\7.2\bin\hipcc.bat" --offload-arch=gfx1100 -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS -fms-runtime-lib=dll -I "%ROOT%ImgReconstruct_backend" -c "%ROOT%ImgReconstruct_backend\gpu_swin.hip" -o "%OBJ%\gpu_swin.obj"
 if errorlevel 1 ( endlocal & exit /b 1 )
 call "C:\Program Files\AMD\ROCm\7.2\bin\hipcc.bat" --offload-arch=gfx1100 -std=c++17 -O2 -D_CRT_SECURE_NO_WARNINGS -fms-runtime-lib=dll -ffp-contract=off -I "%ROOT%ImgReconstruct_backend" -c "%ROOT%ImgReconstruct_backend\gpu_composite.hip" -o "%OBJ%\gpu_composite.obj"
 endlocal & exit /b %errorlevel%

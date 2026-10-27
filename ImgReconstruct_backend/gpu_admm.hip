@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -506,6 +507,22 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         }
         HIP_TRY(hipMemcpy(dTVA.p, tva.data(), (size_t)nt * sizeof(float), hipMemcpyHostToDevice));
     }
+    // Fixed-step rounds run as one k_fista_w launch (fp16 WMMA products) when a tile's operands
+    // fit in LDS; CS_GPU_ADMM_WMMA=0 keeps the fp32 k_gemm2 loop.
+    static const bool wmma_on = [] { const char* e = std::getenv("CS_GPU_ADMM_WMMA"); return !(e && e[0] == '0'); }();
+    const int mp = pad16(L.max_rows), np = pad16(L.max_cols);
+    const size_t w_lds = fista_w_lds(mp, np);
+    const bool fista_w = wmma_on && !prm.bt && prm.inner > 0 && 2 * kWPR * mp <= kFistaThreads && np <= 128 &&
+        w_lds <= 65536;
+    DevBuf<gpu_wmma::half_t> dfrag;
+    if (fista_w) {
+        std::vector<std::uint16_t> hf;
+        std::map<int, int> fo;
+        for (const auto& kv : L.table_off) fo[kv.first] = (int)pack_gemm_frags(hf, L.table.data() + kv.second, kv.first);
+        for (TileDev& d : L.td) { d.pad[0] = fo[d.rows]; d.pad[1] = fo[d.cols]; }
+        if (!dfrag.alloc(hf.size())) return false;
+        HIP_TRY(hipMemcpy(dfrag.p, hf.data(), hf.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice));
+    }
     HIP_TRY(hipMemcpy(dtd.p, L.td.data(), (size_t)nt * sizeof(TileDev), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dq.p, qoff.data(), (size_t)nt * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dtab.p, L.table.data(), L.table.size() * sizeof(float), hipMemcpyHostToDevice));
@@ -585,7 +602,18 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         // Fused fixed-step loop (k_gemm2): inverse pass B + residual + forward pass A, then forward
         // pass B + step + the next inverse pass A; the last step feeds z, so TMP ends as IDCT pass A
         // of the final iterate. Bit-identical to the four-launch loop below.
-        const bool fused = !bt && prm.inner > 0 && L.max_cols <= kFN;
+        const bool fused = !bt && prm.inner > 0 && L.max_cols <= kFN && !fista_w;
+        if (fista_w) {
+            // the whole loop per tile on the WMMA units, ending in PIX = IDCT(z)
+            FistaW fp{};
+            fp.y = dY.p; fp.anch = dANCH.p; fp.blr = dBLR.p; fp.hav = use_hr ? dHAV.p : nullptr; fp.lam = dLAM.p;
+            fp.hrt = use_hr ? dHRT.p : nullptr; fp.hw = prm.hr_weight; fp.aw = rho_k; fp.step = step; fp.step_hr = step_hr;
+            fp.logw = logw; fp.inner = prm.inner;
+            if (use_hr)
+                TIMED("k_fista_w", k_fista_w<true><<<dim3((unsigned)nt), dim3((unsigned)(2 * kWPR * mp)), w_lds>>>(dtd.p, dfrag.p, fp, dPIX.p));
+            else
+                TIMED("k_fista_w", k_fista_w<false><<<dim3((unsigned)nt), dim3((unsigned)(2 * kWPR * mp)), w_lds>>>(dtd.p, dfrag.p, fp, dPIX.p));
+        }
         if (fused) {
             const dim3 fgrid((unsigned)((L.max_rows + kFM - 1) / kFM), (unsigned)nt), fblk(kFThreads);
             TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dY.p, dTMP.p, nbn, none));
@@ -602,7 +630,7 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
                 t = t_new;
             }
         }
-        for (int k = 0; !bt && !fused && k < prm.inner; ++k) {
+        for (int k = 0; !bt && !fused && !fista_w && k < prm.inner; ++k) {
             // PIX = IDCT(y); SC = residual of the 2x2 average at the samples (fused epilogue)
             TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dY.p, dTMP.p, nbn, none));
             Epi er{}; er.blr = dBLR.p;
@@ -618,9 +646,10 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
             t = t_new;
         }
         // px = IDCT(x); v = px + u -> 8-bit; z = NLM(v); u += px - z
-        if (!fused)
+        if (!fused && !fista_w)
             TIMED("gemm_inv_a", k_gemm<OP_DATA, OP_TAB, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, bt ? dZC.p : dXP.p, dTMP.p, nbn, none));
-        TIMED("gemm_inv_b", k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none));
+        if (!fista_w)
+            TIMED("gemm_inv_b", k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none));
         TIMED("k_quant", k_quant<<<pgrid, blk>>>(dtd.p, dq.p, dPIX.p, dU.p, dQ.p));
         TIMED("k_nlm", launch_nlm(nt, L.max_rows, L.max_cols, hmax, dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
         TIMED("k_dual", k_dual<<<grid, blk>>>(dtd.p, dPIX.p, dDN.p, dU.p, Zp));
