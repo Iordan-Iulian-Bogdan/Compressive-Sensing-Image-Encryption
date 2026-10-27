@@ -495,3 +495,31 @@ per WGP (56 KB LDS); with WMMA at ~25% of peak, it is latency bound.
 
 The decode is no longer bit-identical to the fp32 build (fp16 products in FISTA); the difference is ~0.1
 level on average.
+
+## 11. Intrinsics vs standard forms, and rocWMMA
+
+Each candidate swap was compiled to device assembly (`--cuda-device-only -S`) and compared per kernel with
+the baseline, then timed (median of 5 decodes per setting) with the decode PNGs compared byte for byte.
+
+| Intrinsic | Standard form | Result |
+| --- | --- | --- |
+| `__float2int_rn(x)` | `(int)rintf(x)` | identical machine code: swapped |
+| `__fmaf_rn(a, b, c)` | `fmaf(a, b, c)` | identical: swapped (still a guaranteed fused FMA, which the bit-exact dither needs) |
+| `wave_sync()` (wavefront fences + `__builtin_amdgcn_wave_barrier`) | `__syncwarp()` | identical (HIP defines it as those calls): swapped |
+| `__builtin_amdgcn_rsqf(x)` | `rsqrtf(x)` | adds a denormal guard (compare, select, scale): network +1-2%, kept |
+| `__builtin_amdgcn_rcpf(x)` | `__fdividef(1.0f, x)` | compiles to the IEEE division sequence: kept |
+| `__builtin_amdgcn_alignbyte(hi, lo, sh)` | 64-bit shift / `__funnelshift_r(lo, hi, 8 * sh)` | extra shifts in the NLM inner loop: `k_nlm` +8% / +2%, kept |
+| `ld16` (two 8-wide loads + shuffle) | `memcpy` into the 16-wide vector | changes how the WMMA loops unroll: network warm start 1,070 -> 1,280 ms, `k_fista_w` 185 -> 211 ms, kept |
+
+Decodes after the kept swaps: 2,325 / 1,266 / 1,385 / 803 ms (prior, prior `--fast`, no prior, no prior
+`--fast`) against 2,302 / 1,241 / 1,364 / 801 ms before, run-to-run noise on identical machine code; all
+four PNGs byte-identical.
+
+rocWMMA 2.2 (ROCm 7.2) builds and runs on gfx1100 with this toolchain. A 16 x 16 x 16 test agrees with the
+builtin to float rounding, and `load_matrix_sync(..., col_major, 16)` reads the packed weight tiles as they
+are. Porting `k_stem` (accumulators stored to LDS, bias + LayerNorm per pixel from LDS) gave the same output
+(max diff 3e-6) but 5-10% more time (15.4-16.7 -> 17.2-17.5 ms per 3969 tiles), so it was reverted. The
+other kernels fit rocWMMA less well: `k_conv`'s 16-pixel A tiles span two halo rows (no single leading
+dimension), and `k_layer` / `k_fista_w` read accumulators by lane in every epilogue (LayerNorm, softmax,
+the 2x2 exchange, register-resident FISTA state), which rocWMMA keeps opaque. The port stays open
+(`TODO.md`).

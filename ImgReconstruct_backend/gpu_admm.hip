@@ -55,7 +55,7 @@ __global__ void k_quant(const TileDev* td, const int* qoff, const float* PIX, co
     if (p >= PW * PH) return;
     const int sy = reflect101(p / PW - kBorder, T.rows), sx = reflect101(p % PW - kBorder, T.cols);
     const int o = T.off + sy * T.cols + sx;
-    int q = __float2int_rn((PIX[o] + U[o]) * 255.0f);
+    int q = (int)rintf((PIX[o] + U[o]) * 255.0f);
     q = q < 0 ? 0 : (q > 255 ? 255 : q);
     Q[qoff[blockIdx.y] + p] = (std::uint8_t)q;
 }
@@ -73,7 +73,7 @@ __global__ void k_pad_u8(const TileDev* td, const int* qoff, const std::uint8_t*
 // NLM weight of a quantized distance index (ssd >> 6), as OpenCV's fixed-point table.
 __device__ inline int nlm_weight(int idx, float h2) {
     const float dist = (float)idx * kAlmostMul;
-    const int w = __float2int_rn((float)kFixedMult * expf(-dist / h2));
+    const int w = (int)rintf((float)kFixedMult * expf(-dist / h2));
     return w < 38 ? 0 : w;   // weight < 0.001 * fixed-point multiplier (37.4) is dropped
 }
 
@@ -102,6 +102,7 @@ size_t nlm_lds_bytes(int lut_cap, int max_cols) {
 __device__ inline void nlm_fetch8(const std::uint32_t* w, int p, std::uint32_t& lo, std::uint32_t& hi) {
     const int i = p >> 2, sh = p & 3;
     const std::uint32_t w0 = w[i], w1 = w[i + 1], w2 = w[i + 2];
+    // (byte-granular funnel shift; __funnelshift_r(w0, w1, 8 * sh) needs an extra shift per call: k_nlm +2%)
     lo = __builtin_amdgcn_alignbyte(w1, w0, sh);
     hi = __builtin_amdgcn_alignbyte(w2, w1, sh);
 }

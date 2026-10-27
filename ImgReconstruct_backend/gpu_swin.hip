@@ -78,6 +78,9 @@ __device__ inline float max16(float v) {
     v = fmaxf(v, dpp_xor<1>(v)); v = fmaxf(v, dpp_xor<2>(v)); v = fmaxf(v, dpp_xor<4>(v)); v = fmaxf(v, dpp_xor<8>(v));
     return v;
 }
+// The bare hardware reciprocal / reciprocal square root (__builtin_amdgcn_rcpf / rsqf): the
+// standard forms are slower here (__fdividef(1, x) and 1 / x compile to the IEEE division
+// sequence, rsqrtf adds a denormal guard; network +1-2%).
 // GELU, tanh form written as x * sigmoid(2u) (within 5e-4 of the erf form; the result is
 // rounded to fp16 for the next product anyway).
 __device__ inline float gelu(float x) {
@@ -179,13 +182,6 @@ __device__ inline void layer_norm60(float* v, const float* w, const float* b) {
 // Shift-mask region (0, 1, 2) of a coordinate in the shifted frame of an n-wide axis.
 __device__ inline int region(int v, int n) { return v < n - kWin ? 0 : (v < n - kWin / 2 ? 1 : 2); }
 
-// Visibility of a wave's own LDS writes to its other lanes (no workgroup barrier needed).
-__device__ inline void wave_sync() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-}
-
 // One Swin layer on one window (blockIdx.x = window, blockIdx.y = image): reads the tokens from
 // IN, writes them to OUT (may be IN: a window touches only its own pixels). Wave w owns tokens
 // 16w..16w+15. (Splitting the heads into groups to cut LDS and raise occupancy measured slower:
@@ -226,7 +222,7 @@ __global__ void __launch_bounds__(kThreads) k_layer(const Img* im, const float* 
             XP[row * kXS + c] = (half_t)x[t][i];
         }
     }
-    wave_sync();
+    __syncwarp();   // a wave's own LDS writes, visible to its other lanes
     h16 a[4];
     #pragma unroll
     for (int kt = 0; kt < 4; ++kt) a[kt] = ld16(XP + arow * kXS + kt * 16);
@@ -294,14 +290,14 @@ __global__ void __launch_bounds__(kThreads) k_layer(const Img* im, const float* 
             #pragma unroll
             for (int jt = 0; jt < 4; ++jt) P[(2 * i + hi) * kXS + jt * 16 + r16] = (half_t)(s[jt][i] * inv);
         }
-        wave_sync();
+        __syncwarp();
         f8 cx = splat(0.0f);
         #pragma unroll
         for (int kt = 0; kt < 4; ++kt) cx = mma(ld16(P + r16 * kXS + kt * 16), ld16(Vt + (h * 16 + r16) * kVS + kt * 16), cx);
         pin(cx);
         #pragma unroll
         for (int i = 0; i < 8; ++i) Qs[(h * kTok + 16 * w + 2 * i + hi) * 16 + r16] = (half_t)cx[i];
-        wave_sync();
+        __syncwarp();
         const h16 ac = ld16(Qs + (h * kTok + arow) * 16);
         #pragma unroll
         for (int t = 0; t < 4; ++t) o[t] = mma(ac, ldw(L.o, kHeads, t, h, r16), o[t]);
@@ -334,7 +330,7 @@ __global__ void __launch_bounds__(kThreads) k_layer(const Img* im, const float* 
             for (int i = 0; i < 8; ++i)
                 HID[(2 * i + hi) * kHS + (nt + u) * 16 + r16] = (half_t)gelu(c[u][i]);
     }
-    wave_sync();
+    __syncwarp();
     #pragma unroll
     for (int t = 0; t < 4; ++t) o[t] = splat(L.f2b[t * 16 + r16]);
     #pragma unroll
@@ -439,7 +435,7 @@ __global__ void __launch_bounds__(kThreads) k_conv(const Img* im, const float* I
         if constexpr (MODE == 2) {
             if (r16 < 12) {
                 const int c = r16 / 4, ii = (r16 / 2) % 2, jj = r16 % 2;
-                int v = __float2int_rn((acc[0][i] + mean[c]) * 255.0f);
+                int v = (int)rintf((acc[0][i] + mean[c]) * 255.0f);
                 v = v < 0 ? 0 : (v > 255 ? 255 : v);
                 HR[3 * (I.hr + (long long)(2 * y + ii) * (2 * I.C) + 2 * x + jj) + (2 - c)] = (std::uint8_t)v;
             }

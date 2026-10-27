@@ -5,7 +5,9 @@
 #include "gpu_swin.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <utility>
@@ -162,16 +164,16 @@ __global__ void k_dither_wave(const SrDev* sd, float* F, std::uint8_t* HR8) {
         if (i < H2 && j >= 0 && j < W2) {
             // fused like k_dither, where the carry's multiply and add sit in one iteration
             float L = line[j] + d[j];
-            if (j > 0) L = __fmaf_rn(left, 0.364842f, L);
+            if (j > 0) L = fmaf(left, 0.364842f, L);
             const float z0 = avir_round(L);
             const float noise = L - z0;
             const float v = fminf(fmaxf(z0, 0.f), 255.f);
             out[3 * j] = (std::uint8_t)(int)v;
             left = noise;
             if (dn) {
-                dn[j - 1] = __fmaf_rn(noise, 0.207305f, dn[j - 1]);
-                dn[j] = __fmaf_rn(noise, 0.364842f, dn[j]);
-                if (j < W2 - 1) dn[j + 1] = __fmaf_rn(noise, 0.063011f, dn[j + 1]);
+                dn[j - 1] = fmaf(noise, 0.207305f, dn[j - 1]);
+                dn[j] = fmaf(noise, 0.364842f, dn[j]);
+                if (j < W2 - 1) dn[j + 1] = fmaf(noise, 0.063011f, dn[j + 1]);
             }
         }
         __syncthreads();
@@ -200,7 +202,7 @@ __global__ void k_finish(const SrDev* sd, const float* Z, const std::uint8_t* CR
     const int i = blockIdx.x * kThreads + threadIdx.x;
     if (i >= 4 * T.R * T.C) return;
     const int o = T.hr_off + i;
-    const int y = sat8(__float2int_rn(Z[o] * 255.0f));
+    const int y = sat8((int)rintf(Z[o] * 255.0f));
     const int cr = (int)CR[o] - 128, cb = (int)CB[o] - 128;
     std::uint8_t* q = OUT + 3 * (size_t)o;
     q[0] = (std::uint8_t)sat8(y + ((cb * 29049 + (1 << 13)) >> 14));
@@ -208,10 +210,28 @@ __global__ void k_finish(const SrDev* sd, const float* Z, const std::uint8_t* CR
     q[2] = (std::uint8_t)sat8(y + ((cr * 22987 + (1 << 13)) >> 14));
 }
 
+// CS_GPU_PROF=1: one [gpu-sr phases] line per run() (host layout + copies, upload, warm start, ADMM, finish + download).
+struct SrProf {
+    bool on = [] { const char* e = std::getenv("CS_GPU_PROF"); return e && e[0] == '1'; }();
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    double ms[5] = {};
+    void mark(int k) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        ms[k] += std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+    ~SrProf() {
+        if (on) std::fprintf(stderr, "[gpu-sr phases] host layout + copies %.1f ms, upload %.1f, warm start (AVIR, YCrCb) %.1f, "
+            "ADMM call %.1f, finish + download %.1f\n", ms[0], ms[1], ms[2], ms[3], ms[4]);
+    }
+};
+
 }  // namespace
 
 bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior) {
     if (tiles.empty()) return true;
+    SrProf sr_prof;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
     const int nt = (int)tiles.size();
@@ -253,6 +273,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
             hlr.begin() + (size_t)3 * sd[(size_t)t].lr_off);
     });
     const int dstride = 2 * max_c + 2;
+    sr_prof.mark(0);
 
     DevBuf<SrDev> dsd; DevBuf<float> dtab, dTMP, dF, dD, dZ, dH; DevBuf<std::uint8_t> dLR, dHR8, dCR, dCB, dOUT;
     if (!dsd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dTMP.alloc(swin_prior ? 0 : (size_t)6 * lr_total) ||
@@ -265,6 +286,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     HIP_TRY(hipMemcpy(dsd.p, sd.data(), (size_t)nt * sizeof(SrDev), hipMemcpyHostToDevice));
     if (!table.empty()) HIP_TRY(hipMemcpy(dtab.p, table.data(), table.size() * sizeof(float), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dLR.p, hlr.data(), hlr.size(), hipMemcpyHostToDevice));
+    sr_prof.mark(1);
 
     const dim3 blk(kThreads);
     // NLM strength per tile (needed on the host for the ADMM problems)
@@ -290,7 +312,8 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     k_bgr2ycc<<<hgrid, blk>>>(dsd.p, dHR8.p, dZ.p, dCR.p, dCB.p);
     HIP_TRY(hipGetLastError());
     std::vector<float> hh((size_t)nt);
-    HIP_TRY(hipMemcpy(hh.data(), dH.p, (size_t)nt * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_TRY(hipMemcpy(hh.data(), dH.p, (size_t)nt * sizeof(float), hipMemcpyDeviceToHost));   // syncs the warm start
+    sr_prof.mark(2);
 
     // optional verification outputs
     bool dbg = false;
@@ -316,6 +339,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
         probs[(size_t)t] = q;
     }
     if (!gpu_admm::solve_pnp_admm_device(probs, prm, dZ.p)) return false;
+    sr_prof.mark(3);
 
     // 8-bit luma + AVIR chroma -> BGR, back to the host tiles
     k_finish<<<hgrid, blk>>>(dsd.p, dZ.p, dCR.p, dCB.p, dOUT.p);
@@ -325,6 +349,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     for (int t = 0; t < nt && packed; ++t) packed = tiles[(size_t)t].hr_bgr == tiles[0].hr_bgr + (size_t)3 * sd[(size_t)t].hr_off;
     if (packed) {
         HIP_TRY(hipMemcpy(tiles[0].hr_bgr, dOUT.p, (size_t)3 * hr_total, hipMemcpyDeviceToHost));
+        sr_prof.mark(4);
         return true;
     }
     std::vector<std::uint8_t> hout((size_t)3 * hr_total);

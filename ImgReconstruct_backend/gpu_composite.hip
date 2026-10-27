@@ -53,7 +53,7 @@ __global__ void k_blend(const BlendTile* T, const int* tile_of, int ncol_grid, c
         }
     }
     const float sw = fmaxf(ws, 1e-6f);
-    auto cvt = [](float v) { int r = __float2int_rn(v); return (std::uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r)); };
+    auto cvt = [](float v) { int r = (int)rintf(v); return (std::uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r)); };
     std::uint8_t* o = OUT + 3 * (long long)p;
     o[0] = cvt(__fdiv_rn(a0, sw));
     o[1] = cvt(__fdiv_rn(a1, sw));
