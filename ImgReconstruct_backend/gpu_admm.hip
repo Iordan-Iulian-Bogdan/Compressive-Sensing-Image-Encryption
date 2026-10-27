@@ -514,6 +514,9 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     const size_t w_lds = fista_w_lds(mp, np);
     const bool fista_w = wmma_on && !prm.bt && prm.inner > 0 && 2 * kWPR * mp <= kFistaThreads && np <= 128 &&
         w_lds <= 65536;
+    if (const char* pr = std::getenv("CS_GPU_PROF"); pr && pr[0] == '1')
+        std::fprintf(stderr, "[gpu-prof] gpu_admm: tiles up to %d x %d (padded %d x %d), WMMA FISTA %s\n",
+            L.max_rows, L.max_cols, mp, np, fista_w ? "on" : "off (k_gemm2 loop)");
     DevBuf<gpu_wmma::half_t> dfrag;
     if (fista_w) {
         std::vector<std::uint16_t> hf;

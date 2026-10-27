@@ -15,6 +15,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/photo.hpp>
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -1627,7 +1628,17 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             }
             jobs.push_back(J);
         }
-        if (!gpu_sr::run(jobs, g.second.empty() ? gpu_admm::Params{} : pp[g.second.front()].prm, swin)) {
+        const auto t_grp = std::chrono::steady_clock::now();
+        const bool grp_ok = gpu_sr::run(jobs, g.second.empty() ? gpu_admm::Params{} : pp[g.second.front()].prm, swin);
+        if (const char* pr = std::getenv("CS_GPU_PROF"); pr && pr[0] == '1') {   // one line per ADMM parameter group
+            const gpu_admm::Params& q = pp[g.second.front()].prm;
+            long long px = 0;
+            for (size_t k : g.second) px += (long long)pp[k].lr.rows * pp[k].lr.cols;
+            std::fprintf(stderr, "[gpu-sr group] %zu tiles, %lld LR px, admm %d inner %d lip %.3f hr_w %g bt %d: %.1f ms\n",
+                g.second.size(), px, q.admm, q.inner, q.lip, q.hr_weight, q.bt,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_grp).count());
+        }
+        if (!grp_ok) {
             for (size_t k : g.second) tiles[k].hr_out->release();
             continue;
         }
