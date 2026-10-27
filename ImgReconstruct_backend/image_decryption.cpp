@@ -2367,6 +2367,7 @@ int decrypt_image::decrypt_image_tiled(
     }
     cv::Size org_size = dimgs.get_org_size();
     prof.mark("kdf");
+    int reg_tiles = num_tiles;   // grid size the regularization law sees (the square auto count)
 
     if (CSencryption::params == AUTO_PARAM) {
         // iterations: the solver saturates by ~5 steps across compression
@@ -2389,6 +2390,24 @@ int decrypt_image::decrypt_image_tiled(
             num_tiles = (std::min)(96, (std::max)(1, (edge + 16) / 32));
         }
         overlap = photo_up.auto_overlap;
+        reg_tiles = num_tiles;
+        // Per-axis counts: at least the square count above, and enough that no tile
+        // exceeds the batched SR stage's fast WMMA FISTA kernel (gpu_gemm.hpp k_fista_w:
+        // 96 x 128 output px, i.e. 48 x 64 solve px, rows x cols), so every image shape
+        // and size keeps that path. Images that already fit keep the square grid as is.
+        if (!full_res) {
+            constexpr int kMaxRows = 48, kMaxCols = 64;
+            const auto need = [&](int len, int max_len) {
+                const int step = max_len - overlap;   // stride between tile origins
+                return step > 0 ? (len - overlap + step - 1) / step : num_tiles;
+            };
+            dimgs.grid_rows = (std::max)(num_tiles, need(org_size.height, kMaxRows));
+            dimgs.grid_cols = (std::max)(num_tiles, need(org_size.width, kMaxCols));
+            if (dimgs.grid_rows != num_tiles || dimgs.grid_cols != num_tiles)
+                std::cout << "tile grid: " << dimgs.grid_rows << " x " << dimgs.grid_cols
+                          << " (tiles kept within the SR kernel's 96 x 128 px)" << std::endl;
+            num_tiles = (std::max)(dimgs.grid_rows, dimgs.grid_cols);
+        }
         nun_threads = omp_get_max_threads();
     }
 
@@ -2406,7 +2425,7 @@ int decrypt_image::decrypt_image_tiled(
     {
         const float ar = dimgs.get_compression_ratio();
         const int sm = dimgs.get_sampling_mode();
-        const int nt = num_tiles > 0 ? num_tiles : 1;
+        const int nt = reg_tiles > 0 ? reg_tiles : 1;
         if (CSencryption::params == AUTO_PARAM) {
             const float dc = cs_auto_reg_coefficient(sm, ar, nt);
             if (dc >= 0.0f) {
@@ -2497,7 +2516,8 @@ int decrypt_image::decrypt_image_tiled(
         // every tile overlaps with other neighboring tiles  
         // this is done because otherwise the titles wont quite match with eachother along the borders
         // this becomes more obvious as the numer of samples goes down, aka more compression 
-        splitImageIntoTiles(sm, encrypted_image_tiles, coordinates, num_tiles, overlap);
+        splitImageIntoTiles(sm, encrypted_image_tiles, coordinates, dimgs.grid_rows > 0 ? dimgs.grid_rows : num_tiles,
+            dimgs.grid_cols > 0 ? dimgs.grid_cols : num_tiles, overlap);
         // Single-stage segment solve: one resolved param set per tile by
         // majority vote; every tile is solved exactly once with its own
         // class's settings (no per-class passes, no cross-canvas blending).
@@ -3017,8 +3037,10 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // agree)
         std::vector<std::vector<cv::Mat>> y_tiles, y_mask_tiles;
         std::vector<std::vector<TileCoord>> coordinates, mask_coords;
-        splitImageIntoTiles(Y0, y_tiles, coordinates, num_tiles, overlap);
-        splitImageIntoTiles(Ym0, y_mask_tiles, mask_coords, num_tiles, overlap);
+        const int grid_r = dimgs.grid_rows > 0 ? dimgs.grid_rows : num_tiles;
+        const int grid_c = dimgs.grid_cols > 0 ? dimgs.grid_cols : num_tiles;
+        splitImageIntoTiles(Y0, y_tiles, coordinates, grid_r, grid_c, overlap);
+        splitImageIntoTiles(Ym0, y_mask_tiles, mask_coords, grid_r, grid_c, overlap);
         std::vector<std::vector<CsSegClassParams>> seg_tiles;
         std::vector<int> seg_winners;
         if (segpass) {

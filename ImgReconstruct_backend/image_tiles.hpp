@@ -21,6 +21,12 @@ void splitImageIntoTiles(
     const cv::Mat& input_image, std::vector<std::vector<cv::Mat>>& tiles,
     std::vector<std::vector<TileCoord>>& coordinates, int tile_count,
     int overlap);
+// Rectangular grid of tile_rows x tile_cols overlapping tiles, stored in a square
+// max(tile_rows, tile_cols) container whose remaining cells stay empty.
+void splitImageIntoTiles(
+    const cv::Mat& input_image, std::vector<std::vector<cv::Mat>>& tiles,
+    std::vector<std::vector<TileCoord>>& coordinates, int tile_rows,
+    int tile_cols, int overlap);
 cv::Mat blendTilesWithImage(
     const std::vector<std::vector<cv::Mat>>& tiles,
     const std::vector<std::vector<TileCoord>>& coordinates,

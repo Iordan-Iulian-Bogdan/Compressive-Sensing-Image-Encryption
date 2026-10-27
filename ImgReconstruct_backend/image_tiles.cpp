@@ -107,19 +107,28 @@ void splitImageIntoTiles(
     const cv::Mat& input_image, std::vector<std::vector<cv::Mat>>& tiles,
     std::vector<std::vector<TileCoord>>& coordinates, int tile_count,
     int overlap) {
-  if (input_image.empty() || tile_count <= 0 || overlap < 0) return;
+  splitImageIntoTiles(input_image, tiles, coordinates, tile_count, tile_count, overlap);
+}
+
+void splitImageIntoTiles(
+    const cv::Mat& input_image, std::vector<std::vector<cv::Mat>>& tiles,
+    std::vector<std::vector<TileCoord>>& coordinates, int tile_rows,
+    int tile_cols, int overlap) {
+  if (input_image.empty() || tile_rows <= 0 || tile_cols <= 0 || overlap < 0) return;
 
   const int height = input_image.rows;
   const int width = input_image.cols;
   const int tile_width = static_cast<int>(std::ceil(
-      (width + (tile_count - 1) * static_cast<double>(overlap)) / tile_count));
+      (width + (tile_cols - 1) * static_cast<double>(overlap)) / tile_cols));
   const int tile_height = static_cast<int>(std::ceil(
-      (height + (tile_count - 1) * static_cast<double>(overlap)) / tile_count));
+      (height + (tile_rows - 1) * static_cast<double>(overlap)) / tile_rows));
 
-  tiles.resize(tile_count, std::vector<cv::Mat>(tile_count));
-  coordinates.resize(tile_count, std::vector<TileCoord>(tile_count));
-  for (int i = 0; i < tile_count; ++i) {
-    for (int j = 0; j < tile_count; ++j) {
+  // square container (the decoder indexes tiles[i][j] over max x max); cells past the grid stay empty
+  const int n = (std::max)(tile_rows, tile_cols);
+  tiles.resize(n, std::vector<cv::Mat>(n));
+  coordinates.resize(n, std::vector<TileCoord>(n));
+  for (int i = 0; i < tile_rows; ++i) {
+    for (int j = 0; j < tile_cols; ++j) {
       int x = j * (tile_width - overlap);
       int y = i * (tile_height - overlap);
       if (x + tile_width > width && width >= tile_width) x = width - tile_width;

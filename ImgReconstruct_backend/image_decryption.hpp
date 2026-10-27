@@ -197,6 +197,8 @@ public:
     bool has_hr_detail() const { return hr_detail; }
     const std::vector<CsHrSample>& get_hr_samples() const { return hr_samples; }
     size_t get_hr_applied() const { return hr_applied; }
+    // Rectangular tile grid chosen in auto mode (rows x cols, 0 = the square num_tiles grid).
+    int grid_rows = 0, grid_cols = 0;
     int get_sample_bits() const { return sample_bits; }
     int get_sample_bits_chroma() const { return sample_bits_chroma; }
     int get_lod_full_threshold() const { return lod_full_threshold; }
