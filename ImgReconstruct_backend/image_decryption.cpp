@@ -13,6 +13,7 @@
 #include "gpu_decrypt.hpp"
 #include "gpu_admm_broker.hpp"
 #include "gpu_composite.h"
+#include "gpu_calm.h"
 #include "gpu_tiles.h"
 #endif
 #ifdef CS_FAST_PNG
@@ -1981,6 +1982,7 @@ static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
     const cv::Mat& sample_mask, const std::vector<int>& classes, int overlap) {
     if (overlap <= 0 || img.empty() || seg_ids.empty() || sample_mask.empty()) return;
     if (std::getenv("CS_NO_SEG_CALM")) return;   // diagnostic: skip the calm pass
+    bool low_known = false, lowf[256] = { false };   // low-density classes, from the label-grid pass below
     // Low-density test of every class in one pass (area and sampled count per class) before any
     // full-frame work: most decodes have no low-density class and return here. On the label grid
     // when ids and mask share it and the image is 1x or 2x of it (nearest 2x replicates each label
@@ -2009,9 +2011,25 @@ static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
         }
         bool any_low = false;
         for (int c : classes)
-            if (c >= 0 && c < 256 && area[c] > 0 && (double)sampled[c] / (double)area[c] < 0.4) any_low = true;
+            if (c >= 0 && c < 256 && area[c] > 0 && (double)sampled[c] / (double)area[c] < 0.4) any_low = lowf[c] = true;
         if (!any_low) return;
+        low_known = true;
+#ifdef CS_GPU_TILES
+        // GPU pass (gpu_calm.hip): only the gated pixels, on the label grid's frontiers; CS_GPU_CALM=0 keeps the CPU pass.
+        const char* gc = std::getenv("CS_GPU_CALM");
+        if (!(gc && gc[0] == '0') && img.type() == CV_8UC3 && img.isContinuous() && seg_ids.isContinuous()) {
+            double ms = 0.0;
+            if (gpu_calm::run(img.data, img.rows, img.cols, seg_ids.data, seg_ids.rows, seg_ids.cols, lowf, overlap, &ms)) {
+                int touched = 0;
+                for (int c : classes) touched += (c >= 0 && c < 256 && lowf[c]) ? 1 : 0;
+                std::cout << "seg-solve: boundary calm on " << touched << " low-density classes (GPU)" << std::endl;
+                if (cs_profile_enabled()) std::fprintf(stderr, "profile[calm]: gpu=%.1f\n", ms);
+                return;
+            }
+        }
+#endif
     }
+    PhaseLog cprof;   // CS_PROFILE=1: one profile[calm] line
     cv::Mat ids = seg_ids, mask = sample_mask;
     if (ids.size() != img.size())
         cv::resize(ids, ids, img.size(), 0, 0, cv::INTER_NEAREST);
@@ -2026,6 +2044,7 @@ static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
     cv::Mat band_union = cv::Mat::zeros(ids.size(), CV_8U);
     std::vector<cv::Mat> low_masks;
     for (int c : classes) {
+        if (low_known && (c < 0 || c >= 256 || !lowf[c])) continue;   // dense: the label-grid pass already decided
         cv::Mat in_c = (ids == c);
         const int area = cv::countNonZero(in_c);
         if (area == 0) continue;
@@ -2038,15 +2057,22 @@ static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
         cv::bitwise_or(band_union, dist <= (float)overlap, band_union);
     }
     if (low_masks.empty()) return;
+    cprof.mark("bands");
     cv::Mat work_zone;
     cv::dilate(band_union, work_zone, cv::getStructuringElement(cv::MORPH_ELLIPSE, {33, 33}));
     cv::Rect crop = cv::boundingRect(work_zone);
     crop &= cv::Rect(0, 0, img.cols, img.rows);
     if (crop.empty()) return;
+    cprof.mark("zone");
+    if (cprof.on)
+        std::fprintf(stderr, "calm: %zu low classes, crop %dx%d = %.0f%% of %dx%d, work zone %.1f%% of the frame\n",
+            low_masks.size(), crop.width, crop.height, 100.0 * crop.area() / ((double)img.cols * img.rows), img.cols, img.rows,
+            100.0 * cv::countNonZero(work_zone) / ((double)img.cols * img.rows));
     cv::Mat f;
     img.convertTo(f, CV_32FC3);
     cv::Mat smooth_crop;
     cv::bilateralFilter(f(crop), smooth_crop, 13, 18.0, 4.0, cv::BORDER_REPLICATE);
+    cprof.mark("bilateral");
     int touched = 0;
     for (const cv::Mat& in_full : low_masks) {
         cv::Mat in_c = in_full(crop);
@@ -2063,10 +2089,13 @@ static void cs_seg_calm_boundaries(cv::Mat& img, const cv::Mat& seg_ids,
         f_crop += correction;
         touched++;
     }
+    cprof.mark("apply");
     if (touched > 0) {
         f.convertTo(img, CV_8UC3);
         std::cout << "seg-solve: boundary calm on " << touched << " low-density classes" << std::endl;
     }
+    cprof.mark("store");
+    cprof.dump("calm");
 }
 
 static void cs_seg_apply_override(CsSegClassParams& p, const CsSegOverride& o) {
@@ -2996,6 +3025,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         std::cerr << "Warning: joint solver needs one shared RGB grid; ycc split sampling degrades to per-channel FISTA" << std::endl;
     }
 
+    PhaseLog prof;   // CS_PROFILE=1: one profile[ycc] line
     try {
         const cv::Size org_size = dimgs.get_org_size();
         const std::string windowName = output_path.empty() ? "decrypted tiles" : output_path;
@@ -3003,6 +3033,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // per-plane sampled images + 0/1 masks (luma full-res, chroma coarse)
         cv::Mat Y, Ym, Cr, Crm, Cb, Cbm;
         dimgs.get_sampled_ycc420(Y, Ym, Cr, Crm, Cb, Cbm);
+        prof.mark("unpack");
         // Diagnostic (opt-in): CS_DUMP_YMASK=<png> writes the luma sample mask (LR grid, 0 / 255).
         if (const char* dump = std::getenv("CS_DUMP_YMASK"); dump && !Ym.empty()) {
             cv::Mat m = Ym, out;
@@ -3200,6 +3231,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             }
         }
         if (prep_error) std::rethrow_exception(prep_error);
+        prof.mark("prep");
 
         cv::Mat reconstructed = cv::Mat::zeros(rows, cols, CV_8UC3);
 
@@ -3332,6 +3364,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             Pc.iterations, Pc.coef, seg_tile_params,
             segpass ? segpass->per_class_chroma : true, ycc_sr_prior_ctx);
         if (ycc_pipe) ycc_upipe.finish();
+        prof.mark("solve");
 
         if (use_preview) {
             preview.Stop();
@@ -3375,6 +3408,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // the zero-overlap alpha blend; see the BGR solve_grid), on the GPU
         // when available; then resize to 2x the recorded size
         reconstructed = cs_composite_tiles(decrypted, coordinates, false, cv::Size(), ycc_blend_feather);
+        prof.mark("composite");
 
         const cv::Size final_size(full_res ? org_size.width : org_size.width * 2,
             full_res ? org_size.height : org_size.height * 2);
@@ -3544,11 +3578,13 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             }
         }
 
+        prof.mark("calm");
         // Final polish (--final-polish): same whole-image up-then-down pass
         // as the BGR pipeline (misses keep the image untouched).
         if (!photo_up.final_polish.empty() && !reconstructed.empty())
             cs_final_polish_updown(reconstructed, photo_up);
 
+        prof.mark("polish");
         // Restoration CNN (--enhance): on the decode it was trained on, i.e.
         // before the post-hoc anchor replacement, which then still pins the
         // anchor pixels exactly. A load/run failure leaves the image as is.
@@ -3558,6 +3594,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             cs_enhance_net(reconstructed, photo_up.enhance_model, ein);
         }
 
+        prof.mark("enhance");
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
         // the final composite (see the BGR pipeline above).
         if (!dimgs.hr_samples.empty() && !reconstructed.empty() && !std::getenv("CS_HR_NO_POSTHOC")) {
@@ -3573,6 +3610,8 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
 #else
         cv::imwrite(output_path, reconstructed);
 #endif
+        prof.mark("anchors+write");
+        prof.dump("ycc");
     }
     catch (const std::exception& e) {
         std::cerr << "Error: ycc decryption pipeline failed: " << e.what() << std::endl;
