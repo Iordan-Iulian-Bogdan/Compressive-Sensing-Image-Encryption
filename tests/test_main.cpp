@@ -54,6 +54,7 @@ int main(int argc, char* argv[]) {
     test_edge_scores();
     test_hr_detail();
     test_hr_sr_anchors();
+    test_enh_planes();
     test_hf_weighted_spread();
     test_adaptive_tile_grid_limit();
     test_sample_bits();

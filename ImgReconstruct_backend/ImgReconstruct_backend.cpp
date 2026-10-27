@@ -117,6 +117,11 @@ void print_usage(const char* exe) {
   "                        realcugan (configured by the --waifu2x-*/--realcugan-*\n"
   "                        options above); unset by default; a backend\n"
   "                        failure skips the pass with a warning\n"
+  "  --enhance <model>     run a restoration CNN (ONNX, see\n"
+  "                        x64/GpuBuild/export_enh_onnx.py) on the finished\n"
+  "                        decode, with the decoder's sample density, anchor\n"
+  "                        and LR-sample maps as extra inputs; ycc containers\n"
+  "                        only; DirectML with CS_GPU_ONNX=1 in the GPU build\n"
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off). Default: auto (0.01 for\n"
@@ -731,6 +736,8 @@ int main(int argc, char* argv[])
             return set_choice(v, photo_up.final_polish, {"waifu2x", "waifu2x-ncnn", "realcugan"},
                               "Error: --final-polish must be waifu2x, waifu2x-ncnn or realcugan");
         }},
+        // post-pipeline restoration CNN (decrypt-side only, ycc containers)
+        {"--enhance", "ONNX model path", false, [&](const char* v) { photo_up.enhance_model = v; return true; }},
         // weights below do NOT force manual mode: AUTO still derives
         // coef/iterations from the container ratio; only the weight changes
         {"--tv", "floating point", false, [&](const char* v) { return set_float(v, tv_lambda, nullptr, nullptr); }},
@@ -1038,6 +1045,10 @@ int main(int argc, char* argv[])
     if (!photo_up.final_polish.empty() && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --final-polish is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.final_polish.clear();
+    }
+    if (!photo_up.enhance_model.empty() && mode != "decrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --enhance is decrypt-side only; ignoring for encrypt" << std::endl;
+        photo_up.enhance_model.clear();
     }
     if (photo_up.sr_init != "avir" && mode != "decrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --sr-init is decrypt-side only; ignoring for encrypt" << std::endl;

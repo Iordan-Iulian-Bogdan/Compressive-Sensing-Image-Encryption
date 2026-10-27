@@ -1,5 +1,6 @@
 // Backend tests: photo roundtrip, photo upscalers, CS/direct super-resolution, HR detail, coupled dict, DnCNN/ONNX denoisers.
 #include "test_common.hpp"
+#include "enh_net.hpp"
 
 // ---------------------------------------------------------------------------
 // 6. photo-based roundtrip (second data point on real image statistics)
@@ -1081,3 +1082,43 @@ void test_hr_sr_anchors() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// --enhance input planes (enh_net.cpp): the decoder-side maps the restoration
+// CNN was trained with (x64/GpuBuild/enh_inputs.py), on a hand-made case.
+// ---------------------------------------------------------------------------
+void test_enh_planes() {
+    const int H = 6, W = 8;
+    const cv::Mat bgr(H, W, CV_8UC3, cv::Scalar(100, 100, 100));   // luma 100 everywhere
+    cv::Mat M = cv::Mat::zeros(H / 2, W / 2, CV_8U), S = cv::Mat::zeros(H / 2, W / 2, CV_8U);
+    M.at<uint8_t>(0, 0) = 1; S.at<uint8_t>(0, 0) = 108;        // residual (108 - 100) / 8 = 1
+    M.at<uint8_t>(1, 2) = 1; S.at<uint8_t>(1, 2) = 96;         // residual -0.5
+    std::vector<CsHrSample> anchors(3);
+    anchors[0].idx = 1 * W + 1; anchors[0].y = 164;            // residual (164 - 100) / 64 = 1
+    anchors[1].idx = 1 * W + 2; anchors[1].y = 255;            // 155 / 64 clipped to 1
+    anchors[2].idx = H * W + 5; anchors[2].y = 7;              // out of range: skipped
+    CsEnhInputs in; in.y_mask = &M; in.y_samp = &S; in.anchors = &anchors;
+    std::vector<cv::Mat> P;
+    cs_enh_planes(bgr, in, 5, P);
+    bool shapes = P.size() == 5;
+    for (const cv::Mat& p : P) shapes = shapes && p.type() == CV_32F && p.rows == H && p.cols == W;
+    check(shapes, "enh-planes: 5 float planes at the image size");
+    if (!shapes) return;
+    const auto at = [&](int k, int r, int c) { return P[(size_t)k].at<float>(r, c); };
+    check(cv::sum(P[1])[0] == 2.0 && at(1, 1, 1) == 1.0f && at(1, 1, 2) == 1.0f, "enh-planes: anchor indicator, out-of-range index skipped");
+    check(std::fabs(at(2, 1, 1) - 1.0f) < 1e-5f && at(2, 1, 2) == 1.0f && at(2, 0, 0) == 0.0f, "enh-planes: anchor residual / 64, clipped");
+    bool blocks = true;
+    for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 2; ++c)
+            blocks = blocks && at(3, r, c) == 1.0f && std::fabs(at(4, r, c) - 1.0f) < 1e-5f &&
+                     at(3, 2 + r, 4 + c) == 1.0f && std::fabs(at(4, 2 + r, 4 + c) + 0.5f) < 1e-5f;
+    check(blocks && cv::sum(P[3])[0] == 8.0 && at(4, 4, 6) == 0.0f, "enh-planes: LR sample mask/residual on 2x2 blocks");
+    double dmin, dmax;
+    cv::minMaxLoc(P[0], &dmin, &dmax);
+    check(dmin >= -0.5 && dmax <= 0.5 && dmax > dmin, "enh-planes: density centred in [-0.5, 0.5]");
+    std::vector<cv::Mat> P3;
+    cs_enh_planes(bgr, in, 3, P3);
+    check(P3.size() == 3 && cv::norm(P3[2], P[2], cv::NORM_INF) == 0.0, "enh-planes: 3-plane variant is the first 3");
+    cv::Mat img = bgr.clone();
+    check(!cs_enhance_net(img, "no_such_model.onnx", in) && cv::norm(img, bgr, cv::NORM_INF) == 0.0,
+          "enhance: missing model leaves the image untouched");
+}

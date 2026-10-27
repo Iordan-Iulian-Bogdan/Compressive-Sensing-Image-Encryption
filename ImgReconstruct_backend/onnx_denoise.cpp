@@ -748,7 +748,9 @@ bool cs_onnx_sr_upscale_bgr(const cv::Mat& src_bgr, cv::Mat& dst_bgr,
 {
     return cs_onnx_sr_tiled(src_bgr, dst_bgr, model_path, scale_out, seg_roi, single_patch);
 }
+bool cs_onnx_api_ok() { return cs_ort_api_available(); }
 #else
+bool cs_onnx_api_ok() { return false; }
 bool cs_dncnn_available(const std::string& model_path) {
     (void)model_path;
     return false;

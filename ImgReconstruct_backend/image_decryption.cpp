@@ -8,6 +8,7 @@
 #include "gap_tv.hpp"
 #include "admm_l1tv.hpp"
 #include "pnp_nlm.hpp"
+#include "enh_net.hpp"
 #ifdef CS_GPU_TILES
 #include "gpu_decrypt.hpp"
 #include "gpu_admm_broker.hpp"
@@ -2934,6 +2935,8 @@ int decrypt_image::decrypt_image_tiled(
             cs_final_polish_updown(reconstructed, photo_up)) {
             prof.mark("polish");
         }
+        if (!photo_up.enhance_model.empty())
+            std::cerr << "Note: --enhance needs a ycc container (its net uses the luma samples); skipped" << std::endl;
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
         // the final composite, applied last so smoothing passes cannot move
         // them. Out-of-range anchors (geometry mismatch) are skipped.
@@ -3523,6 +3526,15 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // as the BGR pipeline (misses keep the image untouched).
         if (!photo_up.final_polish.empty() && !reconstructed.empty())
             cs_final_polish_updown(reconstructed, photo_up);
+
+        // Restoration CNN (--enhance): on the decode it was trained on, i.e.
+        // before the post-hoc anchor replacement, which then still pins the
+        // anchor pixels exactly. A load/run failure leaves the image as is.
+        if (!photo_up.enhance_model.empty() && !reconstructed.empty()) {
+            CsEnhInputs ein;
+            ein.y_mask = &Ym; ein.y_samp = &Y; ein.anchors = &dimgs.hr_samples;
+            cs_enhance_net(reconstructed, photo_up.enhance_model, ein);
+        }
 
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
         // the final composite (see the BGR pipeline above).

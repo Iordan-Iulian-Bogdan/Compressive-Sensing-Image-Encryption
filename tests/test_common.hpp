@@ -84,6 +84,7 @@ void test_onnx_denoisers();
 void test_onsager();
 void test_hr_detail();
 void test_hr_sr_anchors();
+void test_enh_planes();
 void test_edge_scores();
 void test_adaptive_gamma();
 void test_adaptive_cutoff();

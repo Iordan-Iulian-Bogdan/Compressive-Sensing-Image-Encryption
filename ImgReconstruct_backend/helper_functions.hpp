@@ -451,6 +451,10 @@ void cs_dip_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measure
 Thread-safe; loads lazily on first call. */
 bool cs_dncnn_available(const std::string& model_path);
 
+/** @brief true when the loaded onnxruntime.dll provides the API version the build headers expect (a stale DLL
+on PATH would crash on the first Ort::Env). Always false off Windows. */
+bool cs_onnx_api_ok();
+
 /** @brief denoise one BGR 8U image with the DnCNN color model (tiled
 internally so activation memory stays bounded). Input/output [0,255].
 Returns false when the model cannot be loaded or run (caller falls back).

@@ -183,6 +183,11 @@ struct CsPhotoUpscalerOptions {
   // artifact smoother on top of everything else. Any backend failure skips
   // the pass with a warning, leaving the image untouched.
   std::string final_polish;
+  // Restoration CNN (--enhance <model.onnx>, empty = off): same-size U-Net on
+  // the finished ycc decode, fed the decoder-side planes (sample density,
+  // anchors, LR samples) it was trained with; see enh_net.hpp. Runs before
+  // the post-hoc anchor replacement. ycc containers only.
+  std::string enhance_model;
 };
 
 // Effective args for the subprocess: the explicit override when set,
