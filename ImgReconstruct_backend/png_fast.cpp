@@ -28,7 +28,8 @@ bool write_chunk(std::FILE* f, const char* type, const std::uint8_t* data, std::
 
 std::uint32_t chunk_crc(const char* type, const std::uint8_t* data, std::uint32_t n) {
     uLong c = crc32(0L, (const Bytef*)type, 4);
-    return (std::uint32_t)crc32(c, data, n);
+    // crc32(c, NULL, 0) returns zlib's initial value (0), not c: IEND has no data
+    return n ? (std::uint32_t)crc32(c, data, n) : (std::uint32_t)c;
 }
 
 }  // namespace
