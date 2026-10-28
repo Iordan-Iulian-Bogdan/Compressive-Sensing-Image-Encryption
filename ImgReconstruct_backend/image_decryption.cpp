@@ -545,7 +545,8 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     if (cs_is_tcluster(sampling_mode) || cs_is_tmeans(sampling_mode)) {
         chroma_mode = cs_is_ycc422(sampling_mode) ? CS_MODE_YCC422 : CS_MODE_YCC420;
     }
-    if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG)
+    if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG ||
+        sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL)
         chroma_mode = (sampling_mode == CS_MODE_YCC422_SEG) ? CS_MODE_YCC422 : CS_MODE_YCC420;
     // Chroma draws are uniform in every variant (tagged keys); dims and counts follow the base
     // split mode (4:2:0 halves both axes, 4:2:2 halves the width only). They do not depend on the
@@ -556,7 +557,8 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         try { returnYcc420ChromaIndices(rows, cols, m, cs_key, chroma_mode); }
         catch (...) { chroma_error = std::current_exception(); }
     });
-    if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG) {
+    if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG ||
+        sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL) {
         // Seg-luma variant: the sealed body prefix [nclasses][rates][seglen]
         // [label PNG] (v3, CS_SEG_TAG) regenerates the luma draw; chroma stays
         // uniform on the base split geometry (4:2:0 vs 4:2:2).
@@ -698,18 +700,24 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     }
     const uint8_t* body = encrypted_img.data + CS_HEADER_BYTES + body_off;
 
-    // Trailing HR-detail payload (mode 9): CTR-decrypt the exact stored
-    // bytes after the luma/chroma sections into native-luma anchors.
+    // Trailing HR-detail payload (mode 9: 6-byte samples; mode 19: compact
+    // flag map + luma, hr_count = byte length): CTR-decrypt the bytes after
+    // the luma/chroma sections into native-luma anchors.
     if (hr_detail) {
+        const bool compact = (sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL);
         const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
         const size_t pay_off = (size_t)CS_HEADER_BYTES + body_off +
             (size_t)mY_written + (size_t)2 * (size_t)mC;
-        const size_t pay_len = (size_t)hr_count * CS_HRDETAIL_SAMPLE_BYTES;
+        const size_t pay_len = compact ? (size_t)hr_count : (size_t)hr_count * CS_HRDETAIL_SAMPLE_BYTES;
         if (hr_count == 0 || pay_off + pay_len > total_bytes) {
             throw std::runtime_error("hr-detail container: corrupt payload");
         }
-        if (!cs_read_hr_payload(encrypted_img.data + pay_off, pay_len,
-                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples)) {
+        const bool ok = compact
+            ? cs_read_anchor_payload(encrypted_img.data + pay_off, pay_len,
+                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples)
+            : cs_read_hr_payload(encrypted_img.data + pay_off, pay_len,
+                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples);
+        if (!ok) {
             throw std::runtime_error("hr-detail container: corrupt payload");
         }
     }
@@ -2331,7 +2339,8 @@ int decrypt_image::decrypt_image_tiled(
     bool use_onsager,
     size_t* hr_applied_out,
     const std::string& seg_solve_mask,
-    const std::string& seg_params
+    const std::string& seg_params,
+    cv::Mat* decoded_out
 ) {
     PhaseLog prof;
     if (solver != CS_SOLVER_FISTA && solver != CS_SOLVER_FISTA_JOINT && solver != CS_SOLVER_GAPTV &&
@@ -2504,7 +2513,7 @@ int decrypt_image::decrypt_image_tiled(
             iterations, nun_threads, coef, show_preview, tv,
             full_res, solver, fista_iters, reweights, basis, wscale,
             photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager,
-            hr_applied_out, seg_solve_mask, seg_params, coef_auto);
+            hr_applied_out, seg_solve_mask, seg_params, coef_auto, decoded_out);
     }
     if (photo_up.y_dual_tv > 0.0f || photo_up.y_confidence > 0.0f)
         std::cerr << "Note: --y-dual-tv/--y-confidence require a YCC container; ignoring for BGR" << std::endl;
@@ -2996,11 +3005,14 @@ int decrypt_image::decrypt_image_tiled(
             std::cout << "HR-detail: applied " << applied << "/"
                       << dimgs.hr_samples.size() << " anchors" << std::endl;
         }
+        if (decoded_out) *decoded_out = reconstructed;   // in-memory caller (encoder anchor pass)
+        else {
 #ifdef CS_FAST_PNG
         cs_write_image(output_path, reconstructed);   // parallel PNG encode
 #else
         cv::imwrite(output_path, reconstructed);
 #endif
+        }
         prof.mark("write");
     }
     catch (const std::exception& e) {
@@ -3020,7 +3032,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
     bool full_res, int solver,
     int fista_iters, int reweights, int basis, float wscale,
     const CsPhotoUpscalerOptions& photo_up, bool per_tile_coef, bool per_tile_tv, float grain_tv, bool use_onsager, size_t* hr_applied_out,
-    const std::string& seg_solve_mask, const std::string& seg_params, bool coef_auto) {
+    const std::string& seg_solve_mask, const std::string& seg_params, bool coef_auto, cv::Mat* decoded_out) {
     if (solver == CS_SOLVER_FISTA_JOINT) {
         std::cerr << "Warning: joint solver needs one shared RGB grid; ycc split sampling degrades to per-channel FISTA" << std::endl;
     }
@@ -3605,11 +3617,14 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                       << dimgs.hr_samples.size() << " anchors" << std::endl;
         }
 
+        if (decoded_out) *decoded_out = reconstructed;   // in-memory caller (encoder anchor pass)
+        else {
 #ifdef CS_FAST_PNG
         cs_write_image(output_path, reconstructed);   // parallel PNG encode
 #else
         cv::imwrite(output_path, reconstructed);
 #endif
+        }
         prof.mark("anchors+write");
         prof.dump("ycc");
     }

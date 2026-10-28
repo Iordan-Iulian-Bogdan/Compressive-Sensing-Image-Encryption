@@ -1710,6 +1710,154 @@ std::vector<CsHrSample> cs_select_hr_detail(const cv::Mat& native_bgr,
     return out;
 }
 
+cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr) {
+    if (orig_bgr.empty() || orig_bgr.type() != CV_8UC3 ||
+        dec_bgr.size() != orig_bgr.size() || dec_bgr.type() != CV_8UC3)
+        return cv::Mat();
+    constexpr int BS = CS_ANCHOR_BLOCK;
+    const int bh = orig_bgr.rows / BS, bw = orig_bgr.cols / BS;
+    if (bh == 0 || bw == 0) return cv::Mat();
+    // Mean squared error per 16x16 block (all channels), then flag the
+    // worst 5% of blocks: the closed-loop choice that the measured
+    // anchor gains were obtained with.
+    std::vector<float> score((size_t)bh * bw);
+    for (int by = 0; by < bh; ++by) {
+        for (int bx = 0; bx < bw; ++bx) {
+            double s = 0.0;
+            for (int y = by * BS; y < by * BS + BS; ++y) {
+                const cv::Vec3b* o = orig_bgr.ptr<cv::Vec3b>(y);
+                const cv::Vec3b* d = dec_bgr.ptr<cv::Vec3b>(y);
+                for (int x = bx * BS; x < bx * BS + BS; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        const int e = (int)o[x][c] - (int)d[x][c];
+                        s += (double)(e * e);
+                    }
+                }
+            }
+            score[(size_t)by * bw + bx] = (float)(s / (BS * BS * 3));
+        }
+    }
+    std::vector<float> sorted = score;
+    const size_t nflag = (std::max<size_t>)(1, (size_t)std::llround(0.05 * (double)sorted.size()));
+    std::nth_element(sorted.begin(), sorted.begin() + (sorted.size() - nflag), sorted.end());
+    const float thr = sorted[sorted.size() - nflag];
+    cv::Mat flags(bh, bw, CV_8U);
+    for (int by = 0; by < bh; ++by)
+        for (int bx = 0; bx < bw; ++bx)
+            flags.at<uint8_t>(by, bx) = score[(size_t)by * bw + bx] >= thr ? 1 : 0;
+    return flags;
+}
+
+// K distinct pixels of the flagged blocks: candidates in block-raster then
+// pixel-raster order, partial Fisher-Yates from the HR-tagged key (same
+// generator convention as the sample draws), returned ascending.
+static std::vector<uint32_t> cs_anchor_positions(const cv::Mat& flags, int width,
+    int count, const uint8_t key[32]) {
+    constexpr int BS = CS_ANCHOR_BLOCK;
+    std::vector<uint32_t> pool;
+    for (int by = 0; by < flags.rows; ++by) {
+        for (int bx = 0; bx < flags.cols; ++bx) {
+            if (!flags.at<uint8_t>(by, bx)) continue;
+            for (int y = by * BS; y < by * BS + BS; ++y)
+                for (int x = bx * BS; x < bx * BS + BS; ++x)
+                    pool.push_back((uint32_t)y * (uint32_t)width + (uint32_t)x);
+        }
+    }
+    const int n = (int)pool.size();
+    if (count > n) count = n;
+    uint8_t k2[32];
+    std::memcpy(k2, key, 32);
+    k2[0] ^= CS_HRDETAIL_TAG;
+    std::seed_seq seq(k2, k2 + 32);
+    cs_wipe(k2, sizeof(k2));
+    std::mt19937 generator(seq);
+    for (int k = 0; k < count; ++k) {
+        std::uniform_int_distribution<int> pick(k, n - 1);
+        std::swap(pool[(size_t)k], pool[(size_t)pick(generator)]);
+    }
+    pool.resize((size_t)count);
+    std::sort(pool.begin(), pool.end());
+    return pool;
+}
+
+static void put_u32(std::vector<uint8_t>& v, uint32_t x) {
+    for (int b = 0; b < 4; ++b) v.push_back((uint8_t)((x >> (b * 8)) & 0xff));
+}
+static uint32_t get_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+std::vector<uint8_t> cs_anchor_payload(const CsAnchorPlan& plan, const uint8_t key[32]) {
+    const int W = plan.luma.cols, H = plan.luma.rows;
+    if (plan.count <= 0 || plan.luma.type() != CV_8U || plan.flags.type() != CV_8U ||
+        plan.flags.rows != H / CS_ANCHOR_BLOCK || plan.flags.cols != W / CS_ANCHOR_BLOCK) {
+        throw std::runtime_error("anchor payload: inconsistent plan (internal error)");
+    }
+    const std::vector<uint32_t> pos = cs_anchor_positions(plan.flags, W,
+        (std::min)(plan.count, CS_HRDETAIL_MAX_SAMPLES), key);
+    if (pos.empty()) throw std::runtime_error("anchor payload: no flagged blocks");
+    std::vector<uint8_t> png;
+    if (!cv::imencode(".png", plan.flags, png, { cv::IMWRITE_PNG_COMPRESSION, 9 }) || png.empty()) {
+        throw std::runtime_error("anchor payload: flag map encode failed");
+    }
+    std::vector<uint8_t> out;
+    out.reserve(18 + png.size() + pos.size());
+    put_u32(out, (uint32_t)pos.size());
+    out.push_back((uint8_t)(CS_ANCHOR_BLOCK & 0xff));
+    out.push_back((uint8_t)(CS_ANCHOR_BLOCK >> 8));
+    put_u32(out, (uint32_t)W);
+    put_u32(out, (uint32_t)H);
+    put_u32(out, (uint32_t)png.size());
+    out.insert(out.end(), png.begin(), png.end());
+    for (uint32_t p : pos) out.push_back(plan.luma.data[(size_t)(p / W) * plan.luma.step + p % W]);
+    return out;
+}
+
+bool cs_anchor_payload_xor(uint8_t* p, size_t len, const uint8_t key[32], const uint8_t iv[16]) {
+    uint8_t counter[CS_IV_BYTES];
+    std::memcpy(counter, iv, CS_IV_BYTES);
+    counter[0] ^= CS_HRDETAIL_TAG;
+    const bool ok = cs_aes256_ctr_xor(p, len, key, counter);
+    cs_wipe(counter, sizeof(counter));
+    return ok;
+}
+
+bool cs_read_anchor_payload(const uint8_t* src, size_t len, const uint8_t key[32],
+    const uint8_t iv[16], std::vector<CsHrSample>& out) {
+    out.clear();
+    if (len < 18) return false;
+    std::vector<uint8_t> buf(src, src + len);
+    if (!cs_anchor_payload_xor(buf.data(), buf.size(), key, iv)) return false;
+    const uint32_t K = get_u32(buf.data());
+    const int bs = buf[4] | (buf[5] << 8);
+    const uint32_t W = get_u32(buf.data() + 6), H = get_u32(buf.data() + 10);
+    const uint32_t L = get_u32(buf.data() + 14);
+    bool ok = bs == CS_ANCHOR_BLOCK && K > 0 && K <= CS_HRDETAIL_MAX_SAMPLES &&
+        W >= (uint32_t)bs && H >= (uint32_t)bs && W <= (1u << 16) && H <= (1u << 16) &&
+        (size_t)18 + L + K == len;
+    cv::Mat flags;
+    if (ok) {
+        flags = cv::imdecode(std::vector<uint8_t>(buf.begin() + 18, buf.begin() + 18 + L),
+            cv::IMREAD_GRAYSCALE);
+        ok = !flags.empty() && flags.rows == (int)(H / bs) && flags.cols == (int)(W / bs);
+    }
+    std::vector<uint32_t> pos;
+    if (ok) {
+        pos = cs_anchor_positions(flags, (int)W, (int)K, key);
+        ok = pos.size() == K;
+    }
+    if (ok) {
+        const uint8_t* y = buf.data() + 18 + L;
+        out.resize(K);
+        for (uint32_t k = 0; k < K; ++k) {
+            out[k].idx = pos[k];
+            out[k].y = y[k];
+        }
+    }
+    cs_wipe(buf.data(), buf.size());
+    return ok;
+}
+
 void cs_write_hr_payload(uint8_t* dst, const std::vector<CsHrSample>& s,
     const uint8_t key[32], const uint8_t iv[16]) {
     uint8_t* p = dst;

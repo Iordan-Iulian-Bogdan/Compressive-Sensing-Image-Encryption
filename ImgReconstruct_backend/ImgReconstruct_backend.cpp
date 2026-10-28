@@ -5,6 +5,9 @@
 #include "cs_dict.hpp"
 #include "quality_utils.hpp"
 #include "cs_gpu.h"
+#ifdef CS_GPU_TILES
+#include "gpu_tiles.h"
+#endif
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -17,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <thread>
 
 namespace {
 
@@ -324,6 +328,12 @@ void print_usage(const char* exe) {
   "                        within-class edge refinement: the sharpest half of\n"
   "                        each class's 16x16 blocks is sampled at 1.5x the\n"
   "                        class rate, the rest lowered (same class budget).\n"
+  "  --seg-tile            encrypt/roundtrip only, needs --seg-auto <= 32 (the\n"
+  "                        seg8-tile container with --seg-auto 8): each class\n"
+  "                        split into 8 detail levels of 64x64 tiles (mean\n"
+  "                        |Laplacian|), rates weighted per level inside the\n"
+  "                        class budget; --ratio is the luma sample budget\n"
+  "                        (same as --adaptive at that ratio, not a rate scale).\n"
   "  --seg-blend <w>       encrypt/roundtrip only, needs --seg-mask or --seg-auto: sample\n"
   "                        a <w>-pixel band (0..128, 0 = off) on each\n"
   "                        side of every segment frontier with a smooth local\n"
@@ -655,6 +665,7 @@ int main(int argc, char* argv[])
     std::string sampling = "points";
     int seg_auto = 0;
     bool seg_edge = false;
+    bool seg_tile = false;
     std::string seg_solve;
     std::string seg_params;
     bool show_mask = false;
@@ -839,6 +850,7 @@ int main(int argc, char* argv[])
             return set_int_strict(v, seg_auto, "Error: --seg-auto needs an integer in [2, 255]");
         }},
         {"--seg-edge", nullptr, false, [&](const char*) { seg_edge = true; return true; }},
+        {"--seg-tile", nullptr, false, [&](const char*) { seg_tile = true; return true; }},
         {"--sampling", "points|tcluster|tmeans", false, [&](const char* v) {
             return set_choice(v, sampling, {"points", "tcluster", "tmeans"},
                               "Error: --sampling must be points|tcluster|tmeans");
@@ -984,6 +996,14 @@ int main(int argc, char* argv[])
     if (seg_edge && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --seg-edge is encrypt-side only; ignoring for decrypt" << std::endl;
         seg_edge = false;
+    }
+    if (seg_tile && mode != "encrypt" && mode != "roundtrip") {
+        std::cerr << "Warning: --seg-tile is encrypt-side only; ignoring for decrypt" << std::endl;
+        seg_tile = false;
+    }
+    if (seg_tile && (seg_auto == 0 || seg_auto > 32 || seg_edge)) {
+        std::cerr << "Error: --seg-tile needs --seg-auto <= 32 and no --seg-edge" << std::endl;
+        return 64;
     }
     if (seg_blend != 0 && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --seg-blend is encrypt-side only; ignoring for decrypt" << std::endl;
@@ -1139,11 +1159,35 @@ int main(int argc, char* argv[])
         const bool use_adaptive = adaptive || two_pass || spectral || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
         if (mode == "encrypt") {
+            // --seg-auto + --ycc420 + --hr-detail: the encoder decodes its own
+            // anchor-free container (cs-sr + PnP-ADMM, tv 0, --fast settings: it
+            // only ranks 16x16 blocks by error) in memory, then anchors the worst
+            // blocks. Flag map and anchor luma ride in the container.
+            std::function<cv::Mat(const cv::Mat&)> anchor_decode;
+            if (hr_detail > 0 && seg_auto > 0 && ycc420) {
+                anchor_decode = [&](const cv::Mat& container) {
+                    CsPhotoUpscalerOptions pass_up = photo_up;
+                    pass_up.backend = "cs-sr";
+                    pass_up.sr_pnp = "admm";
+                    pass_up.auto_overlap = 8;
+                    cv::Mat dec;
+                    if (decrypt_image::decrypt_image_tiled(container, "", password,
+                            tiles, 8, iterations, threads, coef, false, 0.0f, full_res, solver, 12, reweights, basis, wscale, pass_up,
+                            per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params, &dec) != 0)
+                        dec.release();
+                    return dec;
+                };
+            }
+#ifdef CS_GPU_TILES
+            // HIP start-up overlaps the image read and segmentation (the in-memory decode has no warm-up of its own)
+            struct JoinedThread { std::thread t; ~JoinedThread() { if (t.joinable()) t.join(); } } gpu_warm;
+            if (anchor_decode && std::getenv("CS_GPU_TILES")) gpu_warm.t = std::thread(gpu_tiles::warmup);
+#endif
             rc = encrypt_image::encrypt_image_tiled(input,
 output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
 full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
-seg_rates, seg_blend, sampling, seg_auto, seg_edge);
+seg_rates, seg_blend, sampling, seg_auto, seg_edge, seg_tile, anchor_decode);
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,
@@ -1155,7 +1199,7 @@ seg_rates, seg_blend, sampling, seg_auto, seg_edge);
 output, password, ratio, periodic_tile_arg, &encrypted, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
 full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
-seg_rates, seg_blend, sampling, seg_auto, seg_edge);
+seg_rates, seg_blend, sampling, seg_auto, seg_edge, seg_tile);
             if (rc == 0) {
                     rc = decrypt_image::decrypt_image_tiled(encrypted, output, password,
                         tiles, overlap, iterations, threads, coef, show_preview, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params);

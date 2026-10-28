@@ -533,6 +533,37 @@ count <= 0 or the image is degenerate. Deterministic. */
 std::vector<CsHrSample> cs_select_hr_detail(const cv::Mat& native_bgr,
     int out_w, int out_h, int count);
 
+/** Compact HR anchors (mode 19): which 16x16 blocks hold anchors, how many,
+and the exact luma they come from. Positions are not stored; both sides draw
+them from (flags, key). */
+#define CS_ANCHOR_BLOCK 16
+struct CsAnchorPlan {
+    cv::Mat flags;   // CV_8U, (H / 16) x (W / 16), 1 = block holds anchors
+    cv::Mat luma;    // CV_8U Y plane at decrypt output geometry (W x H)
+    int count = 0;   // anchors to draw (clamped to the flagged pixel count)
+};
+
+/** @brief closed-loop block choice: flag the worst 5% of 16x16 blocks by
+MSE between the original and a decode of its container (same size, BGR
+8-bit). Empty Mat when the inputs mismatch or are smaller than a block. */
+cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr);
+
+/** @brief plaintext mode-19 anchor payload:
+[u32 K][u16 block][u32 W][u32 H][u32 L][L bytes PNG of flags][K luma bytes].
+Positions are K distinct pixels of the flagged blocks drawn from the key
+(cs_anchor_positions), so only the luma bytes grow with K. Throws on an
+empty plan or a PNG encode failure. */
+std::vector<uint8_t> cs_anchor_payload(const CsAnchorPlan& plan, const uint8_t key[32]);
+
+/** @brief AES-256-CTR over a mode-19 payload in place (counter = container
+IV with counter[0] ^= CS_HRDETAIL_TAG, as the 6-byte payload). Symmetric. */
+bool cs_anchor_payload_xor(uint8_t* p, size_t len, const uint8_t key[32], const uint8_t iv[16]);
+
+/** @brief CTR-decrypt + parse a mode-19 payload and regenerate the anchors
+(idx in W x H output geometry, ascending). False on any inconsistency. */
+bool cs_read_anchor_payload(const uint8_t* src, size_t len, const uint8_t key[32],
+    const uint8_t iv[16], std::vector<CsHrSample>& out);
+
 /** @brief serialize + AES-256-CTR encrypt an HR-detail payload into dst
 (CS_HRDETAIL_SAMPLE_BYTES per sample; dst must hold at least that many
 bytes). Counter is the container IV with counter[0] ^= CS_HRDETAIL_TAG.

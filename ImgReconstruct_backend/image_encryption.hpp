@@ -2,11 +2,16 @@
 #define ENCRYPT_IMAGE_HPP
 
 #include "CS_encryption.hpp"
+#include <functional>
 
 class encrypt_image : CSencryption
 {
 private:
     float bm = 0.0f;
+    // keep_key: the next container reuses the previous salt + key (no PBKDF2, same
+    // sample draws), so a re-encrypt with anchors ships the samples they were chosen on.
+    bool keep_key = false;
+    uint8_t kept_salt[CS_SALT_BYTES] = {};
 
     // Container build steps shared by the encrypt_* modes (see .cpp).
     void derive_container_key(const std::string& password, uint8_t salt[CS_SALT_BYTES]);
@@ -21,6 +26,9 @@ public:
     encrypt_image(const cv::Mat& input, bool global_image);
 
     encrypt_image() {}
+
+    // Next encrypt_* reuses this object's salt + key (see keep_key).
+    void reuse_key() { keep_key = true; }
 
     void get_mat(cv::Mat& dest);
 
@@ -69,10 +77,12 @@ public:
         int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG,
         int seg_blend = 0);
     // Same as encrypt_ycc420_segmask but from resolved ids (--seg-auto).
+    // A non-null anchor plan switches to CS_MODE_YCC420_SEG_HRDETAIL (4:2:0 only)
+    // with the compact anchor payload (see cs_anchor_payload).
     void encrypt_ycc420_segmask_ids(const float& pixel_p, const std::string& password,
         const cv::Mat& ids, const std::vector<float>& rates,
         int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG,
-        int seg_blend = 0);
+        int seg_blend = 0, const CsAnchorPlan* anchors = nullptr);
 
     // YCC 4:2:0 with LOD-driven luma (mode 3 + shipped lod bytes; mode 7 for
     // 4:2:2): same LOD sources as encrypt_adaptive (Laplacian / two-pass /
@@ -138,11 +148,14 @@ public:
     @param adaptive_strength : LOD bias aggression in [0,1] (0=uniform, 0.5=default, 1=max)
     @param show_mask : if true, after encrypt render and show the sampling mask
     @param full_res : if true, keep native input resolution (skip default 2x downscale)
+    @param anchor_decode : --seg-auto + --ycc420 + --hr-detail closed loop: decodes a container
+        to BGR at decrypt output geometry; the anchors go to the worst blocks of that decode
     */
     static int encrypt_image_tiled(const std::string& input_path, const std::string& output_path, const std::string& password, float compression_ratio = 1.0f, int tile_size = 0, cv::Mat* encrypted_out = nullptr, bool adaptive = false, int lod_min = 32, float adaptive_strength = 0.5f, bool show_mask = false, bool full_res = false, bool two_pass = false, float pilot_ratio = 0.05f, const std::string& regions_json = "", float region_blend = 0.5f, float lod_smooth = 0.0f, bool ycc420 = false, bool hf_focus = false,     int sample_bits = 8, int chroma_bits = 0, int lod_full = 0, bool ycc422 = false, bool spectral = false, const
 std::string& sample_split = "", int hr_detail = 0, float lod_gamma = 1.0f, int lod_cutoff = 0, const std::string&
 seg_mask = "", const std::string& seg_rates = "", int seg_blend = 0,
-    const std::string& sampling = "points", int seg_auto = 0, bool seg_edge = false);
+    const std::string& sampling = "points", int seg_auto = 0, bool seg_edge = false,
+    bool seg_tile = false, const std::function<cv::Mat(const cv::Mat&)>& anchor_decode = {});
 
 private:
     // Two-pass coarse-to-fine LOD: uniform pilot sampling of the source at
@@ -180,6 +193,17 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
 // the excess to the cap (CS_SEG_EDGE_NOSPILL=1 disables, for comparison).
 void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
     float pixel_p = 0.0f, int block = 16, float top = 0.5f, float boost = 1.5f);
+// Per-tile detail split (--seg-tile, the "seg8-tile" container): every 64x64
+// tile gets an LOD from its mean |Laplacian| (min-max to [32, 255]) bucketed
+// into 8 levels; label = class * 8 + level, rate = class rate x level weight
+// (256 + bin-centre LOD) / the class's pixel-weighted mean weight, so each
+// class keeps its share. The rates are then scaled by one factor s, solved so
+// that sum(pixels x min(1, s x rate)) = pixel_p x all pixels: the same luma
+// budget as a uniform/adaptive container at that ratio (busy labels cap at 1
+// and the rest keep rising). ids (K -> 8K labels) and rates (final, encrypt
+// at ratio 1) in place. Needs classes <= 32.
+void cs_seg_tile_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
+    float pixel_p);
 
 // Per-tile spectral LOD bytes (free function for test access): each tile's
 // gray DCT energy whitened by the image's global radial spectral decay,

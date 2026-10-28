@@ -110,6 +110,7 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_YCC420_TMEANS 16       // T-means luma + uniform 4:2:0 chroma (pad = 16)
 #define CS_MODE_YCC422_TCLUSTER 17     // T-cluster luma + uniform 4:2:2 chroma (pad = 17)
 #define CS_MODE_YCC422_TMEANS 18       // T-means luma + uniform 4:2:2 chroma (pad = 18)
+#define CS_MODE_YCC420_SEG_HRDETAIL 19 // seg-mask luma + uniform 4:2:0 chroma + HR-detail payload (pad = 19)
 
 // Per-segment sampling (mode 10) body prefix, little-endian, right after the
 // 32-pixel header:
@@ -192,7 +193,7 @@ bool cs_blob_seal_xor(uint8_t* data, size_t len, const uint8_t key[32],
 
 #define CS_HRDETAIL_TAG 0x48
 #define CS_HRDETAIL_SAMPLE_BYTES 6
-#define CS_HRDETAIL_MAX_SAMPLES 65536
+#define CS_HRDETAIL_MAX_SAMPLES (1 << 20)
 // Offset from CS_OFF_PAD for the modes 4/9 HR sample count (u32 LE,
 // 1..CS_HRDETAIL_MAX_SAMPLES). Aliases the HF thumbnail-length field,
 // which is unused outside modes 5/6/8. MAC-covered via the stamped marker.
@@ -327,7 +328,7 @@ inline int cs_chroma_count(int mode, int m_luma, int rows, int cols) {
 inline bool cs_is_ycc(int mode) {
     return mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 ||
         mode == CS_MODE_YCC420_HF || mode == CS_MODE_YCC422_HF ||
-        mode == CS_MODE_YCC420_HRDETAIL ||
+        mode == CS_MODE_YCC420_HRDETAIL || mode == CS_MODE_YCC420_SEG_HRDETAIL ||
         mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG ||
         mode == CS_MODE_YCC420_TCLUSTER || mode == CS_MODE_YCC420_TMEANS ||
         mode == CS_MODE_YCC422_TCLUSTER || mode == CS_MODE_YCC422_TMEANS;
@@ -344,7 +345,8 @@ inline bool cs_is_tmeans(int mode) {
 }
 // Any container carrying a trailing HR-detail payload.
 inline bool cs_is_hrdetail(int mode) {
-    return mode == CS_MODE_BGR_HRDETAIL || mode == CS_MODE_YCC420_HRDETAIL;
+    return mode == CS_MODE_BGR_HRDETAIL || mode == CS_MODE_YCC420_HRDETAIL ||
+        mode == CS_MODE_YCC420_SEG_HRDETAIL;
 }
 inline bool cs_is_ycc422(int mode) {
     return mode == CS_MODE_YCC422 || mode == CS_MODE_YCC422_HF ||

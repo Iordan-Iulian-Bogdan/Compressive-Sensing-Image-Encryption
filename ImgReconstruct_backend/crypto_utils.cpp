@@ -540,6 +540,23 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
             return false;
         }
     }
+    else if (mode == CS_MODE_YCC420_SEG_HRDETAIL) {
+        // Seg-mask luma + uniform chroma + compact anchor payload. The seg
+        // geometry is read by the sampler; hr_count here is the payload BYTE
+        // length (cs_read_anchor_payload checks it), in the pad bytes after
+        // the mode byte (the seg prefix length occupies CS_OFF_SEGPRE_LEN,
+        // so CS_OFF_HR_COUNT cannot be reused).
+        out.sampling_mode = mode;
+        out.hr_detail = true;
+        out.hr_count = (uint32_t)buf[CS_OFF_PAD + 1] |
+            ((uint32_t)buf[CS_OFF_PAD + 2] << 8) |
+            ((uint32_t)buf[CS_OFF_PAD + 3] << 16) |
+            ((uint32_t)buf[CS_OFF_PAD + 4] << 24);
+        if (out.hr_count == 0) {
+            out.legacy = true;
+            return false;
+        }
+    }
     else if (mode == CS_MODE_YCC420 || mode == CS_MODE_YCC422 || mode == CS_MODE_YCC420_HRDETAIL ||
         mode == CS_MODE_YCC420_SEG || mode == CS_MODE_YCC422_SEG ||
         mode == CS_MODE_YCC420_TCLUSTER || mode == CS_MODE_YCC420_TMEANS ||

@@ -471,12 +471,17 @@ encrypt_image::encrypt_image(const cv::Mat& input, bool global_image) {
 
 // Fresh random salt + PBKDF2-derived key for a new container.
 void encrypt_image::derive_container_key(const std::string& password, uint8_t salt[CS_SALT_BYTES]) {
+    if (keep_key && cs_key_valid) {
+        std::memcpy(salt, kept_salt, CS_SALT_BYTES);
+        return;
+    }
     if (!cs_random_bytes(salt, CS_SALT_BYTES)) {
         throw std::runtime_error("cryptographic RNG unavailable");
     }
     if (!cs_derive_key(password, salt, cs_key)) {
         throw std::runtime_error("key derivation (PBKDF2) failed");
     }
+    std::memcpy(kept_salt, salt, CS_SALT_BYTES);
     cs_key_valid = true;
 }
 
@@ -1647,12 +1652,19 @@ void cs_seg_auto_ids(const cv::Mat& bgr, int classes, int rows, int cols, cv::Ma
         cv::Mat is_c = (remapped == c);
         cv::Mat comp, stats, cent;
         const int ncomp = cv::connectedComponentsWithStats(is_c, comp, stats, cent, 8, CV_32S);
+        // one pass marks every tiny component (a full-map compare per component was O(comps x pixels))
+        std::vector<uint8_t> is_tiny((size_t)ncomp, 0);
         for (int k = 1; k < ncomp; ++k) {
             if (stats.at<int>(k, cv::CC_STAT_AREA) < min_area) {
-                cv::Mat sel = (comp == k);
-                sel.copyTo(tiny, sel);
+                is_tiny[(size_t)k] = 255;
                 tiny_count += stats.at<int>(k, cv::CC_STAT_AREA);
             }
+        }
+        for (int y = 0; y < comp.rows; ++y) {
+            const int32_t* cr = comp.ptr<int32_t>(y);
+            uint8_t* tr = tiny.ptr<uint8_t>(y);
+            for (int x = 0; x < comp.cols; ++x)
+                if (is_tiny[(size_t)cr[x]]) tr[x] = 255;
         }
     }
     cv::Mat clean = remapped.clone();
@@ -1706,25 +1718,33 @@ void cs_seg_auto_ids(const cv::Mat& bgr, int classes, int rows, int cols, cv::Ma
         cv::multiply(guide, guide, I2);
         cv::boxFilter(guide, mI, CV_32F, k);
         cv::boxFilter(I2, mII, CV_32F, k);
+        const cv::Mat den = (mII - mI.mul(mI)) + eps;   // varI + eps: the same for every class
+        // Classes filter independently (in parallel); the argmax then runs in class order
+        // so ties resolve exactly as a sequential loop would.
+        std::vector<cv::Mat> qs((size_t)next_id);
+        cv::parallel_for_(cv::Range(0, next_id), [&](const cv::Range& range) {
+            for (int c = range.start; c < range.end; ++c) {
+                cv::Mat ind = (clean == c);
+                ind.convertTo(ind, CV_32F);
+                cv::Mat up;
+                cv::resize(ind, up, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+                cv::Mat Ip, mp, mIp;
+                cv::multiply(guide, up, Ip);
+                cv::boxFilter(up, mp, CV_32F, k);
+                cv::boxFilter(Ip, mIp, CV_32F, k);
+                cv::Mat covIp = mIp - mI.mul(mp);
+                cv::Mat a = covIp / den;
+                cv::Mat b = mp - a.mul(mI);
+                cv::Mat ma, mb;
+                cv::boxFilter(a, ma, CV_32F, k);
+                cv::boxFilter(b, mb, CV_32F, k);
+                qs[(size_t)c] = ma.mul(guide) + mb;
+            }
+        });
         cv::Mat best(rows, cols, CV_32F, cv::Scalar(-1.0f));
         cv::Mat out(rows, cols, CV_8U, cv::Scalar(0));
         for (int c = 0; c < next_id; ++c) {
-            cv::Mat ind = (clean == c);
-            ind.convertTo(ind, CV_32F);
-            cv::Mat up;
-            cv::resize(ind, up, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
-            cv::Mat Ip, mp, mIp;
-            cv::multiply(guide, up, Ip);
-            cv::boxFilter(up, mp, CV_32F, k);
-            cv::boxFilter(Ip, mIp, CV_32F, k);
-            cv::Mat varI = mII - mI.mul(mI);
-            cv::Mat covIp = mIp - mI.mul(mp);
-            cv::Mat a = covIp / (varI + eps);
-            cv::Mat b = mp - a.mul(mI);
-            cv::Mat ma, mb, q;
-            cv::boxFilter(a, ma, CV_32F, k);
-            cv::boxFilter(b, mb, CV_32F, k);
-            q = ma.mul(guide) + mb;
+            const cv::Mat& q = qs[(size_t)c];
             for (int y = 0; y < rows; ++y) {
                 const float* qr = q.ptr<float>(y);
                 float* br = best.ptr<float>(y);
@@ -1775,6 +1795,84 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
         rates[(size_t)c] = (float)(0.08 + 0.92 * std::pow(f, 0.75));
     }
     return rates;
+}
+
+void cs_seg_tile_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
+    float pixel_p) {
+    constexpr int TILE = 64, LEVELS = 8;
+    if (classes < 1 || classes * LEVELS > 256) {
+        throw std::runtime_error("--seg-tile needs --seg-auto <= 32 classes");
+    }
+    if (bgr.empty() || ids.empty() || bgr.size() != ids.size() || (int)rates.size() < classes) {
+        throw std::runtime_error("--seg-tile: geometry/rates mismatch (internal error)");
+    }
+    const int H = ids.rows, W = ids.cols;
+    // |4-neighbour Laplacian| of the luma, clipped to 127 like the 8-bit
+    // filter of the prototype, then the mean per (edge-clipped) tile.
+    cv::Mat gray, lap;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    const cv::Mat k = (cv::Mat_<float>(3, 3) << 0, 1, 0, 1, -4, 1, 0, 1, 0);
+    cv::filter2D(gray, lap, CV_32F, k, cv::Point(-1, -1), 0.0, cv::BORDER_REPLICATE);
+    const int th = (H + TILE - 1) / TILE, tw = (W + TILE - 1) / TILE;
+    std::vector<float> tl((size_t)th * tw, 0.0f);
+    for (int i = 0; i < th; ++i)
+        for (int j = 0; j < tw; ++j) {
+            const int y1 = (std::min)((i + 1) * TILE, H), x1 = (std::min)((j + 1) * TILE, W);
+            double s = 0.0;
+            for (int y = i * TILE; y < y1; ++y) {
+                const float* l = lap.ptr<float>(y);
+                for (int x = j * TILE; x < x1; ++x) s += (std::min)(std::abs(l[x]), 127.0f);
+            }
+            tl[(size_t)i * tw + j] = (float)(s / ((double)(y1 - i * TILE) * (x1 - j * TILE)));
+        }
+    const auto mm = std::minmax_element(tl.begin(), tl.end());
+    const float lo = *mm.first, span = (std::max)(*mm.second - lo, 1e-6f);
+    std::vector<int> lvl_t(tl.size());
+    for (size_t t = 0; t < tl.size(); ++t) {
+        const float lod = 32.0f + 223.0f * (tl[t] - lo) / span;
+        lvl_t[t] = (std::min)((int)((lod - 32.0f) / 223.0f * LEVELS), LEVELS - 1);
+    }
+    double w_lvl[LEVELS];
+    for (int l = 0; l < LEVELS; ++l) w_lvl[l] = 256.0 + 32.0 + (l + 0.5) * 223.0 / LEVELS;
+    // Relabel, and per class the pixel-weighted mean level weight.
+    std::vector<double> wsum((size_t)classes, 0.0);
+    std::vector<long long> n((size_t)classes * LEVELS, 0);
+    for (int y = 0; y < H; ++y) {
+        uint8_t* id = ids.ptr<uint8_t>(y);
+        for (int x = 0; x < W; ++x) {
+            const int c = id[x];
+            if (c >= classes) continue;
+            const int l = lvl_t[(size_t)(y / TILE) * tw + x / TILE];
+            wsum[(size_t)c] += w_lvl[l];
+            n[(size_t)c * LEVELS + l]++;
+            id[x] = (uint8_t)(c * LEVELS + l);
+        }
+    }
+    std::vector<float> r2((size_t)classes * LEVELS, 0.0f);
+    for (int c = 0; c < classes; ++c) {
+        long long nc = 0;
+        for (int l = 0; l < LEVELS; ++l) nc += n[(size_t)c * LEVELS + l];
+        if (nc == 0) continue;
+        const double mean_w = wsum[(size_t)c] / (double)nc;
+        for (int l = 0; l < LEVELS; ++l)
+            r2[(size_t)c * LEVELS + l] = (float)(rates[(size_t)c] * w_lvl[l] / mean_w);
+    }
+    // Solve the scale s for the luma budget pixel_p x H x W (monotone in s).
+    const double target = (double)pixel_p * H * W;
+    auto taken = [&](double s) {
+        double t = 0.0;
+        for (size_t i = 0; i < r2.size(); ++i) t += (double)n[i] * (std::min)(1.0, s * r2[i]);
+        return t;
+    };
+    double s_lo = 0.0, s_hi = 1.0;
+    while (taken(s_hi) < target && s_hi < 1e6) s_hi *= 2.0;
+    for (int it = 0; it < 60; ++it) {
+        const double mid = 0.5 * (s_lo + s_hi);
+        (taken(mid) < target ? s_lo : s_hi) = mid;
+    }
+    rates.assign(r2.size(), 0.0f);
+    for (size_t i = 0; i < r2.size(); ++i) rates[i] = (float)(std::min)(1.0, s_hi * r2[i]);
+    std::cout << "seg-tile: " << classes * LEVELS << " labels, scale " << s_hi << std::endl;
 }
 
 void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
@@ -2020,10 +2118,20 @@ void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::stri
 
 void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::string& password,
     const cv::Mat& ids, const std::vector<float>& rates,
-    int sample_bits, int chroma_bits, int mode, int seg_blend) {
+    int sample_bits, int chroma_bits, int mode, int seg_blend,
+    const CsAnchorPlan* anchors) {
     if (mode != CS_MODE_YCC420_SEG && mode != CS_MODE_YCC422_SEG) {
         throw std::runtime_error("seg-mask ycc: bad split mode (internal error)");
     }
+    if (anchors) {
+        if (mode != CS_MODE_YCC420_SEG) {
+            throw std::runtime_error("--hr-detail with --seg-auto needs --ycc420 (no --ycc422)");
+        }
+        if (sample_bits != 8 || (chroma_bits != 0 && chroma_bits != 8)) {
+            throw std::runtime_error("--hr-detail requires 8-bit samples (no --sample-bits packing)");
+        }
+    }
+    const int out_mode = anchors ? CS_MODE_YCC420_SEG_HRDETAIL : mode;
     if (rates.empty() || rates.size() > 255) {
         throw std::runtime_error("seg-mask: need 1..255 per-class rates (--seg-rates)");
     }
@@ -2096,10 +2204,20 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     const size_t meas_bytes = (size_t)mY_written + (size_t)2 * mC;
     const int meas_pixels = (int)((meas_bytes + 2) / 3);
     const int pre_pixels = (int)((pre_bytes + 2) / 3);
-    const int total = next_perfect_square(meas_pixels + CS_HEADER_PIXELS + pre_pixels + 8);
+    // Compact anchor payload (positions drawn from the key, so it must be
+    // built after key derivation; it is CTR-sealed once the IV exists).
+    std::vector<uint8_t> anchor_payload;
+    if (anchors) {
+        anchor_payload = cs_anchor_payload(*anchors, cs_key);
+        const uint32_t k = (uint32_t)anchor_payload[0] | ((uint32_t)anchor_payload[1] << 8) |
+            ((uint32_t)anchor_payload[2] << 16) | ((uint32_t)anchor_payload[3] << 24);
+        std::cout << "HR anchors: " << k << " (" << anchor_payload.size() << " payload bytes)" << std::endl;
+    }
+    const int hr_pixels = (int)((anchor_payload.size() + 2) / 3);
+    const int total = next_perfect_square(meas_pixels + CS_HEADER_PIXELS + pre_pixels + 8 + hr_pixels);
     uint8_t* buf = alloc_container(total, salt);
 
-    buf[CS_OFF_PAD] = (uint8_t)mode;
+    buf[CS_OFF_PAD] = (uint8_t)out_mode;
     std::memcpy(buf + CS_HEADER_BYTES, prefix.data(), prefix.size());
     std::memcpy(buf + CS_HEADER_BYTES + prefix.size(), png.data(), png.size());
     // v3: seal the seg prefix + label map (see encrypt_segmask_ids).
@@ -2114,6 +2232,22 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     cs_gather_u8(cb_small.data, cb_small.step, ri_cx2.data(), ri_cy2.data(), mC, body + mY_written + mC);
     stamp_sample_bits(buf, sample_bits, chroma_bits);
 
+    // Compact anchors ride as a trailing CTR-encrypted section after Cb; the
+    // payload byte length sits in the pad after the mode byte (the seg
+    // prefix length already holds CS_OFF_HR_COUNT's bytes).
+    if (anchors) {
+        const uint32_t len = (uint32_t)anchor_payload.size();
+        for (int b = 0; b < 4; b++) {
+            buf[CS_OFF_PAD + 1 + b] = (uint8_t)((len >> (b * 8)) & 0xff);
+        }
+        uint8_t* dst = body + mY_written + 2 * mC;
+        std::memcpy(dst, anchor_payload.data(), anchor_payload.size());
+        cs_wipe(anchor_payload.data(), anchor_payload.size());
+        if (!cs_anchor_payload_xor(dst, len, cs_key, buf + CS_OFF_IV)) {
+            throw std::runtime_error("anchor payload encryption failed");
+        }
+    }
+
     // --sample-bits: prefix + label PNG stay raw; the three planes pack
     // independently.
     const size_t y0 = (size_t)CS_HEADER_BYTES + pre_bytes;
@@ -2122,7 +2256,7 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
             { y0, (size_t)mY_written, sample_bits, 0, false },
             { y0 + (size_t)mY_written, (size_t)mC, chroma_bits, 0, false },
             { y0 + (size_t)mY_written + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
-    sampling_mode = mode;
+    sampling_mode = out_mode;
 }
 
 /** @brief Adaptive periodic encryption: score every tile with an 8-bit LOD
@@ -2508,7 +2642,9 @@ int encrypt_image::encrypt_image_tiled(
     int seg_blend,
     const std::string& sampling,
     int seg_auto,
-    bool seg_edge
+    bool seg_edge,
+    bool seg_tile,
+    const std::function<cv::Mat(const cv::Mat&)>& anchor_decode
 ){
     try {
         // the caller-requested ratio is honored in every mode: decryption
@@ -2555,7 +2691,7 @@ int encrypt_image::encrypt_image_tiled(
             throw std::runtime_error("--two-pass and --spectral are mutually exclusive LOD scorers");
         }
         if (hr_detail < 0 || hr_detail > CS_HRDETAIL_MAX_SAMPLES) {
-            throw std::runtime_error("--hr-detail must be in [0, 65536] (0 = off)");
+            throw std::runtime_error("--hr-detail must be in [0, " + std::to_string(CS_HRDETAIL_MAX_SAMPLES) + "] (0 = off)");
         }
         // T-shaped sampling (modes 13/14) is BGR-only and exclusive with
         // every other sampling path; decrypt auto-detects from the mode.
@@ -2593,7 +2729,7 @@ int encrypt_image::encrypt_image_tiled(
             throw std::runtime_error("--seg-blend must be in [0, 128] pixels");
         }
         if (seg_mode && (hf_focus || adaptive || two_pass || spectral || !regions_json.empty() ||
-            lod_smooth > 0.0f || lod_full > 0 || tile_size > 0 || hr_detail > 0 ||
+            lod_smooth > 0.0f || lod_full > 0 || tile_size > 0 || (hr_detail > 0 && !(seg_auto > 0 && ycc420)) ||
             lod_cutoff > 0 || adaptive_strength != 0.5f || lod_min != 32)) {
             throw std::runtime_error("--seg-mask/--seg-auto is exclusive with other sampling flags (--adaptive/--two-pass/--spectral/--regions/--lod-smooth/--lod-full/--adaptive-cutoff/--adaptive-strength/--adaptive-floor/--periodic/--tile-size/--hf-focus/--hr-detail)");
         }
@@ -2630,10 +2766,19 @@ int encrypt_image::encrypt_image_tiled(
         // HR-detail anchors are ground-truth native luma, so select them
         // before the default 2x downscale. Reference geometry = decrypt
         // output geometry (native, or native-resized on odd dimensions).
+        // --seg-auto picks its anchors in a closed loop after sampling (compact
+        // mode-19 payload); keep the native image for their exact luma.
         std::vector<CsHrSample> hr_samples;
-        if (hr_detail > 0) {
-            const int out_w = full_res ? input_img.cols : input_img.cols / 2 * 2;
-            const int out_h = full_res ? input_img.rows : input_img.rows / 2 * 2;
+        const int out_w = full_res ? input_img.cols : input_img.cols / 2 * 2;
+        const int out_h = full_res ? input_img.rows : input_img.rows / 2 * 2;
+        cv::Mat anchor_native;
+        if (hr_detail > 0 && seg_auto > 0) {
+            if (!anchor_decode || !ycc420) {
+                throw std::runtime_error("--hr-detail with --seg-auto needs --ycc420 and the encrypt command");
+            }
+            anchor_native = input_img;   // the 2x downscale below allocates a new buffer
+        }
+        else if (hr_detail > 0) {
             hr_samples = cs_select_hr_detail(input_img, out_w, out_h, hr_detail);
             if (hr_samples.empty()) {
                 throw std::runtime_error("--hr-detail found no edge anchors (flat image?)");
@@ -2701,12 +2846,41 @@ int encrypt_image::encrypt_image_tiled(
                 for (float r : auto_rates) std::printf(" %.2f", r);
                 std::cout << std::endl;
             }
+            if (seg_tile) {
+                // Per-tile detail levels inside each class; the rates come
+                // back final (budget = --ratio x pixels), so encrypt at 1.0.
+                auto_rates.resize((size_t)seg_auto, 0.0f);
+                cs_seg_tile_refine(input_img, auto_ids, auto_rates, seg_auto, compression_ratio);
+            }
+            const float seg_p = seg_tile ? 1.0f : compression_ratio;
             if (ycc420 || ycc422) {
                 const int seg_mode = ycc422 ? CS_MODE_YCC422_SEG : CS_MODE_YCC420_SEG;
-                encrypt_img.encrypt_ycc420_segmask_ids(compression_ratio, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
+                encrypt_img.encrypt_ycc420_segmask_ids(seg_p, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
+                if (hr_detail > 0) {
+                    // Closed loop: decode this container, flag the worst 5% of its
+                    // 16x16 blocks, and re-encrypt with the same key (same samples)
+                    // plus anchors drawn there.
+                    cv::Mat dec = anchor_decode(encrypt_img.get_mat());
+                    if (dec.empty() || dec.type() != CV_8UC3 || dec.cols != out_w || dec.rows != out_h) {
+                        throw std::runtime_error("anchor pass: decode failed or has the wrong geometry");
+                    }
+                    cv::Mat ref = anchor_native;
+                    if (ref.size() != dec.size()) cv::resize(anchor_native, ref, dec.size(), 0, 0, cv::INTER_LINEAR);
+                    CsAnchorPlan plan;
+                    plan.flags = cs_error_anchor_flags(ref, dec);
+                    if (plan.flags.empty()) throw std::runtime_error("anchor pass: image smaller than one 16x16 block");
+                    cv::Mat ycc;
+                    cv::cvtColor(ref, ycc, cv::COLOR_BGR2YCrCb);
+                    cv::extractChannel(ycc, plan.luma, 0);
+                    plan.count = hr_detail;
+                    std::cout << "anchors: " << cv::countNonZero(plan.flags) << " of " << plan.flags.total()
+                              << " blocks flagged by the closed-loop decode" << std::endl;
+                    encrypt_img.reuse_key();
+                    encrypt_img.encrypt_ycc420_segmask_ids(seg_p, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend, &plan);
+                }
             }
             else {
-                encrypt_img.encrypt_segmask_ids(compression_ratio, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_blend);
+                encrypt_img.encrypt_segmask_ids(seg_p, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_blend);
             }
         }
         else if (hf_focus) {
