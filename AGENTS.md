@@ -34,8 +34,9 @@ C++ image encryption via compressive sensing with FISTA reconstruction (per-chan
 - `x64/`, `.vs/`, `.obj`/`.exe` files in root - build output (never read/edit)
 
 ## Build
-- Default toolchain is Clang (LLVM 23 `clang-cl`, installed via `winget install LLVM.LLVM`): run `.\build_clang.bat` (Release, x64, outputs to `x64\Clang\`). It mirrors the MSVC Release flags plus both OpenCV variants (4.90 world for the main binary, static 4.13+contrib for tests) and builds `cs_gpu.hip` with hipcc.
-- Legacy MSVC build: `msbuild ImgReconstruct_backend.sln /p:Configuration=Release /p:Platform=x64`. Use x64 unless told otherwise. Build the specific vcxproj when possible instead of the whole solution.
+- Default build: `.\build_gpu.bat main` (LLVM 23 `clang-cl` + hipcc, Release x64, outputs `x64\GpuBuild\ImgReconstruct_backend.exe`; drop `main` to also build `cs_tests.exe`). It compiles the `*.hip` files under the VS 18 Insiders 14.29 toolset (ROCm 7.2 clang rejects the newer MSVC STL) and the rest under VS 18 BuildTools. Needs AOCL-Compression for the PNG writer. GPU paths are opt-in at run time: `--device gpu` plus `CS_GPU_TILES=1`, `CS_GPU_ADMM=1` (see `docs/gpu-optimizations.md`).
+- `.\build_cpu.bat` builds without ROCm (CPU stub for the `cs_gpu` API).
+- Stale, do not use: `build_clang.bat` (hardcodes VS 2022, which is not installed, and misses `enh_net.cpp`, `gpu_*.cpp`, `png_fast.cpp`) and the MSVC solution `ImgReconstruct_backend.sln` (its vcxproj lacks the same sources).
 
 ## rtk (command-output condenser)
 - The shell environment pipes big-output commands (`rg`, `grep`, `git log/diff/status`, test runners, etc.) through `rtk`, which condenses output: every signal kept, noise dropped.
