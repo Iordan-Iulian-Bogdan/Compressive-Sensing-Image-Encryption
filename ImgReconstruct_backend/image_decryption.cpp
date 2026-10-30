@@ -2480,6 +2480,9 @@ int decrypt_image::decrypt_image_tiled(
             const float dc = cs_auto_reg_coefficient(sm, ar, nt);
             coef = (dc >= 0.0f) ? dc : 0.01f;
         }
+        // Diagnostic (opt-in): CS_COEF_MULT=<f> scales the derived coef (luma, chroma and SR
+        // correction follow it) without leaving auto mode, unlike --coef. Used by the lambda sweeps.
+        if (const char* cm = std::getenv("CS_COEF_MULT"); cm && *cm && coef_auto) coef *= (float)std::atof(cm);
         if (tv == -1.0f) {
             const float dtv = cs_auto_reg_tv(sm, ar);
             tv = (dtv >= 0.0f) ? dtv : 0.0f;

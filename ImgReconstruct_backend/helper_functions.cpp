@@ -347,10 +347,13 @@ float cs_auto_reg_coefficient(int sampling_mode, float ratio, int num_tiles) {
     if (yccm) {
         // Split luma/chroma path. Luma density falls with r and the legacy
         // flat fallback (0.01, erstwhile because cs_is_ycc returned -1) made
-        // low-ratio YCC collapse its DC (green cast). 0.0225/r tracks the
-        // measured sweep optimum across r=0.25..0.75; the per-tile chroma
-        // solve then halves it (coef_c = 0.5*coef).
-        base = 0.0225f / r;
+        // low-ratio YCC collapse its DC (green cast). 0.0225/r tracked the
+        // sweep optimum before anchors and the enhance net; on the production
+        // decode (seg8-tile + 300k anchors + net) half of it wins at
+        // r=0.3..0.9: +0.18..0.31 dB, dE-p95 better, SSIM flat
+        // (Params-test/lam_sweep.py). The per-tile chroma solve then halves
+        // it (coef_c = 0.5*coef).
+        base = 0.01125f / r;
     } else if (segm) {
         base = 0.045f * std::pow(r, -0.75f);
     } else if (sampling_mode == CS_MODE_RANDOM) {
