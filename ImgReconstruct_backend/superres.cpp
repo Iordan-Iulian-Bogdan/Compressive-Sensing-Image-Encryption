@@ -688,6 +688,7 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
                 zpx.data(), correction_coef, nlm_prox_h };
             gp.hr_val = hr_on ? hr_map.data() : nullptr;
             gp.tv = tv;
+            gp.ox = hr_sr.ox; gp.oy = hr_sr.oy;
             const CsSrAdmmSched& sc = cs_sr_admm_sched();
             gpu_admm::Params gprm{ admm, inner, rho, bx.lip, wscale,
                 sc.rho_end, sc.h0, sc.h1, sc.rescale_u ? 1 : 0 };
@@ -1621,6 +1622,7 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             pool_off += (size_t)n;
             gpu_sr::Tile J{ P.lr.rows, P.lr.cols, P.lr.data, P.b.data(), T.ri_x->data(), T.ri_y->data(),
                 (int)T.ri_x->size(), T.coef * 0.1f, T.tv, P.hr_map.empty() ? nullptr : P.hr_map.data(), T.hr_out->data };
+            J.ox = T.hr_sr.ox; J.oy = T.hr_sr.oy;
             if (verify_every > 0 && k % (size_t)verify_every == 0) {
                 P.dbg_avir.resize((size_t)12 * P.lr.rows * P.lr.cols);
                 J.dbg_avir = P.dbg_avir.data();

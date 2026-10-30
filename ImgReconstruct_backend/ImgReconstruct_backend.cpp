@@ -125,7 +125,10 @@ void print_usage(const char* exe) {
   "                        x64/GpuBuild/export_enh_onnx.py) on the finished\n"
   "                        decode, with the decoder's sample density, anchor\n"
   "                        and LR-sample maps as extra inputs; ycc containers\n"
-  "                        only; DirectML with CS_GPU_ONNX=1 in the GPU build\n"
+  "                        only; DirectML with CS_GPU_ONNX=1 in the GPU build.\n"
+  "                        On encrypt (--seg-auto --ycc420 --hr-detail), pass\n"
+  "                        the net you will decode with: the anchors then go\n"
+  "                        where the error is left after it\n"
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off). Default: auto (0.01 for\n"
@@ -1066,8 +1069,11 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --final-polish is decrypt-side only; ignoring for encrypt" << std::endl;
         photo_up.final_polish.clear();
     }
-    if (!photo_up.enhance_model.empty() && mode != "decrypt" && mode != "roundtrip") {
-        std::cerr << "Warning: --enhance is decrypt-side only; ignoring for encrypt" << std::endl;
+    // On encrypt, --enhance only feeds the closed-loop anchor pass (seg + ycc420 + hr-detail): the
+    // blocks are ranked by the error left after the net the container will be decoded with.
+    if (!photo_up.enhance_model.empty() && mode != "decrypt" && mode != "roundtrip" &&
+        !(hr_detail > 0 && seg_auto > 0 && ycc420)) {
+        std::cerr << "Warning: --enhance on encrypt needs --seg-auto + --ycc420 + --hr-detail (anchor ranking); ignoring" << std::endl;
         photo_up.enhance_model.clear();
     }
     if (photo_up.sr_init != "avir" && mode != "decrypt" && mode != "roundtrip") {
@@ -1161,8 +1167,8 @@ int main(int argc, char* argv[])
         if (mode == "encrypt") {
             // --seg-auto + --ycc420 + --hr-detail: the encoder decodes its own
             // anchor-free container (cs-sr + PnP-ADMM, tv 0, --fast settings: it
-            // only ranks 16x16 blocks by error) in memory, then anchors the worst
-            // blocks. Flag map and anchor luma ride in the container.
+            // only ranks 16x16 blocks by error, after the --enhance net when given) in
+            // memory, then anchors the worst blocks. Flag map and anchor luma ride in the container.
             std::function<cv::Mat(const cv::Mat&)> anchor_decode;
             if (hr_detail > 0 && seg_auto > 0 && ycc420) {
                 anchor_decode = [&](const cv::Mat& container) {

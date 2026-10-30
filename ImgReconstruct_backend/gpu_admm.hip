@@ -548,6 +548,23 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     const float hmax = *std::max_element(hh.begin(), hh.end());   // sizes the NLM weight table
     const float rho_end = prm.rho_end > 0.0f ? prm.rho_end : prm.rho;
     float rho_prev = prm.rho;
+    // Diagnostic (opt-in): CS_DUMP_ADMM=<file> appends, for ~1 in CS_DUMP_ADMM_EVERY (default 20)
+    // tiles picked by a hash of the origin (as CS_DUMP_LRTILES), one record per ADMM round:
+    // [int32 ox, oy, rows, cols, round, rounds][float h][rows*cols u8 Q][rows*cols u8 DN], Q being
+    // the 8-bit NLM input (px + u), DN its output and h that round's NLM strength.
+    const char* dump_path = std::getenv("CS_DUMP_ADMM");
+    std::vector<int> dump_tiles;
+    if (dump_path && *dump_path) {
+        int every = 20;
+        if (const char* e = std::getenv("CS_DUMP_ADMM_EVERY")) every = std::max(1, std::atoi(e));
+        for (int t = 0; t < nt; ++t) {
+            const Problem& P = tiles[(size_t)t];
+            const unsigned long long key = ((unsigned long long)(unsigned)P.ox * 73856093ULL) ^
+                ((unsigned long long)(unsigned)P.oy * 19349663ULL);
+            if (every <= 1 || ((key >> 4) % (unsigned long long)every) == 0ULL) dump_tiles.push_back(t);
+        }
+    }
+    std::vector<std::uint8_t> hQ, hDN;
     Prof prof;
     prof.begin_all();
 #define FWD_DCT(src, dst) do {         TIMED("gemm_fwd_a", k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, (src), dTMP.p, nbn, none));         TIMED("gemm_fwd_b", k_gemm<OP_TAB, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, (dst), nbn, none));     } while (0)
@@ -656,6 +673,29 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
             TIMED("gemm_inv_b", k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none));
         TIMED("k_quant", k_quant<<<pgrid, blk>>>(dtd.p, dq.p, dPIX.p, dU.p, dQ.p));
         TIMED("k_nlm", launch_nlm(nt, L.max_rows, L.max_cols, hmax, dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
+        if (!dump_tiles.empty()) {
+            hQ.resize((size_t)qtot);
+            hDN.resize(N);
+            HIP_TRY(hipMemcpy(hQ.data(), dQ.p, (size_t)qtot, hipMemcpyDeviceToHost));
+            HIP_TRY(hipMemcpy(hDN.data(), dDN.p, N, hipMemcpyDeviceToHost));
+            static std::mutex dump_mu;
+            std::lock_guard<std::mutex> lk(dump_mu);
+            if (FILE* f = std::fopen(dump_path, "ab")) {
+                for (int t : dump_tiles) {
+                    const TileDev& T = L.td[(size_t)t];
+                    const Problem& P = tiles[(size_t)t];
+                    const std::int32_t hdr[6] = { P.ox, P.oy, T.rows, T.cols, it, prm.admm };
+                    const float h = hh[(size_t)t] * hmul_k;
+                    std::fwrite(hdr, sizeof(std::int32_t), 6, f);
+                    std::fwrite(&h, sizeof(float), 1, f);
+                    const int PW = T.cols + 2 * kBorder;
+                    for (int y = 0; y < T.rows; ++y)
+                        std::fwrite(hQ.data() + qoff[(size_t)t] + (size_t)(y + kBorder) * PW + kBorder, 1, (size_t)T.cols, f);
+                    std::fwrite(hDN.data() + T.off, 1, (size_t)T.rows * T.cols, f);
+                }
+                std::fclose(f);
+            }
+        }
         TIMED("k_dual", k_dual<<<grid, blk>>>(dtd.p, dPIX.p, dDN.p, dU.p, Zp));
     }
     HIP_TRY(hipGetLastError());

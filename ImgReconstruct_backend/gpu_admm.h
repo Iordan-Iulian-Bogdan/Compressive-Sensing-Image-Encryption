@@ -23,6 +23,7 @@ struct Problem {
     // the pixel has none; null = no anchors. Weight comes from Params::hr_weight.
     const float* hr_val = nullptr;
     float tv = 0.0f;      // smoothed-TV weight of the core (needs Params::bt = 1 when > 0)
+    int ox = 0, oy = 0;   // tile origin in output geometry (only read by the CS_DUMP_ADMM dump)
 };
 
 struct Params {           // shared by every tile of one call

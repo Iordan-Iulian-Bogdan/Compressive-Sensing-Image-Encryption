@@ -31,6 +31,7 @@ struct Tile {
     std::uint8_t* hr_bgr;          // out: HR BGR, (2*lr_rows)*(2*lr_cols)*3 bytes
     std::uint8_t* dbg_avir = nullptr;   // optional out: the 2x BGR warm start, AVIR or prior (verification)
     float* dbg_nlm_h = nullptr;         // optional out: the NLM strength used (verification)
+    int ox = 0, oy = 0;                 // HR tile origin in output geometry (CS_DUMP_ADMM)
 };
 
 // Runs every tile through the pipeline with one shared ADMM parameter set (the caller groups

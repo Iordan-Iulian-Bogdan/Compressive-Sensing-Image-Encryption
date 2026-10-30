@@ -336,6 +336,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
         gpu_admm::Problem q{ 2 * P.lr_rows, 2 * P.lr_cols, P.b, P.rix, P.riy, P.m, nullptr, P.lambda, hh[(size_t)t] };
         q.hr_val = P.hr_val;
         q.tv = P.tv;
+        q.ox = P.ox; q.oy = P.oy;
         probs[(size_t)t] = q;
     }
     if (!gpu_admm::solve_pnp_admm_device(probs, prm, dZ.p)) return false;

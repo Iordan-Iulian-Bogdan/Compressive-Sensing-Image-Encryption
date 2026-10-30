@@ -3058,6 +3058,18 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // Diagnostic (opt-in): CS_DUMP_YSAMP=<png> writes the luma sample values (LR grid, 8 bit, 0 where unsampled).
         if (const char* dump = std::getenv("CS_DUMP_YSAMP"); dump && !Y.empty())
             cv::imwrite(dump, Y);
+        // Diagnostic (opt-in): CS_DUMP_HR=<file> writes the container's HR anchors in the CS_HR_SIDECAR format.
+        if (const char* dump = std::getenv("CS_DUMP_HR"); dump && *dump && !dimgs.hr_samples.empty()) {
+            if (FILE* f = std::fopen(dump, "wb")) {
+                const uint32_t n = (uint32_t)dimgs.hr_samples.size();
+                std::fwrite(&n, 4, 1, f);
+                for (const auto& s : dimgs.hr_samples) {
+                    const uint32_t idx = (uint32_t)s.idx; const uint8_t y = s.y;
+                    std::fwrite(&idx, 4, 1, f); std::fwrite(&y, 1, 1, f);
+                }
+                std::fclose(f);
+            }
+        }
 
         // Luma/chroma split + per-plane solve + merge as one reusable unit:
         // the standard path runs it once; --seg-solve runs it once with
@@ -3597,19 +3609,21 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             cs_final_polish_updown(reconstructed, photo_up);
 
         prof.mark("polish");
-        // Restoration CNN (--enhance): on the decode it was trained on, i.e.
-        // before the post-hoc anchor replacement, which then still pins the
-        // anchor pixels exactly. A load/run failure leaves the image as is.
+        // Restoration CNN (--enhance): on the decode it was trained on (no
+        // post-hoc anchor replacement). Its output is kept as is: writing the
+        // exact anchor luma back over it measured worse (IMG_3690: -0.12 dB,
+        // dE-p95 +0.18). A load/run failure leaves the image as is.
+        bool enhanced = false;
         if (!photo_up.enhance_model.empty() && !reconstructed.empty()) {
             CsEnhInputs ein;
             ein.y_mask = &Ym; ein.y_samp = &Y; ein.anchors = &dimgs.hr_samples;
-            cs_enhance_net(reconstructed, photo_up.enhance_model, ein);
+            enhanced = cs_enhance_net(reconstructed, photo_up.enhance_model, ein);
         }
 
         prof.mark("enhance");
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
-        // the final composite (see the BGR pipeline above).
-        if (!dimgs.hr_samples.empty() && !reconstructed.empty() && !std::getenv("CS_HR_NO_POSTHOC")) {
+        // the final composite (see the BGR pipeline above); skipped after the net.
+        if (!dimgs.hr_samples.empty() && !reconstructed.empty() && !enhanced && !std::getenv("CS_HR_NO_POSTHOC")) {
             const size_t applied = cs_apply_hr_detail(reconstructed, dimgs.hr_samples);
             dimgs.hr_applied = applied;
             if (hr_applied_out) *hr_applied_out = applied;
