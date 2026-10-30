@@ -115,6 +115,49 @@ without the net still apply it. With the change, the default decode (no `CS_HR_N
 above exactly on all 8 photos. The "production + `--enhance`" row of the decoder-options table was measured before
 this change, with the write-back, and so is about 0.1 dB low.
 
+## Closed-loop sample allocation (tested, not adopted)
+
+Question: would spending the fixed luma budget where it improves the post-net output most beat the seg-tile
+heuristic (per 64x64 LR tile, one of 8 levels from the mean |Laplacian|; per class, level weights spanning ~1.65x; a
+global scale for the budget)? If so, a net predicting the gain per sample would be worth training. The encoder can
+measure that gain directly, so this was tested first without a net:
+
+- Probe: encode at the heuristic rates and at 1.5x them (same key, so the probe's samples contain the base ones),
+  decode both with the enhance net, and score each tile (or label) by its error drop per extra sample. Two extra trial
+  decodes, encode 1.6 s -> 3.4 s. Production pipeline otherwise (`--enhance` on encrypt and decrypt), container size
+  unchanged (±0.2%).
+- The switches below were a temporary experiment in `image_encryption.cpp` and have been removed again.
+- Mode 1 (`CS_TILE_LOOP=1`): keep each level's tile count, hand the levels out in measured-gain order.
+- Mode 2 (`CS_TILE_LOOP=2`): per-label rates moved toward equal marginal gain (r *= sqrt(g / mean g)), scale re-solved.
+- Level spread (`CS_TILE_SPREAD=R`): geometric level weights with top/bottom ratio R instead of ~1.65x.
+
+PSNR vs the heuristic (same run, noise ~0.01 dB):
+
+| photo | heuristic | mode 1 | mode 2 | per-label gain spread (CV) |
+|---|---|---|---|---|
+| IMG_3690 | 38.633 | +0.005 | −0.050 | 0.13 |
+| IMG_0007 | 39.810 | −0.019 | +0.036 | 1.88 |
+| IMG_1297 | 25.681 | −0.115 | +0.023 (SSIM −0.0017) | 0.51 |
+| IMG_9321 | 44.184 | −0.040 | +0.035 | 2.13 |
+| D28_rnd_123 | 48.452 | −0.007 | +0.042 | 0.46 |
+| D06_rnd_39 | 29.633 | −0.158 | +0.062 (SSIM −0.0004) | 0.50 |
+| D17_rnd_71 | 38.696 | −0.041 | +0.011 | 0.34 |
+| D17_nat_18 | 45.236 | +0.011 | +0.005 | 0.09 |
+| mean | | **−0.045** | **+0.020** | |
+
+Level spread on IMG_3690: 4x 38.628 (= heuristic), 16x 38.398 (−0.23); with mode 1 on top, 38.636 and 38.406.
+
+Findings:
+- Re-ranking tiles inside a class by measured gain is worse than the Laplacian ranking (6 of 8 photos, up to −0.16 dB):
+  one probe's per-tile gain is noisier than the Laplacian.
+- Moving budget between labels toward equal marginal gain gains +0.02 dB on average with mixed SSIM, for twice the
+  encode time. Even where the measured gains are far from equal (CV ~2 on IMG_0007 and IMG_9321) the rebalance buys
+  only ~0.035 dB.
+- A wider level spread does not help (4x) or hurts (16x).
+- Conclusion: the seg-tile heuristic allocation is already close to the best this budget allows with the current
+  decoder and net. A learned allocator (predicting what this closed loop measures) has under ~0.05 dB to win; not worth
+  building. The anchors placed after the net (+0.06 dB) and the net itself (+2.2 dB) were the levers.
+
 ## Code-level findings
 
 - All 20 `CS_MODE_*` constants in `crypto_utils.hpp` are live: each is written by some encode-flag combination and
