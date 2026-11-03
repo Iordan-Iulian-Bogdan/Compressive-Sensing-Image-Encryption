@@ -1,0 +1,28 @@
+enc random                         7.86 MB     2.5s  33.296 dB  SSIM 0.9159  dE95 4.061  dE99 8.914
+enc periodic                       7.78 MB     2.3s  33.292 dB  SSIM 0.9159  dE95 4.065  dE99 8.925
+enc adaptive                       7.83 MB     2.4s  33.545 dB  SSIM 0.9183  dE95 3.900  dE99 8.632
+enc hf-focus                       7.85 MB     2.7s  33.298 dB  SSIM 0.9160  dE95 4.060  dE99 8.913
+enc tcluster                          6 MB     2.5s  33.145 dB  SSIM 0.9145  dE95 4.140  dE99 9.089
+enc tmeans: decrypt failed
+enc hr-detail                      8.41 MB     2.2s  33.53 dB  SSIM 0.9178  dE95 3.962  dE99 8.627
+enc seg8                           4.67 MB     2.7s  32.643 dB  SSIM 0.8967  dE95 4.388  dE99 9.289
+enc ycc420                         3.73 MB     2.1s  33.106 dB  SSIM 0.9122  dE95 4.447  dE99 9.092
+enc ycc422                         4.85 MB     2.2s  33.158 dB  SSIM 0.9130  dE95 4.334  dE99 9.073
+enc ycc420+adaptive                3.71 MB     2.2s  33.329 dB  SSIM 0.9144  dE95 4.328  dE99 8.842
+enc ycc420+hf                      3.73 MB     1.8s  33.097 dB  SSIM 0.9122  dE95 4.452  dE99 9.113
+enc ycc422+hf                      4.85 MB     2.1s  33.15 dB  SSIM 0.9129  dE95 4.342  dE99 9.079
+enc ycc420+tcluster                 3.6 MB     1.9s  32.974 dB  SSIM 0.9108  dE95 4.505  dE99 9.251
+enc ycc420+tmeans: decrypt failed
+enc ycc420+hr-detail               4.27 MB     2.2s  33.345 dB  SSIM 0.9141  dE95 4.359  dE99 8.803
+enc ycc420+seg8                    2.26 MB     2.1s  32.46 dB  SSIM 0.8976  dE95 4.927  dE99 9.576
+enc ycc422+seg8                    2.92 MB     2.2s  32.524 dB  SSIM 0.8983  dE95 4.770  dE99 9.530
+enc ycc420+seg8-tile               3.77 MB     1.8s  33.401 dB  SSIM 0.9169  dE95 4.300  dE99 8.824
+enc production                     4.06 MB     2.1s  36.108 dB  SSIM 0.9285  dE95 3.442  dE99 5.850
+dec production+net                 4.06 MB     2.2s  38.319 dB  SSIM 0.9579  dE95 3.017  dE99 4.752
+dec production                     4.06 MB     2.2s  36.133 dB  SSIM 0.9282  dE95 3.495  dE99 5.864
+dec sr-pnp prox                    4.06 MB     8.8s  32.49 dB  SSIM 0.8916  dE95 4.835  dE99 9.850
+dec sr-pnp off                     4.06 MB       4s  34.464 dB  SSIM 0.9340  dE95 3.984  dE99 7.877
+dec fast                           4.06 MB     1.4s  36.074 dB  SSIM 0.9284  dE95 3.484  dE99 5.915
+dec avir                           4.06 MB     1.5s  33.25 dB  SSIM 0.9090  dE95 4.418  dE99 9.033
+dec sr-direct                      4.06 MB     3.7s  34.202 dB  SSIM 0.9395  dE95 3.960  dE99 8.435
+dec fsrcnn                         4.06 MB     1.4s  33.25 dB  SSIM 0.9090  dE95 4.418  dE99 9.033

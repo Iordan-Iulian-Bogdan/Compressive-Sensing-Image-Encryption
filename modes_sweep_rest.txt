@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ValueError: operands could not be broadcast together with shapes (3024,4032,3) (1512,2016,3) 
+dec AGENTS default                 4.06 MB     3.3s   dB  SSIM 0.8920  dE95 6.511  dE99 12.772
+dec solver joint                   4.06 MB       2s  36.133 dB  SSIM 0.9282  dE95 3.495  dE99 5.864
+dec basis wavelet                  4.06 MB     3.6s  32.941 dB  SSIM 0.9038  dE95 4.814  dE99 10.318
+dec polish waifu2x-ncnn            4.06 MB     2.2s  36.133 dB  SSIM 0.9282  dE95 3.495  dE99 5.864
+dec polish realcugan               4.06 MB    16.7s  29.999 dB  SSIM 0.9029  dE95 7.899  dE99 16.319
+dec device cpu                     4.06 MB     2.1s  36.133 dB  SSIM 0.9282  dE95 3.495  dE99 5.864
