@@ -134,6 +134,11 @@ clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\photo_
 if errorlevel 1 ( echo ERROR photo_upscaler_t & exit /b 1 )
 clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\cs_gpu_cpu.cpp" /Fo"%OBJT%\cs_gpu.obj"
 if errorlevel 1 ( echo ERROR cs_gpu_cpu_t & exit /b 1 )
+REM GPU glue (the test objects are built with CS_GPU_TILES / CS_ONNX_DML too)
+for %%G in (gpu_decrypt gpu_admm_broker gpu_avir_tables) do (
+    clang-cl %OPTS% %DEFS% %CV413_INC% %BE_INC% "%ROOT%ImgReconstruct_backend\%%G.cpp" /Fo"%OBJT%\%%G.obj"
+    if errorlevel 1 ( echo ERROR %%G_t & exit /b 1 )
+)
 REM test sources: one object per tests\<name>.cpp, listed once here
 set "TEST_UNITS=test_main test_primitives test_solvers test_adaptive test_modes test_dual_tv test_photo_sr"
 for %%T in (%TEST_UNITS%) do (
@@ -151,7 +156,7 @@ if "%~1"=="main" goto :finish
 
 echo [link] cs_tests.exe (static 4.13 set)
 set "STATIC413=opencv_core4130.lib opencv_imgproc4130.lib opencv_highgui4130.lib opencv_imgcodecs4130.lib opencv_dnn4130.lib opencv_dnn_superres4130.lib opencv_photo4130.lib opencv_videoio4130.lib opencv_quality4130.lib ippicvmt.lib ippiw.lib ipphal.lib ittnotify.lib libprotobuf.lib libjpeg-turbo.lib libpng.lib libtiff.lib libopenjp2.lib IlmImf.lib zlib.lib ade.lib"
-link /OUT:"%OUT%\cs_tests.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll "/LIBPATH:C:\Users\iorda\OneDrive\Documents\opencv\Release\lib" /LIBPATH:%ROOT%third_party\onnxruntime\lib "/LIBPATH:%LLVM_ROOT%\lib" "%OBJT%\test_main.obj" "%OBJT%\test_primitives.obj" "%OBJT%\test_solvers.obj" "%OBJT%\test_adaptive.obj" "%OBJT%\test_modes.obj" "%OBJT%\test_dual_tv.obj" "%OBJT%\test_photo_sr.obj" "%OBJT%\CS_encryption.obj" "%OBJT%\crypto_utils.obj" "%OBJT%\cs_dict.obj" "%OBJT%\cs_wavelet.obj" "%OBJT%\helper_functions.obj" "%OBJT%\onnx_denoise.obj" "%OBJT%\enh_net.obj" "%OBJT%\superres.obj" "%OBJT%\gap_tv.obj" "%OBJT%\admm_l1tv.obj" "%OBJT%\pnp_nlm.obj" "%OBJT%\image_decryption.obj" "%OBJT%\image_encryption.obj" "%OBJT%\image_tiles.obj" "%OBJT%\image_preview.obj" "%OBJT%\photo_upscaler.obj" "%OBJT%\cs_gpu.obj" %STATIC413% %SYSLIBS%
+link /OUT:"%OUT%\cs_tests.exe" /DEBUG /SUBSYSTEM:CONSOLE /DELAYLOAD:onnxruntime.dll "/LIBPATH:C:\Users\iorda\OneDrive\Documents\opencv\Release\lib" /LIBPATH:%ORT_DML%\lib "/LIBPATH:C:\Program Files\AMD\ROCm\7.2\lib" "/LIBPATH:%LLVM_ROOT%\lib" "%OBJT%\test_main.obj" "%OBJT%\test_primitives.obj" "%OBJT%\test_solvers.obj" "%OBJT%\test_adaptive.obj" "%OBJT%\test_modes.obj" "%OBJT%\test_dual_tv.obj" "%OBJT%\test_photo_sr.obj" "%OBJT%\CS_encryption.obj" "%OBJT%\crypto_utils.obj" "%OBJT%\cs_dict.obj" "%OBJT%\cs_wavelet.obj" "%OBJT%\helper_functions.obj" "%OBJT%\onnx_denoise.obj" "%OBJT%\enh_net.obj" "%OBJT%\superres.obj" "%OBJT%\gap_tv.obj" "%OBJT%\admm_l1tv.obj" "%OBJT%\pnp_nlm.obj" "%OBJT%\image_decryption.obj" "%OBJT%\image_encryption.obj" "%OBJT%\image_tiles.obj" "%OBJT%\image_preview.obj" "%OBJT%\photo_upscaler.obj" "%OBJT%\cs_gpu.obj" "%OBJT%\gpu_decrypt.obj" "%OBJT%\gpu_admm_broker.obj" "%OBJT%\gpu_avir_tables.obj" "%OBJ%\gpu_tiles.obj" "%OBJ%\gpu_admm.obj" "%OBJ%\gpu_sr.obj" "%OBJ%\gpu_swin.obj" "%OBJ%\gpu_enh.obj" "%OBJ%\gpu_calm.obj" "%OBJ%\gpu_prox.obj" "%OBJ%\gpu_composite.obj" %STATIC413% amdhip64.lib %SYSLIBS%
 if errorlevel 1 ( echo ERROR linking tests & exit /b 1 )
 
 :finish

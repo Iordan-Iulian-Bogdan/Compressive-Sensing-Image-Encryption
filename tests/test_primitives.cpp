@@ -556,8 +556,13 @@ void test_tsampling() {
         const cv::Mat flat = container.reshape(0, (int)container.total());
         check(flat.data[CS_OFF_PAD] == CS_MODE_YCC420_TMEANS, "tsampling: ycc420 tmeans header mode=16");
         const std::string tmp_out = ".cs_test_tsampling_ytm.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
-            0.0f, true) == 0, "tsampling: ycc420 tmeans decrypt succeeds");
+        // manual: AUTO_PARAM would replace the 1 tile / 40 iters / 0.01 below
+        // with the auto grid and the YCC lambda law
+        CSencryption::params = MANUAL_PARAM;
+        const int rc_tm = decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
+            0.0f, true);
+        CSencryption::params = AUTO_PARAM;
+        check(rc_tm == 0, "tsampling: ycc420 tmeans decrypt succeeds");
         cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
         check(!dec.empty(), "tsampling: ycc420 tmeans output readable");
         if (!dec.empty()) {
@@ -595,8 +600,13 @@ void test_tsampling() {
         const cv::Mat flat = container.reshape(0, (int)container.total());
         check(flat.data[CS_OFF_PAD] == CS_MODE_YCC422_TMEANS, "tsampling: ycc422 tmeans header mode=18");
         const std::string tmp_out = ".cs_test_tsampling_ytm422.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
-            0.0f, true) == 0, "tsampling: ycc422 tmeans decrypt succeeds");
+        // manual: AUTO_PARAM would replace the 1 tile / 40 iters / 0.01 below
+        // with the auto grid and the YCC lambda law
+        CSencryption::params = MANUAL_PARAM;
+        const int rc_tm = decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
+            0.0f, true);
+        CSencryption::params = AUTO_PARAM;
+        check(rc_tm == 0, "tsampling: ycc422 tmeans decrypt succeeds");
         cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
         check(!dec.empty(), "tsampling: ycc422 tmeans output readable");
         if (!dec.empty()) {

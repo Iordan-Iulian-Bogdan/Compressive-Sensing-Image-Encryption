@@ -355,12 +355,12 @@ void test_auto_reg_params() {
         "auto-reg: uniform tile-factored below 0.5");
     check(std::fabs(cs_auto_reg_coefficient(CS_MODE_RANDOM, 0.15f, 64) - 0.125f) < 0.002f,
         "auto-reg: uniform 0.15 t64 == 0.125 (extended below 0.5)");
-    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.3f, 64) - 0.075f) < 0.002f,
-        "auto-reg: YCC420 covered (0.0225/r)");
-    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.75f, 64) - 0.03f) < 0.002f,
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.3f, 64) - 0.0375f) < 0.002f,
+        "auto-reg: YCC420 covered (0.01125/r)");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC420, 0.75f, 64) - 0.015f) < 0.002f,
         "auto-reg: YCC420 covered above 0.5");
-    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC422, 0.25f, 64) - 0.09f) < 0.002f,
-        "auto-reg: YCC422 covered (0.0225/r)");
+    check(std::fabs(cs_auto_reg_coefficient(CS_MODE_YCC422, 0.25f, 64) - 0.045f) < 0.002f,
+        "auto-reg: YCC422 covered (0.01125/r)");
     check(cs_auto_reg_coefficient(CS_MODE_ADAPTIVE, 0.3f, 64) < 0.0f,
         "auto-reg: adaptive uncovered");
     check(cs_auto_reg_tv(CS_MODE_SEGMASK, 0.3f) == 0.01f, "auto-reg: seg tv 0.01 below 0.5");
