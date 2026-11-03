@@ -1570,6 +1570,23 @@ static void decrypt_tiles_ycc420(int num_threads,
                         const cs_meas_groups* pg = nullptr) {
                         reconstruct_color_channel_fista(meas, 0, c, R, C, rx, ry, it, r, nxt, nr, t, t_reweights, t_fista_iters, t_basis, t_wscale, use_onsager, pg);
                     };
+                    // Point-sampled planes start from a smooth fill of their own samples, as the GPU
+                    // pre-pass does (gpu_decrypt.cpp). The neighbour start is pixels/10 in a solver
+                    // whose tail is IDCT x 255, a 10x-dark start that small coefs do not converge
+                    // from in the auto iteration count (IMG_3690 at coef x0.2: Cr 23.8 vs 50.8 dB).
+                    auto fill_start = [&](const cv::Mat& meas, int R, int C,
+                        const std::vector<int>& rx, const std::vector<int>& ry, cv::Mat& r) {
+                        if (rx.empty() || t_basis != CS_BASIS_DCT) return;
+                        std::vector<float> b, f;
+                        cs_point_sample_fill(meas, 0, R, C, rx, ry, b, f);
+                        cv::Mat X(R, C, CV_32F, f.data());
+                        cs_dct_forward(X, cs_default_dct_block());
+                        r = X.clone();
+                    };
+                    if (!y_pgrps)
+                        fill_start(y_meas[i][j], Th, Tw, y_tidx.ri_x_g, y_tidx.ri_y_g, x0[0]);
+                    fill_start(cr_meas[i][j], cTh, cTw, cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, x0[1]);
+                    fill_start(cb_meas[i][j], cTh, cTw, cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, x0[2]);
                     // Solve high-TV first as the base, then low-TV from the same
                     // neighbour warm start (independent, not a continuation).
                     mixed = low_tv_tiles && y_dual_tv > 0.0f &&
@@ -1589,7 +1606,7 @@ static void decrypt_tiles_ycc420(int num_threads,
                             tile_tv_y, t_iterations, t_fista_iters, t_basis, t_wscale);
                     solve_plane(cr_meas[i][j], t_coef_c, cTh, cTw,
                         cr_idx[i][j].ri_x_g, cr_idx[i][j].ri_y_g, t_iters_c, x0[1],
-                        true, x0[2], 0.0f);
+                        cb_idx[i][j].ri_x_g.empty(), x0[2], 0.0f);   // Cb keeps its own fill when it has samples
                     solve_plane(cb_meas[i][j], t_coef_c, cTh, cTw,
                         cb_idx[i][j].ri_x_g, cb_idx[i][j].ri_y_g, t_iters_c, x0[2],
                         false, dummy, 0.0f);

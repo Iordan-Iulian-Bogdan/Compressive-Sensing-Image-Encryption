@@ -379,6 +379,18 @@ static bool cs_sr_prox_luma_plane(cv::Mat& plane, const cv::Mat& chroma_cr,
     return true;
 }
 
+// CS_ADMM_PROX_OFF=1: identity prox in the ADMM loop (no NLM), same switch as gpu_admm.
+static bool cs_sr_admm_prox_off()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("CS_ADMM_PROX_OFF");
+        const bool v = e && e[0] == '1';
+        if (v) std::fprintf(stderr, "cs-sr admm: prox off (identity)\n");
+        return v;
+    }();
+    return on;
+}
+
 // Sigma-matched fastNlMeans strength (h) for the PnP prox modes: map the
 // tile's own Immerkaer luma noise estimate to the denoiser's noise parameter
 // (clamped to the useful range; a zero estimate falls back to a mild 3).
@@ -739,6 +751,12 @@ void cs_sr_upscale_tile_2x(const cv::Mat& lr_tile, const cv::Mat& pixel_measurem
             if (red_kind >= 0)
                 zok = cs_sr_prox_luma_plane(zp, init_ycc_chs[1], init_ycc_chs[2],
                     red_kind, red_path, h_k);
+            else if (cs_sr_admm_prox_off()) {
+                // identity prox: only the 8-bit rounding of the NLM input, as gpu_admm's k_unpad_u8
+                cv::Mat u8;
+                zp.convertTo(u8, CV_8U, 255.0);
+                u8.convertTo(zp, CV_32F, 1.0 / 255.0);
+            }
             else
                 cs_sr_prox_luma_plane(zp, cv::Mat(), cv::Mat(), -1, std::string(),
                     h_k);
