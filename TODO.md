@@ -20,6 +20,38 @@
     kernels for gfx11 with a fallback elsewhere (fp32 FISTA loop, ONNX Runtime prior); best done with the
     target GPU at hand to test on.
 
+- [ ] **Profile the LR FISTA stage (`gpu_tiles.hip`) before optimizing it.** `[gpu-tiles-ycc] gpu` is
+  225-335 ms per 12 MP decode, the largest GPU stage, while its floors are ~10-30 ms of VRAM traffic and a few
+  ms of fp32 math (luma batch: 9 arrays of ~3.05M floats, ~110 MB, ~17 array passes per FISTA step, 16-40
+  steps x 1-5 reweights). So it is not bandwidth-bound; find what it is.
+  - Measure: per-kernel times (Radeon GPU Profiler, or hipEvents around `synth` / `adj` / `k_step`), the
+    `Batch::build` + upload share, and how many tiles take `solve_backtrack` (tv > 0 from the per-class seg
+    params?): its 25-trial line search does four blocking `hipMemcpy` round trips per trial.
+  - Done when: the 225-335 ms is attributed (host prep / transfers / kernels / syncs) in
+    `docs/gpu-optimizations.md`.
+
+- [ ] **Fuse the LR FISTA loop per tile, as `k_fista_w` does for cs-sr.** LR tiles are small (luma ~32x24,
+  chroma ~16x12: ~3 KB per fp32 array), so a tile's whole FISTA loop (both DCTs, scatter residual, soft
+  threshold, momentum) fits in one block's LDS and registers. That removes the ~17 whole-image array passes
+  and ~8 launches per step, and keeps the working set out of the Infinity Cache question entirely (today the
+  luma batch's ~110 MB + samples exceeds the 80 MB cache; the chroma batch, ~55 MB, fits). The backtracking
+  branch would move its line search on-device (per-tile accept, no host round trips).
+  - Depends on the profiling item: only worth it if kernels or syncs, not host prep, dominate.
+  - Done when: bit-comparable decodes (or PSNR within 0.01 dB on the 8 photos) and the stage time measured.
+
+- [ ] **Band-fuse the enhance U-Net's full-res layers (`gpu_enh.hip`).** Every conv streams a whole-image
+  NHWC fp16 tensor through VRAM (12 MP: ~385 MB per tensor at c16, ~770 MB at c32), far beyond the 80 MB
+  Infinity Cache. Run head / e0 / tail (and fuse0) in horizontal bands sized so a ResBlock's in / mid / out
+  stay cache-resident (c32: 64-row band ~16 MB per tensor), recomputing the 3x3 halo rows at band edges.
+  - Measured today (`runs/20261101-235435_enh_hip_time`): network 36 ms (c16) / 99 ms (c32); c32 is 2.75x
+    c16 for 4x the MACs, so the narrow layers are memory- or launch-bound. Realistic upside ~20-40 ms of c32.
+  - Done when: identical output to the unfused path and the network time measured on c16 and c32.
+
+- [ ] **Find why `[enhance] upload + planes` scales with net width.** 14 ms (c16) vs 57 ms (c32) on
+  D01_nat_32, 26 vs 118 ms on IMG_3690, though the planes do not depend on the width: probably the weight
+  load / fragment packing is counted there. Cache the loaded net across decodes, or move it out of the timed
+  phase if it is already cached.
+
 - [x] **Replace AMD-specific intrinsics with standard forms where it costs nothing.** Checked per swap
   against the device assembly, the decode timings and bit-identical decode PNGs (section 11).
   - Done, identical machine code: `__float2int_rn(x)` -> `(int)rintf(x)` (`gpu_admm.hip`, `gpu_sr.hip`,
