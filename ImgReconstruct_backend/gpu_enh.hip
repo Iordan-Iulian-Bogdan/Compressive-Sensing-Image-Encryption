@@ -1,9 +1,9 @@
 // Restoration U-Net of --enhance on HIP (see gpu_enh.h).
 //
-// Network (UNetX of x64/GpuBuild/train_enh_fresh.py, c = 16), NHWC fp16 activations, channels padded to 16:
-//   X  = [rgb/255, planes]                 T  = relu(head(X))           S0 = e0(T)               full res, 16 ch
-//   S1 = e1(relu(down1(S0)))               half res, 32 ch              M  = mid(relu(down2(S1))) quarter res, 64 ch
-//   U2 = relu(ps(up2(M)))                  D  = d1(relu(fuse1([U2, S1])))                        half res, 32 ch
+// Network (UNetX of x64/GpuBuild/train_enh_fresh.py, c = 16 or 32), NHWC fp16 activations, channels padded to 16:
+//   X  = [rgb/255, planes]                 T  = relu(head(X))           S0 = e0(T)               full res, c ch
+//   S1 = e1(relu(down1(S0)))               half res, 2c ch              M  = mid(relu(down2(S1))) quarter res, 4c ch
+//   U2 = relu(ps(up2(M)))                  D  = d1(relu(fuse1([U2, S1])))                        half res, 2c ch
 //   U1 = relu(ps(up1(D)))                  V  = fuse0([U1, S0])         out = rgb/255 + tail(V)   full res
 // with ResBlock(x) = x + b(relu(a(x))) and ps = PixelShuffle(2). Every conv is 3x3 and zero padded (stride 2 for
 // down1 / down2) and runs as an implicit GEMM over an fp16 halo in LDS on the WMMA units (fp32 accumulation); bias,
@@ -64,7 +64,8 @@ struct ConvP {
     const std::uint8_t* img; std::uint8_t* out8; int H, W;   // mode 2: the real image and its size
 };
 
-// One 3x3 conv on an 8 x 8 output block: CIN input channels (A then B), NT x 16 output channels, stride S.
+// One 3x3 conv on an 8 x 8 output block: CIN input channels (A then B), NT x 16 output channels from tile
+// blockIdx.y * NT on (wide convs split their output tiles over blockIdx.y), stride S.
 template <int CIN, int NT, int S>
 __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
     constexpr int HS = (kB - 1) * S + 3;   // halo side: 10 (stride 1) or 17 (stride 2)
@@ -85,10 +86,10 @@ __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, r16 = lane & 15, hi = lane >> 4;
-    const int p = 16 * w + r16, py = p / kB, px = p % kB;
+    const int p = 16 * w + r16, py = p / kB, px = p % kB, t0 = blockIdx.y * NT;
     f8 acc[NT];
     #pragma unroll
-    for (int nt = 0; nt < NT; ++nt) acc[nt] = splat(P.bias[nt * 16 + r16]);
+    for (int nt = 0; nt < NT; ++nt) acc[nt] = splat(P.bias[(t0 + nt) * 16 + r16]);
     #pragma unroll
     for (int tap = 0; tap < 9; ++tap) {
         const half_t* a = L + ((py * S + tap / 3) * HS + px * S + tap % 3) * RS;
@@ -96,7 +97,7 @@ __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
         for (int ch = 0; ch < KC; ++ch) {
             const h16 av = ld16(a + ch * 16);
             #pragma unroll
-            for (int nt = 0; nt < NT; ++nt) acc[nt] = mma(av, ldw(P.Wt, KT, nt, tap * KC + ch, r16), acc[nt]);
+            for (int nt = 0; nt < NT; ++nt) acc[nt] = mma(av, ldw(P.Wt, KT, t0 + nt, tap * KC + ch, r16), acc[nt]);
         }
     }
     #pragma unroll
@@ -107,7 +108,7 @@ __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
         if (y >= P.OH || x >= P.OW) continue;
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
-            const int c = nt * 16 + r16;
+            const int c = (t0 + nt) * 16 + r16;
             float v = acc[nt][i];
             if (P.mode == 0) {
                 const size_t o = ((size_t)y * P.OW + x) * P.COUT + c;
@@ -194,11 +195,18 @@ __global__ void k_anchors(const Anchor* A, int n, const std::uint8_t* img, int H
     o[5] = (half_t)clip1((A[t].y - lum(img + (size_t)idx * 3)) / 64.0f);
 }
 
+// nt output tiles go up to 8 per block (register budget), the rest over blockIdx.y.
 bool launch_conv(int cin, int nt, int s, const ConvP& P) {
-    const unsigned g = (unsigned)(((P.OH + kB - 1) / kB) * ((P.OW + kB - 1) / kB));
-#define CS_ENH_CONV(CI, N, S_) if (cin == CI && nt == N && s == S_) { k_conv<CI, N, S_><<<g, kT>>>(P); return true; }
-    CS_ENH_CONV(16, 1, 1) CS_ENH_CONV(16, 2, 2) CS_ENH_CONV(32, 2, 1) CS_ENH_CONV(32, 4, 2) CS_ENH_CONV(64, 4, 1)
-    CS_ENH_CONV(64, 8, 1) CS_ENH_CONV(64, 2, 1) CS_ENH_CONV(32, 4, 1) CS_ENH_CONV(32, 1, 1)
+    const int ntb = std::min(nt, 8);
+    const dim3 g((unsigned)(((P.OH + kB - 1) / kB) * ((P.OW + kB - 1) / kB)), (unsigned)(nt / ntb));
+#define CS_ENH_CONV(CI, N, S_) if (cin == CI && ntb == N && s == S_) { k_conv<CI, N, S_><<<g, kT>>>(P); return true; }
+    if (nt % ntb == 0) {
+        // c = 16
+        CS_ENH_CONV(16, 1, 1) CS_ENH_CONV(16, 2, 2) CS_ENH_CONV(32, 2, 1) CS_ENH_CONV(32, 4, 2) CS_ENH_CONV(64, 4, 1)
+        CS_ENH_CONV(64, 8, 1) CS_ENH_CONV(64, 2, 1) CS_ENH_CONV(32, 4, 1) CS_ENH_CONV(32, 1, 1)
+        // c = 32 (on top of the shared ones): head, down2, mid / up2, fuse1
+        CS_ENH_CONV(16, 2, 1) CS_ENH_CONV(64, 8, 2) CS_ENH_CONV(128, 8, 1) CS_ENH_CONV(128, 4, 1)
+    }
 #undef CS_ENH_CONV
     std::fprintf(stderr, "gpu_enh: no conv kernel for %d input channels, %d output tiles, stride %d\n", cin, nt, s);
     return false;
@@ -238,7 +246,7 @@ bool load(const std::string& path) {
     std::vector<float> fv;
     std::vector<std::uint16_t> hv;
     auto* m = new Model();
-    bool ok = std::fread(hdr, 4, 8, f) == 8 && hdr[0] == 0x31484E45u && hdr[1] == 1 && hdr[2] == 16 && (hdr[6] == 3 || hdr[6] == 5);
+    bool ok = std::fread(hdr, 4, 8, f) == 8 && hdr[0] == 0x31484E45u && hdr[1] == 1 && (hdr[2] == 16 || hdr[2] == 32) &&(hdr[6] == 3 || hdr[6] == 5);
     if (ok) {
         m->c = (int)hdr[2]; m->nx = (int)hdr[6];
         for (int k = 0; k < 3; ++k) m->blocks[k] = (int)hdr[3 + k];

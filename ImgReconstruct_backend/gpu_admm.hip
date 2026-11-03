@@ -10,6 +10,7 @@
 #include "gpu_admm.h"
 #include "gpu_common.hpp"
 #include "gpu_gemm.hpp"
+#include "gpu_prox.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -68,6 +69,15 @@ __global__ void k_pad_u8(const TileDev* td, const int* qoff, const std::uint8_t*
     if (p >= PW * PH) return;
     const int sy = reflect101(p / PW - kBorder, T.rows), sx = reflect101(p % PW - kBorder, T.cols);
     Q[qoff[blockIdx.y] + p] = SRC[T.off + sy * T.cols + sx];
+}
+
+// Identity prox (CS_ADMM_PROX_OFF=1): DN = the unpadded interior of Q.
+__global__ void k_unpad_u8(const TileDev* td, const int* qoff, const std::uint8_t* Q, std::uint8_t* DN) {
+    const TileDev T = td[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= T.rows * T.cols) return;
+    const int PW = T.cols + 2 * kBorder;
+    DN[T.off + i] = Q[qoff[blockIdx.y] + (i / T.cols + kBorder) * PW + i % T.cols + kBorder];
 }
 
 // NLM weight of a quantized distance index (ssd >> 6), as OpenCV's fixed-point table.
@@ -527,6 +537,20 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         if (!dfrag.alloc(hf.size())) return false;
         HIP_TRY(hipMemcpy(dfrag.p, hf.data(), hf.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice));
     }
+    // Learned prox (gpu_prox.h) in place of NLM when CS_ADMM_PROX names its weight file; a load failure keeps NLM.
+    static const bool prox = [] {
+        const char* p = std::getenv("CS_ADMM_PROX");
+        const bool ok = p && *p && gpu_prox::load(p);
+        if (p && *p) std::fprintf(stderr, ok ? "gpu_admm: learned prox %s\n" : "gpu_admm: learned prox %s not loaded; NLM prox\n", p);
+        return ok;
+    }();
+    // CS_ADMM_PROX_OFF=1: identity prox (no denoiser), to measure what the NLM contributes.
+    static const bool prox_off = [] {
+        const char* e = std::getenv("CS_ADMM_PROX_OFF");
+        const bool on = e && e[0] == '1';
+        if (on) std::fprintf(stderr, "gpu_admm: prox off (identity)\n");
+        return on;
+    }();
     HIP_TRY(hipMemcpy(dtd.p, L.td.data(), (size_t)nt * sizeof(TileDev), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dq.p, qoff.data(), (size_t)nt * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dtab.p, L.table.data(), L.table.size() * sizeof(float), hipMemcpyHostToDevice));
@@ -672,7 +696,19 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         if (!fista_w)
             TIMED("gemm_inv_b", k_gemm<OP_TABT, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, dPIX.p, nbn, none));
         TIMED("k_quant", k_quant<<<pgrid, blk>>>(dtd.p, dq.p, dPIX.p, dU.p, dQ.p));
-        TIMED("k_nlm", launch_nlm(nt, L.max_rows, L.max_cols, hmax, dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
+        if (prox) {
+            bool ran = false;
+            TIMED("k_prox", ran = gpu_prox::run(nt, L.max_rows, L.max_cols, dtd.p, L.td.data(), dq.p, kBorder, dQ.p, dBLR.p,
+                                               use_hr ? dHAV.p : nullptr, dH.p, hmul_k, dDN.p));
+            if (!ran) {
+                std::fprintf(stderr, "gpu_admm: learned prox launch failed\n");
+                return false;
+            }
+        } else if (prox_off) {
+            TIMED("k_unpad", k_unpad_u8<<<grid, blk>>>(dtd.p, dq.p, dQ.p, dDN.p));
+        } else {
+            TIMED("k_nlm", launch_nlm(nt, L.max_rows, L.max_cols, hmax, dtd.p, dq.p, dH.p, hmul_k, dQ.p, dDN.p));
+        }
         if (!dump_tiles.empty()) {
             hQ.resize((size_t)qtot);
             hDN.resize(N);

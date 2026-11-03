@@ -2482,7 +2482,13 @@ int decrypt_image::decrypt_image_tiled(
         }
         // Diagnostic (opt-in): CS_COEF_MULT=<f> scales the derived coef (luma, chroma and SR
         // correction follow it) without leaving auto mode, unlike --coef. Used by the lambda sweeps.
+        // NLM-off decoder (cs-sr ADMM with the identity prox, CS_ADMM_PROX_OFF=1): the fitted laws over-regularize it;
+        // x0.2 is the 77-photo sweep's optimum after the post-net at every ratio (x0.15-0.2 plateau, +0.20 dB).
+        // An explicit CS_COEF_MULT replaces this factor.
+        const char* prox_off = std::getenv("CS_ADMM_PROX_OFF");
+        const bool nlm_off = prox_off && prox_off[0] == '1' && photo_up.backend == "cs-sr" && photo_up.sr_pnp == "admm";
         if (const char* cm = std::getenv("CS_COEF_MULT"); cm && *cm && coef_auto) coef *= (float)std::atof(cm);
+        else if (nlm_off && coef_auto) coef *= 0.2f;
         if (tv == -1.0f) {
             const float dtv = cs_auto_reg_tv(sm, ar);
             tv = (dtv >= 0.0f) ? dtv : 0.0f;
@@ -3074,6 +3080,54 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             }
         }
 
+        // Experimental (opt-in): anchors as LR information. CS_ANCHOR_LR=1 promotes each unsampled 2x2 block whose four
+        // HR pixels are all anchors to an LR luma sample (their rounded mean; an LR sample is the 2x2 box mean of the
+        // luma), so the LR FISTA stage sees it. CS_ANCHOR_DERIVE=1 adds the fourth pixel of a sampled block holding three
+        // anchors as an extra anchor (4 * sample - their sum, clamped). The dumps above and the restoration net keep the
+        // container's own samples and anchors, which the net was trained on.
+        cv::Mat Y_net = Y, Ym_net = Ym;
+        std::vector<CsHrSample> hr_net;
+        {
+            const char* elr = std::getenv("CS_ANCHOR_LR");
+            const char* eder = std::getenv("CS_ANCHOR_DERIVE");
+            const bool alr = elr && elr[0] == '1', ader = eder && eder[0] == '1';
+            if ((alr || ader) && !full_res && !dimgs.hr_samples.empty() && Y.type() == CV_8U && Ym.type() == CV_8U) {
+                Y_net = Y.clone(); Ym_net = Ym.clone();
+                if (ader) hr_net = dimgs.hr_samples;
+                const int lrows = Y.rows, lcols = Y.cols, W = lcols * 2;
+                const size_t nb = (size_t)lrows * lcols;
+                std::vector<uint8_t> cnt(nb, 0), bits(nb, 0);
+                std::vector<uint16_t> sum(nb, 0);
+                for (const auto& s : dimgs.hr_samples) {
+                    const int r = (int)(s.idx / (uint32_t)W), c = (int)(s.idx % (uint32_t)W);
+                    if (r / 2 >= lrows) continue;
+                    const size_t b = (size_t)(r / 2) * lcols + c / 2;
+                    ++cnt[b]; sum[b] += s.y; bits[b] |= (uint8_t)(1 << ((r & 1) * 2 + (c & 1)));
+                }
+                size_t promoted = 0, derived = 0;
+                for (size_t b = 0; b < nb; ++b) {
+                    const int br = (int)(b / lcols), bc = (int)(b % lcols);
+                    uint8_t& m = Ym.at<uint8_t>(br, bc);
+                    if (alr && cnt[b] == 4 && !m) {
+                        Y.at<uint8_t>(br, bc) = (uint8_t)((sum[b] + 2) / 4); m = 1; ++promoted;
+                    }
+                    else if (ader && cnt[b] == 3 && m) {
+                        int slot = 0;
+                        while (bits[b] & (1 << slot)) ++slot;
+                        const int v = 4 * (int)Y.at<uint8_t>(br, bc) - (int)sum[b];
+                        CsHrSample s;
+                        s.idx = (uint32_t)(br * 2 + (slot >> 1)) * (uint32_t)W + (uint32_t)(bc * 2 + (slot & 1));
+                        s.y = (uint8_t)std::clamp(v, 0, 255);
+                        dimgs.hr_samples.push_back(s); ++derived;
+                    }
+                }
+                if (derived)
+                    std::sort(dimgs.hr_samples.begin(), dimgs.hr_samples.end(),
+                        [](const CsHrSample& a, const CsHrSample& b) { return a.idx < b.idx; });
+                std::cout << "anchor-lr: " << promoted << " LR samples promoted, " << derived << " anchors derived" << std::endl;
+            }
+        }
+
         // Luma/chroma split + per-plane solve + merge as one reusable unit:
         // the standard path runs it once; --seg-solve runs it once with
         // per-tile class parameters (majority vote, no per-class passes).
@@ -3619,7 +3673,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         bool enhanced = false;
         if (!photo_up.enhance_model.empty() && !reconstructed.empty()) {
             CsEnhInputs ein;
-            ein.y_mask = &Ym; ein.y_samp = &Y; ein.anchors = &dimgs.hr_samples;
+            ein.y_mask = &Ym_net; ein.y_samp = &Y_net; ein.anchors = hr_net.empty() ? &dimgs.hr_samples : &hr_net;
             enhanced = cs_enhance_net(reconstructed, photo_up.enhance_model, ein);
         }
 
