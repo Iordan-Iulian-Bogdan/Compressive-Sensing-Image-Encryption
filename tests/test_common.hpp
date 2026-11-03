@@ -59,6 +59,7 @@ void test_crypto();
 void test_shuffle();
 void test_tile_helpers();
 void test_roundtrip();
+void test_odd_size_roundtrip();
 void test_fista_solvers();
 void test_dct_adjoint();
 void test_block_dct();

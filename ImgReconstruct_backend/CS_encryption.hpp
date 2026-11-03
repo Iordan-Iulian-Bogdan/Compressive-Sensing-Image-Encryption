@@ -43,6 +43,7 @@ protected:
     cv::Mat encrypted_img, input_img;
     cv::Mat decrypted_img;
     cv::Size org_size;
+    int odd_parity = 0;   // native size parity (cs_build_metadata): bit 0 odd height, bit 1 odd width
     int rows, cols, m, n;
     std::vector<int> ri_x, ri_y;
 

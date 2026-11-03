@@ -129,6 +129,7 @@ void decrypt_image::parse_container_header(const cv::Mat& input, const std::stri
     cols = info.cols;
     org_size.height = info.org_h;
     org_size.width = info.org_w;
+    odd_parity = info.odd_parity;
 
     // sampling mode travels in the authenticated header: periodic and
     // adaptive modes restore automatically, no decrypt-side flags needed
@@ -3014,8 +3015,9 @@ int decrypt_image::decrypt_image_tiled(
             std::cout << "HR-detail: applied " << applied << "/"
                       << dimgs.hr_samples.size() << " anchors" << std::endl;
         }
-        if (decoded_out) *decoded_out = reconstructed;   // in-memory caller (encoder anchor pass)
+        if (decoded_out) *decoded_out = reconstructed;   // in-memory caller (encoder anchor pass): padded geometry
         else {
+        dimgs.crop_odd_parity(reconstructed, full_res);
 #ifdef CS_FAST_PNG
         cs_write_image(output_path, reconstructed);   // parallel PNG encode
 #else
@@ -3688,8 +3690,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                       << dimgs.hr_samples.size() << " anchors" << std::endl;
         }
 
-        if (decoded_out) *decoded_out = reconstructed;   // in-memory caller (encoder anchor pass)
+        if (decoded_out) *decoded_out = reconstructed;   // in-memory caller (encoder anchor pass): padded geometry
         else {
+        dimgs.crop_odd_parity(reconstructed, full_res);
 #ifdef CS_FAST_PNG
         cs_write_image(output_path, reconstructed);   // parallel PNG encode
 #else

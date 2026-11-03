@@ -490,7 +490,7 @@ void encrypt_image::derive_container_key(const std::string& password, uint8_t sa
 uint8_t* encrypt_image::alloc_container(int total, const uint8_t salt[CS_SALT_BYTES]) {
     encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width, odd_parity);
     uint8_t* buf = encrypted_img.data;
     if (!cs_write_header(buf, total * 3, text, cs_key, salt)) {
         throw std::runtime_error("failed to write authenticated header");
@@ -2315,7 +2315,7 @@ void encrypt_image::encrypt_hf_focus(const float& pixel_p,
     const int written = static_cast<int>(ri_x.size());
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + lod_pixels + thumb_pixels + 8);
     encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-    const std::string metadata = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    const std::string metadata = cs_build_metadata(m, rows, cols, org_size.height, org_size.width, odd_parity);
     uint8_t* buffer = encrypted_img.data;
     if (!cs_write_header(buffer, static_cast<size_t>(total) * 3, metadata, cs_key, salt))
         throw std::runtime_error("failed to write hf-focus header");
@@ -2402,7 +2402,7 @@ void encrypt_image::encrypt_ycc420_hf(const float& pixel_p,
     const int measure_pixels = static_cast<int>((measure_bytes + 2) / 3);
     const int total = next_perfect_square(CS_HEADER_PIXELS + thumb_pixels + measure_pixels + 8);
     encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
-    const std::string metadata = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    const std::string metadata = cs_build_metadata(m, rows, cols, org_size.height, org_size.width, odd_parity);
     uint8_t* buffer = encrypted_img.data;
     if (!cs_write_header(buffer, static_cast<size_t>(total) * 3, metadata, cs_key, salt))
         throw std::runtime_error("failed to write hf-focus header");
@@ -2571,7 +2571,7 @@ void encrypt_image::encrypt_values(const std::vector<cv::Vec3b>& vals) {
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
     encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width, odd_parity);
     cs_write_header_plain(encrypted_img.data, total * 3, text);
 
     for (int k = 0; k < m; k++) {
@@ -2587,7 +2587,7 @@ void encrypt_image::encrypt(const std::vector<int>& ri_x_g, const std::vector<in
     const int total = next_perfect_square(m + CS_HEADER_PIXELS + 8);
     encrypted_img = cv::Mat(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width);
+    const std::string text = cs_build_metadata(m, rows, cols, org_size.height, org_size.width, odd_parity);
     cs_write_header_plain(encrypted_img.data, total * 3, text);
 
     // write all m measurements (indices CS_HEADER_PIXELS .. CS_HEADER_PIXELS+m-1)
@@ -2763,9 +2763,21 @@ int encrypt_image::encrypt_image_tiled(
             throw std::runtime_error("Failed to load input image: " + input_path);
         }
 
+        // The default 2x pipeline needs even sides: an odd side is padded by one
+        // replicated row / column, recorded in the container, and cropped back
+        // by decrypt, so the output keeps the native size and pixel grid.
+        int odd_parity = 0;
+        if (!full_res) {
+            odd_parity = (input_img.rows % 2) | ((input_img.cols % 2) << 1);
+            if (odd_parity != 0) {
+                cv::copyMakeBorder(input_img, input_img, 0, input_img.rows % 2, 0, input_img.cols % 2,
+                    cv::BORDER_REPLICATE);
+            }
+        }
+
         // HR-detail anchors are ground-truth native luma, so select them
         // before the default 2x downscale. Reference geometry = decrypt
-        // output geometry (native, or native-resized on odd dimensions).
+        // output geometry (native, padded to even sides).
         // --seg-auto picks its anchors in a closed loop after sampling (compact
         // mode-19 payload); keep the native image for their exact luma.
         std::vector<CsHrSample> hr_samples;
@@ -2793,6 +2805,7 @@ int encrypt_image::encrypt_image_tiled(
             cv::resize(input_img, input_img, cv::Size(input_img.cols / 2, input_img.rows / 2));
         }
         encrypt_image encrypt_img(input_img, true);
+        encrypt_img.set_odd_parity(odd_parity);
 
         if (!seg_mask.empty()) {
             // per-segment sampling from the label/color mask: BGR (mode 10),

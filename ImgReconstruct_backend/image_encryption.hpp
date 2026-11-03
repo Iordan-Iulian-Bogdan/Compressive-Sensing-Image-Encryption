@@ -30,6 +30,10 @@ public:
     // Next encrypt_* reuses this object's salt + key (see keep_key).
     void reuse_key() { keep_key = true; }
 
+    // Native size parity recorded in the container (the input was padded to even by one replicated
+    // row / column per odd side; decrypt crops it back).
+    void set_odd_parity(int p) { odd_parity = p; }
+
     void get_mat(cv::Mat& dest);
 
     cv::Mat get_mat();

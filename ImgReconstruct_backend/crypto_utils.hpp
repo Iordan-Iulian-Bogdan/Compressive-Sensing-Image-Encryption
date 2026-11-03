@@ -66,9 +66,10 @@ bool cs_random_bytes(uint8_t* out, size_t len);
 // PBKDF2-HMAC-SHA256 (Windows CNG). Returns false on CNG failure.
 bool cs_derive_key(const std::string& password, const uint8_t* salt, uint8_t key_out[32]);
 
-// Builds the 32-byte '-'-padded metadata string "m|rows|cols|h|w".
-// Throws std::runtime_error if the unpadded text exceeds 32 bytes.
-std::string cs_build_metadata(int m, int rows, int cols, int org_h, int org_w);
+// Builds the 32-byte '-'-padded metadata string "m|rows|cols|h|w", plus "|p" when odd_parity != 0
+// (bit 0: native height odd, bit 1: native width odd; the encoder padded that side by one replicated
+// row/column and decrypt crops it back). Throws std::runtime_error if the unpadded text exceeds 32 bytes.
+std::string cs_build_metadata(int m, int rows, int cols, int org_h, int org_w, int odd_parity = 0);
 
 // Writes a v2 authenticated header into buf (first CS_HEADER_BYTES bytes of a
 // linear CV_8UC3 container). salt must have been generated beforehand (the
@@ -369,6 +370,7 @@ inline void cs_ycc420_channel_key(const uint8_t in[32], uint8_t tag, uint8_t out
 
 struct CsHeaderInfo {
     int m = 0, rows = 0, cols = 0, org_h = 0, org_w = 0;
+    int odd_parity = 0;              // optional 6th metadata field (cs_build_metadata), 0 when absent
     int version = 0;                 // 1 = plain v1, 2 = authenticated v2
     uint8_t key[32] = {};            // derived key (v2 only)
     bool key_valid = false;

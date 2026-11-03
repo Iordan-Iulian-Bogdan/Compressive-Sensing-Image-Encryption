@@ -65,6 +65,23 @@ void test_crypto() {
         tile_info.version == 1 && tile_info.m == 1234567 && !tile_info.key_valid,
         "crypto: v1 tile header parses without password");
 
+    // odd-size parity: optional 6th field, absent for even images (text unchanged)
+    check(cs_build_metadata(1234567, 2016, 1512, 3024, 4032, 0) == meta, "crypto: parity 0 keeps the 5-field metadata");
+    check(tile_info.odd_parity == 0, "crypto: 5-field metadata parses as parity 0");
+    for (int p = 1; p <= 3; ++p) {
+        std::vector<uint8_t> pbuf(CS_HEADER_BYTES);
+        cs_write_header_plain(pbuf.data(), pbuf.size(), cs_build_metadata(1234567, 2016, 1512, 3024, 4032, p));
+        CsHeaderInfo pinfo;
+        check(cs_parse_header(pbuf.data(), pbuf.size(), "", pinfo) && pinfo.odd_parity == p &&
+            pinfo.org_h == 3024 && pinfo.org_w == 4032, "crypto: parity field roundtrips");
+    }
+    {
+        std::vector<uint8_t> pbuf(CS_HEADER_BYTES);
+        cs_write_header_plain(pbuf.data(), pbuf.size(), cs_build_metadata(1234567, 2016, 1512, 3024, 4032, 4));
+        CsHeaderInfo pinfo;
+        check(!cs_parse_header(pbuf.data(), pbuf.size(), "", pinfo), "crypto: parity > 3 rejected");
+    }
+
     std::vector<uint8_t> legacy(96, (uint8_t)'-');
     check(!cs_parse_header(legacy.data(), legacy.size(), "x", bad) && bad.legacy,
         "crypto: legacy container detected");
@@ -235,6 +252,44 @@ cv::Mat encrypted;
     if (s >= 0.0) check(s > 0.85, "roundtrip: SSIM > 0.85");
     else check(false, "roundtrip: SSIM unavailable");
 
+    std::remove(tmp_in.c_str());
+    std::remove(tmp_out.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 4a. odd-size roundtrip: the 2x pipeline keeps the native size and pixel grid
+// ---------------------------------------------------------------------------
+void test_odd_size_roundtrip() {
+    const std::string password = "odd-size-test-password";
+    const std::string tmp_in = ".cs_test_odd_in.png";
+    const std::string tmp_out = ".cs_test_odd_out.png";
+    const cv::Mat full = make_test_image(321, 241);
+    double p_even = 0.0;
+    const int sizes[4][2] = { { 240, 320 }, { 241, 320 }, { 240, 321 }, { 241, 321 } };   // rows, cols
+    for (const auto& hw : sizes) {
+        const cv::Mat original = full(cv::Rect(0, 0, hw[1], hw[0])).clone();
+        cv::imwrite(tmp_in, original);
+        char tag[96];
+        cv::Mat enc;
+        bool ok = encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &enc) == 0;
+        std::snprintf(tag, sizeof(tag), "odd size: %dx%d encrypt", hw[0], hw[1]);
+        check(ok, tag);
+        if (!ok) continue;
+        ok = decrypt_image::decrypt_image_tiled(enc, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0;
+        std::snprintf(tag, sizeof(tag), "odd size: %dx%d decrypt", hw[0], hw[1]);
+        check(ok, tag);
+        if (!ok) continue;
+        const cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        std::snprintf(tag, sizeof(tag), "odd size: %dx%d decodes at the native size", hw[0], hw[1]);
+        check(dec.size() == original.size(), tag);
+        if (dec.size() != original.size()) continue;
+        // pixel-aligned with the original (no resample): as good as the even crop of the same image
+        const double p = cs_quality::psnr(original, dec);
+        std::printf("       odd size %dx%d PSNR: %.2f dB\n", hw[0], hw[1], p);
+        if (hw[0] % 2 == 0 && hw[1] % 2 == 0) p_even = p;
+        std::snprintf(tag, sizeof(tag), "odd size: %dx%d PSNR within 1 dB of the even crop", hw[0], hw[1]);
+        check(p > p_even - 1.0, tag);
+    }
     std::remove(tmp_in.c_str());
     std::remove(tmp_out.c_str());
 }

@@ -179,6 +179,13 @@ public:
 
     cv::Size get_org_size();
 
+    // Crops the 2x output back to the native size when the encoder padded an odd side
+    // (cs_build_metadata parity). No-op for even images and under --full-res.
+    void crop_odd_parity(cv::Mat& img, bool full_res) const {
+        if (full_res || odd_parity == 0 || img.rows < 2 || img.cols < 2) return;
+        img = img(cv::Rect(0, 0, img.cols - ((odd_parity >> 1) & 1), img.rows - (odd_parity & 1))).clone();
+    }
+
     // Tile geometry and the raw container (header + BGR samples), for the
     // batched GPU path (gpu_decrypt.hpp).
     int get_rows() const { return rows; }

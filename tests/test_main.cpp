@@ -26,6 +26,7 @@ int main(int argc, char* argv[]) {
     test_shuffle();
     test_tile_helpers();
     test_roundtrip();
+    test_odd_size_roundtrip();
     test_fista_solvers();
     test_wavelet_basis();
     test_adaptive_counts();

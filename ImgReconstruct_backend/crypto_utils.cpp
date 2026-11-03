@@ -233,9 +233,10 @@ bool cs_aes256_ctr_xor(uint8_t* data, size_t len, const uint8_t key[32], const u
 // Backend-independent container format code
 // ---------------------------------------------------------------------------
 
-std::string cs_build_metadata(int m, int rows, int cols, int org_h, int org_w) {
+std::string cs_build_metadata(int m, int rows, int cols, int org_h, int org_w, int odd_parity) {
     std::string text = std::to_string(m) + "|" + std::to_string(rows) + "|" + std::to_string(cols) + "|" +
         std::to_string(org_h) + "|" + std::to_string(org_w);
+    if (odd_parity != 0) text += "|" + std::to_string(odd_parity);   // even images keep the 5-field text
     if (text.size() > CS_METADATA_BYTES) {
         throw std::runtime_error("metadata too large for header (image dimensions out of range)");
     }
@@ -246,7 +247,8 @@ namespace {
 
 // Parse the '-'-padded "m|rows|cols|h|w" metadata string. Returns false on
 // malformed content instead of throwing, so header errors surface uniformly.
-bool parse_metadata_fields(const uint8_t* meta, int (&vals)[5]) {
+// Five fields "m|rows|cols|h|w", or six with the odd-size parity (vals[5], 0 when absent, 0..3).
+bool parse_metadata_fields(const uint8_t* meta, int (&vals)[6]) {
     std::string text((const char*)meta, CS_METADATA_BYTES);
     const size_t first = text.find_first_not_of('-');
     if (first == std::string::npos) return false;
@@ -267,9 +269,10 @@ bool parse_metadata_fields(const uint8_t* meta, int (&vals)[5]) {
             return false;
         }
     }
-    if (vi != 4) return false;
+    if (vi != 4 && vi != 5) return false;
     try { vals[vi++] = std::stoi(cur); } catch (...) { return false; }
-    return true;
+    if (vi == 5) vals[5] = 0;
+    return vals[5] >= 0 && vals[5] <= 3;
 }
 
 } // namespace
@@ -467,11 +470,11 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
 
     // v1: ephemeral in-memory tile containers (plaintext metadata, no MAC)
     if (buf[CS_OFF_VERSION] == 1) {
-        int vals[5];
+        int vals[6];
         if (!parse_metadata_fields(buf + CS_OFF_META, vals)) return false;
         out.version = 1;
         out.m = vals[0]; out.rows = vals[1]; out.cols = vals[2];
-        out.org_h = vals[3]; out.org_w = vals[4];
+        out.org_h = vals[3]; out.org_w = vals[4]; out.odd_parity = vals[5];
         return true;
     }
 
@@ -504,7 +507,7 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
         return false;
     }
 
-    int vals[5];
+    int vals[6];
     const bool ok = parse_metadata_fields(meta, vals);
     cs_wipe(meta, sizeof(meta));
     if (!ok) {
@@ -515,7 +518,7 @@ bool cs_parse_header(const uint8_t* buf, size_t buf_bytes, const std::string& pa
 
     out.version = CS_VERSION;
     out.m = vals[0]; out.rows = vals[1]; out.cols = vals[2];
-    out.org_h = vals[3]; out.org_w = vals[4];
+    out.org_h = vals[3]; out.org_w = vals[4]; out.odd_parity = vals[5];
 
     // sampling-mode flags live in the authenticated pad region:
     // [CS_OFF_PAD] = mode (0 random, 1 periodic, 2 adaptive), followed by
