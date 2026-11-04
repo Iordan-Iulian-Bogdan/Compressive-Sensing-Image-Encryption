@@ -40,4 +40,13 @@ struct Params {          // shared by every tile of one call
 // Returns false when the device is missing or a HIP call fails; then no x is modified.
 bool solve_fista_dct(const std::vector<TileProblem>& tiles, const Params& p);
 
+// The YCC decode's LR stage with its tail on the device. planes holds Y, Cr, Cb of job j at 3j, 3j+1, 3j+2 (their x
+// are only read); each group is one solve_fista_dct call (tv = 0 tiles, fused kernel). Each job's planes then take the
+// CPU tail's steps on the device: inverse DCT x 255, chroma bilinear to the luma size (cv::resize INTER_LINEAR), 8 bit
+// (convertTo), YCrCb -> BGR (OpenCV fixed point). out receives the jobs' BGR tiles back to back; its device copy is
+// left in gpu_common's resident slot for the cs-sr stage. Returns false (out untouched) when a plane needs another
+// solver, or on a HIP failure.
+struct PlaneGroup { Params prm; std::vector<int> planes; };
+bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<PlaneGroup>& groups, unsigned char* out);
+
 }  // namespace gpu_tiles

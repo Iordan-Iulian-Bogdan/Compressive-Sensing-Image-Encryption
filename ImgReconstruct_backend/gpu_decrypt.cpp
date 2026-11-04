@@ -10,6 +10,8 @@
 
 #include <array>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <tuple>
@@ -35,7 +37,10 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 
 // Smooth-fill DCT warm start, batched FISTA grouped by (inner steps, reweights, wscale), inverse DCT x 255.
 // Planes whose GPU batch failed keep ok = false. Returns false without touching anything when no device.
-bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<void()>& on_gpu = {}) {
+// ycc_bgr (planes 3 per YCC job): first tries gpu_tiles::solve_ycc_bgr, which leaves the merged BGR tiles there
+// and sets *merged (the planes' x then keep their warm start); otherwise the host tail below.
+bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<void()>& on_gpu = {},
+    unsigned char* ycc_bgr = nullptr, bool* merged = nullptr) {
     if (ps.empty() || !gpu_tiles::available()) return false;
     const auto t0 = std::chrono::steady_clock::now();
     const int np = (int)ps.size();
@@ -56,6 +61,23 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<v
     if (on_gpu) on_gpu();
 
     const auto t1 = std::chrono::steady_clock::now();
+    bool all = true;
+    for (const Plane& P : ps) all = all && P.prepared;
+    if (ycc_bgr && all) {
+        std::vector<gpu_tiles::TileProblem> probs;
+        probs.reserve(ps.size());
+        for (Plane& P : ps)
+            probs.push_back({ P.rows, P.cols, P.b.data(), P.rix->data(), P.riy->data(), (int)P.rix->size(), P.x.data(), P.coef, P.tv });
+        std::vector<gpu_tiles::PlaneGroup> pg;
+        for (auto& g : groups) pg.push_back({ { std::get<0>(g.first), std::get<1>(g.first), std::get<2>(g.first) }, g.second });
+        if (gpu_tiles::solve_ycc_bgr(probs, pg, ycc_bgr)) {
+            for (Plane& P : ps) P.ok = true;
+            *merged = true;
+            std::fprintf(stderr, "[%s] phases: prep %.0f ms, gpu + device tail %.0f ms (%zu batches)\n",
+                tag, t_prep, ms_since(t1), groups.size());
+            return true;
+        }
+    }
     for (auto& g : groups) {
         std::vector<gpu_tiles::TileProblem> probs;
         probs.reserve(g.second.size());
@@ -133,10 +155,28 @@ void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>&
             P.coef = G.coef; P.tv = G.tv;
         }
     }
-    if (!solve_planes(ps, "gpu-tiles-ycc", on_gpu)) return;
+    // The device tail's target: the jobs' BGR tiles back to back in one buffer, which the outputs then view (the cs-sr
+    // stage finds the device copy of exactly these bytes). CS_GPU_LR_HOST_TAIL=1 keeps the host tail (A/B).
+    size_t pool_bytes = 0;
+    for (const GpuYccTileJob& J : jobs) pool_bytes += (size_t)3 * J.plane[0].rows * J.plane[0].cols;
+    const char* ht = std::getenv("CS_GPU_LR_HOST_TAIL");
+    cv::Mat pool;
+    if (pool_bytes > 0 && pool_bytes <= (size_t)INT_MAX && !(ht && ht[0] == '1')) pool.create(1, (int)pool_bytes, CV_8U);
+    bool merged = false;
+    if (!solve_planes(ps, "gpu-tiles-ycc", on_gpu, pool.empty() ? nullptr : pool.data, &merged)) return;
+    const int nj = (int)jobs.size();
+    if (merged) {
+        size_t off = 0;
+        for (int j = 0; j < nj; ++j) {
+            const int Th = jobs[(size_t)j].plane[0].rows, n = 3 * Th * jobs[(size_t)j].plane[0].cols;
+            *jobs[(size_t)j].out = pool.colRange((int)off, (int)off + n).reshape(3, Th);
+            off += (size_t)n;
+            solved[(size_t)j] = 1;
+        }
+        return;
+    }
 
     // Same tail as decrypt_tiles_ycc420: chroma bilinear to the luma size, merge YCrCb, 8 bit, BGR.
-    const int nj = (int)jobs.size();
     #pragma omp parallel for schedule(dynamic, 8)
     for (int j = 0; j < nj; ++j) {
         Plane* P = &ps[(size_t)j * 3];

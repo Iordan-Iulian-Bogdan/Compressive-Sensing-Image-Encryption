@@ -318,6 +318,51 @@ __global__ void __launch_bounds__(kLrThreads) k_lr_fista(const TileDev* td, cons
             if (in[i][j]) X[T.off + (mb + i) * N + nb + j] = xp[i][j];
 }
 
+// ---- solve_ycc_bgr's merge: the CPU tail of cs_gpu_solve_tiles_ycc, one block row per job ----
+struct MergeDev {
+    const float *y, *cr, *cb;   // inverse-DCT planes (pixels / 255)
+    int rows, cols, crows, ccols;
+    long long out;              // byte offset of the job's BGR tile
+};
+
+// cv::resize INTER_LINEAR source coordinate of destination index d (scale = source / destination size).
+__device__ inline float lin_src(int d, double scale, int n, int& s0, int& s1) {
+    float f = (float)((d + 0.5) * scale - 0.5);
+    int s = (int)floorf(f);
+    f -= (float)s;
+    if (s < 0) { f = 0.f; s = 0; }
+    if (s >= n - 1) { f = 0.f; s = n - 1; }
+    s0 = s; s1 = min(s + 1, n - 1);
+    return f;
+}
+
+__device__ inline int sat8i(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+// x 255, chroma bilinear (horizontal, then vertical), convertTo CV_8U (round half even, saturate), then
+// YCrCb -> BGR in OpenCV's 8-bit fixed point (as gpu_sr's k_finish).
+__global__ void k_ycc_merge(const MergeDev* md, std::uint8_t* OUT) {
+    const MergeDev M = md[blockIdx.y];
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= M.rows * M.cols) return;
+    const int r = i / M.cols, c = i % M.cols;
+    int x0, x1, y0, y1;
+    const float fx = lin_src(c, (double)M.ccols / M.cols, M.ccols, x0, x1);
+    const float fy = lin_src(r, (double)M.crows / M.rows, M.crows, y0, y1);
+    auto bil = [&](const float* P) {
+        const float* p0 = P + y0 * M.ccols;
+        const float* p1 = P + y1 * M.ccols;
+        const float h0 = p0[x0] * 255.0f * (1.0f - fx) + p0[x1] * 255.0f * fx;
+        const float h1 = p1[x0] * 255.0f * (1.0f - fx) + p1[x1] * 255.0f * fx;
+        return h0 * (1.0f - fy) + h1 * fy;
+    };
+    const int y = sat8i((int)rintf(M.y[i] * 255.0f));
+    const int cr = sat8i((int)rintf(bil(M.cr))) - 128, cb = sat8i((int)rintf(bil(M.cb))) - 128;
+    std::uint8_t* q = OUT + M.out + 3 * (long long)i;
+    q[0] = (std::uint8_t)sat8i(y + ((cb * 29049 + (1 << 13)) >> 14));
+    q[1] = (std::uint8_t)sat8i(y + ((cb * -5636 + cr * -11698 + (1 << 13)) >> 14));
+    q[2] = (std::uint8_t)sat8i(y + ((cr * 22987 + (1 << 13)) >> 14));
+}
+
 // Host layout + device copies of a batch's tiles, samples and warm starts.
 struct Batch {
     int nt = 0, max_n = 0, max_rows = 0, max_cols = 0, total_samples = 0;
@@ -432,8 +477,12 @@ struct Batch {
     }
 };
 
+// solve_ycc_bgr's view of one solve: pix (allocated by the caller, total floats) receives the inverse DCT of the
+// solution instead of the download, tile t at pix + td[t].off.
+struct Kept { DevBuf<float> pix; std::vector<TileDev> td; };
+
 // tv = 0: exact fixed step 1/2 (previous behaviour, unchanged).
-bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm) {
+bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm, Kept* keep = nullptr) {
     PhaseProf pp;
     // Fused per-tile loop (k_lr_fista; CS_GPU_LR_FUSED=0 keeps the launch-per-step loop) when every tile fits one
     // block: at most kLrThreads 4x4 output blocks, and A + B in 64 KB of LDS.
@@ -445,6 +494,7 @@ bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm) {
     }
     const char* ef = std::getenv("CS_GPU_LR_FUSED");
     const bool fused = fit && lds <= 64 * 1024 && !(ef && ef[0] == '0');
+    if (keep && !fused) return false;
     Batch B;
     if (!B.build(tiles, prm.wscale, pp, fused)) return false;
     const size_t N = (size_t)B.total, bytes = N * sizeof(float);
@@ -491,7 +541,16 @@ bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm) {
         if (r + 1 < prm.reweights) B.reweight(dZ.p, dEPS.p);
     }
     pp.mark(1);
-    const bool ok = B.download(tiles);
+    bool ok = true;
+    if (keep) {   // inverse DCT on the device; the solution stays there
+        DevBuf<float> dTMP1;
+        if (!dTMP1.alloc(N)) return false;
+        B.synth(B.dX.p, dTMP1.p, keep->pix.p);
+        HIP_TRY(hipGetLastError());
+        keep->td = B.td;
+    } else {
+        ok = B.download(tiles);
+    }
     pp.mark(2);
     pp.print(fused ? "fixed (fused)" : "fixed", B.nt, B.max_rows, B.max_cols, B.total, B.total_samples, prm.inner, prm.reweights);
     return ok;
@@ -682,6 +741,47 @@ bool solve_fista_dct(const std::vector<TileProblem>& tiles, const Params& prm) {
     for (const TileProblem& P : tiles) (P.tv > 0.0f ? bt : fixed).push_back(P);
     if (!fixed.empty() && !solve_fixed(fixed, prm)) return false;
     if (!bt.empty() && !solve_backtrack(bt, prm)) return false;
+    return true;
+}
+
+bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<PlaneGroup>& groups, unsigned char* out) {
+    if (planes.empty() || planes.size() % 3 || !available()) return false;
+    const int nj = (int)(planes.size() / 3);
+    std::vector<MergeDev> md((size_t)nj);
+    long long out_bytes = 0;
+    int max_n = 0;
+    for (int j = 0; j < nj; ++j) {
+        const TileProblem& Y = planes[3 * (size_t)j];
+        const TileProblem& Cr = planes[3 * (size_t)j + 1];
+        if (Cr.rows != planes[3 * (size_t)j + 2].rows || Cr.cols != planes[3 * (size_t)j + 2].cols) return false;
+        md[(size_t)j] = { nullptr, nullptr, nullptr, Y.rows, Y.cols, Cr.rows, Cr.cols, out_bytes };
+        out_bytes += 3LL * Y.rows * Y.cols;
+        max_n = std::max(max_n, Y.rows * Y.cols);
+    }
+    for (const TileProblem& P : planes) if (P.tv > 0.0f) return false;
+    if (out_bytes > 2000000000LL) return false;
+    DevBuf<std::uint8_t> dOUT;   // first, so the arena reclaims the solves' buffers above it while it stays resident
+    if (!dOUT.alloc((size_t)out_bytes)) return false;
+    std::vector<Kept> kept(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g) {
+        std::vector<TileProblem> tiles;
+        long long n = 0;
+        for (int k : groups[g].planes) { tiles.push_back(planes[(size_t)k]); n += (long long)planes[(size_t)k].rows * planes[(size_t)k].cols; }
+        if (!kept[g].pix.alloc((size_t)n) || !solve_fixed(tiles, groups[g].prm, &kept[g])) return false;
+        for (size_t t = 0; t < tiles.size(); ++t) {
+            const int k = groups[g].planes[t];
+            MergeDev& M = md[(size_t)k / 3];
+            (k % 3 == 0 ? M.y : k % 3 == 1 ? M.cr : M.cb) = kept[g].pix.p + kept[g].td[t].off;
+        }
+    }
+    for (const MergeDev& M : md) if (!M.y || !M.cr || !M.cb) return false;
+    DevBuf<MergeDev> dmd;
+    if (!dmd.alloc(md.size())) return false;
+    HIP_TRY(hipMemcpy(dmd.p, md.data(), md.size() * sizeof(MergeDev), hipMemcpyHostToDevice));
+    k_ycc_merge<<<dim3((unsigned)((max_n + kThreads - 1) / kThreads), (unsigned)nj), dim3(kThreads)>>>(dmd.p, dOUT.p);
+    HIP_TRY(hipGetLastError());
+    HIP_TRY(hipMemcpy(out, dOUT.p, (size_t)out_bytes, hipMemcpyDeviceToHost));
+    gpu_common::resident_put(out, (size_t)out_bytes, dOUT.release());
     return true;
 }
 

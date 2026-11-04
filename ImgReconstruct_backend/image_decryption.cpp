@@ -1313,7 +1313,8 @@ static void decrypt_tiles_ycc420(int num_threads,
     bool sr_dip_2x = false, const CsHrSrCtx& hr_sr = CsHrSrCtx(),
     int chroma_iterations = -1, float chroma_coef = -1.0f,
     const std::vector<std::vector<CsSegClassParams>>* seg_tile_params = nullptr,
-    bool seg_chroma_per_class = true, const CsSrPrior& sr_prior = CsSrPrior()) {
+    bool seg_chroma_per_class = true, const CsSrPrior& sr_prior = CsSrPrior(),
+    std::shared_ptr<void>* free_later = nullptr) {   // receives host state the caller can free off the critical path
 
     if (y_confidence > 0.0f && basis != CS_BASIS_DCT)
         std::cerr << "Note: --y-confidence requires --basis dct; ignoring for wavelet" << std::endl;
@@ -1508,6 +1509,7 @@ static void decrypt_tiles_ycc420(int num_threads,
                       << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count()
                       << " ms" << std::endl;
     }
+    if (free_later) *free_later = std::move(sr_prep);   // ~4k tiles' sample and anchor lists
 #endif
 
     const int n_waves = flat_tiles ? 1 : 2 * (num_tiles - 1) + 1;
@@ -3466,6 +3468,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         }
         if (dual_tv && photo_up.backend != "avir")
             std::cerr << "Note: --y-dual-tv uses AVIR for both candidate grids" << std::endl;
+        std::shared_ptr<void> sr_free_later;   // freed on tile_frees with the tile containers
         decrypt_tiles_ycc420(nun_threads, y_eph, y_idx, cr_eph, cr_idx, cb_eph, cb_idx,
             decrypted, coordinates, num_tiles, overlap, P.iterations, tile_size, P.coef, P.tv,
             P.solver, P.fista_iters, P.reweights, P.basis, P.wscale,
@@ -3481,7 +3484,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             ycc_red_model, photo_up.sr_red_decay,
             ycc_is_dip && !full_res && !ycc_use_dict, ycc_hr_sr_ctx,
             Pc.iterations, Pc.coef, seg_tile_params,
-            segpass ? segpass->per_class_chroma : true, ycc_sr_prior_ctx);
+            segpass ? segpass->per_class_chroma : true, ycc_sr_prior_ctx, &sr_free_later);
         if (ycc_pipe) ycc_upipe.finish();
         prof.mark("solve");
 
@@ -3622,7 +3625,8 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
             tile_frees.t = std::thread([a = std::move(y_tiles), b = std::move(y_mask_tiles), c = std::move(cr_tiles),
                 d = std::move(cr_mask_tiles), e = std::move(cb_tiles), f = std::move(cb_mask_tiles),
                 g = std::move(y_idx), h = std::move(cr_idx), i = std::move(cb_idx), j = std::move(y_eph),
-                k = std::move(cr_eph), l = std::move(cb_eph), m = std::move(decrypted), n = std::move(low_tv_tiles)] {});
+                k = std::move(cr_eph), l = std::move(cb_eph), m = std::move(decrypted), n = std::move(low_tv_tiles),
+                o = std::move(sr_free_later)] {});
             return 0;
         }; // solve_ycc_grid
 

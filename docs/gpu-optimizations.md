@@ -619,3 +619,38 @@ Still open:
 - The cs-sr prep state (`CsSrBatchPrep`) is freed when `decrypt_tiles_ycc420` returns (~12 ms of frees; before,
   inside `cs_sr_gpu_batch`, so not a new cost).
 - Process exit takes ~48 ms after `main` returns.
+
+## 14. Seventh round: LR -> cs-sr on the device (no longer bit-identical)
+
+Section 13's still-open list, measured on an idle GPU (IMG_3690 r0.9 with `CS_GPU_PROF=1`, then the 32-decode
+A/B against 4730b84; production decode path, c32 net).
+
+| Change | Where | Effect |
+| --- | --- | --- |
+| `gpu_tiles::solve_ycc_bgr`: the LR planes' inverse DCT (the batch's dense GEMM, `Batch::synth`) and the tile merge (`k_ycc_merge`: chroma bilinear as `cv::resize` INTER_LINEAR, convertTo 8 bit, YCrCb -> BGR in OpenCV's fixed point) run on the device. The BGR tiles land back to back in one host buffer, which the `mats_out` tiles now view, and the device copy goes into the resident slot. `gpu_sr::run` takes it when its LR tiles are exactly that buffer, instead of gathering and uploading them. The output buffer is allocated before the solves, so the arena reclaims their scratch above it. `CS_GPU_LR_HOST_TAIL=1` keeps the host tail. | `gpu_tiles.*`, `gpu_decrypt.*`, `gpu_sr.hip`, `gpu_common.hpp` | LR stage 253 -> 225 ms (host tail 11 ms and merge ~34 ms gone; the 64 MB coefficient download becomes a 32 MB BGR one). cs-sr host copies 11.5 -> 4.8 ms, upload 2.6 -> 0.3 ms. Solve phase 450 -> 413 ms |
+| The cs-sr prep state (`CsSrBatchPrep`) is handed out of `decrypt_tiles_ycc420` and freed with the tile buffers in `tile_frees` | `image_decryption.cpp` | solve -15 ms in the phase profile, ~-6 ms end to end |
+
+Result: median wall time of the 32 decodes 0.96 -> 0.93 s, total 31.0 -> 29.9 s (-34 ms per decode, two runs).
+The decode is no longer bit-identical to the host tail. A GPU-summed inverse DCT puts a few LR pixels on the other
+side of a rounding step, and ADMM plus the net carry that into 0.5-8% of the output pixels, at most 3-11 levels.
+On the 8 photos x 4 ratios the quality stays put:
+
+| ratio | dPSNR | dSSIM | dDE95 | dDE99 | max abs diff | pixels that differ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.3 | -0.0000 | -0.00000 | +0.0000 | +0.0001 | 8 | 3.00% |
+| 0.5 | -0.0000 | +0.00000 | +0.0000 | +0.0000 | 9 | 2.47% |
+| 0.7 | -0.0000 | +0.00000 | -0.0000 | +0.0000 | 9 | 2.45% |
+| 0.9 | -0.0000 | -0.00000 | +0.0000 | +0.0000 | 11 | 2.20% |
+
+(Per photo, |dPSNR| is at most 0.0002 dB with both signs; IMG_1297 and D06_rnd_39 have the most changed pixels.)
+
+Looked at and left:
+- Process exit: the 48 ms was mostly the Python harness. `main`'s own teardown is ~7-12 ms; ending the
+  process early is not worth it.
+- Composite -> enhance on the device (~3-4 ms of upload): at low ratios the seg boundary calm edits the host
+  image in between, so a device copy can be stale. Not done.
+
+Still open:
+- The first LR batch's first device sync waits ~70 ms (it shows as `layout` or `upload` in the profile line)
+  while the warm-up's runtime start and arena reserve finish. This is the largest wait left before the GPU
+  starts.

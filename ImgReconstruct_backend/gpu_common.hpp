@@ -48,7 +48,7 @@ void arena_reserve(size_t bytes);
 void* arena_alloc(size_t bytes);
 bool arena_free(void* p);
 
-// Device copy of a host buffer handed from one stage to the next (gpu_sr's output tiles to gpu_composite), so the next
+// Device copy of a host buffer handed from one stage to the next (the LR tiles to gpu_sr, its output tiles to gpu_composite), so the next
 // stage need not upload bytes the device already holds. One slot: resident_put takes ownership of dev (an arena or
 // hipMalloc pointer, replacing what the slot held); resident_take hands it over only for the exact host range it was
 // put for, and empties the slot either way (null on a mismatch). The caller owns the result (freed like a DevBuf's).

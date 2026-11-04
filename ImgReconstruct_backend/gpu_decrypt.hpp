@@ -44,8 +44,10 @@ struct GpuYccTileJob {
 };
 
 /** @brief YCC form of cs_gpu_solve_tiles: every plane of every job is solved on the GPU (smooth-fill
-warm start, no neighbours), then each tile is merged exactly like decrypt_tiles_ycc420's CPU tail
-(chroma bilinear to the luma size, YCrCb -> BGR, 8 bit). solved[k] = 1 when job k's out is set. on_gpu, when set, is
+warm start, no neighbours), then each tile is merged as decrypt_tiles_ycc420's CPU tail (chroma bilinear to
+the luma size, YCrCb -> BGR, 8 bit), on the device: float rounding moves a few pixels by a level against the host
+tail (CS_GPU_LR_HOST_TAIL=1 keeps that one), and the outs are views into one buffer, whose device copy gpu_sr
+takes. solved[k] = 1 when job k's out is set. on_gpu, when set, is
 called once the host prep is done and the GPU batches start (the caller's own host work can overlap them). */
 void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved,
     const std::function<void()>& on_gpu = {});

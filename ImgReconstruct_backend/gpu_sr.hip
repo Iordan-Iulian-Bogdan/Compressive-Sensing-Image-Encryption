@@ -267,25 +267,32 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
         max_r = std::max(max_r, P.lr_rows);
     }
     if (3 * hr_total > 2000000000LL) return false;
-    std::vector<std::uint8_t> hlr((size_t)3 * lr_total);
-    parallel_for(nt, [&](int t) {
-        std::copy(tiles[(size_t)t].lr_bgr, tiles[(size_t)t].lr_bgr + (size_t)3 * tiles[(size_t)t].lr_rows * tiles[(size_t)t].lr_cols,
-            hlr.begin() + (size_t)3 * sd[(size_t)t].lr_off);
-    });
+    // LR tiles laid out back to back in one buffer whose device copy the LR stage left (gpu_tiles::solve_ycc_bgr):
+    // taken instead of the copy and upload.
+    DevBuf<std::uint8_t> dLR;
+    bool lr_packed = true;
+    for (int t = 0; t < nt && lr_packed; ++t) lr_packed = tiles[(size_t)t].lr_bgr == tiles[0].lr_bgr + (size_t)3 * sd[(size_t)t].lr_off;
+    if (lr_packed) dLR.p = (std::uint8_t*)gpu_common::resident_take(tiles[0].lr_bgr, (size_t)3 * lr_total);
+    std::vector<std::uint8_t> hlr(dLR.p ? 0 : (size_t)3 * lr_total);
+    if (!dLR.p)
+        parallel_for(nt, [&](int t) {
+            std::copy(tiles[(size_t)t].lr_bgr, tiles[(size_t)t].lr_bgr + (size_t)3 * tiles[(size_t)t].lr_rows * tiles[(size_t)t].lr_cols,
+                hlr.begin() + (size_t)3 * sd[(size_t)t].lr_off);
+        });
     const int dstride = 2 * max_c + 2;
     sr_prof.mark(0);
 
-    DevBuf<SrDev> dsd; DevBuf<float> dtab, dTMP, dF, dD, dZ, dH; DevBuf<std::uint8_t> dLR, dHR8, dCR, dCB, dOUT;
+    DevBuf<SrDev> dsd; DevBuf<float> dtab, dTMP, dF, dD, dZ, dH; DevBuf<std::uint8_t> dHR8, dCR, dCB, dOUT;
     if (!dsd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dTMP.alloc(swin_prior ? 0 : (size_t)6 * lr_total) ||
         !dF.alloc(swin_prior ? 0 : (size_t)3 * hr_total) || !dD.alloc(swin_prior ? 0 : (size_t)3 * nt * dstride) || !dZ.alloc((size_t)hr_total) ||
-        !dH.alloc((size_t)nt) || !dLR.alloc((size_t)3 * lr_total) || !dHR8.alloc((size_t)3 * hr_total) ||
+        !dH.alloc((size_t)nt) || (!dLR.p && !dLR.alloc((size_t)3 * lr_total)) || !dHR8.alloc((size_t)3 * hr_total) ||
         !dCR.alloc((size_t)hr_total) || !dCB.alloc((size_t)hr_total) || !dOUT.alloc((size_t)3 * hr_total)) {
         std::fprintf(stderr, "gpu_sr: device allocation failed\n");
         return false;
     }
     HIP_TRY(hipMemcpy(dsd.p, sd.data(), (size_t)nt * sizeof(SrDev), hipMemcpyHostToDevice));
     if (!table.empty()) HIP_TRY(hipMemcpy(dtab.p, table.data(), table.size() * sizeof(float), hipMemcpyHostToDevice));
-    HIP_TRY(hipMemcpy(dLR.p, hlr.data(), hlr.size(), hipMemcpyHostToDevice));
+    if (!hlr.empty()) HIP_TRY(hipMemcpy(dLR.p, hlr.data(), hlr.size(), hipMemcpyHostToDevice));
     sr_prof.mark(1);
 
     const dim3 blk(kThreads);
