@@ -712,3 +712,23 @@ f29297a exe. `cs_tests` pass; `build_cpu.bat` builds.
 Still open:
 - Device start-up (~310 ms in `hipMemGetInfo`) bounds when the LR stage can start once the host stages before it
   are short.
+
+## 16. Host layouts in GPU time, submitting queued launches (bit-identical)
+
+Most host work before the LR stage is hidden behind device start-up (~310 ms) now, so moving it to the GPU would
+gain nothing; what is left after start-up is host work the GPU waits for.
+
+| Change | Where | Effect |
+| --- | --- | --- |
+| `gpu_admm::prepare_host_layout`: the ADMM batch's host layout (tile layout, LR sample grid, anchor lists; no z, no NLM strengths) is built separately; `gpu_sr::run` builds it while the AVIR warm start runs and passes it to `solve_pnp_admm_device` | `gpu_admm.*`, `gpu_sr.hip` | ADMM host layout 14 -> 1.4 ms on the critical path |
+| `hipStreamQuery(nullptr)` after queuing work the host then does something else next to: the warm start in `gpu_sr::run`, each group in `solve_ycc_bgr`. On Windows the launches otherwise sit unsubmitted until the next synchronizing call | `gpu_sr.hip`, `gpu_tiles.hip` | without it the warm start grew 54 -> 65 ms with the layout moved into it; with it, 50-52 ms |
+
+Per stage (16 decodes, no `CS_GPU_PROF`): LR 219.5 -> 206.4 ms, cs-sr 190.3 -> 180.4, solve 414.6 -> 393.0. Same exe
+with and without the two submissions: -34 ms wall. Against d1811cb, 64 paired decodes (ABBA order, 0.5 s between
+runs, both exes under fresh file names): wall median 738.7 -> 711.9 ms (-29 ms), in `main` -27 ms; 32/32
+byte-identical; `cs_tests` pass.
+
+Measuring note: the exe named `ImgReconstruct_backend.exe` starts ~12 ms slower than a byte-identical copy under
+another name (start-up to `main` 32.7 vs 20.6 ms; likely Windows' per-exe launch history). A/Bs that run the new
+build under that name and the baseline as a renamed copy understate the gain by ~12 ms; back-to-back GPU
+processes also disturb each other.

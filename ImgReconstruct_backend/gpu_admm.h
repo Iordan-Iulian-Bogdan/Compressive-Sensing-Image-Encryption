@@ -4,6 +4,7 @@
 // (pnp_mode 2, NLM prox, luma only), for many tiles at once. Plain C++ header;
 // implementation in gpu_admm.hip.
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace gpu_admm {
@@ -65,7 +66,11 @@ bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& p);
 // Same loop with z resident on the device (Problem::z unused): dZ holds every tile's HR
 // pixels in [0,1], tiles laid out back to back in order (gpu_common TileLayout::add order),
 // initial z in, final z out. Used by the batched tile pipeline (gpu_sr.hip).
-bool solve_pnp_admm_device(const std::vector<Problem>& tiles, const Params& p, float* dZ);
+// pre: the batch's host layout from prepare_host_layout for the same tiles and Params (it reads neither z nor nlm_h,
+// so it can be built while the device is busy); consumed. Null = built here.
+struct HostLayout;
+std::shared_ptr<HostLayout> prepare_host_layout(const std::vector<Problem>& tiles, const Params& p);
+bool solve_pnp_admm_device(const std::vector<Problem>& tiles, const Params& p, float* dZ, HostLayout* pre = nullptr);
 
 // OpenCV-compatible fastNlMeansDenoising(src, dst, h, 7, 15) on 8-bit planes,
 // exposed for validation. src/dst are rows*cols bytes.

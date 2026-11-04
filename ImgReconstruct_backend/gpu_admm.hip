@@ -437,9 +437,78 @@ void Prof::end_all(long long tiles, long long px) {
 }
 #define TIMED(name, ...) do { prof.b(name); __VA_ARGS__; prof.e(); } while (0)
 
+// The host layout of a batch: everything run_admm uploads that depends neither on z nor on the NLM strengths.
+struct HostLayout {
+    int nt = 0;
+    bool use_hr = false, dense = false;
+    TileLayout L;
+    std::vector<int> qoff, hrt, hsi;   // hrt: fixed-step batches: per-tile "has anchors" (step choice)
+    long long qtot = 0;
+    int max_pad = 0;
+    std::vector<float> hblr, hhav, hsv;
+};
+
+static bool build_layout(const std::vector<Problem>& tiles, const Params& prm, HostLayout& H) {
+    const int nt = (int)tiles.size();
+    H.nt = nt;
+    TileLayout& L = H.L;
+    for (const Problem& P : tiles) {
+        if (!supported(P.rows, P.cols)) return false;
+        L.add(P.rows, P.cols);
+        H.max_pad = std::max(H.max_pad, padded_size(P.rows, P.cols));
+    }
+    if (L.total > 2000000000LL) return false;
+    H.qtot = layout_padded(L, H.qoff);
+
+    // Samples live on a per-tile LR grid (offset off/4, rows/2 x cols/2): the
+    // sample value, or a large negative sentinel where there is none.
+    H.hblr.assign((size_t)L.total / 4, -1e30f);
+    parallel_for(nt, [&](int t) {
+        const Problem& P = tiles[(size_t)t];
+        float* blr = H.hblr.data() + L.td[(size_t)t].off / 4;
+        for (int k = 0; k < P.m; ++k) {
+            if (P.rix[k] < 0 || P.riy[k] < 0 || P.rix[k] >= P.rows / 2 || P.riy[k] >= P.cols / 2) continue;
+            blr[P.rix[k] * (P.cols / 2) + P.riy[k]] = P.b[k];
+        }
+    });
+
+    // Exact-HR anchors (tile layout, sentinel where none), only when the batch carries a weight. Dense hr_val maps
+    // are laid out on the host; sparse lists (hr_idx) go up as (layout index, value) pairs and are scattered over a
+    // sentinel fill on the device.
+    H.use_hr = prm.hr_weight > 0.0f;
+    H.hrt.assign((size_t)nt, 0);
+    if (H.use_hr) {
+        std::vector<size_t> so((size_t)nt + 1, 0);
+        for (int t = 0; t < nt; ++t) {
+            const Problem& P = tiles[(size_t)t];
+            H.dense = H.dense || P.hr_val;
+            so[(size_t)t + 1] = so[(size_t)t] + (P.hr_val ? 0 : (size_t)std::max(0, P.n_hr));
+        }
+        if (H.dense) H.hhav.resize((size_t)L.total);
+        H.hsi.resize(so[(size_t)nt]); H.hsv.resize(so[(size_t)nt]);
+        parallel_for(nt, [&](int t) {
+            const Problem& P = tiles[(size_t)t];
+            const int off = L.td[(size_t)t].off;
+            if (H.dense) {
+                const auto o = H.hhav.begin() + off;
+                if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, o);
+                else std::fill(o, o + (size_t)P.rows * P.cols, -1e30f);
+            }
+            if (!P.hr_val)
+                for (int k = 0; k < P.n_hr; ++k) {
+                    H.hsi[so[(size_t)t] + (size_t)k] = off + P.hr_idx[k];
+                    H.hsv[so[(size_t)t] + (size_t)k] = P.hr_v[k];
+                }
+            H.hrt[(size_t)t] = P.hr_val != nullptr || P.n_hr > 0;
+        });
+    }
+    return true;
+}
+
 // The whole ADMM loop. dZext: device z in TileLayout order (add(rows, cols) per tile, in order),
-// updated in place; null = take z from / return it to the host Problem::z arrays.
-static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float* dZext) {
+// updated in place; null = take z from / return it to the host Problem::z arrays. pre: a layout built for these
+// tiles and Params (prepare_host_layout), consumed; null = built here.
+static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float* dZext, HostLayout* pre = nullptr) {
     if (tiles.empty()) return true;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
@@ -455,67 +524,28 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         hms[i] += std::chrono::duration<double, std::milli>(n - hclk).count(); hclk = n;
     };
 
-    TileLayout L;
-    int total_samples = 0, max_pad = 0;
-    for (const Problem& P : tiles) {
-        if (!supported(P.rows, P.cols)) return false;
-        L.add(P.rows, P.cols);
-        total_samples += P.m;
-        max_pad = std::max(max_pad, padded_size(P.rows, P.cols));
-    }
-    if (L.total > 2000000000LL) return false;
-    std::vector<int> qoff;
-    const long long qtot = layout_padded(L, qoff);
-
-    // Samples live on a per-tile LR grid (offset off/4, rows/2 x cols/2): the
-    // sample value, or a large negative sentinel where there is none.
-    std::vector<float> hZ(dZext ? 0 : (size_t)L.total), hblr((size_t)L.total / 4, -1e30f), hlam((size_t)nt), hh((size_t)nt);
-    {
-        parallel_for(nt, [&](int t) {
-            const Problem& P = tiles[(size_t)t];
-            if (!dZext) std::copy(P.z, P.z + (size_t)P.rows * P.cols, hZ.begin() + L.td[(size_t)t].off);
-            float* blr = hblr.data() + L.td[(size_t)t].off / 4;
-            for (int k = 0; k < P.m; ++k) {
-                if (P.rix[k] < 0 || P.riy[k] < 0 || P.rix[k] >= P.rows / 2 || P.riy[k] >= P.cols / 2) continue;
-                blr[P.rix[k] * (P.cols / 2) + P.riy[k]] = P.b[k];
-            }
-            hlam[(size_t)t] = P.lambda;
-            hh[(size_t)t] = P.nlm_h;
-        });
-    }
-
-    // Exact-HR anchors (tile layout, sentinel where none), only when the batch carries a weight. Dense hr_val maps
-    // are laid out on the host; sparse lists (hr_idx) go up as (layout index, value) pairs and are scattered over a
-    // sentinel fill on the device.
+    HostLayout H;
     const bool use_hr = prm.hr_weight > 0.0f;
-    std::vector<float> hhav, hsv;
-    std::vector<int> hrt((size_t)nt, 0), hsi;   // hrt: fixed-step batches: per-tile "has anchors" (step choice)
-    bool dense = false;
-    if (use_hr) {
-        std::vector<size_t> so((size_t)nt + 1, 0);
-        for (int t = 0; t < nt; ++t) {
-            const Problem& P = tiles[(size_t)t];
-            dense = dense || P.hr_val;
-            so[(size_t)t + 1] = so[(size_t)t] + (P.hr_val ? 0 : (size_t)std::max(0, P.n_hr));
-        }
-        if (dense) hhav.resize((size_t)L.total);
-        hsi.resize(so[(size_t)nt]); hsv.resize(so[(size_t)nt]);
-        parallel_for(nt, [&](int t) {
-            const Problem& P = tiles[(size_t)t];
-            const int off = L.td[(size_t)t].off;
-            if (dense) {
-                const auto o = hhav.begin() + off;
-                if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, o);
-                else std::fill(o, o + (size_t)P.rows * P.cols, -1e30f);
-            }
-            if (!P.hr_val)
-                for (int k = 0; k < P.n_hr; ++k) {
-                    hsi[so[(size_t)t] + (size_t)k] = off + P.hr_idx[k];
-                    hsv[so[(size_t)t] + (size_t)k] = P.hr_v[k];
-                }
-            hrt[(size_t)t] = P.hr_val != nullptr || P.n_hr > 0;
-        });
-    }
+    if (pre && pre->nt == nt && pre->use_hr == use_hr) H = std::move(*pre);
+    else if (!build_layout(tiles, prm, H)) return false;
+    TileLayout& L = H.L;
+    const std::vector<int>& qoff = H.qoff;
+    const long long qtot = H.qtot;
+    const int max_pad = H.max_pad;
+    const std::vector<float>& hblr = H.hblr;
+    const std::vector<float>& hhav = H.hhav;
+    const std::vector<float>& hsv = H.hsv;
+    const std::vector<int>& hrt = H.hrt;
+    const std::vector<int>& hsi = H.hsi;
+    const bool dense = H.dense;
+
+    std::vector<float> hZ(dZext ? 0 : (size_t)L.total), hlam((size_t)nt), hh((size_t)nt);
+    parallel_for(nt, [&](int t) {
+        const Problem& P = tiles[(size_t)t];
+        if (!dZext) std::copy(P.z, P.z + (size_t)P.rows * P.cols, hZ.begin() + L.td[(size_t)t].off);
+        hlam[(size_t)t] = P.lambda;
+        hh[(size_t)t] = P.nlm_h;
+    });
 
     hlap(0);
     DevBuf<TileDev> dtd; DevBuf<int> dq, dHRT;
@@ -805,8 +835,14 @@ bool solve_pnp_admm(const std::vector<Problem>& tiles, const Params& prm) {
     return run_admm(tiles, prm, nullptr);
 }
 
-bool solve_pnp_admm_device(const std::vector<Problem>& tiles, const Params& prm, float* dZ) {
-    return dZ != nullptr && run_admm(tiles, prm, dZ);
+std::shared_ptr<HostLayout> prepare_host_layout(const std::vector<Problem>& tiles, const Params& prm) {
+    auto H = std::make_shared<HostLayout>();
+    if (tiles.empty() || !build_layout(tiles, prm, *H)) return nullptr;
+    return H;
+}
+
+bool solve_pnp_admm_device(const std::vector<Problem>& tiles, const Params& prm, float* dZ, HostLayout* pre) {
+    return dZ != nullptr && run_admm(tiles, prm, dZ, pre);
 }
 
 }  // namespace gpu_admm

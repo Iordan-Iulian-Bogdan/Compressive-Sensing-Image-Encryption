@@ -775,6 +775,7 @@ bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<Pla
         long long n = 0;
         for (int k : groups[g].planes) { tiles.push_back(planes[(size_t)k]); n += (long long)planes[(size_t)k].rows * planes[(size_t)k].cols; }
         if (!kept[g].pix.alloc((size_t)n) || !solve_fixed(tiles, groups[g].prm, &kept[g])) return false;
+        (void)hipStreamQuery(nullptr);   // submits this group's launches before the host builds the next group
         for (size_t t = 0; t < tiles.size(); ++t) {
             const int k = groups[g].planes[t];
             MergeDev& M = md[(size_t)k / 3];

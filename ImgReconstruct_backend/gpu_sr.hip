@@ -318,8 +318,23 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     const dim3 hgrid((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)nt);
     k_bgr2ycc<<<hgrid, blk>>>(dsd.p, dHR8.p, dZ.p, dCR.p, dCB.p);
     HIP_TRY(hipGetLastError());
+    (void)hipStreamQuery(nullptr);   // submits the queued launches now, so they run during the host work below
+    // While the warm start runs: the luma ADMM problems (their NLM strengths come with the sync below) and the
+    // ADMM's host layout, which needs none of them.
+    std::vector<gpu_admm::Problem> probs((size_t)nt);
+    for (int t = 0; t < nt; ++t) {
+        const Tile& P = tiles[(size_t)t];
+        gpu_admm::Problem q{ 2 * P.lr_rows, 2 * P.lr_cols, P.b, P.rix, P.riy, P.m, nullptr, P.lambda, 0.0f };
+        q.hr_val = P.hr_val;
+        q.hr_idx = P.hr_idx; q.hr_v = P.hr_v; q.n_hr = P.n_hr;
+        q.tv = P.tv;
+        q.ox = P.ox; q.oy = P.oy;
+        probs[(size_t)t] = q;
+    }
+    const std::shared_ptr<gpu_admm::HostLayout> admm_layout = gpu_admm::prepare_host_layout(probs, prm);
     std::vector<float> hh((size_t)nt);
     HIP_TRY(hipMemcpy(hh.data(), dH.p, (size_t)nt * sizeof(float), hipMemcpyDeviceToHost));   // syncs the warm start
+    for (int t = 0; t < nt; ++t) probs[(size_t)t].nlm_h = hh[(size_t)t];
     sr_prof.mark(2);
 
     // optional verification outputs
@@ -337,17 +352,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     }
 
     // luma PnP-ADMM with z resident on the device
-    std::vector<gpu_admm::Problem> probs((size_t)nt);
-    for (int t = 0; t < nt; ++t) {
-        const Tile& P = tiles[(size_t)t];
-        gpu_admm::Problem q{ 2 * P.lr_rows, 2 * P.lr_cols, P.b, P.rix, P.riy, P.m, nullptr, P.lambda, hh[(size_t)t] };
-        q.hr_val = P.hr_val;
-        q.hr_idx = P.hr_idx; q.hr_v = P.hr_v; q.n_hr = P.n_hr;
-        q.tv = P.tv;
-        q.ox = P.ox; q.oy = P.oy;
-        probs[(size_t)t] = q;
-    }
-    if (!gpu_admm::solve_pnp_admm_device(probs, prm, dZ.p)) return false;
+    if (!gpu_admm::solve_pnp_admm_device(probs, prm, dZ.p, admm_layout.get())) return false;
     sr_prof.mark(3);
 
     // 8-bit luma + AVIR chroma -> BGR, back to the host tiles
