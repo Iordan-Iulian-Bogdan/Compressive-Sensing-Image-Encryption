@@ -32,6 +32,10 @@ struct Tile {
     std::uint8_t* dbg_avir = nullptr;   // optional out: the 2x BGR warm start, AVIR or prior (verification)
     float* dbg_nlm_h = nullptr;         // optional out: the NLM strength used (verification)
     int ox = 0, oy = 0;                 // HR tile origin in output geometry (CS_DUMP_ADMM)
+    // HR anchors sparse instead of hr_val (gpu_admm::Problem::hr_idx): tile-local indices and values
+    const int* hr_idx = nullptr;
+    const float* hr_v = nullptr;
+    int n_hr = 0;
 };
 
 // Runs every tile through the pipeline with one shared ADMM parameter set (the caller groups

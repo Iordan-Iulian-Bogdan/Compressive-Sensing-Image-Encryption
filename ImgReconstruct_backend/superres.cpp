@@ -1567,7 +1567,7 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
 
     // Per-tile host data (kept alive until the GPU pass returns) and ADMM parameter groups.
     struct Prep {
-        cv::Mat lr; std::vector<float> b, hr_map; gpu_admm::Params prm; bool ok = false;
+        cv::Mat lr; std::vector<float> b, hval; std::vector<int> hidx; gpu_admm::Params prm; bool ok = false;
         std::vector<std::uint8_t> dbg_avir; float dbg_h = 0.0f;
     };
     std::vector<Prep> pp(tiles.size());
@@ -1601,8 +1601,17 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             cs_sr_tile_anchors(T.hr_sr, Hr, Wc, hidx, hval);
         const bool hr_on = !hidx.empty() && T.hr_sr.weight > 0.0f;
         if (hr_on) {
-            P.hr_map.assign((size_t)Hr * Wc, -1e30f);
-            for (size_t q = 0; q < hidx.size(); ++q) P.hr_map[(size_t)hidx[q]] = hval[q];
+            // sparse for the device scatter: increasing indices, the last value of a repeated pixel (as a dense
+            // map filled in list order)
+            std::vector<int> order(hidx.size());
+            for (size_t q = 0; q < order.size(); ++q) order[q] = (int)q;
+            std::stable_sort(order.begin(), order.end(), [&](int a, int c) { return hidx[(size_t)a] < hidx[(size_t)c]; });
+            for (size_t q = 0; q < order.size(); ++q) {
+                const int i = hidx[(size_t)order[q]];
+                if (q + 1 < order.size() && hidx[(size_t)order[q + 1]] == i) continue;
+                P.hidx.push_back(i);
+                P.hval.push_back(hval[(size_t)order[q]]);
+            }
         }
         const cs_fista_basis bx = cs_make_basis(Hr, Wc, CS_BASIS_DCT, T.wscale);
         P.prm = gpu_admm::Params{ admm, cs_fista_inner_iters(T.iterations, T.fista_iters), rho, bx.lip, T.wscale,
@@ -1639,8 +1648,9 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
             else T.hr_out->create(2 * P.lr.rows, 2 * P.lr.cols, CV_8UC3);
             pool_off += (size_t)n;
             gpu_sr::Tile J{ P.lr.rows, P.lr.cols, P.lr.data, P.b.data(), T.ri_x->data(), T.ri_y->data(),
-                (int)T.ri_x->size(), T.coef * 0.1f, T.tv, P.hr_map.empty() ? nullptr : P.hr_map.data(), T.hr_out->data };
+                (int)T.ri_x->size(), T.coef * 0.1f, T.tv, nullptr, T.hr_out->data };
             J.ox = T.hr_sr.ox; J.oy = T.hr_sr.oy;
+            J.hr_idx = P.hidx.data(); J.hr_v = P.hval.data(); J.n_hr = (int)P.hidx.size();
             if (verify_every > 0 && k % (size_t)verify_every == 0) {
                 P.dbg_avir.resize((size_t)12 * P.lr.rows * P.lr.cols);
                 J.dbg_avir = P.dbg_avir.data();

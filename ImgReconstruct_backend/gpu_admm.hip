@@ -12,6 +12,7 @@
 #include "gpu_gemm.hpp"
 #include "gpu_prox.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -369,6 +370,12 @@ bool nlm_denoise_u8(const std::vector<NlmPlane>& planes) {
     return true;
 }
 
+// Sparse exact-HR anchors into the tile-layout anchor map (each layout index once).
+__global__ void k_hr_scatter(const int* idx, const float* v, int n, float* HAV) {
+    const int i = blockIdx.x * kThreads + threadIdx.x;
+    if (i < n) HAV[idx[i]] = v[i];
+}
+
 // Opt-in per-kernel timing (env CS_GPU_PROF=1): hipEvent pairs around every
 // launch of solve_pnp_admm, accumulated per kernel name and printed at exit.
 // Without it every launch is still bracketed by a marker event (no timing): measured on
@@ -437,6 +444,16 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
     const int nt = (int)tiles.size();
+    // CS_GPU_PROF=1: host-side phases of this call (device-synced), printed with the kernel table
+    const bool hprof = [] { const char* e = std::getenv("CS_GPU_PROF"); return e && e[0] == '1'; }();
+    auto hclk = std::chrono::steady_clock::now();
+    double hms[4] = {};   // host layout, allocation, upload, download
+    auto hlap = [&](int i) {
+        if (!hprof) return;
+        (void)hipDeviceSynchronize();
+        const auto n = std::chrono::steady_clock::now();
+        hms[i] += std::chrono::duration<double, std::milli>(n - hclk).count(); hclk = n;
+    };
 
     TileLayout L;
     int total_samples = 0, max_pad = 0;
@@ -467,21 +484,40 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         });
     }
 
-    // Exact-HR anchors (tile layout, sentinel where none), only when the batch carries a weight.
+    // Exact-HR anchors (tile layout, sentinel where none), only when the batch carries a weight. Dense hr_val maps
+    // are laid out on the host; sparse lists (hr_idx) go up as (layout index, value) pairs and are scattered over a
+    // sentinel fill on the device.
     const bool use_hr = prm.hr_weight > 0.0f;
-    std::vector<float> hhav;
-    std::vector<int> hrt((size_t)nt, 0);   // fixed-step batches: per-tile "has anchors" (step choice)
+    std::vector<float> hhav, hsv;
+    std::vector<int> hrt((size_t)nt, 0), hsi;   // hrt: fixed-step batches: per-tile "has anchors" (step choice)
+    bool dense = false;
     if (use_hr) {
-        hhav.resize((size_t)L.total);
+        std::vector<size_t> so((size_t)nt + 1, 0);
+        for (int t = 0; t < nt; ++t) {
+            const Problem& P = tiles[(size_t)t];
+            dense = dense || P.hr_val;
+            so[(size_t)t + 1] = so[(size_t)t] + (P.hr_val ? 0 : (size_t)std::max(0, P.n_hr));
+        }
+        if (dense) hhav.resize((size_t)L.total);
+        hsi.resize(so[(size_t)nt]); hsv.resize(so[(size_t)nt]);
         parallel_for(nt, [&](int t) {
             const Problem& P = tiles[(size_t)t];
-            const auto o = hhav.begin() + L.td[(size_t)t].off;
-            if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, o);
-            else std::fill(o, o + (size_t)P.rows * P.cols, -1e30f);
-            hrt[(size_t)t] = P.hr_val != nullptr;
+            const int off = L.td[(size_t)t].off;
+            if (dense) {
+                const auto o = hhav.begin() + off;
+                if (P.hr_val) std::copy(P.hr_val, P.hr_val + (size_t)P.rows * P.cols, o);
+                else std::fill(o, o + (size_t)P.rows * P.cols, -1e30f);
+            }
+            if (!P.hr_val)
+                for (int k = 0; k < P.n_hr; ++k) {
+                    hsi[so[(size_t)t] + (size_t)k] = off + P.hr_idx[k];
+                    hsv[so[(size_t)t] + (size_t)k] = P.hr_v[k];
+                }
+            hrt[(size_t)t] = P.hr_val != nullptr || P.n_hr > 0;
         });
     }
 
+    hlap(0);
     DevBuf<TileDev> dtd; DevBuf<int> dq, dHRT;
     DevBuf<float> dtab, dZ, dU, dANCH, dY, dXP, dZC, dTMP, dPIX, dSC, dWS, dLAM, dH, dBLR, dHAV;
     DevBuf<std::uint8_t> dQ, dDN;
@@ -494,10 +530,21 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         std::fprintf(stderr, "gpu_admm: device allocation failed\n");
         return false;
     }
+    hlap(1);
     float* const Zp = dZext ? dZext : dZ.p;   // z lives here for the whole loop
     if (use_hr) {
         if (!dHRT.alloc((size_t)nt)) return false;
-        HIP_TRY(hipMemcpy(dHAV.p, hhav.data(), N * sizeof(float), hipMemcpyHostToDevice));
+        if (dense) HIP_TRY(hipMemcpy(dHAV.p, hhav.data(), N * sizeof(float), hipMemcpyHostToDevice));
+        else HIP_TRY(hipMemsetD32((hipDeviceptr_t)dHAV.p, 0xF149F2CAu, N));   // -1e30f: no anchor
+        if (!hsi.empty()) {
+            DevBuf<int> dsi; DevBuf<float> dsv;
+            if (!dsi.alloc(hsi.size()) || !dsv.alloc(hsv.size())) return false;
+            HIP_TRY(hipMemcpy(dsi.p, hsi.data(), hsi.size() * sizeof(int), hipMemcpyHostToDevice));
+            HIP_TRY(hipMemcpy(dsv.p, hsv.data(), hsv.size() * sizeof(float), hipMemcpyHostToDevice));
+            k_hr_scatter<<<dim3((unsigned)((hsi.size() + kThreads - 1) / kThreads)), dim3(kThreads)>>>(dsi.p, dsv.p,
+                (int)hsi.size(), dHAV.p);
+            HIP_TRY(hipDeviceSynchronize());   // dsi / dsv go back to the arena here
+        }
         HIP_TRY(hipMemcpy(dHRT.p, hrt.data(), (size_t)nt * sizeof(int), hipMemcpyHostToDevice));
     }
 
@@ -589,6 +636,7 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
         }
     }
     std::vector<std::uint8_t> hQ, hDN;
+    hlap(2);
     Prof prof;
     prof.begin_all();
 #define FWD_DCT(src, dst) do {         TIMED("gemm_fwd_a", k_gemm<OP_DATA, OP_TABT, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, (src), dTMP.p, nbn, none));         TIMED("gemm_fwd_b", k_gemm<OP_TAB, OP_DATA, EPI_STORE><<<ggrid, gblk>>>(dtd.p, dtab.p, dTMP.p, (dst), nbn, none));     } while (0)
@@ -737,12 +785,19 @@ static bool run_admm(const std::vector<Problem>& tiles, const Params& prm, float
     HIP_TRY(hipGetLastError());
     HIP_TRY(hipDeviceSynchronize());
     prof.end_all(nt, L.total);
-    if (dZext) return true;
+    hclk = std::chrono::steady_clock::now();
+    auto hreport = [&] {
+        if (hprof) std::fprintf(stderr, "[gpu-prof] gpu_admm host: layout %.1f ms, alloc %.1f ms, upload %.1f ms, download %.1f ms\n",
+            hms[0], hms[1], hms[2], hms[3]);
+    };
+    if (dZext) { hreport(); return true; }
     HIP_TRY(hipMemcpy(hZ.data(), dZ.p, bytes, hipMemcpyDeviceToHost));
     for (int t = 0; t < nt; ++t) {
         const Problem& P = tiles[(size_t)t];
         std::copy(hZ.begin() + L.td[(size_t)t].off, hZ.begin() + L.td[(size_t)t].off + (size_t)P.rows * P.cols, P.z);
     }
+    hlap(3);
+    hreport();
     return true;
 }
 

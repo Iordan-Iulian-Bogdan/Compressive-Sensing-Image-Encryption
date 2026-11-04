@@ -20,7 +20,9 @@
     kernels for gfx11 with a fallback elsewhere (fp32 FISTA loop, ONNX Runtime prior); best done with the
     target GPU at hand to test on.
 
-- [ ] **Profile the LR FISTA stage (`gpu_tiles.hip`) before optimizing it.** `[gpu-tiles-ycc] gpu` is
+- [x] **Profile the LR FISTA stage (`gpu_tiles.hip`) before optimizing it.** Done (2026-11-04,
+  `docs/gpu-optimizations.md` section 12): build + upload 30-70 ms per batch, the luma loop 108-148 ms, no
+  backtracking tiles in production; the loop was bound by LDS bank conflicts / occupancy, not launches. `[gpu-tiles-ycc] gpu` is
   225-335 ms per 12 MP decode, the largest GPU stage, while its floors are ~10-30 ms of VRAM traffic and a few
   ms of fp32 math (luma batch: 9 arrays of ~3.05M floats, ~110 MB, ~17 array passes per FISTA step, 16-40
   steps x 1-5 reweights). So it is not bandwidth-bound; find what it is.
@@ -30,7 +32,9 @@
   - Done when: the 225-335 ms is attributed (host prep / transfers / kernels / syncs) in
     `docs/gpu-optimizations.md`.
 
-- [ ] **Fuse the LR FISTA loop per tile, as `k_fista_w` does for cs-sr.** LR tiles are small (luma ~32x24,
+- [x] **Fuse the LR FISTA loop per tile, as `k_fista_w` does for cs-sr.** Done for the fixed-step branch
+  (`k_lr_fista`, bit-identical, luma loop 87 -> 30-40 ms; section 12). The backtracking branch still runs
+  the launch-per-step loop with host round trips (no production tile takes it). LR tiles are small (luma ~32x24,
   chroma ~16x12: ~3 KB per fp32 array), so a tile's whole FISTA loop (both DCTs, scatter residual, soft
   threshold, momentum) fits in one block's LDS and registers. That removes the ~17 whole-image array passes
   and ~8 launches per step, and keeps the working set out of the Infinity Cache question entirely (today the
@@ -39,7 +43,9 @@
   - Depends on the profiling item: only worth it if kernels or syncs, not host prep, dominate.
   - Done when: bit-comparable decodes (or PSNR within 0.01 dB on the 8 photos) and the stage time measured.
 
-- [ ] **Band-fuse the enhance U-Net's full-res layers (`gpu_enh.hip`).** Every conv streams a whole-image
+- [x] **Band-fuse the enhance U-Net's full-res layers (`gpu_enh.hip`).** Done (`CS_ENH_BAND`, default 128
+  rows, bit-identical; section 12). The gain was the allocation (93 -> 17-20 ms with the aliased quarter-res
+  buffers); the network time did not measurably change on the shared GPU. Retime it on an idle GPU. Every conv streams a whole-image
   NHWC fp16 tensor through VRAM (12 MP: ~385 MB per tensor at c16, ~770 MB at c32), far beyond the 80 MB
   Infinity Cache. Run head / e0 / tail (and fuse0) in horizontal bands sized so a ResBlock's in / mid / out
   stay cache-resident (c32: 64-row band ~16 MB per tensor), recomputing the 3x3 halo rows at band edges.
@@ -47,7 +53,8 @@
     c16 for 4x the MACs, so the narrow layers are memory- or launch-bound. Realistic upside ~20-40 ms of c32.
   - Done when: identical output to the unfused path and the network time measured on c16 and c32.
 
-- [ ] **Find why `[enhance] upload + planes` scales with net width.** 14 ms (c16) vs 57 ms (c32) on
+- [x] **Find why `[enhance] upload + planes` scales with net width.** It was device allocation of the
+  activations (74-76 of 82 ms at c32); the banded layers fixed it (above). 14 ms (c16) vs 57 ms (c32) on
   D01_nat_32, 26 vs 118 ms on IMG_3690, though the planes do not depend on the width: probably the weight
   load / fragment packing is counted there. Cache the loaded net across decodes, or move it out of the timed
   phase if it is already cached.

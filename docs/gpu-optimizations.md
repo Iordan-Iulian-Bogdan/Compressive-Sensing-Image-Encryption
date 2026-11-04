@@ -247,6 +247,8 @@ the folded graph next to the model instead of in `%TEMP%`.
 | `CS_GPU_PROF=1` | off | per-kernel / batch / session profiling at exit |
 | `CS_GPU_SWIN=0` | on | keep `--sr-prior-model` on ONNX Runtime instead of the HIP network (section 9) |
 | `CS_GPU_ADMM_WMMA=0` | on | fp32 `k_gemm2` FISTA loop instead of `k_fista_w` (section 10) |
+| `CS_GPU_LR_FUSED=0` | on | launch-per-step LR FISTA loop instead of `k_lr_fista` (section 12) |
+| `CS_ENH_BAND` | 128 | row band of the enhance net's full-res layers; 0 = whole image at once (section 12) |
 
 Reproduce the table in section 1: build with `build_gpu.bat main`, set the three switches
 (`CS_GPU_TILES`, `CS_GPU_ADMM`, `CS_GPU_ONNX` = 1), run the decrypt command above; the first run builds and
@@ -523,3 +525,44 @@ other kernels fit rocWMMA less well: `k_conv`'s 16-pixel A tiles span two halo r
 dimension), and `k_layer` / `k_fista_w` read accumulators by lane in every epilogue (LayerNorm, softmax,
 the 2x2 exchange, register-resident FISTA state), which rocWMMA keeps opaque. The port stays open
 (`TODO.md`).
+
+## 12. Fifth round: host prep, the LR FISTA loop, banded enhance net (bit-identical)
+
+Production decode (prox-off, 450k anchors, c32 net), IMG_3690. Measured with the enhance-net training
+sharing the GPU, so absolute GPU times are high; every step was checked byte for byte against the
+production exe (8 photos x r0.3/0.5/0.7/0.9: 32/32 identical) and `cs_tests` / `gpu_tiles_test` pass.
+
+Where the time was (`CS_PROFILE=1 CS_GPU_PROF=1`, which now also prints the LR build / loop / download
+split, the ADMM host phases, the enhance allocation and the warm-up thread):
+
+| Stage | Before | Cause |
+| --- | --- | --- |
+| LR FISTA, luma batch loop | 108-148 ms | not launch-bound (fusing alone gave ~10%): LDS bank conflicts and one block per CU |
+| LR build (layout + upload) | 30-70 ms per batch | per-sample tile ids, W / WS arrays, separate row / column indices |
+| SR host layout | 44 ms | AVIR 2x tables rebuilt serially per decode (R + C resizes per tile size) |
+| ADMM host layout + upload | 45 + 21 ms | dense 43 MB anchor map built on the CPU, copied again, uploaded |
+| Enhance "upload + planes" | 82 ms | 74-76 ms of it allocation: ~4.9 GB of activations at c32, beyond the 2 GB arena |
+
+What changed:
+
+| Change | Files | Effect |
+| --- | --- | --- |
+| `k_lr_fista`: one block per tile runs every step and reweight; Y / SC column-major and TMP in LDS, the DCT tables (plus transposed copies) through the cache, every operand one 16-byte load | `gpu_tiles.hip` | luma loop 87 -> 30-40 ms (fused, tables in LDS: 87 ms; unfused: 97-148 ms) |
+| lean batch for the fused path: one packed sample index, no tile ids, no W / WS | `gpu_tiles.hip` | upload 11-28 -> 8-17 ms per batch |
+| AVIR table probes in parallel (OpenMP) | `gpu_avir_tables.cpp` | SR host layout 44 -> 12 ms |
+| sparse HR anchors (index, value) scattered on the device over a sentinel fill | `superres.cpp`, `gpu_sr.*`, `gpu_admm.*` | ADMM host layout 45 -> 15 ms, upload 21 -> 10 ms |
+| enhance full-res layers in 128-row bands (X, head, e0 into a full S0; up1, fuse0, tail per band; each band recomputes its halo rows) | `gpu_enh.hip` | allocation 93 -> 29 ms |
+| quarter-res buffers carved out of idle half-res ones | `gpu_enh.hip` | allocation 29 -> 17-20 ms |
+
+`k_conv` takes per-buffer row bases (`ConvP::ia / ib / ob / rb`) and an output row window (`y0`, `ny`); all
+zero and `ny = OH` is the whole-image conv as before. Band heights of 36, 64, 128 and the whole image give
+the same bytes; the network time stayed within the run-to-run noise of the shared GPU (130-160 ms).
+
+Result: median wall time of the 32 decodes (incl. process start) 1.38 -> 1.12 s (-19%), total 44.5 -> 36.2 s.
+
+Still open:
+- The warm-up thread needs ~258 ms (HIP runtime) + ~65 ms (2 GB arena). At low ratios the CPU reaches the
+  first LR batch sooner and waits ~90 ms for it (r0.3; none at r0.9).
+- LR layout (10-30 ms per batch) and the CPU warm start of the LR planes (`prep`, ~40 ms) are host work
+  that could move to the device.
+- The enhance network itself (~130-145 ms at c32) and `k_fista_w` (~60 ms) are unchanged.

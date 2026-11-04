@@ -335,6 +335,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
         const Tile& P = tiles[(size_t)t];
         gpu_admm::Problem q{ 2 * P.lr_rows, 2 * P.lr_cols, P.b, P.rix, P.riy, P.m, nullptr, P.lambda, hh[(size_t)t] };
         q.hr_val = P.hr_val;
+        q.hr_idx = P.hr_idx; q.hr_v = P.hr_v; q.n_hr = P.n_hr;
         q.tv = P.tv;
         q.ox = P.ox; q.oy = P.oy;
         probs[(size_t)t] = q;

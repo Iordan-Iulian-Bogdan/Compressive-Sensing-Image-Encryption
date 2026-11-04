@@ -62,6 +62,9 @@ struct ConvP {
     half_t* OUT; int COUT;               // output channels (padded); mode 1 stores COUT / 4 channels at 2x
     int mode, relu;                      // 0 store, 1 pixel shuffle x2, 2 final 8-bit BGR
     const std::uint8_t* img; std::uint8_t* out8; int H, W;   // mode 2: the real image and its size
+    // Row windows (banded full-res layers): A / B / OUT / RES hold image rows from ia / ib / ob / rb on (OUT rows at
+    // 2x in mode 1); output rows y0 .. y0 + ny - 1 are computed. All 0 and ny = OH: the whole image.
+    int ia, ib, ob, rb, y0, ny;
 };
 
 // One 3x3 conv on an 8 x 8 output block: CIN input channels (A then B), NT x 16 output channels from tile
@@ -73,15 +76,14 @@ __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
     constexpr int V8 = CIN / 8, KC = CIN / 16, KT = 9 * KC;
     __shared__ __attribute__((aligned(16))) half_t L[HS * HS * RS];
     const int bpr = (P.OW + kB - 1) / kB;
-    const int by0 = (blockIdx.x / bpr) * kB, bx0 = (blockIdx.x % bpr) * kB;
+    const int by0 = P.y0 + (blockIdx.x / bpr) * kB, bx0 = (blockIdx.x % bpr) * kB, yend = min(P.OH, P.y0 + P.ny);
     const int iy0 = by0 * S - 1, ix0 = bx0 * S - 1;
     for (int e = threadIdx.x; e < HS * HS * V8; e += kT) {
         const int q = e / V8, c0 = (e % V8) * 8, y = iy0 + q / HS, x = ix0 + q % HS;
         h8 v = (half_t)0.0f;
-        if (y >= 0 && y < P.IH && x >= 0 && x < P.IW) {
-            const size_t px = (size_t)y * P.IW + x;
-            v = c0 < P.CA ? *(const h8*)(P.A + px * P.CA + c0) : *(const h8*)(P.B + px * P.CB + (c0 - P.CA));
-        }
+        if (y >= 0 && y < P.IH && x >= 0 && x < P.IW)
+            v = c0 < P.CA ? *(const h8*)(P.A + ((size_t)(y - P.ia) * P.IW + x) * P.CA + c0)
+                          : *(const h8*)(P.B + ((size_t)(y - P.ib) * P.IW + x) * P.CB + (c0 - P.CA));
         *(h8*)(L + q * RS + c0) = v;
     }
     __syncthreads();
@@ -105,20 +107,19 @@ __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int q = 16 * w + 2 * i + hi, y = by0 + q / kB, x = bx0 + q % kB;
-        if (y >= P.OH || x >= P.OW) continue;
+        if (y >= yend || x >= P.OW) continue;
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int c = (t0 + nt) * 16 + r16;
             float v = acc[nt][i];
             if (P.mode == 0) {
-                const size_t o = ((size_t)y * P.OW + x) * P.COUT + c;
-                if (P.RES) v += (float)P.RES[o];
+                if (P.RES) v += (float)P.RES[((size_t)(y - P.rb) * P.OW + x) * P.COUT + c];
                 if (P.relu) v = fmaxf(v, 0.0f);
-                P.OUT[o] = (half_t)v;
+                P.OUT[((size_t)(y - P.ob) * P.OW + x) * P.COUT + c] = (half_t)v;
             } else if (P.mode == 1) {   // PixelShuffle: out[c, 2y + i, 2x + j] = in[4c + 2i + j, y, x]
                 const int co = c >> 2, ii = (c >> 1) & 1, jj = c & 1, cs = P.COUT >> 2;
                 if (P.relu) v = fmaxf(v, 0.0f);
-                P.OUT[((size_t)(2 * y + ii) * (2 * P.OW) + 2 * x + jj) * cs + co] = (half_t)v;
+                P.OUT[((size_t)(2 * y + ii - P.ob) * (2 * P.OW) + 2 * x + jj) * cs + co] = (half_t)v;
             } else if (c < 3 && y < P.H && x < P.W) {   // enhanced = input rgb + residual, clamped, 8-bit BGR
                 const size_t o = ((size_t)y * P.W + x) * 3 + (2 - c);
                 v = fminf(1.0f, fmaxf(0.0f, v + P.img[o] * (1.0f / 255.0f)));
@@ -148,11 +149,12 @@ __global__ void k_blur_v(const float* T, float* Dn, int h, int w, const float* g
 }
 
 // Input tensor X (Hp x Wp x 16, reflect padded past H x W): rgb, density, anchors (0 here, see k_anchors), LR samples.
+// X holds padded rows r0 .. r0 + nr - 1.
 __global__ void k_input(const std::uint8_t* img, int H, int W, int Hp, int Wp, const float* Dn, const std::uint8_t* M,
-    const std::uint8_t* Sm, int h, int w, int nx, half_t* X) {
+    const std::uint8_t* Sm, int h, int w, int nx, half_t* X, int r0, int nr) {
     const int i = blockIdx.x * kE + threadIdx.x;
-    if (i >= Hp * Wp) return;
-    const int yp = i / Wp, xp = i % Wp;
+    if (i >= nr * Wp) return;
+    const int yp = r0 + i / Wp, xp = i % Wp;
     const int y = yp < H ? yp : 2 * (H - 1) - yp, x = xp < W ? xp : 2 * (W - 1) - xp;
     const std::uint8_t* b = img + ((size_t)y * W + x) * 3;
     float o[kXC] = {};
@@ -184,13 +186,14 @@ __global__ void k_input(const std::uint8_t* img, int H, int W, int Hp, int Wp, c
 }
 
 // Anchor indicator / residual into channels 4 / 5 of X (real pixels only).
-__global__ void k_anchors(const Anchor* A, int n, const std::uint8_t* img, int H, int W, int Wp, half_t* X) {
+__global__ void k_anchors(const Anchor* A, int n, const std::uint8_t* img, int H, int W, int Wp, half_t* X, int r0, int nr) {
     const int t = blockIdx.x * kE + threadIdx.x;
     if (t >= n) return;
     const std::uint32_t idx = A[t].idx;
     if (idx >= (std::uint32_t)H * (std::uint32_t)W) return;
     const int y = (int)(idx / (std::uint32_t)W), x = (int)(idx % (std::uint32_t)W);
-    half_t* o = X + ((size_t)y * Wp + x) * kXC;
+    if (y < r0 || y >= r0 + nr) return;
+    half_t* o = X + ((size_t)(y - r0) * Wp + x) * kXC;
     o[4] = (half_t)1.0f;
     o[5] = (half_t)clip1((A[t].y - lum(img + (size_t)idx * 3)) / 64.0f);
 }
@@ -198,7 +201,7 @@ __global__ void k_anchors(const Anchor* A, int n, const std::uint8_t* img, int H
 // nt output tiles go up to 8 per block (register budget), the rest over blockIdx.y.
 bool launch_conv(int cin, int nt, int s, const ConvP& P) {
     const int ntb = std::min(nt, 8);
-    const dim3 g((unsigned)(((P.OH + kB - 1) / kB) * ((P.OW + kB - 1) / kB)), (unsigned)(nt / ntb));
+    const dim3 g((unsigned)(((P.ny + kB - 1) / kB) * ((P.OW + kB - 1) / kB)), (unsigned)(nt / ntb));
 #define CS_ENH_CONV(CI, N, S_) if (cin == CI && ntb == N && s == S_) { k_conv<CI, N, S_><<<g, kT>>>(P); return true; }
     if (nt % ntb == 0) {
         // c = 16
@@ -311,15 +314,30 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
     const size_t npx = (size_t)H * W, nf = (size_t)Hp * Wp, nh = (size_t)Hh * Wh, nq = (size_t)Hq * Wq;
     const bool lr = in.y_mask && in.h > 0 && in.w > 0;
     const size_t nlr = lr ? (size_t)in.h * in.w : 1;
+    // The full-res layers (X, head, e0 before down1; up1, fuse0, tail after d1) run in bands of BR output rows, so
+    // their activations stay cache sized and only S0 (fuse0's skip input) is kept at full size. Each band recomputes
+    // the halo rows its 3x3 convs need (one per conv), so the output is the same as the whole image at once.
+    // CS_ENH_BAND=<rows> sets BR (default 128; 0 = one band).
+    const int* bk = m->blocks;
+    static const int band = [] { const char* e = std::getenv("CS_ENH_BAND"); return e ? std::max(0, std::atoi(e)) : 128; }();
+    const int BR = band > 0 ? std::min(Hp, (band + 3) / 4 * 4) : Hp;
+    const int hA = 1 + 2 * bk[0];                                   // X -> S0: head and e0's convs
+    const int rows_f = std::min(Hp, BR + std::max(2 * hA, 6));      // band buffer rows (stage B: U1 +-2, even ends)
+    const size_t nb = (size_t)rows_f * Wp;
     DevBuf<std::uint8_t> dimg, dout, dM, dS;
     DevBuf<float> dT, dD;
     DevBuf<Anchor> dA;
-    DevBuf<half_t> X, T0, T1, S0, Hb[4], Qb[3];
+    DevBuf<half_t> X, F[3], S0, Hb[4];
     bool ok = dimg.alloc(npx * 3) && dout.alloc(npx * 3) && dM.alloc(nlr) && dS.alloc(nlr) && dT.alloc(nlr) && dD.alloc(nlr) &&
-        dA.alloc(in.n_anchors > 0 ? (size_t)in.n_anchors : 1) && X.alloc(nf * kXC) && T0.alloc(nf * c) && T1.alloc(nf * c) && S0.alloc(nf * c);
+        dA.alloc(in.n_anchors > 0 ? (size_t)in.n_anchors : 1) && X.alloc(nb * kXC) && S0.alloc(nf * c);
+    for (auto& b : F) ok = ok && b.alloc(nb * c);
     for (auto& b : Hb) ok = ok && b.alloc(nh * 2 * c);
-    for (auto& b : Qb) ok = ok && b.alloc(nq * 4 * c);
     if (!ok) { std::fprintf(stderr, "gpu_enh: device allocation failed\n"); return false; }
+    if (const char* e = std::getenv("CS_GPU_PROF"); e && e[0] == '1') {
+        (void)hipDeviceSynchronize();
+        std::fprintf(stderr, "[gpu-prof] gpu_enh: device allocation %.1f ms (bands of %d rows)\n",
+            std::chrono::duration<double, std::milli>(clk::now() - t0).count(), BR);
+    }
     HIP_TRY(hipMemcpy(dimg.p, in.bgr, npx * 3, hipMemcpyHostToDevice));
     if (lr) {
         HIP_TRY(hipMemcpy(dM.p, in.y_mask, nlr, hipMemcpyHostToDevice));
@@ -332,49 +350,95 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
         k_blur_h<<<grid(nlr), kE>>>(dM.p, dT.p, in.h, in.w, gk);
         k_blur_v<<<grid(nlr), kE>>>(dT.p, dD.p, in.h, in.w, gk);
     }
-    k_input<<<grid(nf), kE>>>(dimg.p, H, W, Hp, Wp, dD.p, lr ? dM.p : nullptr, lr && in.y_samp ? dS.p : nullptr,
-        in.h, in.w, m->nx, X.p);
-    if (in.n_anchors > 0) k_anchors<<<grid((size_t)in.n_anchors), kE>>>(dA.p, in.n_anchors, dimg.p, H, W, Wp, X.p);
     HIP_TRY(hipGetLastError());
     HIP_TRY(hipDeviceSynchronize());
     const auto t1 = clk::now();
 
-    size_t k = 0;
-    auto conv = [&](const half_t* A, int CA, const half_t* B, int CB, int IH, int IW, int S, half_t* OUT,
-                    const half_t* RES, int mode, int relu) {
-        const Conv& cv = m->conv[k++];
+    // Conv number li (file order) on output rows y0 .. y0 + ny - 1; ia / ib / ob / rb: first image row held by A / B /
+    // OUT / RES (OUT rows at 2x for mode 1).
+    auto conv = [&](int li, const half_t* A, int CA, int ia, const half_t* B, int CB, int ib, int IH, int IW, int S,
+                    half_t* OUT, int ob, const half_t* RES, int rb, int mode, int relu, int y0, int ny) {
+        const Conv& cv = m->conv[(size_t)li];
         ConvP P{};
         P.A = A; P.B = B; P.CA = CA; P.CB = CB; P.IH = IH; P.IW = IW; P.OH = IH / S; P.OW = IW / S;
         P.Wt = m->hbuf.p + cv.w; P.bias = m->fbuf.p + cv.b; P.RES = RES; P.OUT = OUT; P.COUT = cv.cout_p;
         P.mode = mode; P.relu = relu; P.img = dimg.p; P.out8 = dout.p; P.H = H; P.W = W;
+        P.ia = ia; P.ib = ib; P.ob = ob; P.rb = rb; P.y0 = y0; P.ny = ny;
         return launch_conv(CA + CB, cv.cout_p / 16, S, P);
     };
-    // n residual blocks at (IH, IW, C): cur -> result pointer; tmp holds a(x), alt receives x + b(...)
-    auto resblocks = [&](int n, half_t* cur, half_t* tmp, half_t* alt, int C, int IH, int IW) -> half_t* {
+    auto full = [&](int li, const half_t* A, int CA, const half_t* B, int CB, int IH, int IW, int S, half_t* OUT,
+                    const half_t* RES, int mode, int relu) {
+        return conv(li, A, CA, 0, B, CB, 0, IH, IW, S, OUT, 0, RES, 0, mode, relu, 0, IH / S);
+    };
+    // n residual blocks from conv li at (IH, IW, C), whole image: cur -> result pointer
+    auto resblocks = [&](int li, int n, half_t* cur, half_t* tmp, half_t* alt, int C, int IH, int IW) -> half_t* {
         for (int i = 0; i < n; ++i) {
-            if (!conv(cur, C, nullptr, 0, IH, IW, 1, tmp, nullptr, 0, 1)) return nullptr;
-            if (!conv(tmp, C, nullptr, 0, IH, IW, 1, alt, cur, 0, 0)) return nullptr;
+            if (!full(li + 2 * i, cur, C, nullptr, 0, IH, IW, 1, tmp, nullptr, 0, 1)) return nullptr;
+            if (!full(li + 2 * i + 1, tmp, C, nullptr, 0, IH, IW, 1, alt, cur, 0, 0)) return nullptr;
             std::swap(cur, alt);
         }
         return cur;
     };
-    const int* bk = m->blocks;
-    ok = conv(X.p, kXC, nullptr, 0, Hp, Wp, 1, T0.p, nullptr, 0, 1);                               // head
-    half_t* s0 = ok ? resblocks(bk[0], T0.p, T1.p, S0.p, c, Hp, Wp) : nullptr;                     // e0
-    ok = s0 && conv(s0, c, nullptr, 0, Hp, Wp, 2, Hb[0].p, nullptr, 0, 1);                          // down1
-    half_t* s1 = ok ? resblocks(bk[1], Hb[0].p, Hb[1].p, Hb[2].p, 2 * c, Hh, Wh) : nullptr;         // e1
-    ok = s1 && conv(s1, 2 * c, nullptr, 0, Hh, Wh, 2, Qb[0].p, nullptr, 0, 1);                      // down2
-    half_t* mm = ok ? resblocks(bk[2], Qb[0].p, Qb[1].p, Qb[2].p, 4 * c, Hq, Wq) : nullptr;        // mid
-    std::vector<half_t*> freeh;                                                                     // half-res buffers not holding s1
-    for (auto& b : Hb) if (b.p != s1) freeh.push_back(b.p);
-    ok = mm && conv(mm, 4 * c, nullptr, 0, Hq, Wq, 1, freeh[0], nullptr, 1, 1);                     // up2 -> U2
-    ok = ok && conv(freeh[0], 2 * c, s1, 2 * c, Hh, Wh, 1, freeh[1], nullptr, 0, 1);                 // fuse1 -> D
-    half_t* d = ok ? resblocks(bk[1], freeh[1], freeh[0], freeh[2], 2 * c, Hh, Wh) : nullptr;      // d1
-    half_t* u1 = s0 == T0.p ? S0.p : T0.p;                                                         // full-res buffer free after e0
-    ok = d && conv(d, 2 * c, nullptr, 0, Hh, Wh, 1, u1, nullptr, 1, 1);                             // up1 -> U1
-    ok = ok && conv(u1, c, s0, c, Hp, Wp, 1, T1.p, nullptr, 0, 0);                                  // fuse0 -> V (linear)
-    ok = ok && conv(T1.p, c, nullptr, 0, Hp, Wp, 1, nullptr, nullptr, 2, 0);                        // tail -> 8-bit
-    if (!ok || k != m->conv.size()) return false;
+    const int L_e0 = 1, L_down1 = L_e0 + 2 * bk[0], L_e1 = L_down1 + 1, L_down2 = L_e1 + 2 * bk[1], L_mid = L_down2 + 1,
+              L_up2 = L_mid + 2 * bk[2], L_fuse1 = L_up2 + 1, L_d1 = L_fuse1 + 1, L_up1 = L_d1 + 2 * bk[1],
+              L_fuse0 = L_up1 + 1, L_tail = L_fuse0 + 1;
+    if (L_tail + 1 != (int)m->conv.size()) return false;
+    // rows b0 - h .. b1 + h - 1 of the padded image, clipped
+    auto win = [&](int b0, int b1, int h, int& r0, int& r1) { r0 = std::max(0, b0 - h); r1 = std::min(Hp, b1 + h); };
+
+    // Stage A: X, head and e0 per band, into S0
+    for (int b0 = 0; ok && b0 < Hp; b0 += BR) {
+        const int b1 = std::min(Hp, b0 + BR);
+        int x0, x1;
+        win(b0, b1, hA, x0, x1);
+        k_input<<<grid((size_t)(x1 - x0) * Wp), kE>>>(dimg.p, H, W, Hp, Wp, dD.p, lr ? dM.p : nullptr,
+            lr && in.y_samp ? dS.p : nullptr, in.h, in.w, m->nx, X.p, x0, x1 - x0);
+        if (in.n_anchors > 0)
+            k_anchors<<<grid((size_t)in.n_anchors), kE>>>(dA.p, in.n_anchors, dimg.p, H, W, Wp, X.p, x0, x1 - x0);
+        // conv l of the chain (head = 1) leaves halo hA - l; the last one writes rows b0 .. b1 - 1 of S0
+        int h = hA - 1, r0, r1;
+        win(b0, b1, h, r0, r1);
+        half_t* cur = h == 0 ? S0.p : F[0].p;
+        int cb = h == 0 ? 0 : r0;
+        ok = conv(0, X.p, kXC, x0, nullptr, 0, 0, Hp, Wp, 1, cur, cb, nullptr, 0, 0, 1, r0, r1 - r0);   // head
+        half_t* tmp = F[1].p; half_t* alt = F[2].p;
+        for (int i = 0; ok && i < bk[0]; ++i) {                                                      // e0
+            int t0_, t1_;
+            win(b0, b1, --h, t0_, t1_);
+            ok = conv(L_e0 + 2 * i, cur, c, cb, nullptr, 0, 0, Hp, Wp, 1, tmp, t0_, nullptr, 0, 0, 1, t0_, t1_ - t0_);
+            win(b0, b1, --h, r0, r1);
+            half_t* o = h == 0 ? S0.p : alt;
+            const int ob = h == 0 ? 0 : r0;
+            ok = ok && conv(L_e0 + 2 * i + 1, tmp, c, t0_, nullptr, 0, 0, Hp, Wp, 1, o, ob, cur, cb, 0, 0, r0, r1 - r0);
+            alt = cur; cur = o; cb = ob;
+        }
+    }
+    ok = ok && full(L_down1, S0.p, c, nullptr, 0, Hp, Wp, 2, Hb[0].p, nullptr, 0, 1);                       // down1
+    half_t* s1 = ok ? resblocks(L_e1, bk[1], Hb[0].p, Hb[1].p, Hb[2].p, 2 * c, Hh, Wh) : nullptr;           // e1
+    // The quarter-res buffers (each half a half-res one) live in two of the half-res buffers not holding s1 (fA, fB);
+    // the third (fC) takes U2, so fuse1 and d1 can reuse fA / fB once the quarter-res data is dead.
+    std::vector<half_t*> fr;                                                                                // half-res buffers not holding s1
+    for (auto& b : Hb) if (b.p != s1) fr.push_back(b.p);
+    half_t* Qb[3] = { fr[0], fr[0] + nq * 4 * c, fr[1] };
+    ok = s1 && full(L_down2, s1, 2 * c, nullptr, 0, Hh, Wh, 2, Qb[0], nullptr, 0, 1);                       // down2
+    half_t* mm = ok ? resblocks(L_mid, bk[2], Qb[0], Qb[1], Qb[2], 4 * c, Hq, Wq) : nullptr;                // mid
+    half_t* freeh[3] = { fr[2], fr[0], fr[1] };
+    ok = mm && full(L_up2, mm, 4 * c, nullptr, 0, Hq, Wq, 1, freeh[0], nullptr, 1, 1);                      // up2 -> U2
+    ok = ok && full(L_fuse1, freeh[0], 2 * c, s1, 2 * c, Hh, Wh, 1, freeh[1], nullptr, 0, 1);                // fuse1 -> D
+    half_t* d = ok ? resblocks(L_d1, bk[1], freeh[1], freeh[0], freeh[2], 2 * c, Hh, Wh) : nullptr;         // d1
+    ok = d != nullptr;
+    // Stage B: up1 (half-res rows -> U1 row pairs), fuse0 with S0, tail per band
+    for (int b0 = 0; ok && b0 < Hp; b0 += BR) {
+        const int b1 = std::min(Hp, b0 + BR);
+        int v0, v1, u0, u1;
+        win(b0, b1, 1, v0, v1);
+        win(b0, b1, 2, u0, u1);
+        u0 &= ~1; u1 = std::min(Hp, (u1 + 1) & ~1);
+        ok = conv(L_up1, d, 2 * c, 0, nullptr, 0, 0, Hh, Wh, 1, F[0].p, u0, nullptr, 0, 1, 1, u0 / 2, (u1 - u0) / 2);     // up1 -> U1
+        ok = ok && conv(L_fuse0, F[0].p, c, u0, S0.p, c, 0, Hp, Wp, 1, F[1].p, v0, nullptr, 0, 0, 0, v0, v1 - v0);     // fuse0 -> V
+        ok = ok && conv(L_tail, F[1].p, c, v0, nullptr, 0, 0, Hp, Wp, 1, nullptr, 0, nullptr, 0, 2, 0, b0, b1 - b0);  // tail -> 8-bit
+    }
+    if (!ok) return false;
     HIP_TRY(hipGetLastError());
     HIP_TRY(hipDeviceSynchronize());
     const auto t2 = clk::now();

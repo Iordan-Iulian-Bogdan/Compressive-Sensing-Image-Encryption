@@ -11,6 +11,8 @@
 #include "gpu_gemm.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -118,56 +120,278 @@ __global__ void k_trial(const TileDev* td, const float* Y, const float* G, const
     Z[o] = (av > thr) ? ((v > 0.0f ? 1.0f : -1.0f) * (av - thr)) : 0.0f;
 }
 
+// Opt-in phase timing (env CS_GPU_PROF=1): device-synced marks around build (host layout + upload),
+// the FISTA loop and the download of each solve, printed per call.
+struct PhaseProf {
+    bool on = false;
+    std::chrono::steady_clock::time_point t;
+    double ms[3] = {}, sub[2] = {};   // ms: build (rest = upload), loop, download; sub: host layout, device allocation
+    PhaseProf() { const char* e = std::getenv("CS_GPU_PROF"); on = e && e[0] == '1'; t = std::chrono::steady_clock::now(); }
+    void lap(double& out) {
+        if (!on) return;
+        (void)hipDeviceSynchronize();
+        const auto n = std::chrono::steady_clock::now();
+        out = std::chrono::duration<double, std::milli>(n - t).count(); t = n;
+    }
+    void mark(int i) { lap(ms[i]); }
+    void mark_sub(int i) { lap(sub[i]); }
+    void print(const char* kind, int nt, int max_rows, int max_cols, long long total, int samples, int inner, int rw) const {
+        if (!on) return;
+        std::fprintf(stderr, "[gpu-prof] gpu_tiles %s: %d tiles (max %dx%d, %.2f Mpx, %d samples), %d steps x %d reweights: "
+            "build %.1f ms (layout %.1f, alloc %.1f, upload %.1f), loop %.1f ms, download %.1f ms\n", kind, nt, max_rows,
+            max_cols, total * 1e-6, samples, inner, rw, sub[0] + sub[1] + ms[0], sub[0], sub[1], ms[0], ms[1], ms[2]);
+    }
+};
+
+// ---- tv = 0 tiles, fused: the whole reweighted FISTA loop of one tile in one block ----
+// k_lr_fista replaces solve_fixed's launches (two GEMM pairs, memset, scatter and k_step per step;
+// absmax / wupdate per reweight) with one block per tile that keeps everything in LDS and registers.
+// Thread t owns the 4x4 output block t of the tile in every product (rows 4 (t / nbn).., columns
+// 4 (t % nbn)..), so each element's sum runs over k in ascending order as in k_gemm and the
+// elementwise steps are the same expressions: the results match the unfused path.
+// LDS: A (Y, then PIX / SC) and B (TMP); the DCT tables are read through the cache (LDS for them halved the
+// blocks per CU).
+constexpr int kLrThreads = 256;
+
+// One 4x4 output block of a per-tile product, by k_gemm's operand conventions:
+//   P 0: TMP = Y  * Cc     P 1: PIX = Cr^T * TMP     P 2: TMP = SC * Cc^T     P 3: G = Cr * TMP
+// A (Y, SC) is stored column-major (A[k * M + m]) and B (TMP) row-major; CrT / CcT are the transposed tables, so every
+// operand is read along its contiguous side. V: M and N are multiples of 4 (and the tables 16-byte aligned), so the
+// four operands of a k step are one 16-byte load each.
+template <int P, bool V>
+__device__ inline void lr_prod(const float* A, const float* B, const float* Cr, const float* CrT, const float* Cc,
+    const float* CcT, int M, int N, int mb, int nb, float acc[4][4]) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    int mi[4], ni[4];   // clamped rows / columns (outputs past the tile are computed but not used)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) { mi[i] = min(mb + i, M - 1); ni[i] = min(nb + i, N - 1); }
+    // a(m, k) = SA[k * M + m], b(k, n) = SB[k * N + n]
+    const float* SA = (P == 0 || P == 2) ? A : (P == 1 ? Cr : CrT);
+    const float* SB = P == 0 ? Cc : (P == 2 ? CcT : B);
+    const int K = (P == 0 || P == 2) ? N : M;
+    for (int k = 0; k < K; ++k) {
+        float a[4], b[4];
+        if (V) {
+            const float4 va = *(const float4*)(SA + k * M + mb), vb = *(const float4*)(SB + k * N + nb);
+            a[0] = va.x; a[1] = va.y; a[2] = va.z; a[3] = va.w;
+            b[0] = vb.x; b[1] = vb.y; b[2] = vb.z; b[3] = vb.w;
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = SA[k * M + mi[i]];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = SB[k * N + ni[j]];
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+    }
+}
+
+// soff: per-tile sample offsets (nt + 1); sidx / sb: tile-local sample pixel indices (row * cols + col), values.
+// MOM: the inner momentum factors (the same in every reweighting pass). X: warm start in, solution out.
+__global__ void __launch_bounds__(kLrThreads) k_lr_fista(const TileDev* td, const float* tab, const int* soff,
+    const int* sidx, const float* sb, const float* LAM, const float* MOM, float* X, int inner,
+    int reweights, float logw) {
+    extern __shared__ float lds[];
+    const TileDev T = td[blockIdx.x];
+    const int M = T.rows, N = T.cols, n = M * N;
+    float* A = lds;
+    float* B = lds + n;
+    const float* Cr = tab + T.rtab;
+    const float* Cc = tab + T.ctab;
+    const float* CrT = tab + T.pad[0];   // transposed tables (Batch::build, lean)
+    const float* CcT = tab + T.pad[1];
+    const int t = threadIdx.x;
+    const bool vec = ((M | N) & 3) == 0 && ((T.rtab | T.ctab | T.pad[0] | T.pad[1]) & 3) == 0;
+    // samples as a dense map (sentinel where none), read into the owned blocks' registers
+    for (int i = t; i < n; i += kLrThreads) A[i] = -1e30f;
+    __syncthreads();
+    for (int s = soff[blockIdx.x] + t; s < soff[blockIdx.x + 1]; s += kLrThreads) A[sidx[s]] = sb[s];
+    __syncthreads();
+    const int nbn = (N + 3) / 4;
+    const bool own = t < ((M + 3) / 4) * nbn;
+    const int mb = own ? (t / nbn) * 4 : 0, nb = own ? (t % nbn) * 4 : 0;
+    bool in[4][4];
+    float bs[4][4], y[4][4], xp[4][4], w[4][4], ws[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int m = mb + i, c = nb + j;
+            in[i][j] = own && m < M && c < N;
+            bs[i][j] = in[i][j] ? A[m * N + c] : -1e30f;
+            y[i][j] = xp[i][j] = in[i][j] ? X[T.off + m * N + c] : 0.0f;
+            w[i][j] = 1.0f;
+            // frequency weight, as k_ws
+            const float fr = M > 1 ? (float)m / (float)(M - 1) : 0.0f;
+            const float fc = N > 1 ? (float)c / (float)(N - 1) : 0.0f;
+            ws[i][j] = expf(logw * 0.5f * (fr + fc));
+        }
+    const float lam = LAM[blockIdx.x];
+    __shared__ float red[kLrThreads];
+    for (int r = 0; r < reweights; ++r) {
+        for (int k = 0; k < inner; ++k) {
+            __syncthreads();   // the previous step's last product (reads B) is done everywhere
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (in[i][j]) A[(nb + j) * M + mb + i] = y[i][j];
+            __syncthreads();
+            float acc[4][4];
+            if (vec) lr_prod<0, true>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            else lr_prod<0, false>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            __syncthreads();   // A free (Y was only this product's operand)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (in[i][j]) B[(mb + i) * N + nb + j] = acc[i][j];
+            __syncthreads();
+            if (vec) lr_prod<1, true>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            else lr_prod<1, false>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            // residual at the samples, zero elsewhere (k_scatter)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (in[i][j]) A[(nb + j) * M + mb + i] = bs[i][j] > -1e29f ? acc[i][j] - bs[i][j] : 0.0f;
+            __syncthreads();
+            if (vec) lr_prod<2, true>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            else lr_prod<2, false>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            __syncthreads();   // B free
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (in[i][j]) B[(mb + i) * N + nb + j] = acc[i][j];
+            __syncthreads();
+            if (vec) lr_prod<3, true>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            else lr_prod<3, false>(A, B, Cr, CrT, Cc, CcT, M, N, mb, nb, acc);
+            // soft threshold + momentum (k_step)
+            const float mom = MOM[k];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float v = y[i][j] - acc[i][j];
+                    const float thr = 0.5f * lam * w[i][j] * ws[i][j];
+                    const float a = fabsf(v);
+                    const float z = a > thr ? (v > 0.0f ? a - thr : thr - a) : 0.0f;
+                    y[i][j] = z + mom * (z - xp[i][j]);
+                    xp[i][j] = z;
+                }
+        }
+        if (r + 1 < reweights) {
+            // eps = max(0.02 * max|z|, 1e-3) over the tile, W = eps / (|z| + eps) (k_absmax, k_wupdate)
+            float m = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (in[i][j]) m = fmaxf(m, fabsf(xp[i][j]));
+            red[t] = m;
+            __syncthreads();
+            for (int s = kLrThreads / 2; s > 0; s >>= 1) {
+                if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+                __syncthreads();
+            }
+            const float e0 = 0.02f * red[0];
+            const float e = e0 < 1e-3f ? 1e-3f : e0;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    w[i][j] = e / (fabsf(xp[i][j]) + e);
+                    y[i][j] = xp[i][j];   // the next pass starts from z
+                }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (in[i][j]) X[T.off + (mb + i) * N + nb + j] = xp[i][j];
+}
+
 // Host layout + device copies of a batch's tiles, samples and warm starts.
 struct Batch {
     int nt = 0, max_n = 0, max_rows = 0, max_cols = 0, total_samples = 0;
     long long total = 0;
     std::vector<TileDev> td;
     std::vector<float> table, hX;
-    DevBuf<TileDev> dtd; DevBuf<float> dtab, dX, db, dLAM, dWS, dW; DevBuf<int> drix, driy, dst;
+    DevBuf<TileDev> dtd; DevBuf<float> dtab, dX, db, dLAM, dWS, dW; DevBuf<int> drix, driy, dst, dso;
 
-    bool build(const std::vector<TileProblem>& tiles, float wscale) {
+    // lean (fused kernel): samples as one packed index each (in drix), no per-sample tile ids and no W / WS arrays
+    bool build(const std::vector<TileProblem>& tiles, float wscale, PhaseProf& pp, bool lean) {
         nt = (int)tiles.size();
         TileLayout lay;
         for (const TileProblem& P : tiles) { lay.add(P.rows, P.cols); total_samples += P.m; }
         td = lay.td; table = lay.table; total = lay.total; max_n = lay.max_n;
         max_rows = lay.max_rows; max_cols = lay.max_cols;
+        if (lean) {   // the fused kernel also reads every table transposed (pad[0]: rows table, pad[1]: columns table)
+            std::map<int, int> toff;
+            for (const auto& kv : lay.table_off) {
+                const int N = kv.first, off = kv.second;
+                table.resize((table.size() + 3) / 4 * 4);   // 16-byte aligned
+                toff[N] = (int)table.size();
+                for (int r = 0; r < N; ++r)
+                    for (int c = 0; c < N; ++c) table.push_back(lay.table[(size_t)off + (size_t)c * N + r]);
+            }
+            for (TileDev& d : td) { d.pad[0] = toff[d.rows]; d.pad[1] = toff[d.cols]; }
+        }
         if (total > 2000000000LL) return false;
         hX.resize((size_t)total);
         std::vector<float> hb((size_t)total_samples), lam((size_t)nt);
-        std::vector<int> hrix((size_t)total_samples), hriy((size_t)total_samples), hst((size_t)total_samples);
+        std::vector<int> hrix((size_t)total_samples), hriy(lean ? 0 : (size_t)total_samples), hst(lean ? 0 : (size_t)total_samples);
         std::vector<int> so((size_t)nt + 1, 0);
         for (int t = 0; t < nt; ++t) so[(size_t)t + 1] = so[(size_t)t] + tiles[(size_t)t].m;
         parallel_for(nt, [&](int t) {
             const TileProblem& P = tiles[(size_t)t];
             std::copy(P.x, P.x + (size_t)P.rows * P.cols, hX.begin() + td[(size_t)t].off);
             const size_t o = (size_t)so[(size_t)t];
-            for (int k = 0; k < P.m; ++k) {
-                hb[o + k] = P.b[k];
-                hrix[o + k] = P.rix[k];
-                hriy[o + k] = P.riy[k];
-                hst[o + k] = t;
-            }
+            if (lean)
+                for (int k = 0; k < P.m; ++k) {
+                    hb[o + k] = P.b[k];
+                    hrix[o + k] = P.rix[k] * P.cols + P.riy[k];
+                }
+            else
+                for (int k = 0; k < P.m; ++k) {
+                    hb[o + k] = P.b[k];
+                    hrix[o + k] = P.rix[k];
+                    hriy[o + k] = P.riy[k];
+                    hst[o + k] = t;
+                }
             lam[(size_t)t] = P.lambda;
         });
+        pp.mark_sub(0);
         const size_t ns = (size_t)std::max(1, total_samples);
         if (!dtd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dX.alloc((size_t)total) || !db.alloc(ns) ||
-            !drix.alloc(ns) || !driy.alloc(ns) || !dst.alloc(ns) || !dLAM.alloc((size_t)nt) ||
-            !dWS.alloc((size_t)total) || !dW.alloc((size_t)total)) {
+            !drix.alloc(ns) || !dLAM.alloc((size_t)nt) || !dso.alloc((size_t)nt + 1) ||
+            (!lean && (!driy.alloc(ns) || !dst.alloc(ns) || !dWS.alloc((size_t)total) || !dW.alloc((size_t)total)))) {
             std::fprintf(stderr, "gpu_tiles: device allocation failed\n");
             return false;
         }
+        pp.mark_sub(1);
         const size_t bytes = (size_t)total * sizeof(float);
         HIP_TRY(hipMemcpy(dtd.p, td.data(), (size_t)nt * sizeof(TileDev), hipMemcpyHostToDevice));
         HIP_TRY(hipMemcpy(dtab.p, table.data(), table.size() * sizeof(float), hipMemcpyHostToDevice));
         HIP_TRY(hipMemcpy(dX.p, hX.data(), bytes, hipMemcpyHostToDevice));
         HIP_TRY(hipMemcpy(dLAM.p, lam.data(), (size_t)nt * sizeof(float), hipMemcpyHostToDevice));
+        HIP_TRY(hipMemcpy(dso.p, so.data(), ((size_t)nt + 1) * sizeof(int), hipMemcpyHostToDevice));
         if (total_samples > 0) {
             HIP_TRY(hipMemcpy(db.p, hb.data(), (size_t)total_samples * sizeof(float), hipMemcpyHostToDevice));
             HIP_TRY(hipMemcpy(drix.p, hrix.data(), (size_t)total_samples * sizeof(int), hipMemcpyHostToDevice));
-            HIP_TRY(hipMemcpy(driy.p, hriy.data(), (size_t)total_samples * sizeof(int), hipMemcpyHostToDevice));
-            HIP_TRY(hipMemcpy(dst.p, hst.data(), (size_t)total_samples * sizeof(int), hipMemcpyHostToDevice));
+            if (!lean) {
+                HIP_TRY(hipMemcpy(driy.p, hriy.data(), (size_t)total_samples * sizeof(int), hipMemcpyHostToDevice));
+                HIP_TRY(hipMemcpy(dst.p, hst.data(), (size_t)total_samples * sizeof(int), hipMemcpyHostToDevice));
+            }
         }
+        if (lean) return true;
         const float logw = wscale > 1.0f ? std::log(wscale) : 0.0f;
         k_ws<<<grid(), dim3(kThreads)>>>(dtd.p, dWS.p, logw);
         HIP_TRY(hipMemsetD32((hipDeviceptr_t)dW.p, 0x3F800000, (size_t)total));   // W = 1.0f initially
@@ -210,17 +434,45 @@ struct Batch {
 
 // tv = 0: exact fixed step 1/2 (previous behaviour, unchanged).
 bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm) {
+    PhaseProf pp;
+    // Fused per-tile loop (k_lr_fista; CS_GPU_LR_FUSED=0 keeps the launch-per-step loop) when every tile fits one
+    // block: at most kLrThreads 4x4 output blocks, and A + B in 64 KB of LDS.
+    size_t lds = 0;
+    bool fit = true;
+    for (const TileProblem& P : tiles) {
+        lds = std::max(lds, (size_t)(2 * P.rows * P.cols) * sizeof(float));
+        fit = fit && ((P.rows + 3) / 4) * ((P.cols + 3) / 4) <= kLrThreads;
+    }
+    const char* ef = std::getenv("CS_GPU_LR_FUSED");
+    const bool fused = fit && lds <= 64 * 1024 && !(ef && ef[0] == '0');
     Batch B;
-    if (!B.build(tiles, prm.wscale)) return false;
+    if (!B.build(tiles, prm.wscale, pp, fused)) return false;
     const size_t N = (size_t)B.total, bytes = N * sizeof(float);
     DevBuf<float> dY, dXP, dZ, dTMP, dPIX, dSC, dG, dEPS;
-    if (!dY.alloc(N) || !dXP.alloc(N) || !dZ.alloc(N) || !dTMP.alloc(N) || !dPIX.alloc(N) ||
-        !dSC.alloc(N) || !dG.alloc(N) || !dEPS.alloc((size_t)B.nt)) {
+    if (!fused && (!dY.alloc(N) || !dXP.alloc(N) || !dZ.alloc(N) || !dTMP.alloc(N) || !dPIX.alloc(N) ||
+        !dSC.alloc(N) || !dG.alloc(N) || !dEPS.alloc((size_t)B.nt))) {
         std::fprintf(stderr, "gpu_tiles: device allocation failed\n");
         return false;
     }
     const dim3 blk(kThreads), grid = B.grid(), sgrid = B.sgrid();
-    for (int r = 0; r < prm.reweights; ++r) {
+    pp.mark(0);
+    if (fused) {
+        std::vector<float> mom((size_t)std::max(1, prm.inner));
+        float t = 1.0f;
+        for (int k = 0; k < prm.inner; ++k) {   // the momentum sequence of the loop below
+            const float t_new = 0.5f * (1.0f + std::sqrt(1.0f + 4.0f * t * t));
+            mom[(size_t)k] = (t - 1.0f) / t_new;
+            t = t_new;
+        }
+        DevBuf<float> dMOM;
+        if (!dMOM.alloc(mom.size())) return false;
+        HIP_TRY(hipMemcpy(dMOM.p, mom.data(), mom.size() * sizeof(float), hipMemcpyHostToDevice));
+        const float logw = prm.wscale > 1.0f ? std::log(prm.wscale) : 0.0f;
+        k_lr_fista<<<dim3((unsigned)B.nt), dim3(kLrThreads), lds>>>(B.dtd.p, B.dtab.p, B.dso.p, B.drix.p,
+            B.db.p, B.dLAM.p, dMOM.p, B.dX.p, prm.inner, prm.reweights, logw);
+        HIP_TRY(hipGetLastError());
+    }
+    for (int r = 0; r < (fused ? 0 : prm.reweights); ++r) {
         HIP_TRY(hipMemcpyAsync(dY.p, B.dX.p, bytes, hipMemcpyDeviceToDevice));
         HIP_TRY(hipMemcpyAsync(dXP.p, B.dX.p, bytes, hipMemcpyDeviceToDevice));
         float t = 1.0f;
@@ -238,13 +490,18 @@ bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm) {
         HIP_TRY(hipMemcpyAsync(B.dX.p, dZ.p, bytes, hipMemcpyDeviceToDevice));
         if (r + 1 < prm.reweights) B.reweight(dZ.p, dEPS.p);
     }
-    return B.download(tiles);
+    pp.mark(1);
+    const bool ok = B.download(tiles);
+    pp.mark(2);
+    pp.print(fused ? "fixed (fused)" : "fixed", B.nt, B.max_rows, B.max_cols, B.total, B.total_samples, prm.inner, prm.reweights);
+    return ok;
 }
 
 // tv > 0: smoothed-TV term + per-tile backtracking, as cs_fista_core_single (bt branch).
 bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
+    PhaseProf pp;
     Batch B;
-    if (!B.build(tiles, prm.wscale)) return false;
+    if (!B.build(tiles, prm.wscale, pp, false)) return false;
     const int nt = B.nt;
     const size_t N = (size_t)B.total, bytes = N * sizeof(float);
     DevBuf<float> dY, dXP, dZ, dTMP, dPIX, dSC, dG, dEPS, dTVG, dPHI, dS, dTV, dLT;
@@ -262,6 +519,7 @@ bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
     std::vector<double> fy((size_t)nt), fz((size_t)nt), d2(2 * (size_t)nt);
     std::vector<int> act((size_t)nt);
     const dim3 blk(kThreads), grid = B.grid(), sgrid = B.sgrid(), tgrid((unsigned)nt);
+    pp.mark(0);
     // smooth objective of the pixels in PIX: residual into SC, TV gradient into TVG, f into F
     auto smooth = [&](const float* coef) {
         B.synth(coef, dTMP.p, dPIX.p);
@@ -301,7 +559,11 @@ bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
         HIP_TRY(hipMemcpyAsync(B.dX.p, dZ.p, bytes, hipMemcpyDeviceToDevice));
         if (r + 1 < prm.reweights) B.reweight(dZ.p, dEPS.p);
     }
-    return B.download(tiles);
+    pp.mark(1);
+    const bool ok = B.download(tiles);
+    pp.mark(2);
+    pp.print("backtrack", B.nt, B.max_rows, B.max_cols, B.total, B.total_samples, prm.inner, prm.reweights);
+    return ok;
 }
 
 }  // namespace
@@ -361,12 +623,18 @@ bool available() {
 }
 
 void warmup() {
+    const auto t0 = std::chrono::steady_clock::now();
     if (!available()) return;
     // The device arena: half the free memory, at most 2 GiB (reserving it must finish while the CPU
     // still unpacks; a larger decode takes its overflow from hipMalloc).
     size_t free_b = 0, total_b = 0;
     if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return;
+    const auto t1 = std::chrono::steady_clock::now();
     gpu_common::arena_reserve(std::min<size_t>(free_b / 2, (size_t)2 << 30));
+    if (const char* e = std::getenv("CS_GPU_PROF"); e && e[0] == '1')
+        std::fprintf(stderr, "[gpu-prof] warmup: runtime %.1f ms, arena reserve %.1f ms\n",
+            std::chrono::duration<double, std::milli>(t1 - t0).count(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
 }
 
 bool solve_fista_dct(const std::vector<TileProblem>& tiles, const Params& prm) {

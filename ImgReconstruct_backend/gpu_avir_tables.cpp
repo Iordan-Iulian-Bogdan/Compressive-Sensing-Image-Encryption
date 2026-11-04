@@ -26,18 +26,20 @@ std::vector<float> avir_ch0(const std::vector<float>& X1, int R, int C) {
 
 // X = 1 e_j^T gives (A_r 1) A_c[:,j]^T and X = e_i 1^T gives A_r[:,i] (A_c 1)^T. The measured
 // columns carry a = (A_c 1)[C] and b = (A_r 1)[R], and a*b = AVIR(ones)[R][C] is divided out
-// of A_c so that A_r X A_c^T reproduces AVIR.
+// of A_c so that A_r X A_c^T reproduces AVIR. The R + C probes are independent (one resizer each).
 void extract(int R, int C, Tables& T) {
     T.Ar.assign((size_t)2 * R * R, 0.f);
     T.Ac.assign((size_t)2 * C * C, 0.f);
     const std::vector<float> s = avir_ch0(std::vector<float>((size_t)R * C, 1.f), R, C);
     const double ab = s[(size_t)R * 2 * C + C];
+    #pragma omp parallel for schedule(dynamic, 1)
     for (int j = 0; j < C; ++j) {
         std::vector<float> X((size_t)R * C, 0.f);
         for (int i = 0; i < R; ++i) X[(size_t)i * C + j] = 1.f;
         const std::vector<float> o = avir_ch0(X, R, C);
         for (int q = 0; q < 2 * C; ++q) T.Ac[(size_t)q * C + j] = (float)(o[(size_t)R * 2 * C + q] / ab);
     }
+    #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < R; ++i) {
         std::vector<float> X((size_t)R * C, 0.f);
         for (int j = 0; j < C; ++j) X[(size_t)i * C + j] = 1.f;

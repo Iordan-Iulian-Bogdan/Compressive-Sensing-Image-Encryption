@@ -22,7 +22,12 @@ struct Problem {
     // Exact-HR anchors (--hr-detail / sidecar): rows*cols values in [0,1], < -1e29 where
     // the pixel has none; null = no anchors. Weight comes from Params::hr_weight.
     const float* hr_val = nullptr;
-    float tv = 0.0f;      // smoothed-TV weight of the core (needs Params::bt = 1 when > 0)
+    // Or the same anchors sparse (read when hr_val is null): n_hr tile-local pixel indices and values, increasing
+    // indices, each pixel once; they are scattered on the device.
+    const int* hr_idx = nullptr;
+    const float* hr_v = nullptr;
+    int n_hr = 0;
+    float tv = 0.0f;     // smoothed-TV weight of the core (needs Params::bt = 1 when > 0)
     int ox = 0, oy = 0;   // tile origin in output geometry (only read by the CS_DUMP_ADMM dump)
 };
 
