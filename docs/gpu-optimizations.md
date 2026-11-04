@@ -650,7 +650,65 @@ Looked at and left:
 - Composite -> enhance on the device (~3-4 ms of upload): at low ratios the seg boundary calm edits the host
   image in between, so a device copy can be stale. Not done.
 
+The start-up wait (timestamps on one clock, IMG_3690 r0.9, ms after the warm-up thread starts): `hipMemGetInfo`
+returns at +319 (the device start itself, ~310 ms), the 1 GiB block at +352, and the LR stage's first upload is
+issued at +364 but returns only at +424, right after the 2 GiB `hipMalloc` of the rest (+419): a `hipMalloc` holds
+the runtime's lock. The warm-up now reserves the rest in 256 MiB blocks with a 0.5 ms pause after each, so the
+waiting upload gets in after one block (`gpu_tiles.hip`). Without the pause the warm-up thread takes the lock
+straight back (256 MiB blocks alone: 61 -> 32 ms):
+
+| second reserve | first-upload wait | solve | profile total |
+| --- | --- | --- | --- |
+| one 2 GiB block | 56-61 ms | 406-417 | 686-696 |
+| 256 MiB blocks, 0.5 ms pause | 2-3 ms | 368-370 | 645-652 |
+| 384 MiB blocks, 0.5 ms pause | 3.5 ms | 375 | 650 |
+| 128 MiB blocks, 0.5 ms pause | 1.3 ms | 403 | 685 (the reserve ends too late for cs-sr) |
+
+(4 photos x 2 at r0.9, c16 net.) The reserve now ends ~115 ms after the LR stage starts, before cs-sr needs it;
+the arena misses are unchanged (one 162 MB plane on some photos, with or without the blocks). Against f29297a, 32
+decodes on the c16 net: 32/32 byte-identical. Per phase at r0.3 + r0.9: solve -17.5 ms, total -28 ms. Wall time:
+-12 ms per decode (median 0.81 s both). r0.3 gains less: its LR stage starts earlier, when the device start
+itself (~310 ms) is what it waits for.
+
 Still open:
-- The first LR batch's first device sync waits ~70 ms (it shows as `layout` or `upload` in the profile line)
-  while the warm-up's runtime start and arena reserve finish. This is the largest wait left before the GPU
-  starts.
+- Device start-up (~310 ms in `hipMemGetInfo`) now bounds the LR stage's start when the host stages before it
+  are short (r0.3).
+
+## 15. Unpack and OpenMP idle waits (bit-identical)
+
+c16 net from here on (`enh_seg8a_x5_ema256_mix450c02_c16_unet.onnx`), production decode path otherwise.
+
+Unpack (`get_sampled_ycc420`, IMG_3690 r0.9, timestamps): label PNG 5 ms, per-class pixel pools 7.6, keyed luma
+draws 41.7, keyed shuffle 7.2, HR-anchor payload read 25.8, zeroed planes and scatter 12.3 (105 ms; the chroma
+draws already ran alongside).
+
+| Change | Where | Effect |
+| --- | --- | --- |
+| The seg-luma modes read the HR-anchor payload on a side thread during the luma draw (its offset is the prefix length from the header pad plus m and the chroma count) | `image_decryption.cpp` | 25.8 ms off the critical path |
+| Partial Fisher-Yates draws: each batch of 256 picks is drawn first (same generator calls, same order), then the swaps run with the pool entries prefetched 16 ahead; the output lists are reserved | `CS_encryption.cpp` (shared with the encoder) | draws 41.7 -> 21.7 ms |
+| Seg-luma and chroma sample scatter in parallel (their positions are distinct) | `image_decryption.cpp` | 12.3 -> 8.5 ms |
+
+Unpack 105 -> 54 ms at r0.9, 65 -> 36 ms at r0.3. Alone it barely moved the wall time: the LR stage then started
+earlier and waited on device start-up. Splitting the wall time (QPC on both sides) showed what did:
+
+| Same exe | start-up | main | teardown | wall |
+| --- | --- | --- | --- | --- |
+| default | 36.9 | 743.7 | 41.4 | 832.5 |
+| `OMP_WAIT_POLICY=passive` | 34.0 | 687.9 | 36.2 | 757.2 |
+| `KMP_BLOCKTIME=0` | 38.1 | 687.0 | 36.1 | 768.6 |
+
+libomp's workers spin for 200 ms after every parallel region and take the cores the decode's other threads (GPU
+driving, the side preps, PNG write) need. `main` now sets `OMP_WAIT_POLICY=PASSIVE` unless one is set. It has to
+go into the OS environment block (`SetEnvironmentVariableA`): libomp links its own CRT and reads that block when
+it initializes, so `_putenv_s` is not seen. It also has to happen before that initialization:
+`gpu_admm_broker.cpp`'s `g_target` was a static initializer calling `omp_get_max_threads()`, which started libomp
+before `main`. It now reads it at first use (`ImgReconstruct_backend.cpp`, `gpu_admm_broker.cpp`).
+
+Result against f29297a (section 14's start-up wait fix plus this section): 32 decodes 32/32 byte-identical, median 0.82 ->
+0.76 s, total 26.3 -> 24.4 s (-59 ms per decode, -7%). CPU decode (IMG_3690 r0.9) 9.8 -> 9.3 s, identical output.
+Encrypt (production format) 1.58 -> 1.51 s. A container from the new encoder decodes byte-identically on the
+f29297a exe. `cs_tests` pass; `build_cpu.bat` builds.
+
+Still open:
+- Device start-up (~310 ms in `hipMemGetInfo`) bounds when the LR stage can start once the host stages before it
+  are short.

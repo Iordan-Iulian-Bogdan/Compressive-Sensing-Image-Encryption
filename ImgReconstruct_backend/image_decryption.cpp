@@ -558,6 +558,44 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
         try { returnYcc420ChromaIndices(rows, cols, m, cs_key, chroma_mode); }
         catch (...) { chroma_error = std::current_exception(); }
     });
+    // Trailing HR-detail payload (mode 9: 6-byte samples; mode 19: compact
+    // flag map + luma, hr_count = byte length): CTR-decrypt the bytes after
+    // the luma/chroma sections into native-luma anchors.
+    auto read_hr = [&](size_t boff, int mY, int mCh) {
+        const bool compact = (sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL);
+        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
+        const size_t pay_off = (size_t)CS_HEADER_BYTES + boff + (size_t)mY + (size_t)2 * (size_t)mCh;
+        const size_t pay_len = compact ? (size_t)hr_count : (size_t)hr_count * CS_HRDETAIL_SAMPLE_BYTES;
+        if (hr_count == 0 || pay_off + pay_len > total_bytes) {
+            throw std::runtime_error("hr-detail container: corrupt payload");
+        }
+        const bool ok = compact
+            ? cs_read_anchor_payload(encrypted_img.data + pay_off, pay_len,
+                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples)
+            : cs_read_hr_payload(encrypted_img.data + pay_off, pay_len,
+                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples);
+        if (!ok) {
+            throw std::runtime_error("hr-detail container: corrupt payload");
+        }
+    };
+    // In the seg-luma modes its offset is known before the luma draw (the prefix length sits in the header pad and the
+    // luma count is m), so it is read on a side thread meanwhile.
+    const bool seg_luma = sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG ||
+        sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL;
+    std::exception_ptr hr_error;
+    CsJoinedThread hr_read;
+    if (hr_detail && seg_luma) {
+        const size_t pre_bytes =
+            (size_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN] |
+            ((size_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 1] << 8) |
+            ((size_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 2] << 16) |
+            ((size_t)encrypted_img.data[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + 3] << 24);
+        const int mCh = cs_chroma_count(chroma_mode, m, rows, cols);
+        hr_read.t = std::thread([&, pre_bytes, mCh] {
+            try { read_hr(pre_bytes, m, mCh); }
+            catch (...) { hr_error = std::current_exception(); }
+        });
+    }
     if (sampling_mode == CS_MODE_YCC420_SEG || sampling_mode == CS_MODE_YCC422_SEG ||
         sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL) {
         // Seg-luma variant: the sealed body prefix [nclasses][rates][seglen]
@@ -701,26 +739,12 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
     }
     const uint8_t* body = encrypted_img.data + CS_HEADER_BYTES + body_off;
 
-    // Trailing HR-detail payload (mode 9: 6-byte samples; mode 19: compact
-    // flag map + luma, hr_count = byte length): CTR-decrypt the bytes after
-    // the luma/chroma sections into native-luma anchors.
-    if (hr_detail) {
-        const bool compact = (sampling_mode == CS_MODE_YCC420_SEG_HRDETAIL);
-        const size_t total_bytes = encrypted_img.total() * encrypted_img.elemSize();
-        const size_t pay_off = (size_t)CS_HEADER_BYTES + body_off +
-            (size_t)mY_written + (size_t)2 * (size_t)mC;
-        const size_t pay_len = compact ? (size_t)hr_count : (size_t)hr_count * CS_HRDETAIL_SAMPLE_BYTES;
-        if (hr_count == 0 || pay_off + pay_len > total_bytes) {
-            throw std::runtime_error("hr-detail container: corrupt payload");
-        }
-        const bool ok = compact
-            ? cs_read_anchor_payload(encrypted_img.data + pay_off, pay_len,
-                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples)
-            : cs_read_hr_payload(encrypted_img.data + pay_off, pay_len,
-                cs_key, encrypted_img.data + CS_OFF_IV, hr_samples);
-        if (!ok) {
-            throw std::runtime_error("hr-detail container: corrupt payload");
-        }
+    if (hr_read.t.joinable()) {
+        hr_read.t.join();
+        if (hr_error) std::rethrow_exception(hr_error);
+    }
+    else if (hr_detail) {
+        read_hr(body_off, mY_written, mC);
     }
 
     y = cv::Mat::zeros(rows, cols, CV_8U);
@@ -742,10 +766,16 @@ void decrypt_image::get_sampled_ycc420(cv::Mat& y, cv::Mat& y_mask,
             }
         }
     }
-    else for (int k = 0; k < mY_written; k++) {
-        y.at<uint8_t>(ri_x[k], ri_y[k]) = body[k];
-        y_mask.at<uint8_t>(ri_x[k], ri_y[k]) = 1;
+    // The seg-luma draws and the chroma draws pick distinct positions (partial Fisher-Yates over disjoint pools), so
+    // those scatters run in parallel.
+    else {
+        #pragma omp parallel for if (seg_luma)
+        for (int k = 0; k < mY_written; k++) {
+            y.at<uint8_t>(ri_x[k], ri_y[k]) = body[k];
+            y_mask.at<uint8_t>(ri_x[k], ri_y[k]) = 1;
+        }
     }
+    #pragma omp parallel for
     for (int k = 0; k < mC; k++) {
         cr.at<uint8_t>(ri_cx1[k], ri_cy1[k]) = body[mY_written + k];
         cr_mask.at<uint8_t>(ri_cx1[k], ri_cy1[k]) = 1;

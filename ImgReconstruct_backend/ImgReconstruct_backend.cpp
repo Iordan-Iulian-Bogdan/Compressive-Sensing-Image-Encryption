@@ -21,6 +21,9 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 namespace {
 
@@ -539,6 +542,11 @@ static void cs_gpu_env_defaults()
 
 int main(int argc, char* argv[])
 {
+    // OpenMP workers sleep between parallel regions instead of spinning: spinning workers took the cores the decode's
+    // other threads (GPU driving, side preps, PNG write) need. -64 ms per GPU decode, -0.4 s on a CPU decode. An
+    // OMP_WAIT_POLICY already set is kept. libomp has its own CRT and reads the OS environment block on first use, so
+    // the variable goes there (_putenv_s would only change this CRT's copy).
+    if (GetEnvironmentVariableA("OMP_WAIT_POLICY", nullptr, 0) == 0) SetEnvironmentVariableA("OMP_WAIT_POLICY", "PASSIVE");
 #ifdef CS_GPU_TILES
     cs_gpu_env_defaults();
 #endif

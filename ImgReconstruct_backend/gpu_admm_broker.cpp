@@ -32,7 +32,9 @@ std::mutex g_mu;
 std::condition_variable g_cv;
 std::vector<Job*> g_queue;
 bool g_busy = false;
-std::atomic<int> g_target{ omp_get_max_threads() };   // batch closes at this many waiting jobs
+// batch closes at this many waiting jobs; 0 = omp_get_max_threads(), read at first use (as a static initializer it would
+// start the OpenMP runtime before main sets OMP_WAIT_POLICY)
+std::atomic<int> g_target{ 0 };
 
 struct Stats {
     std::atomic<long long> tiles{0}, batches{0}, failed{0};
@@ -89,7 +91,7 @@ int cs_gpu_admm_threads(int num_tiles, int num_threads) {
 
 bool cs_gpu_admm_run(const gpu_admm::Problem& p, const gpu_admm::Params& prm) {
     if (!gpu_admm::supported(p.rows, p.cols)) return false;
-    const int target = g_target;
+    const int target = g_target > 0 ? g_target.load() : omp_get_max_threads();
     Job job;
     job.p = p;
     job.prm = prm;

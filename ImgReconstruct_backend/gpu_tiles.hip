@@ -721,13 +721,20 @@ void warmup() {
     if (!available()) return;
     // The device arena: half the free memory, at most 3 GiB (a 12 MP decode peaks at ~2.7 GiB in the cs-sr
     // ADMM; a larger one takes its overflow from hipMalloc). A 1 GiB first block, enough for the LR solve, is
-    // usable at once; the rest is reserved while that solve runs.
+    // usable at once; the rest is reserved while that solve runs (below).
     size_t free_b = 0, total_b = 0;
     if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return;
     const auto t1 = std::chrono::steady_clock::now();
     const size_t total = std::min<size_t>(free_b / 2, (size_t)3 << 30), first = std::min<size_t>(total, (size_t)1 << 30);
     gpu_common::arena_reserve(first);
-    gpu_common::arena_reserve(total - first);
+    // The rest in 256 MiB blocks with a 0.5 ms pause after each: a hipMalloc holds the HIP runtime's lock (~8 ms per
+    // 256 MiB), so an upload the LR solve issues meanwhile waits for one block, not for the whole reserve (~60 ms).
+    for (size_t left = total - first; left > 0;) {
+        const size_t b = std::min<size_t>(left, (size_t)256 << 20);
+        gpu_common::arena_reserve(b);
+        left -= b;
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
     if (const char* e = std::getenv("CS_GPU_PROF"); e && e[0] == '1')
         std::fprintf(stderr, "[gpu-prof] warmup: runtime %.1f ms, arena reserve %.1f ms\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),

@@ -8,6 +8,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <xmmintrin.h>
 
 int CSencryption::params = AUTO_PARAM;
 
@@ -516,18 +517,31 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
         }
     }
 
+    auto want_of = [](size_t pix, uint8_t q) {
+        if (pix == 0 || q == 0) return (size_t)0;
+        const size_t want = (size_t)std::llround((double)pix * (double)q / 255.0);
+        return want > pix ? pix : want;
+    };
     auto draw_pool = [&](std::vector<int>& pool, uint8_t q) {
-        const size_t pix = pool.size();
-        if (pix == 0 || q == 0) return;
-        size_t want = (size_t)std::llround((double)pix * (double)q / 255.0);
-        if (want > pix) want = pix;
-        for (size_t k = 0; k < want; ++k) {
-            std::uniform_int_distribution<size_t> pick(k, pix - 1);
-            const size_t j = pick(generator);
-            std::swap(pool[k], pool[j]);
-            const int lin = pool[(size_t)k];
-            ri_x.push_back(lin / ym);
-            ri_y.push_back(lin % ym);
+        const size_t pix = pool.size(), want = want_of(pix, q);
+        // The picks depend on the stream only, not on the pool: a batch of them is drawn first (same calls, same
+        // order), so the swaps can prefetch the pool entries they will touch.
+        constexpr size_t kBatch = 256, kAhead = 16;
+        size_t js[kBatch];
+        for (size_t k0 = 0; k0 < want; k0 += kBatch) {
+            const size_t n = (std::min)(kBatch, want - k0);
+            for (size_t t = 0; t < n; ++t) {
+                std::uniform_int_distribution<size_t> pick(k0 + t, pix - 1);
+                js[t] = pick(generator);
+            }
+            for (size_t t = 0; t < n; ++t) {
+                if (t + kAhead < n) _mm_prefetch((const char*)&pool[js[t + kAhead]], _MM_HINT_T0);
+                const size_t k = k0 + t;
+                std::swap(pool[k], pool[js[t]]);
+                const int lin = pool[k];
+                ri_x.push_back(lin / ym);
+                ri_y.push_back(lin % ym);
+            }
         }
     };
 
@@ -543,6 +557,13 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
             (in_band ? bpools : pools)[(size_t)c].push_back(r * ym + col);
         }
     }
+    size_t total_want = 0;
+    for (size_t c = 0; c < rates_q.size(); ++c) {
+        const bool has_band = seg_blend > 0 && c < band.size() && !band[c].empty();
+        total_want += want_of(pools[c].size(), rates_q[c]) + (has_band ? want_of(bpools[c].size(), boost[c]) : 0);
+    }
+    ri_x.reserve(total_want);
+    ri_y.reserve(total_want);
     for (size_t c = 0; c < rates_q.size(); ++c) {
         uint8_t qc = rates_q[c];
         const bool has_band = seg_blend > 0 && c < band.size() && !band[c].empty();
