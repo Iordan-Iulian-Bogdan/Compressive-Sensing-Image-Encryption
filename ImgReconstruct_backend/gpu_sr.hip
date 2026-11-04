@@ -351,6 +351,8 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     for (int t = 0; t < nt && packed; ++t) packed = tiles[(size_t)t].hr_bgr == tiles[0].hr_bgr + (size_t)3 * sd[(size_t)t].hr_off;
     if (packed) {
         HIP_TRY(hipMemcpy(tiles[0].hr_bgr, dOUT.p, (size_t)3 * hr_total, hipMemcpyDeviceToHost));
+        // The composite blends exactly these bytes next: it takes the device copy instead of uploading them again.
+        gpu_common::resident_put(tiles[0].hr_bgr, (size_t)3 * hr_total, dOUT.release());
         sr_prof.mark(4);
         return true;
     }

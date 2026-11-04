@@ -2,6 +2,7 @@
 // Batched GPU solve of decrypt tiles (plain C++, no HIP headers). Built only in
 // the GPU build (-DCS_GPU_TILES, see build_gpu.bat).
 #include <opencv2/core.hpp>
+#include <functional>
 #include <vector>
 
 struct GpuTileJob {
@@ -44,5 +45,7 @@ struct GpuYccTileJob {
 
 /** @brief YCC form of cs_gpu_solve_tiles: every plane of every job is solved on the GPU (smooth-fill
 warm start, no neighbours), then each tile is merged exactly like decrypt_tiles_ycc420's CPU tail
-(chroma bilinear to the luma size, YCrCb -> BGR, 8 bit). solved[k] = 1 when job k's out is set. */
-void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved);
+(chroma bilinear to the luma size, YCrCb -> BGR, 8 bit). solved[k] = 1 when job k's out is set. on_gpu, when set, is
+called once the host prep is done and the GPU batches start (the caller's own host work can overlap them). */
+void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved,
+    const std::function<void()>& on_gpu = {});

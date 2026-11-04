@@ -1413,6 +1413,38 @@ static void decrypt_tiles_ycc420(int num_threads,
     std::vector<std::vector<cv::Mat>> sr_hr((size_t)num_tiles, std::vector<cv::Mat>((size_t)num_tiles));
     std::vector<std::vector<char>> sr_done((size_t)num_tiles, std::vector<char>((size_t)num_tiles, 0));
 #ifdef CS_GPU_TILES
+    // The batched cs-sr stage below (taken when every tile ends up GPU-solved): its tile list, and the host prep that
+    // does not read the LR pixels, which runs on a side thread while the LR batches are on the GPU.
+    const bool sr_batch = fuse_upscale && hr_out && superres_2x && !sr_dict && sr_fsrcnn_model.empty() &&
+        !sr_direct_2x && !sr_dip_2x && !pipe && !(grain_tv > 0.0f);
+    std::vector<CsSrBatchTile> bt;
+    std::vector<std::pair<int, int>> bt_where;
+    if (sr_batch) {
+        std::vector<std::pair<int, int>>& where = bt_where;
+        for (int i = 0; i < num_tiles; ++i)
+            for (int j = 0; j < num_tiles; ++j) {
+                if (y_meas[i][j].empty() || mats_out[i][j].empty()) continue;
+                const YccTileParams tp = tile_params(i, j);
+                CsSrBatchTile T{};
+                T.lr_tile = &mats_out[i][j];
+                T.meas = &y_meas[i][j];
+                T.ri_x = &y_idx[i][j].ri_x_g;
+                T.ri_y = &y_idx[i][j].ri_y_g;
+                T.coef = tp.coef_y;
+                T.tv = tp.tv_y;
+                T.iterations = tp.iterations;
+                T.fista_iters = tp.fista_iters;
+                T.wscale = tp.wscale;
+                T.hr_sr = hr_sr;
+                T.hr_sr.ox = coordinates[i][j].x * 2;
+                T.hr_sr.oy = coordinates[i][j].y * 2;
+                T.hr_out = &sr_hr[(size_t)i][(size_t)j];
+                bt.push_back(T);
+                where.push_back({ i, j });
+            }
+    }
+    std::shared_ptr<CsSrBatchPrep> sr_prep;
+    CsJoinedThread sr_prep_thread;
     // GPU pre-pass (env CS_GPU_TILES=1): Y, Cr and Cb of every eligible tile in one batch, each
     // from a smooth fill of its own samples (no neighbour warm start). The CPU ycc solve is
     // per-plane FISTA whatever --solver says, so only the basis/Onsager/grouping gate applies;
@@ -1440,7 +1472,13 @@ static void decrypt_tiles_ycc420(int num_threads,
             }
         std::vector<char> solved;
         const auto g0 = std::chrono::steady_clock::now();
-        cs_gpu_solve_tiles_ycc(jobs, solved);
+        cs_gpu_solve_tiles_ycc(jobs, solved, [&] {
+            if (!bt.empty())
+                sr_prep_thread.t = std::thread([&] {
+                    omp_set_num_threads(8);   // a third of the cores: the LR batches' own host work keeps the rest
+                    sr_prep = cs_sr_gpu_batch_prepare(bt, sr_red_denoiser, sr_cascade, sr_prior);
+                });
+        });
         int n_ok = 0;
         for (size_t k = 0; k < solved.size(); ++k)
             if (solved[k]) { gpu_done[(size_t)where[k].first][(size_t)where[k].second] = 1; ++n_ok; }
@@ -1456,34 +1494,12 @@ static void decrypt_tiles_ycc420(int num_threads,
     // Batched GPU cs-sr stage, as decrypt_tiles: the luma SR of every tile in one GPU pass. The
     // per-tile call below takes the merged BGR tile with the luma container (gray-as-BGR, so the
     // BGR2Y weights collapse to 1), which is exactly what a CsSrBatchTile carries.
-    if (flat_tiles && fuse_upscale && hr_out && superres_2x && !sr_dict && sr_fsrcnn_model.empty() &&
-        !sr_direct_2x && !sr_dip_2x && !pipe && !(grain_tv > 0.0f)) {
-        std::vector<CsSrBatchTile> bt;
-        std::vector<std::pair<int, int>> where;
-        for (int i = 0; i < num_tiles; ++i)
-            for (int j = 0; j < num_tiles; ++j) {
-                if (y_meas[i][j].empty() || mats_out[i][j].empty()) continue;
-                const YccTileParams tp = tile_params(i, j);
-                CsSrBatchTile T{};
-                T.lr_tile = &mats_out[i][j];
-                T.meas = &y_meas[i][j];
-                T.ri_x = &y_idx[i][j].ri_x_g;
-                T.ri_y = &y_idx[i][j].ri_y_g;
-                T.coef = tp.coef_y;
-                T.tv = tp.tv_y;
-                T.iterations = tp.iterations;
-                T.fista_iters = tp.fista_iters;
-                T.wscale = tp.wscale;
-                T.hr_sr = hr_sr;
-                T.hr_sr.ox = coordinates[i][j].x * 2;
-                T.hr_sr.oy = coordinates[i][j].y * 2;
-                T.hr_out = &sr_hr[(size_t)i][(size_t)j];
-                bt.push_back(T);
-                where.push_back({ i, j });
-            }
+    if (sr_prep_thread.t.joinable()) sr_prep_thread.t.join();
+    if (flat_tiles && sr_batch) {
+        const std::vector<std::pair<int, int>>& where = bt_where;
         std::vector<char> done;
         const auto s0 = std::chrono::steady_clock::now();
-        cs_sr_gpu_batch(bt, sr_red_denoiser, sr_cascade, sr_prior, done);
+        cs_sr_gpu_batch(bt, sr_red_denoiser, sr_cascade, sr_prior, done, sr_prep.get());
         int n_ok = 0;
         for (size_t k = 0; k < done.size(); ++k)
             if (done[k]) { sr_done[(size_t)where[k].first][(size_t)where[k].second] = 1; ++n_ok; }
@@ -1737,9 +1753,12 @@ int decrypt_image::decrypt_image_tiled(
     const std::string& seg_params
 ) {
 #ifdef CS_GPU_TILES
-    // HIP runtime start-up overlaps the container read, key derivation and unpacking.
-    CsJoinedThread gpu_warm;
+    // HIP runtime start-up overlaps the container read, key derivation and unpacking; so does loading the
+    // --enhance weights (their upload waits for the runtime).
+    CsJoinedThread gpu_warm, enh_prefetch;
     if (std::getenv("CS_GPU_TILES")) gpu_warm.t = std::thread(gpu_tiles::warmup);
+    if (!photo_up.enhance_model.empty())
+        enh_prefetch.t = std::thread([&photo_up] { cs_enhance_prefetch(photo_up.enhance_model); });
 #endif
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
     return decrypt_image_tiled(encrypted_img_g, output_path, password, num_tiles, overlap, iterations, nun_threads, coef, show_preview, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve_mask, seg_params);

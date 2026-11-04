@@ -63,6 +63,8 @@ __global__ void k_blend(const BlendTile* T, const int* tile_of, int ncol_grid, c
 }  // namespace
 
 bool blend_tiles(const std::vector<TileRef>& tiles, int W, int H, std::uint8_t* out_bgr) {
+    // On every return the gpu_sr handoff slot ends empty (a leftover would hold its arena piece): freed unless taken below.
+    struct SlotGuard { ~SlotGuard() { (void)resident_take(nullptr, 0); } } slot_guard;
     if (tiles.empty() || W <= 0 || H <= 0) return false;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
@@ -124,8 +126,11 @@ bool blend_tiles(const std::vector<TileRef>& tiles, int W, int H, std::uint8_t* 
     const std::uint8_t* src_p = packed ? tiles[0].bgr : src.data();
 
     DevBuf<BlendTile> dT; DevBuf<int> dTO, dC, dR; DevBuf<float> dW; DevBuf<std::uint8_t> dS, dO;
+    // The tiles may still be on the device from gpu_sr (resident_put): then they need no upload.
+    dS.p = (std::uint8_t*)resident_take(src_p, (size_t)(3 * total));
+    const bool resident = dS.p != nullptr;
     if (!dT.alloc(bt.size()) || !dTO.alloc(tile_of.size()) || !dC.alloc(colj.size()) || !dR.alloc(rowi.size()) ||
-        !dW.alloc(wt.size()) || !dS.alloc((size_t)(3 * total)) || !dO.alloc((size_t)3 * W * H)) {
+        !dW.alloc(wt.size()) || (!resident && !dS.alloc((size_t)(3 * total))) || !dO.alloc((size_t)3 * W * H)) {
         std::fprintf(stderr, "gpu_composite: device allocation failed\n");
         return false;
     }
@@ -134,7 +139,7 @@ bool blend_tiles(const std::vector<TileRef>& tiles, int W, int H, std::uint8_t* 
     HIP_TRY(hipMemcpy(dC.p, colj.data(), colj.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dR.p, rowi.data(), rowi.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dW.p, wt.data(), wt.size() * sizeof(float), hipMemcpyHostToDevice));
-    HIP_TRY(hipMemcpy(dS.p, src_p, (size_t)(3 * total), hipMemcpyHostToDevice));
+    if (!resident) HIP_TRY(hipMemcpy(dS.p, src_p, (size_t)(3 * total), hipMemcpyHostToDevice));
     k_blend<<<dim3((unsigned)(((long long)W * H + kThreads - 1) / kThreads)), dim3(kThreads)>>>(
         dT.p, dTO.p, nj, dC.p, dR.p, dW.p, dS.p, W, H, dO.p);
     HIP_TRY(hipGetLastError());

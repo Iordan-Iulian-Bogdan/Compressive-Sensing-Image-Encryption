@@ -572,46 +572,81 @@ bool solve_backtrack(const std::vector<TileProblem>& tiles, const Params& prm) {
 
 namespace gpu_common {
 namespace {
-struct Arena {
-    std::mutex mu;
+struct Block {
     char* base = nullptr;
     size_t cap = 0, top = 0;
     struct Piece { size_t off; bool live; };
     std::vector<Piece> pieces;   // in address order
+};
+struct Arena {
+    std::mutex mu;
+    std::vector<Block> blocks;
 } g_arena;
 }  // namespace
 
 void arena_reserve(size_t bytes) {
-    std::lock_guard<std::mutex> lk(g_arena.mu);
-    if (g_arena.base || bytes == 0) return;
-    void* p = nullptr;
+    if (bytes == 0) return;
+    void* p = nullptr;   // allocated outside the lock: stages keep using the blocks already there meanwhile
     if (hipMalloc(&p, bytes) != hipSuccess) return;
-    g_arena.base = (char*)p;
-    g_arena.cap = bytes;
+    std::lock_guard<std::mutex> lk(g_arena.mu);
+    Block b;
+    b.base = (char*)p;
+    b.cap = bytes;
+    g_arena.blocks.push_back(std::move(b));
 }
 
 void* arena_alloc(size_t bytes) {
     std::lock_guard<std::mutex> lk(g_arena.mu);
     const size_t n = (bytes + 255) & ~(size_t)255;
-    if (!g_arena.base || g_arena.cap - g_arena.top < n) return nullptr;
-    g_arena.pieces.push_back({ g_arena.top, true });
-    void* p = g_arena.base + g_arena.top;
-    g_arena.top += n;
-    return p;
+    for (Block& b : g_arena.blocks) {
+        if (b.cap - b.top < n) continue;
+        b.pieces.push_back({ b.top, true });
+        void* p = b.base + b.top;
+        b.top += n;
+        return p;
+    }
+    return nullptr;
 }
 
 bool arena_free(void* p) {
     std::lock_guard<std::mutex> lk(g_arena.mu);
     char* c = (char*)p;
-    if (!g_arena.base || c < g_arena.base || c >= g_arena.base + g_arena.cap) return false;
-    const size_t off = (size_t)(c - g_arena.base);
-    for (auto it = g_arena.pieces.rbegin(); it != g_arena.pieces.rend(); ++it)
-        if (it->off == off) { it->live = false; break; }
-    while (!g_arena.pieces.empty() && !g_arena.pieces.back().live) {
-        g_arena.top = g_arena.pieces.back().off;
-        g_arena.pieces.pop_back();
+    for (Block& b : g_arena.blocks) {
+        if (c < b.base || c >= b.base + b.cap) continue;
+        const size_t off = (size_t)(c - b.base);
+        for (auto it = b.pieces.rbegin(); it != b.pieces.rend(); ++it)
+            if (it->off == off) { it->live = false; break; }
+        while (!b.pieces.empty() && !b.pieces.back().live) {
+            b.top = b.pieces.back().off;
+            b.pieces.pop_back();
+        }
+        return true;
     }
-    return true;
+    return false;
+}
+
+namespace {
+struct Resident {
+    std::mutex mu;
+    const void* host = nullptr;
+    size_t bytes = 0;
+    void* dev = nullptr;
+} g_res;
+void dev_free(void* p) { if (p && !arena_free(p)) (void)hipFree(p); }
+}  // namespace
+
+void resident_put(const void* host, size_t bytes, void* dev) {
+    std::lock_guard<std::mutex> lk(g_res.mu);
+    dev_free(g_res.dev);
+    g_res.host = host; g_res.bytes = bytes; g_res.dev = dev;
+}
+
+void* resident_take(const void* host, size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_res.mu);
+    void* d = g_res.dev;
+    if (!(d && host == g_res.host && bytes == g_res.bytes)) { dev_free(d); d = nullptr; }
+    g_res.host = nullptr; g_res.bytes = 0; g_res.dev = nullptr;
+    return d;
 }
 }  // namespace gpu_common
 
@@ -625,12 +660,15 @@ bool available() {
 void warmup() {
     const auto t0 = std::chrono::steady_clock::now();
     if (!available()) return;
-    // The device arena: half the free memory, at most 2 GiB (reserving it must finish while the CPU
-    // still unpacks; a larger decode takes its overflow from hipMalloc).
+    // The device arena: half the free memory, at most 3 GiB (a 12 MP decode peaks at ~2.7 GiB in the cs-sr
+    // ADMM; a larger one takes its overflow from hipMalloc). A 1 GiB first block, enough for the LR solve, is
+    // usable at once; the rest is reserved while that solve runs.
     size_t free_b = 0, total_b = 0;
     if (hipMemGetInfo(&free_b, &total_b) != hipSuccess) return;
     const auto t1 = std::chrono::steady_clock::now();
-    gpu_common::arena_reserve(std::min<size_t>(free_b / 2, (size_t)2 << 30));
+    const size_t total = std::min<size_t>(free_b / 2, (size_t)3 << 30), first = std::min<size_t>(total, (size_t)1 << 30);
+    gpu_common::arena_reserve(first);
+    gpu_common::arena_reserve(total - first);
     if (const char* e = std::getenv("CS_GPU_PROF"); e && e[0] == '1')
         std::fprintf(stderr, "[gpu-prof] warmup: runtime %.1f ms, arena reserve %.1f ms\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),

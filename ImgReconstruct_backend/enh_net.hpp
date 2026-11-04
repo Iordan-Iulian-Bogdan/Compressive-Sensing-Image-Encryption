@@ -27,3 +27,7 @@ CPU; the plane count comes from the model's input channels (3 + 3 or 3 + 5). Ret
 printed) when no path can run. CS_ENH_DUMP=<prefix> (ONNX path) writes the input image (<prefix>_in.png) and each
 plane (<prefix>_p<k>.f32, raw float32 rows) for checking against the Python side. */
 bool cs_enhance_net(cv::Mat& bgr, const std::string& model_path, const CsEnhInputs& in);
+
+/** @brief GPU build: loads and uploads the HIP weights of `model_path` (as cs_enhance_net would on first use), so a
+decode can do it on a side thread while it unpacks and solves. No-op in the CPU build or with CS_GPU_ENH=0. */
+void cs_enhance_prefetch(const std::string& model_path);

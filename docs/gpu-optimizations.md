@@ -566,3 +566,56 @@ Still open:
 - LR layout (10-30 ms per batch) and the CPU warm start of the LR planes (`prep`, ~40 ms) are host work
   that could move to the device.
 - The enhance network itself (~130-145 ms at c32) and `k_fista_w` (~60 ms) are unchanged.
+
+## 13. Sixth round: arena blocks, overlapped host work, cs-sr -> composite on the device (bit-identical)
+
+Same production decode as section 12. The GPU kernels were busy for only ~0.35 s of the ~1.0 s decode; the rest
+was serial host work, transfers, allocations and start-up. Checked byte for byte against the section 12 exe
+(16729dd): 8 photos x r0.3/0.5/0.7/0.9, 32/32 identical; a CPU-path decode (`--device cpu`, GPU stages off) is
+identical too; `cs_tests` passes and `build_cpu.bat` builds.
+
+What decided the changes was a timeline of one decode: ms since process creation at every stage edge (a temporary
+instrumentation, not kept in the code). IMG_3690 r0.9, before, with the training sharing the GPU:
+
+| ms | Event | Note |
+| --- | --- | --- |
+| 0-58 | DLL loading | before `main` |
+| 59 | warm-up thread starts | 0.7 ms after `main`: it cannot start earlier |
+| 70 / 307 | HIP runtime / device context ready | `hipGetDeviceCount` 11 ms, `hipMemGetInfo` ~235 ms |
+| 357 -> 378 | first LR batch waits | for the 2 GB arena reserve, which held the arena lock for its whole `hipMalloc` (72 ms); ~115 ms at r0.3 |
+| 533-584 | LR tail + tile merge (CPU) | inverse DCT, chroma resize, YCrCb -> BGR per tile |
+| 585-615 | cs-sr host prep (CPU) | samples, anchor lists, ADMM groups: independent of the LR result |
+| inside cs-sr | ADMM layout 21 ms, alloc 20 ms | four 163 MB and two 6 MB buffers overflow the arena (peak ~2.7 GB) |
+| 884-909 | composite | re-uploads the 128 MB of HR tiles the cs-sr stage had just downloaded |
+| 910-935 | `gpu_enh::load` | read, pack and upload the 7 MB weight file |
+| inside enhance | alloc 20 ms | two 372 MB buffers overflow the arena (peak ~2.45 GB) |
+| 1171 -> ~1219 | process exit | after `main` returns |
+
+What changed:
+
+| Change | Files | Effect |
+| --- | --- | --- |
+| The arena is a list of blocks (pieces go to the first block with room; each block keeps the stack discipline); `arena_reserve` adds a block and runs `hipMalloc` outside the lock | `gpu_tiles.hip`, `gpu_common.hpp` | stages keep allocating while a block is being reserved |
+| Warm-up reserves a 1 GiB block first (enough for the LR solve), then the rest; total min(free / 2, 3 GiB), was 2 GiB | `gpu_tiles.hip` | the first LR batch no longer waits for the reserve; ADMM and enhance allocation 20 -> 0 ms each |
+| `cs_enhance_prefetch`: the decrypt entry loads the HIP weights on a side thread (next to the warm-up); `gpu_enh::load` takes them from plain `hipMalloc`, not the arena (a long-lived piece would strand the space below it) | `enh_net.*`, `gpu_enh.*`, `image_decryption.cpp` | 25 ms before the enhance stage -> 0 |
+| `cs_sr_gpu_batch_prepare`: the host part of the cs-sr batch that does not read the LR pixels; `decrypt_tiles_ycc420` builds the tile list before the LR solve and runs it on 8 OpenMP threads from `cs_gpu_solve_tiles_ycc`'s new `on_gpu` hook (when the LR batches reach the GPU); `cs_sr_gpu_batch` only takes the solved tiles (a tile whose size changed is dropped) | `superres.cpp`, `helper_functions.hpp`, `gpu_decrypt.*`, `image_decryption.cpp` | `sr enter` -> `sr gpu enter` ~28 -> 1 ms. With all 24 threads it slowed the second LR batch (97 -> 118 ms); 8 leave it at ~91 ms |
+| `resident_put` / `resident_take`: `gpu_sr::run` keeps its packed output tiles on the device in a one-slot handoff keyed on the host range it downloaded them to; `gpu_composite::blend_tiles` takes that buffer instead of uploading the same bytes, and empties the slot on every return | `gpu_tiles.hip`, `gpu_common.hpp`, `gpu_sr.hip`, `gpu_composite.hip` | composite 21-28 -> 13-15 ms; the host tiles are still downloaded, so every fallback sees the same bytes |
+
+Result on an idle GPU: median wall time of the 32 decodes (incl. process start) 1.03 -> 0.98 s, total
+32.9 -> 31.3 s (-50 ms per decode, -4.9%); the network time is unchanged (144 / 142 ms median). With the enhance
+training sharing the GPU the same A/B gave 1.18 -> 1.14 s (-28 ms per decode). The single-decode timelines
+suggested ~100 ms: part of what left the critical path (the cs-sr prep, the second arena block) still competes
+for CPU or device time with what remains on it.
+
+Tried: starting the warm-up earlier (it already starts 0.7 ms after `main`; the 58-88 ms before `main` is DLL
+loading).
+
+Still open:
+- LR -> cs-sr on the device (~60 ms): the CPU inverse DCT and tile merge (~45 ms) and cs-sr's tile copy and
+  upload (~16 ms). The inverse DCT is `cv::dct` today; a GPU one rounds some pixels differently, so the decode
+  would no longer be bit-identical.
+- Composite -> enhance on the device (~4 ms of upload): the seg boundary calm edits the image on the host in
+  between at low ratios.
+- The cs-sr prep state (`CsSrBatchPrep`) is freed when `decrypt_tiles_ycc420` returns (~12 ms of frees; before,
+  inside `cs_sr_gpu_batch`, so not a new cost).
+- Process exit takes ~48 ms after `main` returns.

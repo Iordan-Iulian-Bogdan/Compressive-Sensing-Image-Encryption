@@ -35,7 +35,7 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 
 // Smooth-fill DCT warm start, batched FISTA grouped by (inner steps, reweights, wscale), inverse DCT x 255.
 // Planes whose GPU batch failed keep ok = false. Returns false without touching anything when no device.
-bool solve_planes(std::vector<Plane>& ps, const char* tag) {
+bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<void()>& on_gpu = {}) {
     if (ps.empty() || !gpu_tiles::available()) return false;
     const auto t0 = std::chrono::steady_clock::now();
     const int np = (int)ps.size();
@@ -53,6 +53,7 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag) {
         if (ps[(size_t)k].prepared)
             groups[std::make_tuple(ps[(size_t)k].inner, ps[(size_t)k].reweights, ps[(size_t)k].wscale)].push_back(k);
     const double t_prep = ms_since(t0);
+    if (on_gpu) on_gpu();
 
     const auto t1 = std::chrono::steady_clock::now();
     for (auto& g : groups) {
@@ -116,7 +117,8 @@ void cs_gpu_solve_tiles(std::vector<GpuTileJob>& jobs, std::vector<char>& solved
     }
 }
 
-void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved) {
+void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved,
+    const std::function<void()>& on_gpu) {
     solved.assign(jobs.size(), 0);
     std::vector<Plane> ps(jobs.size() * 3);
     for (size_t j = 0; j < jobs.size(); ++j) {
@@ -131,7 +133,7 @@ void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>&
             P.coef = G.coef; P.tv = G.tv;
         }
     }
-    if (!solve_planes(ps, "gpu-tiles-ycc")) return;
+    if (!solve_planes(ps, "gpu-tiles-ycc", on_gpu)) return;
 
     // Same tail as decrypt_tiles_ycc420: chroma bilinear to the luma size, merge YCrCb, 8 bit, BGR.
     const int nj = (int)jobs.size();

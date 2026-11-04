@@ -38,14 +38,22 @@ struct TileDev {
         }                                                                          \
     } while (0)
 
-// Device arena (gpu_tiles.hip): one block reserved up front (arena_reserve, from the warm-up
-// thread) so the stages' buffers are carved from it instead of hipMalloc'd one by one. Pieces are
-// taken from the top and the top retreats over freed pieces, which fits the stack-ordered DevBuf
-// lifetimes. arena_alloc returns null when the arena is missing or full (the caller falls back to
+// Device arena (gpu_tiles.hip): blocks reserved up front (arena_reserve, from the warm-up thread;
+// each call adds one block, usable as soon as it returns) so the stages' buffers are carved from
+// them instead of hipMalloc'd one by one. Within a block, pieces are taken from the top and the top
+// retreats over freed pieces, which fits the stack-ordered DevBuf lifetimes; a piece goes to the
+// first block with room. arena_alloc returns null when no block has room (the caller falls back to
 // hipMalloc); arena_free returns false for pointers it did not hand out.
 void arena_reserve(size_t bytes);
 void* arena_alloc(size_t bytes);
 bool arena_free(void* p);
+
+// Device copy of a host buffer handed from one stage to the next (gpu_sr's output tiles to gpu_composite), so the next
+// stage need not upload bytes the device already holds. One slot: resident_put takes ownership of dev (an arena or
+// hipMalloc pointer, replacing what the slot held); resident_take hands it over only for the exact host range it was
+// put for, and empties the slot either way (null on a mismatch). The caller owns the result (freed like a DevBuf's).
+void resident_put(const void* host, size_t bytes, void* dev);
+void* resident_take(const void* host, size_t bytes);
 
 namespace {
 
@@ -165,6 +173,7 @@ struct DevBuf {
         p = (T*)arena_alloc(bytes);
         return p != nullptr || hipMalloc((void**)&p, bytes) == hipSuccess;
     }
+    T* release() { T* q = p; p = nullptr; return q; }
 };
 
 }  // namespace

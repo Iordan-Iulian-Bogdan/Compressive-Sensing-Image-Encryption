@@ -1538,41 +1538,46 @@ void cs_sr_cascade_init(const float* b, const int* rix, const int* riy, int m,
 }
 
 #ifdef CS_GPU_TILES
-void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_denoiser,
-    bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done)
+// Per-tile host data of cs_sr_gpu_batch (kept alive until the GPU pass returns) and its ADMM parameter groups.
+struct CsSrBatchPrep {
+    struct Tile {
+        int rows = 0, cols = 0;   // LR tile size the tile was prepared for
+        cv::Mat lr; std::vector<float> b, hval; std::vector<int> hidx; gpu_admm::Params prm; bool ok = false;
+        std::vector<std::uint8_t> dbg_avir; float dbg_h = 0.0f;
+    };
+    using Key = std::tuple<int, int, float, float, float, float, float, float, int, float, int>;
+    std::vector<Tile> pp;
+    std::map<Key, std::vector<size_t>> groups;
+    bool swin = false;
+};
+
+std::shared_ptr<CsSrBatchPrep> cs_sr_gpu_batch_prepare(const std::vector<CsSrBatchTile>& tiles,
+    const std::string& red_denoiser, bool sr_cascade, const CsSrPrior& sr_prior)
 {
-    done.assign(tiles.size(), 0);
     // Same gate as the per-tile GPU ADMM path of cs_sr_upscale_tile_2x (pnp_mode 2, NLM prox).
     if (tiles.empty() || sr_prior.pnp_mode != 2 || sr_cascade ||
         cs_onnx_kind_for(red_denoiser) >= 0 || cs_default_dct_block() > 0 || !cs_gpu_admm_enabled())
-        return;
+        return nullptr;
+    auto S = std::make_shared<CsSrBatchPrep>();
     // --sr-prior-model: the HIP Swin2SR (gpu_swin) replaces ONNX Runtime when the model's exported
     // weights are there and no segment gate is set (seg-gated tiles mix prior and cs-sr patches).
     // A tile at most 256 px a side is one ONNX patch, so the HIP output is the same warm start.
-    const bool swin = !sr_prior.model.empty();
+    const bool swin = S->swin = !sr_prior.model.empty();
     if (swin) {
         if ((sr_prior.seg_lr && !sr_prior.seg_lr->empty()) || !cs_sr_gpu_prior_ready(sr_prior.model) ||
             !gpu_swin::load(gpu_swin::weights_path(sr_prior.model)))
-            return;
+            return nullptr;
         for (const CsSrBatchTile& T : tiles)
             if (!T.lr_tile || T.lr_tile->rows > 256 || T.lr_tile->cols > 256 ||
                 !gpu_swin::supported(T.lr_tile->rows, T.lr_tile->cols))
-                return;
+                return nullptr;
     }
     const int admm = (std::min)(50, (std::max)(1, sr_prior.pnp_iters));
     const float rho = sr_prior.pnp_rho > 0.0f ? sr_prior.pnp_rho : 0.1f;
     const CsSrAdmmSched& sc = cs_sr_admm_sched();
-    int verify_every = 0;
-    if (const char* v = std::getenv("CS_GPU_SR_VERIFY")) verify_every = (std::max)(0, std::atoi(v));
 
-    // Per-tile host data (kept alive until the GPU pass returns) and ADMM parameter groups.
-    struct Prep {
-        cv::Mat lr; std::vector<float> b, hval; std::vector<int> hidx; gpu_admm::Params prm; bool ok = false;
-        std::vector<std::uint8_t> dbg_avir; float dbg_h = 0.0f;
-    };
-    std::vector<Prep> pp(tiles.size());
-    using Key = std::tuple<int, int, float, float, float, float, float, float, int, float, int>;
-    std::map<Key, std::vector<size_t>> groups;
+    std::vector<CsSrBatchPrep::Tile>& pp = S->pp;
+    pp.resize(tiles.size());
     // Anchors sorted once (every tile shares the decode's anchor list).
     const std::vector<CsHrSample>* anchors = tiles.front().hr_sr.anchors;
     std::vector<CsHrSample> sorted_anchors;
@@ -1585,14 +1590,14 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
     for (long long kk = 0; kk < (long long)tiles.size(); ++kk) {
         const size_t k = (size_t)kk;
         const CsSrBatchTile& T = tiles[k];
-        Prep& P = pp[k];
+        CsSrBatchPrep::Tile& P = pp[k];
         if (!T.lr_tile || T.lr_tile->empty() || T.lr_tile->type() != CV_8UC3) continue;
         const int Lr = T.lr_tile->rows, Lc = T.lr_tile->cols, Hr = 2 * Lr, Wc = 2 * Lc;
         const int m = (int)T.ri_x->size();
         if (Lr < 8 || Lc < 8 || !(T.tv >= 0.0f) || !gpu_admm::supported(Hr, Wc) ||
             T.meas->total() < (size_t)CS_HEADER_PIXELS + (size_t)m)
             continue;
-        P.lr = T.lr_tile->isContinuous() ? *T.lr_tile : T.lr_tile->clone();
+        P.rows = Lr; P.cols = Lc;   // the pixels are taken in cs_sr_gpu_batch (the LR solve may still be running)
         cs_sr_luma_samples(*T.meas, m, P.b);
         std::vector<int> hidx; std::vector<float> hval;
         if (T.hr_sr.anchors == anchors && !sorted_anchors.empty())
@@ -1623,13 +1628,38 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
         P.ok = true;
     }
     for (size_t k = 0; k < tiles.size(); ++k) {
-        const Prep& P = pp[k];
+        const CsSrBatchPrep::Tile& P = pp[k];
         if (!P.ok) continue;
-        groups[Key(P.prm.admm, P.prm.inner, P.prm.rho, P.prm.lip, P.prm.wscale, P.prm.rho_end, P.prm.h_start,
-            P.prm.h_end, P.prm.rescale_u, P.prm.hr_weight, P.prm.bt)].push_back(k);
+        S->groups[CsSrBatchPrep::Key(P.prm.admm, P.prm.inner, P.prm.rho, P.prm.lip, P.prm.wscale, P.prm.rho_end,
+            P.prm.h_start, P.prm.h_end, P.prm.rescale_u, P.prm.hr_weight, P.prm.bt)].push_back(k);
+    }
+    return S;
+}
+
+void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_denoiser,
+    bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done, CsSrBatchPrep* prep)
+{
+    done.assign(tiles.size(), 0);
+    std::shared_ptr<CsSrBatchPrep> own;
+    if (!prep) { own = cs_sr_gpu_batch_prepare(tiles, red_denoiser, sr_cascade, sr_prior); prep = own.get(); }
+    if (!prep || prep->pp.size() != tiles.size()) return;
+    std::vector<CsSrBatchPrep::Tile>& pp = prep->pp;
+    const bool swin = prep->swin;
+    int verify_every = 0;
+    if (const char* v = std::getenv("CS_GPU_SR_VERIFY")) verify_every = (std::max)(0, std::atoi(v));
+    // The solved LR tiles, which must have kept the size they were prepared for.
+    for (size_t k = 0; k < tiles.size(); ++k) {
+        CsSrBatchPrep::Tile& P = pp[k];
+        const cv::Mat* L = tiles[k].lr_tile;
+        if (!P.ok) continue;
+        if (!L || L->type() != CV_8UC3 || L->rows != P.rows || L->cols != P.cols) { P.ok = false; continue; }
+        P.lr = L->isContinuous() ? *L : L->clone();
     }
 
-    for (auto& g : groups) {
+    for (auto& g0 : prep->groups) {
+        std::pair<const CsSrBatchPrep::Key, std::vector<size_t>> g{ g0.first, {} };
+        for (size_t k : g0.second) if (pp[k].ok) g.second.push_back(k);
+        if (g.second.empty()) continue;
         std::vector<gpu_sr::Tile> jobs;
         jobs.reserve(g.second.size());
         // The group's output tiles are views into one buffer: one allocation (and one free)
@@ -1642,7 +1672,7 @@ void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_d
         size_t pool_off = 0;
         for (size_t k : g.second) {
             const CsSrBatchTile& T = tiles[k];
-            Prep& P = pp[k];
+            CsSrBatchPrep::Tile& P = pp[k];
             const int n = 12 * P.lr.rows * P.lr.cols;
             if (pooled) *T.hr_out = pool.colRange((int)pool_off, (int)pool_off + n).reshape(3, 2 * P.lr.rows);
             else T.hr_out->create(2 * P.lr.rows, 2 * P.lr.cols, CV_8UC3);
@@ -1721,8 +1751,16 @@ bool cs_sr_gpu_prior_ready(const std::string& model)
     return f != nullptr;
 }
 #else
+struct CsSrBatchPrep {};
+
+std::shared_ptr<CsSrBatchPrep> cs_sr_gpu_batch_prepare(const std::vector<CsSrBatchTile>&, const std::string&, bool,
+    const CsSrPrior&)
+{
+    return nullptr;
+}
+
 void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string&, bool, const CsSrPrior&,
-    std::vector<char>& done)
+    std::vector<char>& done, CsSrBatchPrep*)
 {
     done.assign(tiles.size(), 0);
 }

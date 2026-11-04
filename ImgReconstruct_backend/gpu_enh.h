@@ -13,7 +13,8 @@ namespace gpu_enh {
 // Weight file that belongs to an ONNX model ("<dir>/<stem>.enh.bin").
 std::string weights_path(const std::string& onnx_model);
 
-// Loads (once per path) and uploads the weights; false when the file is missing or malformed.
+// Loads (once per path) and uploads the weights; false when the file is missing or malformed. Thread-safe (a decode
+// prefetches them on a side thread, cs_enhance_prefetch).
 bool load(const std::string& weights_file);
 
 // Extra input planes of the loaded model (3 or 5), 0 when none is loaded.

@@ -292,7 +292,10 @@ bool load(const std::string& path) {
     double gs = 0.0;
     for (int k = -kBlurR; k <= kBlurR; ++k) gs += std::exp(-(double)k * k / (2.0 * kBlurSigma * kBlurSigma));
     for (int k = -kBlurR; k <= kBlurR; ++k) fv.push_back((float)(std::exp(-(double)k * k / (2.0 * kBlurSigma * kBlurSigma)) / gs));
-    if (!ok || !m->fbuf.alloc(fv.size()) || !m->hbuf.alloc(hv.size()) ||
+    // Plain hipMalloc, not the arena: the weights may load while a stage holds arena pieces (cs_enhance_prefetch), and a
+    // long-lived piece above those would keep their space from being reused.
+    if (!ok || hipMalloc((void**)&m->fbuf.p, fv.size() * sizeof(float)) != hipSuccess ||
+        hipMalloc((void**)&m->hbuf.p, hv.size() * sizeof(half_t)) != hipSuccess ||
         hipMemcpy(m->fbuf.p, fv.data(), fv.size() * sizeof(float), hipMemcpyHostToDevice) != hipSuccess ||
         hipMemcpy(m->hbuf.p, hv.data(), hv.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice) != hipSuccess) {
         std::fprintf(stderr, "gpu_enh: %s is not a restoration-net weight file (re-run x64/GpuBuild/export_enh_onnx.py)\n", path.c_str());

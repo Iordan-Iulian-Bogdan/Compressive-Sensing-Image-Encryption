@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -408,9 +409,17 @@ prox, no cascade): AVIR warm start, or the Swin2SR prior on HIP (gpu_swin.h) whe
 every eligible tile in one GPU pass (gpu_sr.h), grouped by ADMM parameters. done[k] = 1 when
 tile k's hr_out was produced; the rest are left to the per-tile path. Without the GPU build or
 with CS_GPU_ADMM off nothing is done. CS_GPU_SR_VERIFY=<n> compares every n-th tile's warm
-start, NLM strength and final tile with the CPU functions and prints the differences. */
+start, NLM strength and final tile with the CPU functions and prints the differences. `prep`, when given,
+is cs_sr_gpu_batch_prepare's result for the same tiles (null = prepared here). */
+struct CsSrBatchPrep;
 void cs_sr_gpu_batch(std::vector<CsSrBatchTile>& tiles, const std::string& red_denoiser,
-    bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done);
+    bool sr_cascade, const CsSrPrior& sr_prior, std::vector<char>& done, CsSrBatchPrep* prep = nullptr);
+
+/** @brief The host part of cs_sr_gpu_batch that does not read the LR pixels (samples, anchor lists, ADMM groups), so a
+decode can run it while the LR solve is still on the GPU. The tiles' lr_tile must already have their final size and
+type; cs_sr_gpu_batch drops a tile whose size changed. Null when the batch would not run. */
+std::shared_ptr<CsSrBatchPrep> cs_sr_gpu_batch_prepare(const std::vector<CsSrBatchTile>& tiles,
+    const std::string& red_denoiser, bool sr_cascade, const CsSrPrior& sr_prior);
 
 /** @brief True when cs_sr_gpu_batch can run the --sr-prior-model network itself: GPU build,
 CS_GPU_ADMM=1, CS_GPU_SWIN not "0", and the model's exported weights

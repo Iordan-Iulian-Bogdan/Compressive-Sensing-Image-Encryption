@@ -251,10 +251,14 @@ static bool enhance_onnx(cv::Mat&, const std::string&, const CsEnhInputs&) {
 #ifdef CS_GPU_TILES
 // HIP path (gpu_enh.hip): planes, network and 8-bit output on the GPU. Used when the weight file exported next to the
 // model (<stem>.enh.bin, or the .enh.bin itself) loads; CS_GPU_ENH=0 forces the ONNX Runtime path.
+static std::string enh_weights_file(const std::string& model_path) {
+    const bool is_bin = model_path.size() > 8 && model_path.compare(model_path.size() - 8, 8, ".enh.bin") == 0;
+    return is_bin ? model_path : gpu_enh::weights_path(model_path);
+}
+
 static bool enhance_hip(cv::Mat& bgr, const std::string& model_path, const CsEnhInputs& in) {
     if (const char* g = std::getenv("CS_GPU_ENH"); g && g[0] == '0') return false;
-    const bool is_bin = model_path.size() > 8 && model_path.compare(model_path.size() - 8, 8, ".enh.bin") == 0;
-    const std::string wp = is_bin ? model_path : gpu_enh::weights_path(model_path);
+    const std::string wp = enh_weights_file(model_path);
     if (!gpu_enh::load(wp)) return false;
     static_assert(sizeof(gpu_enh::Anchor) == sizeof(CsHrSample) && offsetof(gpu_enh::Anchor, idx) == offsetof(CsHrSample, idx) &&
         offsetof(gpu_enh::Anchor, y) == offsetof(CsHrSample, y), "gpu_enh::Anchor must mirror CsHrSample");
@@ -283,6 +287,15 @@ static bool enhance_hip(cv::Mat& bgr, const std::string& model_path, const CsEnh
     return true;
 }
 #endif
+
+void cs_enhance_prefetch(const std::string& model_path) {
+#ifdef CS_GPU_TILES
+    if (const char* g = std::getenv("CS_GPU_ENH"); g && g[0] == '0') return;
+    (void)gpu_enh::load(enh_weights_file(model_path));
+#else
+    (void)model_path;
+#endif
+}
 
 bool cs_enhance_net(cv::Mat& bgr, const std::string& model_path, const CsEnhInputs& in) {
     if (bgr.empty() || bgr.type() != CV_8UC3) return false;
