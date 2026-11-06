@@ -1,7 +1,7 @@
 """Training pairs for the --enhance net from the CURRENT production pipeline, in the layout train_enh_fresh.py reads.
 
 Per photo (same photos and train/val split as x64/GpuBuild/gen_enh_seg8tile_anchor.py):
-  encode: production format, --seg-auto 8 --ycc420 --seg-tile --ratio ENH_RATIO --hr-detail 300000, with the current net
+  encode: production format (single-scale, --multiscale off), --seg-auto 8 --ycc420 --seg-tile --ratio ENH_RATIO --hr-detail 300000, with the current net
           as --enhance for the closed-loop anchor ranking (ENH_RANK_NET, default the production net)
   decode: production decoder without the net (the net's input): --tv 0 cs-sr + ADMM, --hr-weight 1, CS_HR_NO_POSTHOC=1,
           the auto lambda law as built, and the dumps the trainer's planes need (CS_DUMP_YMASK / YSAMP / HR)
@@ -66,7 +66,7 @@ def one_photo(split, name, f, log):
     ratio = RATIOS[zlib.crc32(name.encode()) % len(RATIOS)] if RATIOS else RATIO
     t0 = time.time()
     rc = run(["encrypt", f, enc, "--password", PW, "--no-preview", "--ratio", str(ratio), "--seg-auto", "8", "--ycc420",
-              "--seg-tile", "--hr-detail", ANCHORS, "--enhance", RANK_NET], ENV, SCR + r"\enc.log")
+              "--seg-tile", "--multiscale", "off", "--hr-detail", ANCHORS, "--enhance", RANK_NET], ENV, SCR + r"\enc.log")
     if rc != 0 or not os.path.exists(enc):
         print("encode failed", name, rc, flush=True); return
     t1 = time.time()
@@ -124,7 +124,7 @@ def run_chunk(chunk):
         with open(lst, "w") as fh:
             fh.writelines(f"{f}\t{SCR}\\{name}.enc.png\n" for _, name, f in js)
         run(["encrypt", "@" + lst, "--password", PW, "--no-preview", "--ratio", str(ratio), "--seg-auto", "8", "--ycc420",
-             "--seg-tile", "--hr-detail", ANCHORS, "--enhance", RANK_NET], ENV, SCR + rf"\enc_{ratio}.log")
+             "--seg-tile", "--multiscale", "off", "--hr-detail", ANCHORS, "--enhance", RANK_NET], ENV, SCR + rf"\enc_{ratio}.log")
     done = [(s, n, f) for s, n, f in chunk if os.path.exists(SCR + rf"\{n}.enc.png")]
     lst = SCR + r"\dec.tsv"
     with open(lst, "w") as fh:

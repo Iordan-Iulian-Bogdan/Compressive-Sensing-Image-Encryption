@@ -371,6 +371,54 @@
       - Alone, vs the production pair: −0.16 / −0.12 / −0.17 dB, ΔE95 +0.08..0.10.
       - Followed by u2dc: −0.04 / −0.05 / −0.10 dB, ΔE95 −0.01 / +0.01 / +0.02 (r0.1 / 0.3 / 0.5).
       - Not promoted.
+  - Settings oracle, 2026-11-06: should a net choose the encode settings per photo? (scratchpad `oracle/oracle.py`,
+    `oracle_metrics.py`, `analyze.py`; decodes kept in `F:\oracle\<photo>\`.)
+    - Photos: 88 in all, 72 at ≤13 MP and 16 at >20 MP. They are the 77 validation photos of the enhance-net set plus
+      IMG_0615..0625.
+    - Configs: 8 in all, each at `--ratio` 0.2 / 0.3 / 0.5 / 0.7 / 0.9, with exe `ms30` and the production decode.
+      - `P_m*`: production at `--hr-scale` 0.5 / 1 / 2 / 4.
+      - `M_c0_m*`: `--multiscale auto` at `--hr-scale` 0.5 / 1 / 2.
+      - `M_c0.3_m1`: `--multiscale auto --ms-coarse 0.3`.
+    - Method: equal bytes. Every config is read at the production default's (`P_m1`) bytes by log-bytes interpolation.
+      - rule = the one config with the best mean at that ratio.
+      - oracle = the best config per photo.
+    - Gains over production (`P_m1`). The rule shown is the SSIM-best config, except at r0.7 / 0.9 (picked by ΔE95):
+
+      | ratio | rule | rule PSNR / SSIM / ΔE95 | oracle − rule (SSIM pick / ΔE95 pick / PSNR pick) |
+      |---|---|---|---|
+      | 0.2 | M_c0_m0.5 | +1.81 dB / +0.0285 / −1.01 | +0.0013 / −0.05 / +0.21 dB |
+      | 0.3 | M_c0_m0.5 | +1.31 / +0.0157 / −0.59 | +0.0006 / −0.06 / +0.13 |
+      | 0.5 | M_c0_m0.5 | +0.54 / +0.0062 / −0.22 | +0.0005 / −0.04 / +0.18 |
+      | 0.7 | M_c0_m2 (ΔE95) or M_c0_m0.5 (SSIM) | +0.27 / −0.0005 / −0.07 or −0.04 / +0.0023 / −0.02 | +0.0009 / −0.03 / +0.18 |
+      | 0.9 | M_c0_m2 (ΔE95); P_m1 (SSIM) | +0.35 / −0.0001 / −0.08 | +0.0012 / −0.02 / +0.18 |
+
+    - On >20 MP the headroom is smaller still: oracle − rule is ≤ 0.0003 SSIM, ≤ 0.025 ΔE95 and ≤ 0.10 dB.
+      - The ΔE-best rule there uses more anchors one step earlier: m1 at r0.3 / 0.5, m2 from r0.7.
+    - Verdict: a per-photo settings net is not worth building. Picking by ratio captures nearly all the gain. The
+      remaining headroom (≤ 0.0015 SSIM, ≤ 0.06 ΔE95) is at the noise level of what we promote.
+    - The gain is in the settings themselves: multi-scale with anchors rising with ratio.
+      - Proposed rule: m0.5 up to r0.5, m2 from r0.7.
+      - At r0.2, `--ms-coarse 0.3` is the ΔE-best (−1.08 vs −1.01) but SSIM-worse (+0.024 vs +0.029).
+    - Cost, mean over all runs:
+      - encode 4.6 s multi-scale vs 3.4 s production;
+      - decode 2.6 s vs 2.2 s (two GPU workers running at once, so absolute times are contended).
+    - Adopted 2026-11-06 (exe `ms31`, `ImgReconstruct_backend.cpp` main):
+      - The production flags (`--seg-auto --ycc420 --seg-tile --hr-detail`) now default to `--multiscale auto`.
+      - Without an explicit `--hr-scale`, the multiplier is m = 0.5 · 4^clamp((r − 0.5) / 0.2, 0, 1): 0.5 up to
+        r0.5, 1 at r0.6, 2 from r0.7.
+      - `--multiscale off` restores the single-scale container. `Params-test/gen_enh_prod.py` passes it, so the
+        training data stays in the nets' format.
+      - `--multiscale auto` now also works in batch mode (`encrypt @list`), one plan per photo.
+      - Checked on two oracle photos at r0.3 / 0.9, against the oracle runs:
+        - anchors are identical (145,240 / 900,000), and bytes are within 0.02%;
+        - PSNR is within +0.06 dB. Encodes are not byte-reproducible (a fresh salt each time), so decodes are
+          compared by metrics, not pixels.
+        - Batch decodes match their single runs.
+      - Not done: the size-dependent variant (>20 MP prefers m1 at r0.3 / 0.5 by ΔE95). `--show-mask` has no mask
+        view for mode 20 containers.
+    - Sweep speed: the first version computed metrics (`ratio_sweep.metrics`, ~19 s per 12 MP decode) inside the
+      encode/decode worker, which left the GPU idle. Moving them to a separate pool of 8–12 processes cut it from
+      ~11 s per run per worker to ~2 s.
   - Open: the 48 MP photo with the planner; the 12 MP test photos.
 - [ ] **Per-tile sampling rate chosen closed-loop.** The scale test above found that choosing each 64x64 tile's
   sampling rate from the decodes at r0.05 / 0.1 / 0.3 / 0.5 / 0.9 (same total luma samples) beats the seg-auto

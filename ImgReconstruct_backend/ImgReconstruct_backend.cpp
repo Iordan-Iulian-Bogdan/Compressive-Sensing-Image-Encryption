@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <functional>
@@ -256,8 +257,11 @@ void print_usage(const char* exe) {
         "                        (12.2 MP); other sizes get K x their area /\n"
         "                        12.2 MP (same anchor density). Off: K at any size\n"
         "  --hr-scale <m>        encrypt only: multiply the --hr-detail anchor\n"
-        "                        count by m (0..16, default 1; the container\n"
-        "                        grows or shrinks with the anchors)\n"
+        "                        count by m (0..16; the container grows or\n"
+        "                        shrinks with the anchors). Default 1, except\n"
+        "                        on the default multi-scale production encode:\n"
+        "                        0.5 up to --ratio 0.5, 2 from 0.7, between\n"
+        "                        log-linear (1 at 0.6)\n"
   "  --sample-bits <L[,C]> bits for luma and optional chroma, each [1, 8]\n"
   "                        (one value applies to both; default 8; lower values shrink\n"
   "                        the container near-linearly at the cost of\n"
@@ -358,6 +362,9 @@ void print_usage(const char* exe) {
   "                        channel 1 the tile's luma rate x 255 (decrypt needs\n"
   "                        no flag). \"auto\": the encoder plans it for the\n"
   "                        budget of a production container at --ratio.\n"
+  "                        Default \"auto\" on the production encode\n"
+  "                        (--seg-auto --ycc420 --seg-tile --hr-detail);\n"
+  "                        \"off\" keeps the single-scale container.\n"
   "  --ms-coarse <a>       encrypt only, with --multiscale auto: push tiles to the\n"
   "                        coarse scales (0..1, default 0 = the plain plan). The\n"
   "                        plan's coarseness (area mean of log(s/2)/log 3: 0 all\n"
@@ -687,6 +694,7 @@ int main(int argc, char* argv[])
     bool hf_focus = false;
     int hr_detail = 0;
     float hr_scale = 1.0f;
+    bool hr_scale_set = false;
     int adaptive_floor = 32;    float adaptive_strength = 0.5f;
     float adaptive_gamma = 1.0f;
     int adaptive_cutoff = 0;
@@ -856,6 +864,7 @@ int main(int argc, char* argv[])
         {"--hr-detail", "integer", false, [&](const char* v) { return set_int(v, hr_detail, nullptr, nullptr); }},
         {"--hr-area", nullptr, false, [&](const char*) { cs_set_hr_area_scaling(true); return true; }},
         {"--hr-scale", "floating point in [0,16]", false, [&](const char* v) {
+            hr_scale_set = true;
             return set_float(v, hr_scale, [](float x) { return x < 0.0f || x > 16.0f; }, "Error: --hr-scale must be in [0, 16]");
         }},
         {"--adaptive", nullptr, false, [&](const char*) { adaptive = true; return true; }},
@@ -1105,6 +1114,14 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --hf-focus is encrypt-side only; ignoring for decrypt" << std::endl;
         hf_focus = false;
     }
+    // The production encode (--seg-auto --ycc420 --seg-tile --hr-detail) writes a multi-scale container by default,
+    // with the anchor count scaled by --ratio: x0.5 up to r0.5, x2 from r0.7, log-linear between (settings oracle,
+    // 88 photos, 2026-11-06: TODO.md). --multiscale off keeps the single-scale container; --hr-scale overrides m.
+    if (multiscale_plan == "off") multiscale_plan.clear();
+    else if (mode == "encrypt" && multiscale_plan.empty() && seg_auto > 0 && ycc420 && seg_tile && hr_detail > 0) {
+        multiscale_plan = "auto";
+        if (!hr_scale_set) hr_scale = 0.5f * std::pow(4.0f, std::clamp((ratio - 0.5f) / 0.2f, 0.0f, 1.0f));
+    }
     if (hr_scale != 1.0f && hr_detail > 0)   // --hr-scale: the anchor count x m (the encoder then scales it by area)
         hr_detail = (int)std::lround((double)hr_detail * hr_scale);
     if (hr_detail != 0 && mode != "encrypt" && mode != "roundtrip") {
@@ -1233,8 +1250,8 @@ int main(int argc, char* argv[])
             std::cout << "[batch] " << (j + 1) << "/" << jobs.size() << " " << jobs[j].second << " " <<
                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - tj).count() << " ms" << std::endl;
         };
-        if (mode == "encrypt" && !multiscale_plan.empty() && batch) {
-            std::cerr << "Error: --multiscale takes one input, not a batch" << std::endl; return 64;
+        if (mode == "encrypt" && !multiscale_plan.empty() && multiscale_plan != "auto" && batch) {
+            std::cerr << "Error: a --multiscale plan PNG takes one input, not a batch (use auto)" << std::endl; return 64;
         }
         else if (mode == "encrypt") {
             // --seg-auto + --ycc420 + --hr-detail: the encoder decodes its own
@@ -1263,7 +1280,16 @@ int main(int argc, char* argv[])
 #endif
             if (!batch) jobs.emplace_back(input, output);
             int failed = 0;
-            if (!multiscale_plan.empty()) { rc = cs_encrypt_multiscale(input, output, password, multiscale_plan, hr_detail, anchor_decode, ratio, ms_coarse); jobs.clear(); }
+            if (!multiscale_plan.empty()) {
+                for (size_t j = 0; j < jobs.size(); ++j) {
+                    const auto tj = std::chrono::high_resolution_clock::now();
+                    const int r = cs_encrypt_multiscale(jobs[j].first, jobs[j].second, password, multiscale_plan, hr_detail, anchor_decode, ratio, ms_coarse);
+                    if (!batch) { rc = r; break; }
+                    failed += r != 0;
+                    batch_line(j, r, tj);
+                }
+                jobs.clear();
+            }
             for (size_t j = 0; j < jobs.size(); ++j) {
                 const auto tj = std::chrono::high_resolution_clock::now();
                 const int r = encrypt_image::encrypt_image_tiled(jobs[j].first,
