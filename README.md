@@ -432,8 +432,22 @@ Alternatively point CMake at any OpenCV with CMake config files via `-DOpenCV_DI
 ```
 ImgReconstruct_backend encrypt  <input.png> <output.png> [--password <pw>] [--ratio R] [--periodic] [--adaptive] [--hf-focus] [--ycc420] [--tile-size N] [--adaptive-floor N] [--adaptive-strength S] [--lod-full N] [--seg-mask F --seg-rates L] [--sample-bits L[,C]] [--show-mask] [--full-res]
 ImgReconstruct_backend decrypt  <input.png> <output.png> [--password <pw>] [--tiles N] [--overlap N] [--iterations N] [--threads N] [--coef F] [--per-tile-coef] [--per-tile-tv] [--manual] [--no-preview] [--photo-upscaler avir|waifu2x] [--device cpu|gpu]
+ImgReconstruct_backend encrypt|decrypt @<pairs.tsv> [options]
 ImgReconstruct_backend roundtrip <input.png> <output.png> [options]
 ImgReconstruct_backend compare   <original.png> <decrypted.png> <out_prefix> [--amp F]
+```
+
+**Batches.** `encrypt @<pairs.tsv>` / `decrypt @<pairs.tsv>` process many images in one process with one set of
+options. The list file holds one `input<TAB>output` pair per line. Start-up, GPU initialisation and model loading
+happen once, and `decrypt` reads the next container while the current one decodes. A failed image is reported and
+the rest continue; the exit code is 1 if any failed. Preview windows are off in a batch. For the most throughput,
+split the list in two and run two batch processes at once (12 MP photos on an RX 7900 XT: decode 439 ms and encode
+732 ms per photo, against 687 ms and 1352 ms with one process per image; see `docs/gpu-optimizations.md` section 17).
+Example (PowerShell; `` `t `` is a tab):
+
+```
+"a.enc.png`ta.dec.png", "b.enc.png`tb.dec.png" | Set-Content pairs.tsv
+ImgReconstruct_backend decrypt @pairs.tsv --password <pw> --no-preview [decrypt options]
 ```
 
 `compare` scores a decryption against the original (PSNR, SSIM, MAE, max abs error) and writes `<out_prefix>_sidebyside.png` (original | decrypted | JET error map) plus `<out_prefix>_error.png` (amplified absolute-error map) for inspecting tile seams, blur, and solver noise. `--amp` sets a fixed error-map gain (default: auto-scale to peak).

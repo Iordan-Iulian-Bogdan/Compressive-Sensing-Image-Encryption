@@ -54,6 +54,8 @@ bool arena_free(void* p);
 // put for, and empties the slot either way (null on a mismatch). The caller owns the result (freed like a DevBuf's).
 void resident_put(const void* host, size_t bytes, void* dev);
 void* resident_take(const void* host, size_t bytes);
+// The host range the slot holds (null / 0 when empty), so a caller can see which of its buffers lie inside it.
+void resident_range(const void** host, size_t* bytes);
 
 namespace {
 

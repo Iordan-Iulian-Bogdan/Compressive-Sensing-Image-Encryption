@@ -732,3 +732,284 @@ Measuring note: the exe named `ImgReconstruct_backend.exe` starts ~12 ms slower 
 another name (start-up to `main` 32.7 vs 20.6 ms; likely Windows' per-exe launch history). A/Bs that run the new
 build under that name and the baseline as a renamed copy understate the gain by ~12 ms; back-to-back GPU
 processes also disturb each other.
+
+## 17. Batch encode / decode in one process (2026-11-05, bit-identical)
+
+`encrypt @<pairs.tsv> [options]` and `decrypt @<pairs.tsv> [options]` run a list of jobs (one `input<TAB>output` per
+line, `\r\n` accepted) in one process with one set of options (`ImgReconstruct_backend.cpp`). Per-process costs are
+paid once: process start (~50 ms), HIP start-up and kernel loads, the `--enhance` weights. `decrypt` also reads the
+next container on a side thread while the current one decodes. A failed job is reported (`Error: job failed: <input>`)
+and the batch goes on; the exit code is 1 if any failed. Each job prints `[batch] i/n <output> <ms> ms`. Preview
+windows are off in a batch (`--show-mask` is ignored).
+
+The decoder's training dumps take `*` for a per-job path: `CS_DUMP_YMASK=*`, `CS_DUMP_YSAMP=*`, `CS_DUMP_HR=*` and
+`CS_DUMP_CHROMA=*` write `<output>.ymask.png`, `.ysamp.png`, `.anchors.bin` and `.crmask.png` / `.crsamp.png` /
+`.cbmask.png` / `.cbsamp.png` next to each output (an explicit path still works for single decodes).
+`Params-test/gen_enh_prod.py` uses this with `ENH_BATCH=N`: per chunk of N photos one batch encode per ratio and one
+batch decode, crops cut in a process pool while the next chunk runs.
+
+Measured on the 8 test photos (12 MP), production flags (encode r0.5 with `--hr-detail 450000` and the ranking net;
+prox-off decode with c16d2), RX 7900 XT, totals divided by 8:
+
+| Setup | Decode per photo | Encode per photo |
+| --- | --- | --- |
+| one process per photo | 687 ms | 1352 ms |
+| two processes at a time | 523 ms | 877 ms |
+| one batch process | 574 ms (515 ms after the first job) | 1146 ms |
+| two batch processes (list split in half) | **439 ms** | **732 ms** |
+
+Two batch processes are fastest: one decode's CPU stages (container read, unpack 73 ms, prep 60 ms, PNG write 26 ms)
+run while the other's GPU stages do. Decode output is byte-identical to single decodes (8/8). Batch-encoded
+containers decode to the same quality as single encodes within the salt's run-to-run noise (IMG_3690, D28_rnd_123,
+IMG_9321: within 0.015 dB, SSIM and ΔE-p95 equal). Training-data generation (2 workers, `ENH_BATCH=32`): 68 s per
+32-photo chunk per worker, ~2.0 h for the 6,847-photo set against 2.9 h with one process per encode and decode.
+
+## 18. Multi-scale (mode 20) layered decode (2026-11-06)
+
+### 18.1 What the decode does
+
+A mode-20 container (`encrypt --multiscale auto --ratio r`) holds a descriptor (photo size, tile side T = 120, per-tile
+scale map 2x..6x) and one seg-mask layer container per scale used. Each layer is the photo shrunk by its scale s. It is
+sampled only on the tiles of that scale plus an 8 px margin (`kMsMargin`; seg prefix version 2 also draws chroma only
+there). The 2x layer also carries the closed-loop anchors.
+
+The decoder (`decrypt_image_tiled`, the `mode == 20` branch) works in four steps:
+1. It decodes every layer with the production ycc path: LR solve, cs-sr, tile merge, calm, enhance nets, data
+   consistency.
+2. It then composites tile by tile. A tile whose 3x3 neighbourhood holds one scale is that layer resampled (cubic).
+   The other tiles blend their neighbours' layers with the weights of a 17x17 box over the scale map, done
+   separably on the tile grid.
+3. Each layer's output is width / s x 2 (the 2x layer is full size).
+4. It writes the PNG.
+
+Workload for every number below:
+- the auto-planned r0.3 containers of the 11 dataset photos `IMG_0615`..`IMG_0625` (24.5 MP in total), plus
+  production containers of the same photos;
+- the production decode command (`--photo-upscaler cs-sr --sr-pnp admm --sr-pnp-iters 2 --tv 0 --hr-weight 1`,
+  `--enhance 6bc450_c16d2 --enhance2 6bc450_u2dc`, `CS_ADMM_PROX_OFF=1 CS_GPU_TILES=1 CS_GPU_ADMM=1`);
+- an idle GPU (no training running).
+
+Wall times include process start. Each exe was pinned under its own name (`x64/GpuBuild/ImgReconstruct_backend.msNN.exe`)
+and timed alternately (ABBA), 1 s apart. On IMG_0621 the production decode takes 1.37-1.41 s.
+
+### 18.2 Result in one table
+
+Per-step ladder, re-timed on 2026-11-06 from the pinned exes, mean of 4 runs. Output is compared with the step
+before.
+
+| Step (exe) | IMG_0621 | IMG_0615 | Output vs the step before |
+| --- | --- | --- | --- |
+| one key, planner v2 (ms14) | 2864 ms | 3054 ms | — |
+| + cs-sr skipped on tiles without luma samples (ms15) | 2623 ms (−241) | 2901 ms (−153) | identical |
+| + LR solve skipped on tiles without any sample (ms16) | 2274 ms (−349) | 2606 ms (−295) | max 2 levels on 0.09 / 0.22% of pixels |
+| + cs-sr host prep skip + parallel PNG writer (ms17) | 1900 ms (−374) | 2118 ms (−488) | identical |
+| + one thread per layer, GPU stages under a lock (ms18) | 1797 ms (−103) | 1910 ms (−208) | identical |
+| + enhance nets only on the blocks the composite reads (ms23) | 1628 ms (−169) | 1831 ms (−79) | identical |
+| + tile merge reads the resident cs-sr output, flat tiles shared (ms24) | 1406 ms (−222) | 1650 ms (−181) | identical |
+
+On all 11 photos (ABBA, 4 runs each), with output identical on 11 / 11 and the production decode identical too:
+- ms20 (= ms18) against ms23: wall 1887 -> 1793 ms per photo;
+- ms23 against ms24: wall 1786 -> 1620 ms per photo.
+
+IMG_0621 now decodes in 1.40-1.41 s, about production's time (1.37-1.49 s).
+
+### 18.3 The optimizations
+
+**One key derivation per container** (`crypto_utils.cpp`: `cs_derive_key` over `cs_derive_key_pbkdf2`;
+`image_encryption.cpp`: `use_key`)
+- What changed:
+  - Before, every layer had its own salt, so a 5-layer decode ran PBKDF2-HMAC-SHA256 (200,000 iterations) five
+    times.
+  - Now the encoder derives the outer container's key once and hands it to every layer (`CsEncryptor::use_key`).
+    The headers still get their own random IVs.
+  - `cs_derive_key` keeps the last (password, salt) -> key under a mutex, so the four layers after the first get it
+    from the cache.
+- Measured: one derivation takes ~50 ms (hashlib, same parameters), so 5 -> 1 removes ~200 ms. This is not
+  re-measured in the decoder: the ladder starts at ms14, which already has it.
+
+**cs-sr skipped on tiles without luma samples** (`decrypt_tiles_ycc420`, `ms_layer` flag)
+- What changed:
+  - Each layer decodes its whole frame, but only its own tiles and their margin have samples.
+  - The other tiles get zero weight in the composite. They are left out of the batched cs-sr tile list
+    (`sr_batch`: `if (ms_layer && y_idx[i][j].ri_x_g.empty()) continue;`).
+  - The tile loop gives them a bilinear 2x (`cv::resize(..., INTER_LINEAR)`) instead of the solve.
+- Gating: `ms_layer` is set from seg prefix version 2 (`get_sampled_ycc420`: `ms_layer = chroma_masked`), so
+  production containers never take this path.
+- Measured on IMG_0621: cs-sr ran on 5679 of the 15742 tiles of the five layer grids; production runs on all 7921
+  of its tiles.
+
+  | Layer | Grid tiles | Tiles with samples |
+  | --- | --- | --- |
+  | 2x | 7921 | 3116 |
+  | 3x | 3600 | 1012 |
+  | 4x | 2025 | 849 |
+  | 5x | 1296 | 232 |
+  | 6x | 900 | 477 |
+
+  - cs-sr summed over the layers went from ~800 to ~300 ms (production: 380 ms).
+  - On an idle GPU that is 40 µs per tile here against 49 µs in production. The saving is the tile count, not
+    faster tiles.
+
+**LR solve skipped on tiles without any sample** (`decrypt_tiles_ycc420`, before the GPU job list)
+- What changed:
+  - A layer tile with no luma, Cr or Cb sample is filled with flat gray (128) and marked `gpu_done`.
+  - The GPU job loop skips it.
+- Output: the fill feeds the tile merge's feather at tile edges, so 0.09-0.22% of the composited pixels move by at
+  most 2 levels. They are next to zero-weight tiles.
+- Measured: the LR solve summed over the layers went from ~750 to ~310 ms.
+
+**cs-sr host prep skip and parallel PNG writer** (`decrypt_tiles_ycc420`; mode-20 branch: `cs_write_image`)
+- What changed:
+  - The host prep of the cs-sr batch (`cs_sr_gpu_batch_prepare`: samples, anchor lists, ADMM groups) is built only
+    for the batch's tiles, so the empty tiles cost nothing on the CPU either.
+  - The composite was written with `cv::imwrite`; it now goes through `cs_write_image` (`png_fast.cpp`, the
+    strip-parallel deflate the production path already used).
+- Measured: −374 / −488 ms for the two changes together (they were built together). The PNG writer alone measured
+  −280 ms when it went in.
+
+**One thread per layer, GPU stages under a lock** (mode-20 branch; `t_ms_gpu_lock`)
+- What changed:
+  - The layers decode on one thread each.
+  - A thread-local `std::mutex*` is set to a shared lock, held from the grid solve (after `prof.mark("prep")`)
+    through `prof.mark("enhance")`.
+  - The container read, unpack and prep of one layer run while another layer holds the GPU.
+  - The GPU stages stay one layer at a time: they share the arena, the resident handoff slot and the HIP stream, and
+    the per-stage code is not written for concurrent use.
+- Measured: −103 / −208 ms; output identical.
+
+**Enhance nets only on the blocks the composite reads** (`gpu_enh.hip`: `Inputs::active`, `rf_of`, the `k_conv`
+early exit; `image_decryption.cpp`: `cs_ms_needed_blocks`, `t_ms_need`; `enh_net.*`: `CsEnhInputs::active`,
+`cs_enhance_receptive_field`)
+- The problem: each layer ran both nets over its whole frame, so the 2x layer's nets cost as much as production's
+  (full 12 MP) although that layer holds 39% of the tiles.
+- What the decoder passes, per layer:
+  - the 8x8 output blocks of the layer that the composite reads: blocks within 8 px (the feather box) plus the cubic
+    taps (2 layer px) of a tile of the layer's scale;
+  - for the first net, the same blocks dilated by the second net's receptive field, because the second net's input
+    there must be exact too.
+- What `gpu_enh::run` does with them:
+  - It dilates them by the net's receptive field: 69 px for c16d2. This is an upper bound summed over the convs:
+    full-res x1, half x2, quarter x4, plus 8 px of slack.
+  - It ORs them into half- and quarter-res block flags.
+  - Each `k_conv` workgroup exits at once when its 8x8 output block is not flagged.
+- Why the output is exact on the needed blocks:
+  - Every conv runs on at least the dilated region.
+  - A conv's output is exact wherever its 3x3 inputs are. The stale values outside the region (arena memory, never
+    written) can reach inward by at most one conv radius per conv, so by at most the receptive field.
+  - `dout` starts as a copy of the input image, so unflagged pixels hold the un-enhanced decode, not stale bytes.
+- Active blocks on IMG_0621:
+
+  | Layer | First net | Second net |
+  | --- | --- | --- |
+  | 5x | 28% | 20% |
+  | 6x | 72% | 58% |
+  | 4x | 73% | 52% |
+  | 3x | 46% | 33% |
+  | 2x | 45% | 41% |
+
+- Measured:
+  - Network time summed over the layers fell from 337 to 172 ms on IMG_0621, and from 340 to 221 ms per photo on
+    the 11 photos.
+  - Output identical on 11 / 11. Without the second-net dilation, 0.002% of the pixels were 1 level off.
+- Switch: `CS_MS_ENH_ALL=1` turns it off. Production decodes never pass `active`.
+
+**Tile merge on the resident cs-sr output, flat tiles shared** (`gpu_composite.hip`: `blend_tiles`; `gpu_tiles.hip` /
+`gpu_common.hpp`: `resident_range`; `decrypt_tiles_ycc420`: `ms_flat_hr`)
+- The problem:
+  - The tile merge (`cs_composite_tiles` -> `gpu_composite::blend_tiles`, the `profile[ycc] composite` stage) took
+    150-160 ms over the five layers, 74-87 ms of it in the 2x layer, against 15 ms in production.
+  - `blend_tiles` could use the device copy of the cs-sr output (`resident_take`) only when every tile sat back to
+    back in exactly that buffer.
+  - In a layer, the tiles cs-sr skipped (bilinear) are separate `cv::Mat`s between the pooled ones. So it repacked
+    every tile on the host (~255 MB for the 2x layer) and uploaded the lot, while the cs-sr output on the device was
+    freed unused.
+- What changed:
+  - `resident_range` reports the host range the handoff slot holds.
+  - `blend_tiles` reads every tile inside that range from the slot's device buffer at its offset. It uploads only the
+    other tiles, once per distinct host buffer, after the resident part: one device-side copy into a combined buffer,
+    then one upload.
+  - With every tile resident (production), it reads the slot's buffer itself as before. With no slot and every tile
+    packed, it uploads that buffer without repacking, as before.
+  - A slot that holds none of the tiles is ignored (freed by the guard as before).
+  - In a layer, the flat-filled tiles (no luma, Cr or Cb sample; the LR fill is gray 128) take a shared 2x tile per
+    size (`ms_flat_hr`, gray 128, read-only), which is exactly the bilinear 2x of the fill. So the composite uploads
+    one copy instead of one per tile. Tiles with chroma samples but no luma still get their own bilinear 2x.
+- Output: `CS_GPU_COMPOSITE_VERIFY=1` reports 0 values different from `blendTilesWithImage` on all five layers. The
+  decode is identical on 11 / 11 photos and in production.
+- Measured:
+  - Tile merge over the five layers fell from 151-165 to 40-42 ms on IMG_0621 (2x layer: 74-87 -> 19 ms).
+  - Decode (internal) fell from 1454-1478 to 1272 ms. That is more than the merge stage alone; probably the 255 MB
+    host repack also slowed the other layer threads' CPU work, but that was not measured.
+  - Wall time on the 11 photos fell from 1786 to 1620 ms per photo.
+
+### 18.4 Tried and not kept
+
+**Banded enhance per layer** (bands of 512 / 1024 rows, each cropped to the columns of its samples, one net call per
+band)
+- Output: max 1 level.
+- Time: 2.08 / 2.00 s against 1.93 s whole-frame. It made 28-48 net calls instead of 10, and each call has a fixed
+  cost of ~5-8 ms (uploads, plane kernels, three device syncs, download, data consistency).
+
+**Reusing the net's device buffers across calls** (proposed as the fix for the banded version)
+- Measured, not built: allocation is not the per-call cost.
+- With `CS_GPU_PROF=1`, `gpu_enh: device allocation` is 0.0 ms on 9 of the 10 calls of a layered decode; the
+  buffers come from the device arena.
+- The exception is the first full-frame call, where S0 (372 MB, more than the 256 MiB arena blocks) falls back to
+  `hipMalloc`: 32 ms. Production pays this too.
+- A second call of the same size takes 0 ms, because the driver keeps the freed allocation and hands it back.
+
+**Nets cropped to each layer's bounding box** (+48 px of context, one call per layer)
+- Exe `ms21`.
+- A layer's tiles are spread over the frame, so the box covers 38-90% of it, and only 1-3 layers per photo came in
+  under 90%.
+- Network −21 ms per photo on 11 photos, inside the wall-time noise; output max 1 level off. Superseded by the
+  block mask.
+
+**Layer-tuned enhance net** (`6bclay_c16d2`, a quality change, not speed)
+- A 16k-step fine-tune on layer decodes. Validation rose from 26.64 to 26.80 dB, but on the 11 photos it lost to
+  the production pair at equal bytes.
+  - Alone: −0.16 / −0.12 / −0.17 dB at r0.1 / 0.3 / 0.5.
+  - Followed by u2dc: −0.04 / −0.05 / −0.10 dB.
+- Not promoted (`TODO.md`).
+
+### 18.5 Where the remaining time goes
+
+IMG_0621 r0.3, ms23, `CS_GPU_PROF=1 CS_PROFILE=1`. The left column sums each stage over the five layers.
+
+| Stage | 5 layers | Production | Difference | On the critical path |
+| --- | --- | --- | --- | --- |
+| LR solve (`tiles on the GPU in`) | 444 ms | 261 ms | +183 | yes (GPU lock) |
+| cs-sr | 227 ms | 388 ms | −161 | yes |
+| tile merge (`profile[ycc] composite`) | 160 ms | 15 ms | +146 | yes |
+| calm | 69 ms | 39 ms | +30 | yes |
+| net uploads + planes / downloads | 89 / 34 ms | 51 / 18 ms | +54 | yes |
+| net | 170 ms | 175 ms | −5 | yes |
+| data consistency | 22 ms | 21 ms | +1 | yes |
+| multi-scale composite | 63-78 ms | — | +70 | yes (after the layers) |
+| PNG write | ~70 ms | ~40 ms | +30 | yes |
+| unpack + prep (CPU) | 215 + 172 ms | 112 + 92 ms | | mostly hidden behind other layers' GPU time |
+
+Layer finish times: 5x 346 ms, 6x 429, 4x 578, 3x 779, 2x 1364 ms; composited at 1497 ms. The four small layers hold
+the GPU for ~430 ms before the 2x layer can start. The 2x layer then holds it for 585 ms.
+
+What is still slower than production, largest first:
+1. **LR solve, +183 ms.**
+   - The first layer to reach the GPU (5x, 227 tiles) spends 195 ms waiting for the HIP runtime and the arena reserve.
+     Production hides that wait behind its 112 ms unpack and 92 ms prep. A layer thread reaches the GPU after ~30 ms.
+   - The other four layers cost 22-38 ms each, even the 480-tile 6x layer: a fixed cost per solve call (layout,
+     uploads, two batches, device tail).
+2. **Tile merge, +146 ms (fixed in ms24: now 41 ms over the five layers, +26 against production).**
+   - In a layer, the skipped tiles' bilinear outputs were separate `cv::Mat`s, so the tiles were no longer one
+     packed buffer.
+   - `gpu_composite::blend_tiles` then repacked every tile on the host and uploaded it, instead of taking the cs-sr
+     output still on the device. See the ms24 entry in 18.3.
+3. **Multi-scale composite, ~70 ms.** A CPU pass after all layers, tile-parallel: a cubic remap per used layer per
+   tile, then the box-weight blend.
+4. **Net transfers, +54 ms.** Per call: an upload of the full frame, planes built on the GPU, a download of the full
+   frame. That is ten calls instead of two, and the masked nets still move whole frames.
+5. **Calm, +30 ms.** `cs_seg_calm_boundaries` runs on every layer's full frame.
+6. **PNG write, +30 ms.** The composite is written after the GPU stages end, so nothing overlaps it. Production is
+   in the same position, but its write measured 40 ms against ~70 here.
+
+Together: about +480 ms of extra stage time against −161 ms of cs-sr. With the overlaps that leaves the
+measured gap of ~0.3-0.4 s (1.63-1.83 s against 1.37-1.41 s).

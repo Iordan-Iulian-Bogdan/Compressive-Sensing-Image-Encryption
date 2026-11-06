@@ -188,6 +188,10 @@ struct CsPhotoUpscalerOptions {
   // anchors, LR samples) it was trained with; see enh_net.hpp. Runs before
   // the post-hoc anchor replacement. ycc containers only.
   std::string enhance_model;
+  // Second unrolled stage (--enhance2 <model.onnx>, decrypt only, empty =
+  // off): the same kind of net run again on the projected output of the
+  // first, its planes rebuilt against that output, then projected again.
+  std::string enhance2_model;
 };
 
 // Effective args for the subprocess: the explicit override when set,

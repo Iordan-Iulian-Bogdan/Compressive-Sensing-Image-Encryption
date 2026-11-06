@@ -700,6 +700,12 @@ void resident_put(const void* host, size_t bytes, void* dev) {
     g_res.host = host; g_res.bytes = bytes; g_res.dev = dev;
 }
 
+void resident_range(const void** host, size_t* bytes) {
+    std::lock_guard<std::mutex> lk(g_res.mu);
+    *host = g_res.dev ? g_res.host : nullptr;
+    *bytes = g_res.dev ? g_res.bytes : 0;
+}
+
 void* resident_take(const void* host, size_t bytes) {
     std::lock_guard<std::mutex> lk(g_res.mu);
     void* d = g_res.dev;

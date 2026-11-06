@@ -1713,7 +1713,7 @@ std::vector<CsHrSample> cs_select_hr_detail(const cv::Mat& native_bgr,
     return out;
 }
 
-cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr) {
+cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr, int count) {
     if (orig_bgr.empty() || orig_bgr.type() != CV_8UC3 ||
         dec_bgr.size() != orig_bgr.size() || dec_bgr.type() != CV_8UC3)
         return cv::Mat();
@@ -1722,7 +1722,8 @@ cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr) {
     if (bh == 0 || bw == 0) return cv::Mat();
     // Mean squared error per 16x16 block (all channels), then flag the
     // worst 5% of blocks: the closed-loop choice that the measured
-    // anchor gains were obtained with.
+    // anchor gains were obtained with. More anchors than 74% of those
+    // blocks' pixels (production's fill) flag more blocks, at that fill.
     std::vector<float> score((size_t)bh * bw);
     for (int by = 0; by < bh; ++by) {
         for (int bx = 0; bx < bw; ++bx) {
@@ -1741,7 +1742,8 @@ cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr) {
         }
     }
     std::vector<float> sorted = score;
-    const size_t nflag = (std::max<size_t>)(1, (size_t)std::llround(0.05 * (double)sorted.size()));
+    const size_t nfill = (size_t)std::ceil((double)count / (0.74 * BS * BS));
+    const size_t nflag = (std::min)(sorted.size(), (std::max)((std::max<size_t>)(1, (size_t)std::llround(0.05 * (double)sorted.size())), nfill));
     std::nth_element(sorted.begin(), sorted.begin() + (sorted.size() - nflag), sorted.end());
     const float thr = sorted[sorted.size() - nflag];
     cv::Mat flags(bh, bw, CV_8U);

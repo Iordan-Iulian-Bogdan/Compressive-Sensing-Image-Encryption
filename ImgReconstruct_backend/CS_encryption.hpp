@@ -38,6 +38,11 @@ void cs_hf_thumb_weights(const cv::Mat& thumbnail, std::vector<float>& weights,
 cv::Mat cs_segmask_density(const cv::Mat& labels,
     const std::vector<uint8_t>& rates_q, int width);
 
+// Chroma support of a label map (seg prefix version 2): CV_8U at the mode's
+// chroma geometry, 255 where any luma pixel of the chroma pixel's block has a
+// label with rate > 0. Labels at luma (pipeline) geometry rows x cols.
+cv::Mat cs_seg_chroma_support(const cv::Mat& labels, const std::vector<uint8_t>& rates_q, int mode);
+
 class CSencryption {
 protected:
     cv::Mat encrypted_img, input_img;
@@ -119,6 +124,9 @@ protected:
     // returnYcc420Indices; ri_x/ri_y keep the full-res luma positions.
     std::vector<int> ri_cx1, ri_cy1, ri_cx2, ri_cy2;
     int m_chroma = 0;
+    // Non-empty (CV_8U at the chroma geometry): the chroma draws pick only its
+    // nonzero pixels (seg prefix version 2, cs_seg_chroma_support).
+    cv::Mat chroma_support;
 
     // YCC 4:2:0 index generation: m_luma full-res luma positions from the key
     // plus m_chroma coarse-grid positions per chroma plane from tagged key

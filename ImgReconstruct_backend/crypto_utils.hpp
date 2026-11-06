@@ -112,6 +112,17 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 #define CS_MODE_YCC422_TCLUSTER 17     // T-cluster luma + uniform 4:2:2 chroma (pad = 17)
 #define CS_MODE_YCC422_TMEANS 18       // T-means luma + uniform 4:2:2 chroma (pad = 18)
 #define CS_MODE_YCC420_SEG_HRDETAIL 19 // seg-mask luma + uniform 4:2:0 chroma + HR-detail payload (pad = 19)
+// Multi-scale (pad = 20): the photo split into T x T tiles (full resolution), each tile coded at one scale
+// s = 2..6 (the photo pre-shrunk by s/2 before the usual 2x pipeline). One complete seg-mask layer container
+// (mode 11, seg prefix version 2) per scale in use carries that scale's tiles; the decoder decodes every layer,
+// scales it to full size and blends the layers by the tile scale map. Body after the header:
+//   [descriptor, AES-CTR sealed with CS_MS_TAG; byte length (u32) at CS_OFF_PAD + CS_OFF_SEGPRE_LEN]
+//     [u8 version = 1][u16 W][u16 H][u16 T][u8 n]{[u8 scale][u32 layer bytes]} x n [u32 map bytes][map PNG]
+//     (map: 8-bit, ceil(H / T) x ceil(W / T), the tile's scale)
+//   [layer containers' raw bytes, in descriptor order (each a square CV_8UC3 image)]
+// The outer HMAC covers everything.
+#define CS_MODE_MULTISCALE 20
+#define CS_MS_TAG 0x4D
 
 // Per-segment sampling (mode 10) body prefix, little-endian, right after the
 // 32-pixel header:
@@ -129,6 +140,10 @@ bool cs_verify_header(const uint8_t* buf, size_t buf_bytes, const uint8_t key[32
 // v3: the whole prefix ([0] through the PNG) is AES-256-CTR sealed in place
 // with CS_SEG_TAG; its byte length rides in the MAC-covered pad at
 // CS_OFF_SEGPRE_LEN. (v2 containers left the label map in the clear.)
+// Version 2 of the extended prefix ([0][2][width 0..128]...) also draws the
+// chroma positions only inside the label map's support (chroma pixels whose
+// luma block holds a label with rate > 0; cs_seg_chroma_support), for the
+// layers of a multi-scale container; the chroma count is unchanged.
 #define CS_SEGBLEND_MAX 128
 struct CsSegPrefix {
     uint8_t nclasses = 0;
@@ -136,15 +151,18 @@ struct CsSegPrefix {
     uint32_t seglen = 0;
     uint8_t blend = 0;
     bool smooth_blend = false;
+    bool chroma_masked = false;
     size_t total = 0; // 1 + nclasses + 4 + seglen
 };
 inline bool cs_segmask_parse_prefix(const uint8_t* body, size_t body_bytes, CsSegPrefix& out) {
     out = CsSegPrefix{};
     if (body_bytes < 5) return false;
-    // Extended prefix: [0][version=1][width][nclasses][rates][u32 PNG length].
+    // Extended prefix: [0][version=1|2][width][nclasses][rates][u32 PNG length].
     // A separate version keeps existing flat-band containers readable.
     const bool extended = body[0] == 0;
-    if (extended && (body_bytes < 8 || body[1] != 1 || body[2] == 0 || body[2] > CS_SEGBLEND_MAX)) return false;
+    if (extended && (body_bytes < 8 || (body[1] != 1 && body[1] != 2) || (body[1] == 1 && body[2] == 0) ||
+                     body[2] > CS_SEGBLEND_MAX)) return false;
+    out.chroma_masked = extended && body[1] == 2;
     const size_t offset = extended ? 3 : 0;
     const uint8_t n = body[offset];
     if (n == 0) return false;
@@ -194,7 +212,7 @@ bool cs_blob_seal_xor(uint8_t* data, size_t len, const uint8_t key[32],
 
 #define CS_HRDETAIL_TAG 0x48
 #define CS_HRDETAIL_SAMPLE_BYTES 6
-#define CS_HRDETAIL_MAX_SAMPLES (1 << 20)
+#define CS_HRDETAIL_MAX_SAMPLES (1 << 24)   // 16.8 M: --hr-detail scales with the photo area (37 x 450k at 12.2 MP)
 // Offset from CS_OFF_PAD for the modes 4/9 HR sample count (u32 LE,
 // 1..CS_HRDETAIL_MAX_SAMPLES). Aliases the HF thumbnail-length field,
 // which is unused outside modes 5/6/8. MAC-covered via the stamped marker.

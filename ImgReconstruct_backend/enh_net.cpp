@@ -28,6 +28,7 @@
 namespace {
 constexpr float kResScale = 64.0f;    // anchor residual scale (enh_inputs.RES_SCALE)
 constexpr float kSresScale = 8.0f;    // LR sample residual scale (enh_inputs.SRES_SCALE)
+constexpr float kCresScale = 4.0f;    // chroma sample residual scale (enh_inputs.CRES_SCALE)
 constexpr double kBlurLr = 4.0;       // density blur on the LR grid (enh_inputs.BLUR_LR)
 constexpr int kTile = 1024, kPad = 64;   // tiles + context (train_enh_fresh.enhance_full)
 
@@ -94,6 +95,35 @@ void cs_enh_planes(const cv::Mat& bgr, const CsEnhInputs& in, int n, std::vector
             }
         });
     }
+    // 5..8: Cr / Cb sample mask and residual (sample - 4x4 mean of the decode's Cr / Cb), each on its 4x4 block.
+    // Cr / Cb as cv::COLOR_BGR2YCrCb: (R - Y) * 0.713 + 128, (B - Y) * 0.564 + 128.
+    const auto u8 = [](const cv::Mat* m) { return m && !m->empty() && m->type() == CV_8UC1; };
+    if (n >= 9 && u8(in.cr_mask) && u8(in.cr_samp) && u8(in.cb_mask) && u8(in.cb_samp)) {
+        const int h = (std::min)(in.cr_mask->rows, H / 4), w = (std::min)(in.cr_mask->cols, W / 4);
+        const cv::Mat* src[2][2] = { { in.cr_mask, in.cr_samp }, { in.cb_mask, in.cb_samp } };
+        cv::parallel_for_(cv::Range(0, h), [&](const cv::Range& rr) {
+            for (int i = rr.start; i < rr.end; ++i)
+                for (int j = 0; j < w; ++j) {
+                    float R = 0, G = 0, B = 0;
+                    for (int dy = 0; dy < 4; ++dy) {
+                        const cv::Vec3b* s = bgr.ptr<cv::Vec3b>(4 * i + dy) + 4 * j;
+                        for (int dx = 0; dx < 4; ++dx) { B += s[dx][0]; G += s[dx][1]; R += s[dx][2]; }
+                    }
+                    R *= 1.0f / 16; G *= 1.0f / 16; B *= 1.0f / 16;
+                    const float Yv = 0.299f * R + 0.587f * G + 0.114f * B;
+                    const float dec[2] = { (R - Yv) * 0.713f + 128.0f, (B - Yv) * 0.564f + 128.0f };
+                    for (int c = 0; c < 2; ++c) {
+                        if (!src[c][0]->at<uint8_t>(i, j)) continue;
+                        const float r = clip1(((float)src[c][1]->at<uint8_t>(i, j) - dec[c]) / kCresScale);
+                        for (int dy = 0; dy < 4; ++dy) {
+                            float* k = P[(size_t)5 + 2 * c].ptr<float>(4 * i + dy) + 4 * j;
+                            float* q = P[(size_t)6 + 2 * c].ptr<float>(4 * i + dy) + 4 * j;
+                            for (int dx = 0; dx < 4; ++dx) { k[dx] = 1.0f; q[dx] = r; }
+                        }
+                    }
+                }
+        });
+    }
 }
 
 #ifdef _WIN32
@@ -136,8 +166,8 @@ EnhSession* enh_session(const std::string& path) {
         e->out_name = e->session->GetOutputNameAllocated(0, alloc).get();
         const auto ti = e->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
         const auto shp = ti.GetShape();
-        if (ti.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || shp.size() != 4 || (shp[1] != 6 && shp[1] != 8))
-            throw Ort::Exception("expected float NCHW input with 6 or 8 channels", ORT_INVALID_ARGUMENT);
+        if (ti.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || shp.size() != 4 || (shp[1] != 6 && shp[1] != 8 && shp[1] != 12))
+            throw Ort::Exception("expected float NCHW input with 6, 8 or 12 channels", ORT_INVALID_ARGUMENT);
         e->channels = (int)shp[1];
         return g_enh_cache.emplace(path, std::move(e)).first->second.get();
     }
@@ -275,6 +305,14 @@ static bool enhance_hip(cv::Mat& bgr, const std::string& model_path, const CsEnh
         gi.anchors = reinterpret_cast<const gpu_enh::Anchor*>(in.anchors->data());
         gi.n_anchors = (int)in.anchors->size();
     }
+    if (u8(in.cr_mask) && u8(in.cr_samp) && u8(in.cb_mask) && u8(in.cb_samp) && in.cr_samp->size() == in.cr_mask->size() &&
+        in.cb_mask->size() == in.cr_mask->size() && in.cb_samp->size() == in.cr_mask->size()) {
+        gi.cr_mask = in.cr_mask->data; gi.cr_samp = in.cr_samp->data; gi.cb_mask = in.cb_mask->data; gi.cb_samp = in.cb_samp->data;
+        gi.ch = in.cr_mask->rows; gi.cw = in.cr_mask->cols;
+    }
+    if (in.active && !in.active->empty() && in.active->type() == CV_8UC1 && in.active->isContinuous()) {
+        gi.active = in.active->data; gi.ah = in.active->rows; gi.aw = in.active->cols;
+    }
     cv::Mat out(src.size(), CV_8UC3);
     double ms[3] = {};
     if (!gpu_enh::run(gi, out.data, ms)) {
@@ -288,6 +326,16 @@ static bool enhance_hip(cv::Mat& bgr, const std::string& model_path, const CsEnh
 }
 #endif
 
+int cs_enhance_receptive_field(const std::string& model_path) {
+#ifdef CS_GPU_TILES
+    if (const char* g = std::getenv("CS_GPU_ENH"); g && g[0] == '0') return 0;
+    return gpu_enh::load(enh_weights_file(model_path)) ? gpu_enh::receptive_field() : 0;
+#else
+    (void)model_path;
+    return 0;
+#endif
+}
+
 void cs_enhance_prefetch(const std::string& model_path) {
 #ifdef CS_GPU_TILES
     if (const char* g = std::getenv("CS_GPU_ENH"); g && g[0] == '0') return;
@@ -295,6 +343,97 @@ void cs_enhance_prefetch(const std::string& model_path) {
 #else
     (void)model_path;
 #endif
+}
+
+// Quantization bin [lo, hi] of the 8-bit values v that dequantize to s at `bits` (cs_quant / cs_dequant).
+static void quant_bins(int bits, float lo[256], float hi[256]) {
+    for (int s = 0; s < 256; ++s) { lo[s] = 1e9f; hi[s] = -1e9f; }
+    const int maxv = (1 << bits) - 1;
+    for (int v = 0; v < 256; ++v) {
+        const int s = bits >= 8 ? v : (((v * maxv + 127) / 255) * 255 + maxv / 2) / maxv;
+        lo[s] = (std::min)(lo[s], (float)v); hi[s] = (std::max)(hi[s], (float)v);
+    }
+}
+
+void cs_enh_project(cv::Mat& bgr, const CsEnhInputs& in) {
+    if (const char* e = std::getenv("CS_ENH_DC"); e && e[0] == '0') return;
+    if (bgr.empty() || bgr.type() != CV_8UC3) return;
+    constexpr float kPad = 0.75f;   // the sample's own rounding (8-bit Y / Cr / Cb before the block mean) and the mean's
+    const auto t0 = std::chrono::steady_clock::now();
+    const int H = bgr.rows, W = bgr.cols;
+    const auto u8 = [](const cv::Mat* m) { return m && !m->empty() && m->type() == CV_8UC1; };
+    const auto lum = [](const float* p) { return 0.114f * p[0] + 0.587f * p[1] + 0.299f * p[2]; };
+    const bool chroma = u8(in.cr_mask) && u8(in.cr_samp) && u8(in.cb_mask) && u8(in.cb_samp);
+    const bool luma = u8(in.y_mask) && u8(in.y_samp);
+    float clo[256], chi[256], ylo[256], yhi[256];
+    quant_bins(in.c_bits, clo, chi); quant_bins(in.y_bits, ylo, yhi);
+    const int hc = chroma ? (std::min)(in.cr_mask->rows, H / 4) : 0, wc = chroma ? (std::min)(in.cr_mask->cols, W / 4) : 0;
+    const int hl = luma ? (std::min)(in.y_mask->rows, H / 2) : 0, wl = luma ? (std::min)(in.y_mask->cols, W / 2) : 0;
+    // One pass over 4x4 blocks (a chroma block and its four 2x2 luma blocks) in float, written back rounded.
+    cv::parallel_for_(cv::Range(0, (std::max)((hl + 1) / 2, hc)), [&](const cv::Range& rr) {
+        float v[4][4][3];
+        for (int i = rr.start; i < rr.end; ++i)
+            for (int j = 0; j < (std::max)((wl + 1) / 2, wc); ++j) {
+                const int ny = (std::min)(4, H - 4 * i), nx = (std::min)(4, W - 4 * j);
+                bool touched = false;
+                for (int dy = 0; dy < ny; ++dy) {
+                    const uint8_t* q = bgr.ptr<uint8_t>(4 * i + dy) + 12 * j;
+                    for (int dx = 0; dx < nx; ++dx) for (int c = 0; c < 3; ++c) v[dy][dx][c] = q[3 * dx + c];
+                }
+                if (i < hc && j < wc) {
+                    const bool mr = in.cr_mask->at<uint8_t>(i, j) != 0, mb = in.cb_mask->at<uint8_t>(i, j) != 0;
+                    if (mr || mb) {
+                        float B = 0, R = 0, Y = 0;
+                        for (int dy = 0; dy < 4; ++dy) for (int dx = 0; dx < 4; ++dx) {
+                            B += v[dy][dx][0]; R += v[dy][dx][2]; Y += lum(v[dy][dx]);
+                        }
+                        B *= 1.0f / 16; R *= 1.0f / 16; Y *= 1.0f / 16;
+                        float dcr = 0, dcb = 0;
+                        if (mr) { const int sv = in.cr_samp->at<uint8_t>(i, j); const float m = (R - Y) * 0.713f + 128.0f;
+                                  dcr = std::clamp(m, clo[sv] - kPad, chi[sv] + kPad) - m; }
+                        if (mb) { const int sv = in.cb_samp->at<uint8_t>(i, j); const float m = (B - Y) * 0.564f + 128.0f;
+                                  dcb = std::clamp(m, clo[sv] - kPad, chi[sv] + kPad) - m; }
+                        if (dcr != 0 || dcb != 0) {
+                            const float dR = dcr / 0.713f, dB = dcb / 0.564f, dG = -(0.299f * dR + 0.114f * dB) / 0.587f;   // luma kept
+                            for (int dy = 0; dy < 4; ++dy) for (int dx = 0; dx < 4; ++dx) {
+                                v[dy][dx][0] += dB; v[dy][dx][1] += dG; v[dy][dx][2] += dR;
+                            }
+                            touched = true;
+                        }
+                    }
+                }
+                for (int by = 0; by < 2; ++by)
+                    for (int bx = 0; bx < 2; ++bx) {
+                        const int li = 2 * i + by, lj = 2 * j + bx;
+                        if (li >= hl || lj >= wl || !in.y_mask->at<uint8_t>(li, lj)) continue;
+                        float (*p)[3] = &v[2 * by][2 * bx];
+                        const float mu = (lum(p[0]) + lum(p[1]) + lum(v[2 * by + 1][2 * bx]) + lum(v[2 * by + 1][2 * bx + 1])) * 0.25f;
+                        const int sv = in.y_samp->at<uint8_t>(li, lj);
+                        const float d = std::clamp(mu, ylo[sv] - kPad, yhi[sv] + kPad) - mu;
+                        if (d == 0) continue;
+                        for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx)
+                            for (int c = 0; c < 3; ++c) v[2 * by + dy][2 * bx + dx][c] += d;
+                        touched = true;
+                    }
+                if (!touched) continue;
+                for (int dy = 0; dy < ny; ++dy) {
+                    uint8_t* q = bgr.ptr<uint8_t>(4 * i + dy) + 12 * j;
+                    for (int dx = 0; dx < nx; ++dx) for (int c = 0; c < 3; ++c) q[3 * dx + c] = cv::saturate_cast<uint8_t>(v[dy][dx][c]);
+                }
+            }
+    });
+    if (in.anchors) {   // exact luma on the (rounded) result
+        const size_t N = (size_t)H * W;
+        for (const CsHrSample& s : *in.anchors) {
+            if ((size_t)s.idx >= N) continue;
+            uint8_t* q = bgr.ptr<uint8_t>((int)(s.idx / (uint32_t)W)) + 3 * (size_t)(s.idx % (uint32_t)W);
+            const float f[3] = { (float)q[0], (float)q[1], (float)q[2] };
+            const float d = (float)s.y - lum(f);
+            for (int c = 0; c < 3; ++c) q[c] = cv::saturate_cast<uint8_t>(f[c] + d);
+        }
+    }
+    std::printf("[enhance] data consistency %.0f ms\n",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
 bool cs_enhance_net(cv::Mat& bgr, const std::string& model_path, const CsEnhInputs& in) {

@@ -65,7 +65,6 @@ def metrics(orig_path, dec_path):
     psnr = 10 * np.log10(255.0 ** 2 / mse)
     s = ssim(a / 255.0, b / 255.0, channel_axis=2, data_range=1.0)
     de = deltaE_ciede2000(rgb2lab(a / 255.0), rgb2lab(b / 255.0))
-    os.remove(dec_path)
     return psnr, s, float(np.quantile(de, 0.95)), float(np.quantile(de, 0.99))
 
 

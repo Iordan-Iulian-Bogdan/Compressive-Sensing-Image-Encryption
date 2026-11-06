@@ -519,9 +519,22 @@ void encrypt_image::finish_container(int total, int sample_bits, int chroma_bits
     if (!cs_seal_header(encrypted_img.data, sealed_bytes, cs_key)) {
         throw std::runtime_error("failed to seal header (HMAC)");
     }
+    if (!keep_key) release_key();   // reuse_key() holds it for the next container
+    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+}
+
+void encrypt_image::use_key(const uint8_t salt[CS_SALT_BYTES], const uint8_t key[32]) {
+    std::memcpy(kept_salt, salt, CS_SALT_BYTES);
+    std::memcpy(cs_key, key, 32);
+    cs_key_valid = true;
+    keep_key = true;
+}
+
+void encrypt_image::release_key() {
+    keep_key = false;
     cs_key_valid = false;
     cs_wipe(cs_key, sizeof(cs_key));
-    encrypted_img = encrypted_img.reshape(0, (int)std::sqrt((double)encrypted_img.total()));
+    cs_wipe(kept_salt, sizeof(kept_salt));
 }
 
 void encrypt_image::get_mat(cv::Mat& dest) {
@@ -1797,6 +1810,109 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
     return rates;
 }
 
+// Closed-loop per-tile luma rates (CS_RATE_LOOP=<g>): from one decode of the container, each 32x32 LR tile (64x64
+// at output geometry) gets samples s' ~ (E s^g)^(1/(1+g)) (E = its luma MSE after the decode, s = its expected
+// samples), the same total, no pixel below floor x its old rate or above 1. Every LR pixel keeps its old rate times
+// its tile's factor; the label becomes the quantized rate itself, so the container format and the decoder (which
+// reads per-label rates) are unchanged. ids and rates (final, encrypt at 1) in place. delta adds samples to the
+// budget (the caller matches the container bytes with it).
+static void cs_rate_loop_relabel(const cv::Mat& ref, const cv::Mat& dec, cv::Mat& ids, std::vector<float>& rates,
+    double g, double floor, double delta) {
+    constexpr int T = 32;
+    const int H = ids.rows, W = ids.cols, th = (H + T - 1) / T, tw = (W + T - 1) / T;
+    cv::Mat ry, dy, ycc;
+    cv::cvtColor(ref, ycc, cv::COLOR_BGR2YCrCb); cv::extractChannel(ycc, ry, 0); ry.convertTo(ry, CV_32F);
+    cv::cvtColor(dec, ycc, cv::COLOR_BGR2YCrCb); cv::extractChannel(ycc, dy, 0); dy.convertTo(dy, CV_32F);
+    // CS_RATE_LOOP_REL=1: E = MSE / (tile luma variance + C2), SSIM's contrast term, instead of the MSE.
+    // CS_RATE_LOOP_TILE=1: one rate per tile (its mean old rate x factor), a blocky label map instead of the class
+    // edges inside tiles. CS_RATE_LOOP_NOERR=1: every tile the same factor (control: the label map change alone).
+    const bool noerr = std::getenv("CS_RATE_LOOP_NOERR") && std::atoi(std::getenv("CS_RATE_LOOP_NOERR")) != 0;
+    const bool rel = std::getenv("CS_RATE_LOOP_REL") && std::atoi(std::getenv("CS_RATE_LOOP_REL")) != 0;
+    const bool per_tile = std::getenv("CS_RATE_LOOP_TILE") && std::atoi(std::getenv("CS_RATE_LOOP_TILE")) != 0;
+    std::vector<double> err((size_t)th * tw, 0.0), smp((size_t)th * tw, 0.0), cnt((size_t)th * tw, 0.0);
+    std::vector<double> s1((size_t)th * tw, 0.0), s2((size_t)th * tw, 0.0), npx((size_t)th * tw, 0.0);
+    for (int y = 0; y < ry.rows; ++y) {
+        const float* a = ry.ptr<float>(y); const float* b = dy.ptr<float>(y);
+        for (int x = 0; x < ry.cols; ++x) {
+            if (y / (2 * T) >= th || x / (2 * T) >= tw) continue;
+            const size_t t = (size_t)(y / (2 * T)) * tw + x / (2 * T);
+            err[t] += (double)(a[x] - b[x]) * (a[x] - b[x]); cnt[t] += 1.0;
+            s1[t] += a[x]; s2[t] += (double)a[x] * a[x];
+        }
+    }
+    std::vector<double> rq(rates.size());
+    for (size_t c = 0; c < rates.size(); ++c) rq[c] = cs_segmask_quantize_rate(rates[c]) / 255.0;
+    const auto rate_at = [&](uint8_t c) { return c < rq.size() ? rq[c] : 0.0; };
+    for (int y = 0; y < H; ++y) {
+        const uint8_t* id = ids.ptr<uint8_t>(y);
+        for (int x = 0; x < W; ++x) { smp[(size_t)(y / T) * tw + x / T] += rate_at(id[x]); npx[(size_t)(y / T) * tw + x / T] += 1.0; }
+    }
+    // Per-tile factor base: (E s^g)^(1/(1+g)) / s; the budget fixes the common scale k.
+    std::vector<double> fb((size_t)th * tw, 0.0);
+    double total = 0.0;
+    for (size_t t = 0; t < fb.size(); ++t) {
+        total += smp[t];
+        if (smp[t] > 0.0 && cnt[t] > 0.0) {
+            double e = err[t] / cnt[t] + 1e-3;
+            if (rel) e /= (std::max)(0.0, s2[t] / cnt[t] - (s1[t] / cnt[t]) * (s1[t] / cnt[t])) + 58.5225;
+            fb[t] = noerr ? 1.0 : std::pow(e * std::pow(smp[t], g), 1.0 / (1.0 + g)) / smp[t];
+        }
+    }
+    const auto base_rate = [&](uint8_t c, size_t t) { return per_tile ? smp[t] / npx[t] : rate_at(c); };
+    const auto new_rate = [&](double r, size_t t, double k) {
+        return fb[t] > 0.0 ? (std::min)(1.0, (std::max)(floor * r, k * fb[t] * r)) : r;
+    };
+    const auto taken = [&](double k) {
+        double s = 0.0;
+        for (int y = 0; y < H; ++y) {
+            const uint8_t* id = ids.ptr<uint8_t>(y);
+            for (int x = 0; x < W; ++x) {
+                const size_t t = (size_t)(y / T) * tw + x / T;
+                s += new_rate(base_rate(id[x], t), t, k);
+            }
+        }
+        return s;
+    };
+    const auto solve_k = [&](double budget) {
+        double k_lo = 0.0, k_hi = 1.0;
+        while (taken(k_hi) < budget && k_hi < 1e9) k_hi *= 2.0;
+        for (int it = 0; it < 40; ++it) {
+            const double mid = 0.5 * (k_lo + k_hi);
+            (taken(mid) < budget ? k_lo : k_hi) = mid;
+        }
+        return k_hi;
+    };
+    // Quantized rate per pixel (1..255, at most 255 labels).
+    const auto quantize = [&](double k) {
+        cv::Mat q(H, W, CV_8U);
+        for (int y = 0; y < H; ++y) {
+            const uint8_t* id = ids.ptr<uint8_t>(y);
+            uint8_t* qr = q.ptr<uint8_t>(y);
+            for (int x = 0; x < W; ++x) {
+                const size_t t = (size_t)(y / T) * tw + x / T;
+                qr[x] = (std::max)((uint8_t)1, cs_segmask_quantize_rate((float)new_rate(base_rate(id[x], t), t, k)));
+            }
+        }
+        return q;
+    };
+    const double k = solve_k((std::min)((double)H * W, (std::max)(0.0, total + delta)));
+    const double got = taken(k);
+    cv::Mat q = quantize(k);
+    int label_of[256];
+    std::fill(label_of, label_of + 256, -1);
+    rates.clear();
+    for (int y = 0; y < H; ++y) {
+        uint8_t* qr = q.ptr<uint8_t>(y);
+        for (int x = 0; x < W; ++x) {
+            if (label_of[qr[x]] < 0) { label_of[qr[x]] = (int)rates.size(); rates.push_back(qr[x] / 255.0f); }
+            qr[x] = (uint8_t)label_of[qr[x]];
+        }
+    }
+    ids = q;
+    std::cout << "rate-loop: g " << g << (rel ? " rel" : "") << (per_tile ? " per-tile" : "") << ", " << fb.size()
+              << " tiles, " << rates.size() << " labels, samples " << (long long)total << " -> " << (long long)got << std::endl;
+}
+
 void cs_seg_tile_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
     float pixel_p) {
     constexpr int TILE = 64, LEVELS = 8;
@@ -2113,22 +2229,22 @@ void encrypt_image::encrypt_ycc420_segmask(const float& pixel_p, const std::stri
         throw std::runtime_error("seg-mask: cannot load '" + mask_path + "'");
     }
     cv::Mat ids = cs_segmask_resolve_ids(mask_raw, rows, cols);
-    encrypt_ycc420_segmask_ids(pixel_p, password, ids, rates, sample_bits, chroma_bits, mode, seg_blend);
+    // CS_SEG_CHROMA_MASKED=1 (testing hook for the multi-scale layers): chroma drawn inside the label support.
+    const char* cm = std::getenv("CS_SEG_CHROMA_MASKED");
+    encrypt_ycc420_segmask_ids(pixel_p, password, ids, rates, sample_bits, chroma_bits, mode, seg_blend, nullptr,
+        cm && std::atoi(cm) != 0);
 }
 
 void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::string& password,
     const cv::Mat& ids, const std::vector<float>& rates,
     int sample_bits, int chroma_bits, int mode, int seg_blend,
-    const CsAnchorPlan* anchors) {
+    const CsAnchorPlan* anchors, bool chroma_masked) {
     if (mode != CS_MODE_YCC420_SEG && mode != CS_MODE_YCC422_SEG) {
         throw std::runtime_error("seg-mask ycc: bad split mode (internal error)");
     }
     if (anchors) {
         if (mode != CS_MODE_YCC420_SEG) {
             throw std::runtime_error("--hr-detail with --seg-auto needs --ycc420 (no --ycc422)");
-        }
-        if (sample_bits != 8 || (chroma_bits != 0 && chroma_bits != 8)) {
-            throw std::runtime_error("--hr-detail requires 8-bit samples (no --sample-bits packing)");
         }
     }
     const int out_mode = anchors ? CS_MODE_YCC420_SEG_HRDETAIL : mode;
@@ -2166,6 +2282,7 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     // chroma dims/counts key off the 4:2:0 vs 4:2:2 geometry (modes 3/7),
     // not the seg-luma variants, so map to the base split mode first
     const int base = (mode == CS_MODE_YCC422_SEG) ? CS_MODE_YCC422 : CS_MODE_YCC420;
+    chroma_support = chroma_masked ? cs_seg_chroma_support(ids, q, base) : cv::Mat();
     returnYcc420ChromaIndices(rows, cols, m, cs_key, base);
     const int mC = m_chroma;
 
@@ -2187,7 +2304,7 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     }
     std::vector<uint8_t> prefix;
     prefix.reserve(1 + q.size() + 4);
-    if (seg_blend > 0) prefix.insert(prefix.end(), {0, 1, (uint8_t)seg_blend});
+    if (seg_blend > 0 || chroma_masked) prefix.insert(prefix.end(), {0, (uint8_t)(chroma_masked ? 2 : 1), (uint8_t)seg_blend});
     prefix.push_back((uint8_t)q.size());
     prefix.insert(prefix.end(), q.begin(), q.end());
     const uint32_t sl = (uint32_t)png.size();
@@ -2235,6 +2352,7 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     // Compact anchors ride as a trailing CTR-encrypted section after Cb; the
     // payload byte length sits in the pad after the mode byte (the seg
     // prefix length already holds CS_OFF_HR_COUNT's bytes).
+    const size_t anchor_len = anchors ? anchor_payload.size() : 0;
     if (anchors) {
         const uint32_t len = (uint32_t)anchor_payload.size();
         for (int b = 0; b < 4; b++) {
@@ -2249,13 +2367,16 @@ void encrypt_image::encrypt_ycc420_segmask_ids(const float& pixel_p, const std::
     }
 
     // --sample-bits: prefix + label PNG stay raw; the three planes pack
-    // independently.
+    // independently; the anchor payload follows them as an 8-bit section.
     const size_t y0 = (size_t)CS_HEADER_BYTES + pre_bytes;
-    finish_container(total, sample_bits, chroma_bits,
-        {
-            { y0, (size_t)mY_written, sample_bits, 0, false },
-            { y0 + (size_t)mY_written, (size_t)mC, chroma_bits, 0, false },
-            { y0 + (size_t)mY_written + (size_t)mC, (size_t)mC, chroma_bits, 0, false } });
+    std::vector<cs_body_section> sections = {
+        { y0, (size_t)mY_written, sample_bits, 0, false },
+        { y0 + (size_t)mY_written, (size_t)mC, chroma_bits, 0, false },
+        { y0 + (size_t)mY_written + (size_t)mC, (size_t)mC, chroma_bits, 0, false } };
+    if (anchors) {
+        sections.push_back({ y0 + (size_t)mY_written + (size_t)2 * mC, anchor_len, 8, 0, false });
+    }
+    finish_container(total, sample_bits, chroma_bits, sections);
     sampling_mode = out_mode;
 }
 
@@ -2609,6 +2730,18 @@ void encrypt_image::writeEncryptedImageToDisk(const std::string& output_path) {
     cv::imwrite(output_path, encrypted_img);
 }
 
+// --hr-area: --hr-detail n is the anchor count for a 4032 x 3024 photo (12.2 MP, production's reference size) and other
+// sizes get n x their area / that area, so the anchor density stays the same. Off (default): n anchors at any size.
+static bool g_hr_area = false;
+void cs_set_hr_area_scaling(bool on) { g_hr_area = on; }
+static int cs_hr_detail_scaled(int n, int W, int H) {
+    if (n <= 0 || !g_hr_area) return n;
+    const double k = std::round((double)n * ((double)W * H) / (4032.0 * 3024.0));
+    const int out = (int)(std::min)((double)CS_HRDETAIL_MAX_SAMPLES, (std::max)(1.0, k));
+    std::printf("anchors: --hr-detail %d per 12.2 MP -> %d for %dx%d\n", n, out, W, H);
+    return out;
+}
+
 int encrypt_image::encrypt_image_tiled(
     const std::string& input_path,
     const std::string& output_path,
@@ -2646,7 +2779,14 @@ int encrypt_image::encrypt_image_tiled(
     bool seg_tile,
     const std::function<cv::Mat(const cv::Mat&)>& anchor_decode
 ){
+    // sample_bits 0 = production default (seg-auto ycc420 + anchors without --sample-bits): 6-bit
+    // luma / 8-bit chroma, sample ratio raised to keep the 8-bit byte budget of --ratio
+    const bool luma6 = (sample_bits == 0);
+    if (luma6) { sample_bits = 6; chroma_bits = 8; }
     try {
+        if (luma6 && !(seg_auto > 0 && ycc420 && hr_detail > 0)) {
+            throw std::runtime_error("default 6-bit luma applies to --seg-auto --ycc420 --hr-detail only (internal error)");
+        }
         // the caller-requested ratio is honored in every mode: decryption
         // derives its own coef/iterations from the container's actual ratio,
         // so auto mode has no reason to force full sampling
@@ -2745,7 +2885,7 @@ int encrypt_image::encrypt_image_tiled(
                 throw std::runtime_error("--hr-detail supports --ycc420 only (no --ycc422 in this prototype)");
             }
             const int cb_eff = (chroma_bits == 0) ? sample_bits : chroma_bits;
-            if (sample_bits != 8 || cb_eff != 8) {
+            if ((sample_bits != 8 || cb_eff != 8) && !(seg_auto > 0 && ycc420)) {   // seg-auto ycc420 packs around the anchors
                 throw std::runtime_error("--hr-detail requires 8-bit samples (no --sample-bits packing)");
             }
         }
@@ -2762,6 +2902,7 @@ int encrypt_image::encrypt_image_tiled(
         if (input_img.empty()) {
             throw std::runtime_error("Failed to load input image: " + input_path);
         }
+        hr_detail = cs_hr_detail_scaled(hr_detail, input_img.cols, input_img.rows);
 
         // The default 2x pipeline needs even sides: an odd side is padded by one
         // replicated row / column, recorded in the container, and cropped back
@@ -2827,6 +2968,16 @@ int encrypt_image::encrypt_image_tiled(
             // lists leave trailing classes at 0). Same containers/modes as
             // --seg-mask, so decrypt needs no new flags.
             // Segment at the sampling geometry (rows x cols members).
+            if (luma6) {
+                // Default 6-bit luma: same body bytes as 8-bit at --ratio, m6 (6/8 + 2k) = m8 (1 + 2k)
+                // with k the chroma/luma count ratio, so ~1.2x the samples; capped at full sampling.
+                int crows, ccols;
+                cs_chroma_dims(CS_MODE_YCC420, input_img.rows, input_img.cols, crows, ccols);
+                const double k = (double)crows * ccols / ((double)input_img.rows * input_img.cols);
+                const float r8 = compression_ratio;
+                compression_ratio = (float)std::min(1.0, r8 * (1.0 + 2.0 * k) / (0.75 + 2.0 * k));
+                std::printf("6-bit luma: --ratio %.3f budget -> sample ratio %.3f\n", r8, compression_ratio);
+            }
             cv::Mat auto_ids;
             cs_seg_auto_ids(input_img, seg_auto, input_img.rows, input_img.cols, auto_ids);
             std::vector<float> auto_rates = seg_rates.empty()
@@ -2868,6 +3019,7 @@ int encrypt_image::encrypt_image_tiled(
             const float seg_p = seg_tile ? 1.0f : compression_ratio;
             if (ycc420 || ycc422) {
                 const int seg_mode = ycc422 ? CS_MODE_YCC422_SEG : CS_MODE_YCC420_SEG;
+                if (hr_detail > 0) encrypt_img.reuse_key();   // the anchored re-encrypt keeps this salt + key
                 encrypt_img.encrypt_ycc420_segmask_ids(seg_p, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
                 if (hr_detail > 0) {
                     // Closed loop: decode this container, flag the worst 5% of its
@@ -2879,8 +3031,40 @@ int encrypt_image::encrypt_image_tiled(
                     }
                     cv::Mat ref = anchor_native;
                     if (ref.size() != dec.size()) cv::resize(anchor_native, ref, dec.size(), 0, 0, cv::INTER_LINEAR);
+                    // CS_RATE_LOOP=<g> (experimental): move luma samples between tiles by the error of this
+                    // decode, re-encrypt, and decode again for the anchor ranking. No tile drops below the
+                    // samples of an r0.05 container (sample ratio 0.06).
+                    // The container keeps the first pass's PNG bytes: the sample budget moves by the byte
+                    // difference (1 byte per sample to start, then the measured slope), up to 4 encrypts.
+                    if (const char* rl = std::getenv("CS_RATE_LOOP"); rl && std::atof(rl) > 0.0) {
+                        const auto png_size = [](const cv::Mat& m) {
+                            std::vector<uint8_t> b; cv::imencode(".png", m, b); return (double)b.size();
+                        };
+                        const double size0 = png_size(encrypt_img.get_mat());
+                        const cv::Mat ids0 = auto_ids.clone();
+                        const std::vector<float> rates0 = auto_rates;
+                        double delta = 0.0, prev_delta = 0.0, prev_size = -1.0, size1 = 0.0;
+                        for (int it = 0; it < 4; ++it) {
+                            auto_ids = ids0.clone(); auto_rates = rates0;
+                            cs_rate_loop_relabel(ref, dec, auto_ids, auto_rates, std::atof(rl),
+                                (std::min)(1.0, 0.06 / (std::max)(compression_ratio, 1e-3f)), delta);
+                            encrypt_img.encrypt_ycc420_segmask_ids(seg_p, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend);
+                            size1 = png_size(encrypt_img.get_mat());
+                            if (std::abs(size1 - size0) < 0.001 * size0) break;
+                            const double slope = (prev_size >= 0.0 && delta != prev_delta)
+                                ? (std::max)(0.2, (size1 - prev_size) / (delta - prev_delta)) : 1.0;
+                            prev_delta = delta; prev_size = size1;
+                            delta -= (size1 - size0) / slope;
+                        }
+                        std::printf("rate-loop: container %.0f -> %.0f bytes (%+.2f%%), budget %+.0f samples\n",
+                            size0, size1, 100.0 * (size1 / size0 - 1.0), delta);
+                        dec = anchor_decode(encrypt_img.get_mat());
+                        if (dec.empty() || dec.type() != CV_8UC3 || dec.cols != out_w || dec.rows != out_h) {
+                            throw std::runtime_error("rate loop: decode failed or has the wrong geometry");
+                        }
+                    }
                     CsAnchorPlan plan;
-                    plan.flags = cs_error_anchor_flags(ref, dec);
+                    plan.flags = cs_error_anchor_flags(ref, dec, hr_detail);
                     if (plan.flags.empty()) throw std::runtime_error("anchor pass: image smaller than one 16x16 block");
                     cv::Mat ycc;
                     cv::cvtColor(ref, ycc, cv::COLOR_BGR2YCrCb);
@@ -2888,8 +3072,8 @@ int encrypt_image::encrypt_image_tiled(
                     plan.count = hr_detail;
                     std::cout << "anchors: " << cv::countNonZero(plan.flags) << " of " << plan.flags.total()
                               << " blocks flagged by the closed-loop decode" << std::endl;
-                    encrypt_img.reuse_key();
                     encrypt_img.encrypt_ycc420_segmask_ids(seg_p, password, auto_ids, auto_rates, sample_bits, chroma_bits, seg_mode, seg_blend, &plan);
+                    encrypt_img.release_key();
                 }
             }
             else {
@@ -2993,5 +3177,371 @@ int encrypt_image::encrypt_image_tiled(
         return -1;
     }
 
+    return 0;
+}
+
+// Multi-scale planner features, per 120 px tile and scale s = 2..6 (the layer as cs_encrypt_multiscale builds it:
+// the photo area-shrunk by s/2, its LR = bilinear half): D = RGB MSE of the layer cubic-upscaled back to full size
+// (the scale's floor; 0 at 2x), G = luma MSE between the layer and its LR bilinear-upscaled (detail cs-sr must
+// recover), V = mean squared Laplacian of the LR luma (how hard the CS solve is). Tiles by pixel centre.
+struct MsTileFeat { float D, G, V; };
+static std::vector<MsTileFeat> ms_tile_features(const cv::Mat& src, int s, int T) {
+    const int W = src.cols, H = src.rows, th = (H + T - 1) / T, tw = (W + T - 1) / T;
+    const double f = s / 2.0;
+    const int lw = (int)(W / f) / 2 * 2, lh = (int)(H / f) / 2 * 2;
+    cv::Mat layer, lr;
+    if (s == 2) layer = src(cv::Rect(0, 0, lw, lh));
+    else cv::resize(src, layer, cv::Size(lw, lh), 0, 0, cv::INTER_AREA);
+    cv::resize(layer, lr, cv::Size(lw / 2, lh / 2));
+    std::vector<double> sd((size_t)th * tw, 0.0), sg((size_t)th * tw, 0.0), sv((size_t)th * tw, 0.0);
+    std::vector<double> nd((size_t)th * tw, 0.0), ng((size_t)th * tw, 0.0), nv((size_t)th * tw, 0.0);
+    // Per-pixel squared error, summed per tile; rows grouped by tile row so threads never share a tile.
+    const auto per_tile = [&](const cv::Mat& e, std::vector<double>& sum, std::vector<double>& cnt) {
+        const int eh = e.rows, ew = e.cols;
+        std::vector<int> tx((size_t)ew);
+        for (int x = 0; x < ew; ++x) tx[(size_t)x] = (std::min)(tw - 1, (int)((x + 0.5) * W / ew) / T);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int r = 0; r < th; ++r) {
+            for (int y = 0; y < eh; ++y) {
+                if ((std::min)(th - 1, (int)((y + 0.5) * H / eh) / T) != r) continue;
+                const float* p = e.ptr<float>(y);
+                for (int x = 0; x < ew; ++x) { sum[(size_t)r * tw + tx[(size_t)x]] += p[x]; cnt[(size_t)r * tw + tx[(size_t)x]] += 1.0; }
+            }
+        }
+    };
+    if (s > 2) {
+        cv::Mat up, d;
+        cv::resize(layer, up, cv::Size(W, H), 0, 0, cv::INTER_CUBIC);
+        cv::absdiff(up, src, d);
+        d.convertTo(d, CV_32FC3);
+        d = d.mul(d);
+        cv::Mat ch[3];
+        cv::split(d, ch);
+        cv::Mat e = (ch[0] + ch[1] + ch[2]) / 3.0f;
+        per_tile(e, sd, nd);
+    }
+    cv::Mat ly, ry;
+    cv::cvtColor(layer, ly, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(lr, ry, cv::COLOR_BGR2GRAY);
+    ly.convertTo(ly, CV_32F);
+    ry.convertTo(ry, CV_32F);
+    cv::Mat rup, eg, lap;
+    cv::resize(ry, rup, ly.size(), 0, 0, cv::INTER_LINEAR);
+    eg = ly - rup;
+    eg = eg.mul(eg);
+    per_tile(eg, sg, ng);
+    cv::Laplacian(ry, lap, CV_32F, 1, 1.0, 0.0, cv::BORDER_REPLICATE);
+    lap = lap.mul(lap);
+    per_tile(lap, sv, nv);
+    std::vector<MsTileFeat> out((size_t)th * tw);
+    for (size_t t = 0; t < out.size(); ++t)
+        out[t] = { (float)(nd[t] > 0 ? sd[t] / nd[t] : 0.0), (float)(ng[t] > 0 ? sg[t] / ng[t] : 0.0), (float)(nv[t] > 0 ? sv[t] / nv[t] : 0.0) };
+    return out;
+}
+
+// A multi-scale layer's luma rate per LR pixel (lrw x lrh), x 255: its tile's where the tile is scale s, else the rate
+// of a scale-s tile within kMsMargin px (full res; 8 neighbours), else 0. The margin lets the decoder's 17 px feather
+// blend two sampled layers (IMG_0620 r0.3: -0.86 -> -0.20 dB vs production at equal bytes; 16 px fixes it fully but
+// costs the other photos 0.15-0.4 dB).
+constexpr int kMsMargin = 8;
+static cv::Mat ms_layer_rates(const cv::Mat& map, const cv::Mat& qmap, int s, int W, int H, int T, int lrw, int lrh) {
+    const int th = map.rows, tw = map.cols;
+    cv::Mat q8(lrh, lrw, CV_8U);
+    #pragma omp parallel for schedule(static)
+    for (int y = 0; y < lrh; ++y) {
+        const int ty = (std::min)(th - 1, (int)((y + 0.5) * H / lrh) / T);
+        uint8_t* qr = q8.ptr<uint8_t>(y);
+        for (int x = 0; x < lrw; ++x) {
+            const int tx = (std::min)(tw - 1, (int)((x + 0.5) * W / lrw) / T);
+            int q = map.at<uint8_t>(ty, tx) == s ? qmap.at<uint8_t>(ty, tx) : 0;
+            if (q == 0) {
+                const double X = (x + 0.5) * W / lrw, Y = (y + 0.5) * H / lrh;
+                for (int k = 0; k < 8 && q == 0; ++k) {
+                    static const int ox[8] = { -1, 1, 0, 0, -1, 1, -1, 1 }, oy[8] = { 0, 0, -1, 1, -1, -1, 1, 1 };
+                    const int nx = (int)(X + ox[k] * kMsMargin), ny = (int)(Y + oy[k] * kMsMargin);
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                    if (map.at<uint8_t>(ny / T, nx / T) == s) q = qmap.at<uint8_t>(ny / T, nx / T);
+                }
+            }
+            qr[x] = (uint8_t)q;
+        }
+    }
+    return q8;
+}
+
+// Per-tile error model of the planner, per scale 2x..6x: MSE = D + exp(a . [1, lD, lG, lV, lG^2, lV^2, lG lV]
+// + lq min(b . [1, lD, lG, lV], -0.05)), lX = log(1 + X) of ms_tile_features clamped to the training maximum, lq =
+// log(rate): the scale's floor D plus a reconstruction error that falls with the rate. Fitted on 16 dataset photos
+// (none of the evaluation set), each scale as a whole-photo layer at random rates held over 6x6-tile blocks (as a
+// plan's regions; per-tile random rates let starved tiles borrow from their neighbours), production decode; held-out
+// log error RMSE 0.56 (2x) / 0.40-0.43 (3x-6x).
+struct MsErrModel { double a[7], b[4], lmax[3]; };
+static const MsErrModel kMsModel[5] = {
+    { { -1.04656, 0, 0.732277, 0.505001, -0.0323643, -0.0571419, 0.0693871 }, { 0.252447, 0, 0.316446, -0.277803 }, { 0, 7.05747, 10.1007 } },
+    { { -0.685989, 0.156419, 0.989368, 0.11643, 0.110375, 0.0369118, -0.142217 }, { 0.427264, 0.00145417, 0.494178, -0.417393 }, { 6.18446, 7.0095, 9.75632 } },
+    { { -0.565965, 0.173049, 0.975387, 0.0586176, 0.0448857, 0.0146763, -0.0620851 }, { 0.502667, -0.0198731, 0.560642, -0.471172 }, { 6.75201, 7.30921, 9.88583 } },
+    { { -0.915025, 0.360086, 0.466349, 0.337929, 0.0130645, -0.0166716, 0.00610654 }, { 0.331764, 0.102952, 0.354456, -0.37899 }, { 7.21561, 6.98675, 9.93173 } },
+    { { -1.10041, 0.325245, 0.567029, 0.312329, 0.0504057, -0.000978317, -0.0446536 }, { 0.159896, 0.113276, 0.305696, -0.337293 }, { 7.46319, 6.9594, 10.1227 } }
+};
+
+// `--multiscale auto`: per tile the (scale, rate) of least predicted error for the budget of a production container
+// at --ratio (6-bit luma: 1.2 x ratio of the LR pixels, capped at 1, plus the anchors), by a Lagrangian over all
+// tiles. Costs in luma samples: one carries 0.75 byte + its chroma share 0.5, an anchor ~1 byte, so an anchor = 0.8.
+// The tiles' own samples leave out the margins; the plan is redone with the budget scaled by planned / counted
+// samples (twice), which lands the container within a few % of production's bytes.
+// coarse (--ms-coarse, 0..1): moves the plan's coarseness (the area mean of log(s / 2) / log 3: 0 = all 2x, 1 = all
+// 6x) from the plain plan's c0 to c0 + coarse (1 - c0), at the same budget. A second multiplier mu (bisected) prices
+// coarseness: each tile minimizes E - mu * area * log(s / 2) / log 3 + lambda * C, so the tiles that lose the least
+// predicted error per step of coarseness go coarser first. 0 = the plain plan.
+static void ms_auto_plan(const cv::Mat& src, int T, float ratio, int hr_detail, cv::Mat& map, cv::Mat& qmap, float coarse) {
+    const int W = src.cols, H = src.rows, th = (H + T - 1) / T, tw = (W + T - 1) / T, nt = th * tw;
+    constexpr int NQ = 20;
+    double qs[NQ];
+    for (int i = 0; i < NQ; ++i) qs[i] = std::exp(std::log(0.02) * (1.0 - i / (NQ - 1.0)));
+    constexpr double kAnchor = 0.8;
+    const double anchor_cost = hr_detail > 0 ? kAnchor * hr_detail / nt : 0.0;   // per 2x tile
+    std::vector<double> E((size_t)nt * 5 * NQ), C((size_t)nt * 5 * NQ), P((size_t)nt * 5 * NQ);   // error, cost, coarseness
+    for (int si = 0; si < 5; ++si) {
+        const int s = si + 2;
+        const std::vector<MsTileFeat> ft = ms_tile_features(src, s, T);
+        const double f = s / 2.0, ls = std::log(f) / std::log(3.0);
+        const int lrw = (int)(W / f) / 2 * 2 / 2, lrh = (int)(H / f) / 2 * 2 / 2;
+        std::vector<double> rows_in((size_t)th, 0.0), cols_in((size_t)tw, 0.0);   // LR pixels per tile row / column
+        for (int y = 0; y < lrh; ++y) rows_in[(size_t)(std::min)(th - 1, (int)((y + 0.5) * H / lrh) / T)] += 1.0;
+        for (int x = 0; x < lrw; ++x) cols_in[(size_t)(std::min)(tw - 1, (int)((x + 0.5) * W / lrw) / T)] += 1.0;
+        for (int t = 0; t < nt; ++t) {
+            const int ty = t / tw, tx = t % tw;
+            const double npx = rows_in[(size_t)ty] * cols_in[(size_t)tx];
+            const double full = (double)(std::min)(T, H - ty * T) * (std::min)(T, W - tx * T);
+            const MsErrModel& m = kMsModel[si];
+            const double lD = (std::min)(m.lmax[0], std::log1p((double)ft[(size_t)t].D)), lG = (std::min)(m.lmax[1], std::log1p((double)ft[(size_t)t].G)),
+                         lV = (std::min)(m.lmax[2], std::log1p((double)ft[(size_t)t].V));
+            const double base = m.a[0] + m.a[1] * lD + m.a[2] * lG + m.a[3] * lV + m.a[4] * lG * lG + m.a[5] * lV * lV + m.a[6] * lG * lV;
+            const double slope = (std::min)(-0.05, m.b[0] + m.b[1] * lD + m.b[2] * lG + m.b[3] * lV);
+            for (int i = 0; i < NQ; ++i) {
+                const size_t o = ((size_t)t * 5 + si) * NQ + i;
+                E[o] = full * (ft[(size_t)t].D + std::exp(base + slope * std::log(qs[i])));
+                P[o] = full * ls;
+                C[o] = qs[i] * npx + (s == 2 ? anchor_cost : 0.0);
+            }
+        }
+    }
+    const double budget = (std::min)(1.0, 1.2 * ratio) * (double)(W / 2) * (H / 2) + kAnchor * hr_detail;
+    std::vector<int> pick((size_t)nt);
+    double mu = 0.0;   // price of coarseness (--ms-coarse)
+    const auto choose = [&](double lam) {
+        double cost = 0.0;
+        for (int t = 0; t < nt; ++t) {
+            double best = 1e300; int bo = 0;
+            for (int o = 0; o < 5 * NQ; ++o) {
+                const size_t k = (size_t)t * 5 * NQ + o;
+                const double v = E[k] - mu * P[k] + lam * C[k];
+                if (v < best) { best = v; bo = o; }
+            }
+            pick[(size_t)t] = bo;
+            cost += C[(size_t)t * 5 * NQ + bo];
+        }
+        return cost;
+    };
+    const auto fit_budget = [&](double target) {   // lambda for the budget at this mu
+        double lo = 1e-6, hi = 1e6;   // cost falls as lambda grows
+        for (int it = 0; it < 60; ++it) {
+            const double mid = std::sqrt(lo * hi);
+            if (choose(mid) > target) lo = mid; else hi = mid;
+        }
+        return choose(hi);
+    };
+    const auto coarseness = [&]() {
+        double c = 0.0, a = 0.0;
+        for (int t = 0; t < nt; ++t) {
+            c += P[(size_t)t * 5 * NQ + pick[(size_t)t]];
+            a += P[(size_t)t * 5 * NQ + 4 * NQ];   // P at 6x = the tile's area
+        }
+        return c / a;
+    };
+    double c0 = -1.0, c1 = -1.0;   // the plain plan's coarseness, the target
+    map.create(th, tw, CV_8U);
+    qmap.create(th, tw, CV_8U);
+    int count[7] = {};
+    double target = budget, cost = 0.0, counted = 0.0;
+    for (int pass = 0; pass < 3; ++pass) {
+        mu = 0.0;
+        cost = fit_budget(target);
+        if (coarse > 0.0f) {
+            if (c0 < 0.0) { c0 = coarseness(); c1 = c0 + coarse * (1.0 - c0); }
+            double lo = 1e-4, hi = 1e5;   // coarseness grows with mu
+            for (int it = 0; it < 40; ++it) {
+                mu = std::sqrt(lo * hi);
+                fit_budget(target);
+                if (coarseness() < c1) lo = mu; else hi = mu;
+            }
+            mu = hi;
+            cost = fit_budget(target);
+        }
+        std::fill(count, count + 7, 0);
+        for (int t = 0; t < nt; ++t) {
+            const int si = pick[(size_t)t] / NQ, i = pick[(size_t)t] % NQ;
+            map.at<uint8_t>(t / tw, t % tw) = (uint8_t)(si + 2);
+            qmap.at<uint8_t>(t / tw, t % tw) = (uint8_t)(std::min)(254.0, (std::max)(1.0, std::round(qs[i] * 255.0)));
+            ++count[si + 2];
+        }
+        counted = kAnchor * hr_detail * count[2] / nt;   // the samples the layers will draw, margins included
+        for (int s = 2; s <= 6; ++s) {
+            if (!count[s]) continue;
+            const double f = s / 2.0;
+            const cv::Mat q8 = ms_layer_rates(map, qmap, s, W, H, T, (int)(W / f) / 2 * 2 / 2, (int)(H / f) / 2 * 2 / 2);
+            counted += cv::sum(q8)[0] / 255.0;
+        }
+        if (std::abs(counted / budget - 1.0) < 0.01) break;
+        target *= budget / counted;
+    }
+    if (coarse > 0.0f)
+        std::printf("multi-scale plan: --ms-coarse %.2f: coarseness %.3f -> %.3f (target %.3f)\n", coarse, c0, coarseness(), c1);
+    std::printf("multi-scale plan: budget %.0f luma samples, planned %.0f, with margins %.0f; tiles 2x %d, 3x %d, 4x %d, 5x %d, 6x %d\n",
+        budget, cost, counted, count[2], count[3], count[4], count[5], count[6]);
+}
+
+int cs_encrypt_multiscale(const std::string& input_path, const std::string& output_path, const std::string& password,
+    const std::string& plan_path, int hr_detail, const std::function<cv::Mat(const cv::Mat&)>& anchor_decode, float ratio,
+    float coarse) {
+    constexpr int T = 120;
+    try {
+        const cv::Mat src = cv::imread(input_path, cv::IMREAD_COLOR);
+        if (src.empty()) throw std::runtime_error("cannot read '" + input_path + "'");
+        const int W = src.cols, H = src.rows, th = (H + T - 1) / T, tw = (W + T - 1) / T;
+        if (W > 65535 || H > 65535) throw std::runtime_error("multi-scale: image wider or taller than 65535");
+        hr_detail = cs_hr_detail_scaled(hr_detail, W, H);
+        if (const char* fd = std::getenv("CS_MS_DUMP_FEATURES")) {   // planner data: tile,scale,D,G,V
+            FILE* f = std::fopen(fd, "w");
+            if (!f) throw std::runtime_error(std::string("cannot write '") + fd + "'");
+            for (int sc = 2; sc <= 6; ++sc) {
+                const std::vector<MsTileFeat> ft = ms_tile_features(src, sc, T);
+                for (size_t t = 0; t < ft.size(); ++t) std::fprintf(f, "%zu,%d,%.5g,%.5g,%.5g\n", t, sc, ft[t].D, ft[t].G, ft[t].V);
+            }
+            std::fclose(f);
+        }
+        cv::Mat map(th, tw, CV_8U), qmap(th, tw, CV_8U);
+        const cv::Mat plan = plan_path == "auto" ? cv::Mat() : cv::imread(plan_path, cv::IMREAD_COLOR);
+        if (plan_path == "auto") {
+            ms_auto_plan(src, T, ratio, hr_detail, map, qmap, coarse);
+            if (const char* dp = std::getenv("CS_MS_DUMP_PLAN")) {   // the plan as a --multiscale PNG (B = scale, G = rate)
+                cv::Mat ch[3] = { map, qmap, cv::Mat::zeros(th, tw, CV_8U) }, png;
+                cv::merge(ch, 3, png);
+                cv::imwrite(dp, png);
+            }
+        }
+        else if (plan.rows != th || plan.cols != tw)
+            throw std::runtime_error("multi-scale: plan must be " + std::to_string(tw) + " x " + std::to_string(th) + " (120 px tiles)");
+        for (int i = 0; i < th && !plan.empty(); ++i)
+            for (int j = 0; j < tw; ++j) {
+                const cv::Vec3b p = plan.at<cv::Vec3b>(i, j);
+                if (p[0] < 2 || p[0] > 6) throw std::runtime_error("multi-scale: plan scale outside 2..6");
+                map.at<uint8_t>(i, j) = p[0];
+                qmap.at<uint8_t>(i, j) = (std::min)((uint8_t)254, (std::max)((uint8_t)1, p[1]));   // label 0 = rate 0
+            }
+        // One seg-mask layer per scale in use: the photo pre-shrunk by s/2 (area), then the pipeline's 2x
+        // (bilinear, as encrypt_image_tiled); labels = the tile's quantized rate where the tile is this
+        // scale's, rate 0 elsewhere; chroma drawn inside that support (seg prefix version 2).
+        // One PBKDF2 for the container: every layer is sealed with its salt + key (each header has its own IV).
+        uint8_t salt[CS_SALT_BYTES], key[32];
+        if (!cs_random_bytes(salt, CS_SALT_BYTES) || !cs_derive_key(password, salt, key))
+            throw std::runtime_error("multi-scale: key derivation failed");
+        std::vector<uint8_t> scales;
+        std::vector<cv::Mat> layers;
+        for (int s = 2; s <= 6; ++s) {
+            if (cv::countNonZero(map == s) == 0) continue;
+            const double f = s / 2.0;
+            const int lw = (int)(W / f) / 2 * 2, lh = (int)(H / f) / 2 * 2;
+            cv::Mat layer;
+            if (s == 2) layer = src(cv::Rect(0, 0, lw, lh));
+            else cv::resize(src, layer, cv::Size(lw, lh), 0, 0, cv::INTER_AREA);
+            cv::Mat lr;
+            cv::resize(layer, lr, cv::Size(lw / 2, lh / 2));
+            cv::Mat ids(lr.rows, lr.cols, CV_8U);
+            int label_of[256];
+            std::fill(label_of, label_of + 256, -1);
+            std::vector<float> rates = { 0.0f };
+            label_of[0] = 0;
+            const cv::Mat q8 = ms_layer_rates(map, qmap, s, W, H, T, lr.cols, lr.rows);
+            for (int y = 0; y < lr.rows; ++y) {
+                const uint8_t* qr = q8.ptr<uint8_t>(y);
+                uint8_t* id = ids.ptr<uint8_t>(y);
+                for (int x = 0; x < lr.cols; ++x) {
+                    const int q = qr[x];
+                    if (label_of[q] < 0) { label_of[q] = (int)rates.size(); rates.push_back(q / 255.0f); }
+                    id[x] = (uint8_t)label_of[q];
+                }
+            }
+            encrypt_image e(lr, true);
+            int chroma_bits = 8;
+            // The 2x layer: production's closed loop (decode, flag the worst 16x16 blocks, re-encrypt with the same
+            // key plus anchors there), the flags limited to its own tiles (the others decode flat).
+            const int n2 = s == 2 ? cv::countNonZero(map == 2) : 0;
+            const bool anchored = n2 > 0 && hr_detail > 0 && anchor_decode;
+            e.use_key(salt, key);
+            e.encrypt_ycc420_segmask_ids(1.0f, password, ids, rates, 6, chroma_bits, CS_MODE_YCC420_SEG, 0, nullptr, true);
+            if (anchored) {
+                const cv::Mat dec = anchor_decode(e.get_mat());
+                if (dec.empty() || dec.type() != CV_8UC3 || dec.cols != lw || dec.rows != lh)
+                    throw std::runtime_error("multi-scale: anchor pass decode failed or has the wrong geometry");
+                cv::Mat ref = layer.clone();
+                for (int y = 0; y < lh; ++y)
+                    for (int x = 0; x < lw; ++x)
+                        if (map.at<uint8_t>(y / T, x / T) != 2) ref.at<cv::Vec3b>(y, x) = dec.at<cv::Vec3b>(y, x);
+                CsAnchorPlan ap;
+                ap.count = (int)std::lround((double)hr_detail * n2 / ((double)th * tw));
+                ap.flags = cs_error_anchor_flags(ref, dec, ap.count);
+                cv::Mat ycc;
+                cv::cvtColor(layer, ycc, cv::COLOR_BGR2YCrCb);
+                cv::extractChannel(ycc, ap.luma, 0);
+                std::cout << "multi-scale: 2x layer anchors " << ap.count << ", " << cv::countNonZero(ap.flags)
+                          << " blocks flagged" << std::endl;
+                e.encrypt_ycc420_segmask_ids(1.0f, password, ids, rates, 6, chroma_bits, CS_MODE_YCC420_SEG, 0, &ap, true);
+            }
+            e.release_key();
+            cv::Mat c = e.get_mat();
+            if (!c.isContinuous()) c = c.clone();
+            std::cout << "multi-scale: " << s << "x layer " << lw << "x" << lh << ", " << cv::countNonZero(map == s)
+                      << " tiles, " << rates.size() << " labels, " << c.total() * 3 << " bytes" << std::endl;
+            scales.push_back((uint8_t)s);
+            layers.push_back(c);
+        }
+        // Descriptor + layers in one outer container.
+        std::vector<uint8_t> png;
+        cv::imencode(".png", map, png, { cv::IMWRITE_PNG_COMPRESSION, 9 });
+        std::vector<uint8_t> desc;
+        const auto put = [&](uint32_t v, int n) { for (int b = 0; b < n; ++b) desc.push_back((uint8_t)(v >> (8 * b))); };
+        put(1, 1); put(W, 2); put(H, 2); put(T, 2); put((uint32_t)layers.size(), 1);
+        for (size_t i = 0; i < layers.size(); ++i) { put(scales[i], 1); put((uint32_t)(layers[i].total() * 3), 4); }
+        put((uint32_t)png.size(), 4);
+        desc.insert(desc.end(), png.begin(), png.end());
+        size_t body = desc.size();
+        for (const cv::Mat& c : layers) body += c.total() * 3;
+        const int total = next_perfect_square(CS_HEADER_PIXELS + (int)((body + 2) / 3) + 8);
+        cv::Mat out(1, total, CV_8UC3, cv::Scalar(0, 0, 0));
+        uint8_t* buf = out.data;
+        if (!cs_write_header(buf, (size_t)total * 3, cs_build_metadata((int)layers.size(), H, W, H, W), key, salt))
+            throw std::runtime_error("multi-scale: header write failed");
+        buf[CS_OFF_PAD] = CS_MODE_MULTISCALE;
+        const size_t desc_len = desc.size();
+        for (int b = 0; b < 4; ++b) buf[CS_OFF_PAD + CS_OFF_SEGPRE_LEN + b] = (uint8_t)(desc_len >> (8 * b));
+        std::memcpy(buf + CS_HEADER_BYTES, desc.data(), desc_len);
+        cs_wipe(desc.data(), desc_len);
+        if (!cs_blob_seal_xor(buf + CS_HEADER_BYTES, desc_len, key, buf + CS_OFF_IV, CS_MS_TAG))
+            throw std::runtime_error("multi-scale: descriptor encryption failed");
+        size_t off = CS_HEADER_BYTES + desc_len;
+        for (const cv::Mat& c : layers) { std::memcpy(buf + off, c.data, c.total() * 3); off += c.total() * 3; }
+        const bool sealed = cs_seal_header(buf, (size_t)total * 3, key);
+        cs_wipe(key, sizeof(key));
+        if (!sealed) throw std::runtime_error("multi-scale: sealing failed");
+        const int side = (int)std::lround(std::sqrt((double)total));
+        out = out.reshape(3, side);
+        if (!cv::imwrite(output_path, out)) throw std::runtime_error("failed to write '" + output_path + "'");
+        std::cout << "multi-scale: " << layers.size() << " layers, container " << (size_t)total * 3 << " bytes" << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -1;
+    }
     return 0;
 }

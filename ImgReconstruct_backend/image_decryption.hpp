@@ -157,6 +157,9 @@ private:
     std::vector<cv::Vec3b> tgrp_val;
 
 public:
+    // Set by get_sampled_ycc420: a multi-scale (mode 20) layer, i.e. seg prefix version 2 (chroma inside the labels).
+    bool ms_layer = false;
+
     decrypt_image(const std::string input_path, const std::string& password = "");
 
     decrypt_image() {}

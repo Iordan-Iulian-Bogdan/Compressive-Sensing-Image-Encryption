@@ -1,5 +1,6 @@
 #include "crypto_utils.hpp"
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
@@ -110,7 +111,7 @@ bool cs_random_bytes(uint8_t* out, size_t len) {
     }
 }
 
-bool cs_derive_key(const std::string& password, const uint8_t* salt, uint8_t key_out[32]) {
+static bool cs_derive_key_pbkdf2(const std::string& password, const uint8_t* salt, uint8_t key_out[32]) {
     if (password.empty()) return false;
     try {
         AlgHandle alg(L"SHA256", BCRYPT_ALG_HANDLE_HMAC_FLAG);
@@ -207,7 +208,7 @@ bool cs_random_bytes(uint8_t* out, size_t len) {
     return len == 0 || RAND_bytes(out, (int)len) == 1;
 }
 
-bool cs_derive_key(const std::string& password, const uint8_t* salt, uint8_t key_out[32]) {
+static bool cs_derive_key_pbkdf2(const std::string& password, const uint8_t* salt, uint8_t key_out[32]) {
     if (password.empty()) return false;
     return PKCS5_PBKDF2_HMAC(
         password.data(), (int)password.size(),
@@ -228,6 +229,30 @@ bool cs_aes256_ctr_xor(uint8_t* data, size_t len, const uint8_t key[32], const u
 }
 
 #endif // _WIN32
+
+// The last derivation is kept in memory: a multi-scale container's layers share its salt, so the decoder runs
+// PBKDF2 once instead of once per layer. Hit only on the same password and salt.
+bool cs_derive_key(const std::string& password, const uint8_t* salt, uint8_t key_out[32]) {
+    static std::mutex mu;
+    static std::string last_pw;
+    static uint8_t last_salt[CS_SALT_BYTES], last_key[32];
+    static bool have = false;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (have && password == last_pw && std::memcmp(salt, last_salt, CS_SALT_BYTES) == 0) {
+            std::memcpy(key_out, last_key, 32);
+            return true;
+        }
+    }
+    if (!cs_derive_key_pbkdf2(password, salt, key_out)) return false;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!last_pw.empty()) cs_wipe(last_pw.data(), last_pw.size());
+    last_pw = password;
+    std::memcpy(last_salt, salt, CS_SALT_BYTES);
+    std::memcpy(last_key, key_out, 32);
+    have = true;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Backend-independent container format code

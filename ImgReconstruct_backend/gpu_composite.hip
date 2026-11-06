@@ -96,50 +96,77 @@ bool blend_tiles(const std::vector<TileRef>& tiles, int W, int H, std::uint8_t* 
             rowi[(size_t)r * kMaxCover + s] = i;
         }
     }
-    // Each distinct weight map is uploaded once; tiles that already sit back to back in one
-    // buffer (the batched SR output) are uploaded from it without repacking.
+    // Each distinct weight map is uploaded once. Tile pixels: tiles inside the host range the gpu_sr handoff slot holds
+    // (resident_put: the batched SR output, still on the device) are read there in place; the others are uploaded after
+    // it, once per distinct buffer (a multi-scale layer's flat fill tiles share one). Without a slot and with every tile
+    // back to back in one buffer, that buffer is uploaded without repacking.
+    const void* rh_v = nullptr;
+    size_t rb = 0;
+    resident_range(&rh_v, &rb);
+    const std::uint8_t* rh = (const std::uint8_t*)rh_v;
+    const auto in_slot = [&](const TileRef& t) {
+        const long long n = (long long)t.w * t.h;
+        return rh && t.bgr >= rh && t.bgr + 3 * n <= rh + 3 * (long long)(rb / 3) && (t.bgr - rh) % 3 == 0;
+    };
+    if (std::none_of(tiles.begin(), tiles.end(), in_slot)) { rh = nullptr; rb = 0; }   // a slot not for these tiles
     std::vector<BlendTile> bt(tiles.size());
     std::map<const float*, long long> wmap;
+    std::map<const std::uint8_t*, long long> smap;   // uploaded tile buffer -> pixel offset
     std::vector<float> wt;
-    long long total = 0;
-    bool packed = true;
+    std::vector<size_t> extra;                       // the uploaded tiles, in order
+    const long long nres = (long long)(rb / 3);      // resident pixels; the uploaded ones follow
+    long long total = nres, run = 0;
+    bool packed = rh == nullptr;
     for (size_t k = 0; k < tiles.size(); ++k) {
         const TileRef& t = tiles[k];
+        const long long n = (long long)t.w * t.h;
         BlendTile b{};
-        b.x = t.x; b.y = t.y; b.w = t.w; b.h = t.h; b.off = total;
+        b.x = t.x; b.y = t.y; b.w = t.w; b.h = t.h;
+        if (in_slot(t)) {
+            b.off = (long long)((t.bgr - rh) / 3);
+        } else {
+            auto si = smap.find(t.bgr);
+            if (si == smap.end()) { si = smap.emplace(t.bgr, total).first; extra.push_back(k); total += n; }
+            b.off = si->second;
+        }
         auto it = wmap.find(t.weights);
         if (it == wmap.end()) {
             it = wmap.emplace(t.weights, (long long)wt.size()).first;
-            wt.insert(wt.end(), t.weights, t.weights + (size_t)t.w * t.h);
+            wt.insert(wt.end(), t.weights, t.weights + (size_t)n);
         }
         b.woff = it->second;
         bt[k] = b;
-        packed = packed && t.bgr == tiles[0].bgr + 3 * total;
-        total += (long long)t.w * t.h;
+        packed = packed && t.bgr == tiles[0].bgr + 3 * run;
+        run += n;
     }
+    const long long nup = total - nres;   // uploaded pixels
+    packed = packed && extra.size() == tiles.size();
     std::vector<std::uint8_t> src;
-    if (!packed) {
-        src.resize((size_t)(3 * total));
-        for (size_t k = 0; k < tiles.size(); ++k)
-            std::copy(tiles[k].bgr, tiles[k].bgr + (size_t)3 * tiles[k].w * tiles[k].h, src.begin() + 3 * bt[k].off);
+    if (!packed && nup > 0) {
+        src.resize((size_t)(3 * nup));
+        for (size_t k : extra)
+            std::copy(tiles[k].bgr, tiles[k].bgr + (size_t)3 * tiles[k].w * tiles[k].h, src.begin() + 3 * (smap[tiles[k].bgr] - nres));
     }
     const std::uint8_t* src_p = packed ? tiles[0].bgr : src.data();
 
-    DevBuf<BlendTile> dT; DevBuf<int> dTO, dC, dR; DevBuf<float> dW; DevBuf<std::uint8_t> dS, dO;
-    // The tiles may still be on the device from gpu_sr (resident_put): then they need no upload.
-    dS.p = (std::uint8_t*)resident_take(src_p, (size_t)(3 * total));
-    const bool resident = dS.p != nullptr;
+    DevBuf<BlendTile> dT; DevBuf<int> dTO, dC, dR; DevBuf<float> dW; DevBuf<std::uint8_t> dS, dO, dRes;
+    // The resident part needs no upload; with uploaded tiles too, both go into one buffer (a device-side copy).
+    if (rh) dRes.p = (std::uint8_t*)resident_take(rh, rb);
+    if (rh && !dRes.p) return false;
+    const bool alias = rh && nup == 0;    // every tile resident: read the slot's buffer itself
     if (!dT.alloc(bt.size()) || !dTO.alloc(tile_of.size()) || !dC.alloc(colj.size()) || !dR.alloc(rowi.size()) ||
-        !dW.alloc(wt.size()) || (!resident && !dS.alloc((size_t)(3 * total))) || !dO.alloc((size_t)3 * W * H)) {
+        !dW.alloc(wt.size()) || (!alias && !dS.alloc((size_t)(3 * total))) || !dO.alloc((size_t)3 * W * H)) {
         std::fprintf(stderr, "gpu_composite: device allocation failed\n");
         return false;
     }
+    if (alias) std::swap(dS.p, dRes.p);
     HIP_TRY(hipMemcpy(dT.p, bt.data(), bt.size() * sizeof(BlendTile), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dTO.p, tile_of.data(), tile_of.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dC.p, colj.data(), colj.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dR.p, rowi.data(), rowi.size() * sizeof(int), hipMemcpyHostToDevice));
     HIP_TRY(hipMemcpy(dW.p, wt.data(), wt.size() * sizeof(float), hipMemcpyHostToDevice));
-    if (!resident) HIP_TRY(hipMemcpy(dS.p, src_p, (size_t)(3 * total), hipMemcpyHostToDevice));
+    if (dRes.p && nres > 0) HIP_TRY(hipMemcpy(dS.p, dRes.p, (size_t)(3 * nres), hipMemcpyDeviceToDevice));
+    if (nup > 0) HIP_TRY(hipMemcpy(dS.p + 3 * nres, src_p, (size_t)(3 * nup), hipMemcpyHostToDevice));
     k_blend<<<dim3((unsigned)(((long long)W * H + kThreads - 1) / kThreads)), dim3(kThreads)>>>(
         dT.p, dTO.p, nj, dC.p, dR.p, dW.p, dS.p, W, H, dO.p);
     HIP_TRY(hipGetLastError());

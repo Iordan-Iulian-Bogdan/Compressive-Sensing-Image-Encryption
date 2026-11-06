@@ -27,8 +27,12 @@ public:
 
     encrypt_image() {}
 
-    // Next encrypt_* reuses this object's salt + key (see keep_key).
+    // Call before an encrypt_*: its key survives the container, and every later encrypt_* reuses
+    // that salt + key (see keep_key) until release_key() wipes it.
     void reuse_key() { keep_key = true; }
+    void release_key();
+    // Like reuse_key, with a salt + key derived elsewhere (a multi-scale container's layers share its key).
+    void use_key(const uint8_t salt[CS_SALT_BYTES], const uint8_t key[32]);
 
     // Native size parity recorded in the container (the input was padded to even by one replicated
     // row / column per odd side; decrypt crops it back).
@@ -86,7 +90,7 @@ public:
     void encrypt_ycc420_segmask_ids(const float& pixel_p, const std::string& password,
         const cv::Mat& ids, const std::vector<float>& rates,
         int sample_bits = 8, int chroma_bits = 0, int mode = CS_MODE_YCC420_SEG,
-        int seg_blend = 0, const CsAnchorPlan* anchors = nullptr);
+        int seg_blend = 0, const CsAnchorPlan* anchors = nullptr, bool chroma_masked = false);
 
     // YCC 4:2:0 with LOD-driven luma (mode 3 + shipped lod bytes; mode 7 for
     // 4:2:2): same LOD sources as encrypt_adaptive (Laplacian / two-pass /
@@ -197,6 +201,18 @@ std::vector<float> cs_seg_auto_rates(const cv::Mat& bgr, const cv::Mat& ids, int
 // the excess to the cap (CS_SEG_EDGE_NOSPILL=1 disables, for comparison).
 void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& rates, int classes,
     float pixel_p = 0.0f, int block = 16, float top = 0.5f, float boost = 1.5f);
+// Multi-scale container (mode 20, --multiscale <plan.png>): plan = 8-bit BGR at the 120 px tile grid
+// (ceil(H/120) x ceil(W/120)), channel 0 the tile's scale (2..6), channel 1 its luma rate in its layer
+// (q / 255 of the layer's LR pixels in the tile). hr_detail > 0 with anchor_decode: the 2x layer gets the
+// production closed-loop anchors, hr_detail x its share of the tiles. plan_path "auto": the encoder plans the
+// tiles for the budget of a production container at ratio; coarse in (0, 1] (--ms-coarse) moves the plan's
+// coarseness (area mean of log(s / 2) / log 3) that fraction of the way from the plain plan's to all-6x. Writes the container to output_path; returns 0 on success.
+// --hr-area: scale every encode's --hr-detail count by the photo's area / 4032 x 3024 (off by default).
+void cs_set_hr_area_scaling(bool on);
+int cs_encrypt_multiscale(const std::string& input_path, const std::string& output_path, const std::string& password,
+    const std::string& plan_path, int hr_detail = 0,
+    const std::function<cv::Mat(const cv::Mat&)>& anchor_decode = {}, float ratio = 0.3f, float coarse = 0.0f);
+
 // Per-tile detail split (--seg-tile, the "seg8-tile" container): every 64x64
 // tile gets an LOD from its mean |Laplacian| (min-max to [32, 255]) bucketed
 // into 8 levels; label = class * 8 + level, rate = class rate x level weight

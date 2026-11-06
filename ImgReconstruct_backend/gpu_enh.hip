@@ -5,6 +5,7 @@
 //   S1 = e1(relu(down1(S0)))               half res, 2c ch              M  = mid(relu(down2(S1))) quarter res, 4c ch
 //   U2 = relu(ps(up2(M)))                  D  = d1(relu(fuse1([U2, S1])))                        half res, 2c ch
 //   U1 = relu(ps(up1(D)))                  V  = fuse0([U1, S0])         out = rgb/255 + tail(V)   full res
+//   (version-2 weights: V = d0(relu(fuse0([U1, S0]))), d0 full-res residual blocks of c channels)
 // with ResBlock(x) = x + b(relu(a(x))) and ps = PixelShuffle(2). Every conv is 3x3 and zero padded (stride 2 for
 // down1 / down2) and runs as an implicit GEMM over an fp16 halo in LDS on the WMMA units (fp32 accumulation); bias,
 // ReLU, residual add, pixel shuffle, concatenated inputs and the final clamped 8-bit store are fused into it. The
@@ -35,7 +36,7 @@ using namespace gpu_wmma;
 constexpr int kT = 128;          // four waves of 32; a wave owns 16 pixels of an 8 x 8 output block
 constexpr int kB = 8;            // output block side
 constexpr int kE = 256;          // threads of the elementwise kernels
-constexpr int kXC = 16;          // channels of the input tensor X (3 + up to 5 planes, zero padded)
+constexpr int kXC = 16;          // channels of the input tensor X (3 + up to 9 planes, zero padded)
 constexpr int kBlurR = 12;       // Gaussian radius on the LR grid (OpenCV's 25 taps for sigma 4)
 constexpr float kBlurSigma = 4.0f;
 
@@ -43,7 +44,7 @@ struct Conv { int cin, cout, cin_p, cout_p; size_t w, b; };   // fp16 fragment /
 struct Model {
     DevBuf<float> fbuf;
     DevBuf<half_t> hbuf;
-    int c = 0, nx = 0, blocks[3] = {};
+    int c = 0, nx = 0, blocks[3] = {}, d0 = 0;   // d0: full-res residual blocks after relu(fuse0) (version-2 files)
     std::vector<Conv> conv;
 };
 std::mutex g_mu;
@@ -65,6 +66,7 @@ struct ConvP {
     // Row windows (banded full-res layers): A / B / OUT / RES hold image rows from ia / ib / ob / rb on (OUT rows at
     // 2x in mode 1); output rows y0 .. y0 + ny - 1 are computed. All 0 and ny = OH: the whole image.
     int ia, ib, ob, rb, y0, ny;
+    const std::uint8_t* act;             // ceil(OH / 8) x ceil(OW / 8) output block flags, null = all (gpu_enh::Inputs::active)
 };
 
 // One 3x3 conv on an 8 x 8 output block: CIN input channels (A then B), NT x 16 output channels from tile
@@ -77,6 +79,10 @@ __global__ void __launch_bounds__(kT) k_conv(const ConvP P) {
     __shared__ __attribute__((aligned(16))) half_t L[HS * HS * RS];
     const int bpr = (P.OW + kB - 1) / kB;
     const int by0 = P.y0 + (blockIdx.x / bpr) * kB, bx0 = (blockIdx.x % bpr) * kB, yend = min(P.OH, P.y0 + P.ny);
+    if (P.act) {   // band rows need not be 8-aligned: the block spans flag rows by0 / 8 and (by0 + 7) / 8
+        const int nr = (P.OH + kB - 1) / kB, ry = by0 / kB, rz = min(nr - 1, (by0 + kB - 1) / kB);
+        if (!P.act[ry * bpr + bx0 / kB] && !P.act[rz * bpr + bx0 / kB]) return;
+    }
     const int iy0 = by0 * S - 1, ix0 = bx0 * S - 1;
     for (int e = threadIdx.x; e < HS * HS * V8; e += kT) {
         const int q = e / V8, c0 = (e % V8) * 8, y = iy0 + q / HS, x = ix0 + q % HS;
@@ -148,10 +154,13 @@ __global__ void k_blur_v(const float* T, float* Dn, int h, int w, const float* g
     Dn[i] = s;
 }
 
-// Input tensor X (Hp x Wp x 16, reflect padded past H x W): rgb, density, anchors (0 here, see k_anchors), LR samples.
-// X holds padded rows r0 .. r0 + nr - 1.
+// Chroma sample planes (9-plane nets): masks / values of Cr and Cb on the chroma grid (output / 4).
+struct ChromaIn { const std::uint8_t *crm, *crs, *cbm, *cbs; int ch, cw; };
+
+// Input tensor X (Hp x Wp x 16, reflect padded past H x W): rgb, density, anchors (0 here, see k_anchors), LR samples,
+// chroma samples. X holds padded rows r0 .. r0 + nr - 1.
 __global__ void k_input(const std::uint8_t* img, int H, int W, int Hp, int Wp, const float* Dn, const std::uint8_t* M,
-    const std::uint8_t* Sm, int h, int w, int nx, half_t* X, int r0, int nr) {
+    const std::uint8_t* Sm, int h, int w, int nx, ChromaIn C, half_t* X, int r0, int nr) {
     const int i = blockIdx.x * kE + threadIdx.x;
     if (i >= nr * Wp) return;
     const int yp = r0 + i / Wp, xp = i % Wp;
@@ -176,6 +185,22 @@ __global__ void k_input(const std::uint8_t* img, int H, int W, int Hp, int Wp, c
             const float box = (lum(q) + lum(q + 3) + lum(q + (size_t)W * 3) + lum(q + (size_t)W * 3 + 3)) * 0.25f;
             o[6] = 1.0f;
             o[7] = clip1((Sm[(size_t)li * w + lj] - box) / 8.0f);
+        }
+    }
+    // Cr / Cb sample mask and residual (sample - 4x4 mean of the decode's Cr / Cb, as cv::COLOR_BGR2YCrCb) / 4
+    const int ci = y / 4, cj = x / 4;
+    if (nx >= 9 && C.crm && ci < min(C.ch, H / 4) && cj < min(C.cw, W / 4)) {
+        const size_t k = (size_t)ci * C.cw + cj;
+        if (C.crm[k] || C.cbm[k]) {
+            float R = 0.0f, G = 0.0f, B = 0.0f;
+            for (int dy = 0; dy < 4; ++dy) {
+                const std::uint8_t* q = img + ((size_t)(4 * ci + dy) * W + 4 * cj) * 3;
+                for (int dx = 0; dx < 4; ++dx) { B += q[3 * dx]; G += q[3 * dx + 1]; R += q[3 * dx + 2]; }
+            }
+            R *= 1.0f / 16.0f; G *= 1.0f / 16.0f; B *= 1.0f / 16.0f;
+            const float Yv = 0.299f * R + 0.587f * G + 0.114f * B;
+            if (C.crm[k]) { o[8] = 1.0f; o[9] = clip1((C.crs[k] - ((R - Yv) * 0.713f + 128.0f)) / 4.0f); }
+            if (C.cbm[k]) { o[10] = 1.0f; o[11] = clip1((C.cbs[k] - ((B - Yv) * 0.564f + 128.0f)) / 4.0f); }
         }
     }
     h8 v0, v1;
@@ -238,20 +263,30 @@ std::string weights_path(const std::string& onnx_model) {
 
 int extra_planes() { return g_cur ? g_cur->nx : 0; }
 
+// full-res convs, half res x2, quarter x4, + slack for the strides / shuffles and the planes' 2x2 / 4x4 blocks
+static int rf_of(const Model& m) {
+    const int* bk = m.blocks;
+    return (1 + 2 * bk[0]) + 2 + 2 * (2 * bk[1] + 1) + 4 * (2 * bk[2] + 1) + 2 * (1 + 2 * bk[1] + 1) + (1 + 2 * m.d0 + 1) + 8;
+}
+int receptive_field() { return g_cur ? rf_of(*g_cur) : 0; }
+
 bool load(const std::string& path) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (auto it = g_models.find(path); it != g_models.end()) { g_cur = it->second; return g_cur != nullptr; }
     g_models[path] = nullptr;
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
-    // header: magic "ENH1", version 1, c, blocks[3], extra planes, conv count; then per conv: cout, cin, w, b (fp32)
-    std::uint32_t hdr[8] = {};
+    // header: magic "ENH1", version (1, or 2 = one more u32: d0 blocks), c, blocks[3], extra planes, conv count; then per
+    // conv: cout, cin, w, b (fp32)
+    std::uint32_t hdr[8] = {}, nd0 = 0;
     std::vector<float> fv;
     std::vector<std::uint16_t> hv;
     auto* m = new Model();
-    bool ok = std::fread(hdr, 4, 8, f) == 8 && hdr[0] == 0x31484E45u && hdr[1] == 1 && (hdr[2] == 16 || hdr[2] == 32) &&(hdr[6] == 3 || hdr[6] == 5);
+    bool ok = std::fread(hdr, 4, 8, f) == 8 && hdr[0] == 0x31484E45u && (hdr[1] == 1 || hdr[1] == 2) &&
+        (hdr[2] == 16 || hdr[2] == 32) && (hdr[6] == 3 || hdr[6] == 5 || hdr[6] == 9);
+    if (ok && hdr[1] == 2) ok = std::fread(&nd0, 4, 1, f) == 1 && nd0 >= 1 && nd0 <= 8;
     if (ok) {
-        m->c = (int)hdr[2]; m->nx = (int)hdr[6];
+        m->c = (int)hdr[2]; m->nx = (int)hdr[6]; m->d0 = (int)nd0;
         for (int k = 0; k < 3; ++k) m->blocks[k] = (int)hdr[3 + k];
         const int c = m->c, *bk = m->blocks;
         // expected (cin, cout) of every conv, in file order
@@ -266,6 +301,7 @@ bool load(const std::string& path) {
         for (int i = 0; i < 2 * bk[1]; ++i) want.push_back({ 2 * c, 2 * c });
         want.push_back({ 2 * c, 4 * c });       // up1 (pixel shuffle -> c)
         want.push_back({ 2 * c, c });           // fuse0 ([U1, S0])
+        for (int i = 0; i < 2 * m->d0; ++i) want.push_back({ c, c });   // d0
         want.push_back({ c, 3 });               // tail
         ok = hdr[7] == want.size();
         for (size_t k = 0; ok && k < want.size(); ++k) {
@@ -325,7 +361,8 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
     static const int band = [] { const char* e = std::getenv("CS_ENH_BAND"); return e ? std::max(0, std::atoi(e)) : 128; }();
     const int BR = band > 0 ? std::min(Hp, (band + 3) / 4 * 4) : Hp;
     const int hA = 1 + 2 * bk[0];                                   // X -> S0: head and e0's convs
-    const int rows_f = std::min(Hp, BR + std::max(2 * hA, 6));      // band buffer rows (stage B: U1 +-2, even ends)
+    const int nd0 = m->d0;
+    const int rows_f = std::min(Hp, BR + std::max(2 * hA, 6 + 4 * nd0));   // band buffer rows (stage B: U1 +-(2 + 2 d0), even ends)
     const size_t nb = (size_t)rows_f * Wp;
     DevBuf<std::uint8_t> dimg, dout, dM, dS;
     DevBuf<float> dT, dD;
@@ -347,6 +384,55 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
         if (in.y_samp) HIP_TRY(hipMemcpy(dS.p, in.y_samp, nlr, hipMemcpyHostToDevice));
     }
     if (in.n_anchors > 0) HIP_TRY(hipMemcpy(dA.p, in.anchors, (size_t)in.n_anchors * sizeof(Anchor), hipMemcpyHostToDevice));
+    ChromaIn chroma{};
+    DevBuf<std::uint8_t> dC;
+    if (m->nx >= 9 && in.cr_mask && in.cr_samp && in.cb_mask && in.cb_samp && in.ch > 0 && in.cw > 0) {
+        const size_t nc = (size_t)in.ch * in.cw;
+        if (!dC.alloc(4 * nc)) { std::fprintf(stderr, "gpu_enh: device allocation failed\n"); return false; }
+        const std::uint8_t* src[4] = { in.cr_mask, in.cr_samp, in.cb_mask, in.cb_samp };
+        for (int k = 0; k < 4; ++k) HIP_TRY(hipMemcpy(dC.p + k * nc, src[k], nc, hipMemcpyHostToDevice));
+        chroma = { dC.p, dC.p + nc, dC.p + 2 * nc, dC.p + 3 * nc, in.ch, in.cw };
+    }
+    // Active blocks (in.active): the caller's blocks dilated by the receptive field, at full res; the half / quarter
+    // res flags OR their 2 x 2 / 4 x 4 full-res blocks. Every conv runs on (at least) that region, so a conv's output
+    // is exact wherever its 3x3 inputs are, and the stale values outside the region reach in by at most the receptive
+    // field. Pixels outside it keep the input image.
+    const std::uint8_t* act[3] = {};   // full, half, quarter res
+    DevBuf<std::uint8_t> dAct;
+    if (in.active && in.ah == (H + kB - 1) / kB && in.aw == (W + kB - 1) / kB) {
+        const int rf = rf_of(*m);
+        const int db = (rf + kB - 1) / kB;
+        const int fh = (Hp + kB - 1) / kB, fw = (Wp + kB - 1) / kB, hh = (Hh + kB - 1) / kB, hw = (Wh + kB - 1) / kB,
+                  qh = (Hq + kB - 1) / kB, qw = (Wq + kB - 1) / kB;
+        std::vector<std::uint8_t> a((size_t)fh * fw + (size_t)hh * hw + (size_t)qh * qw, 0), t((size_t)fh * fw, 0);
+        for (int y = 0; y < fh; ++y)   // horizontal then vertical max over +-db blocks
+            for (int x = 0; x < fw; ++x) {
+                std::uint8_t v = 0;
+                for (int k = std::max(0, x - db); !v && k <= std::min(in.aw - 1, x + db); ++k) v = y < in.ah && in.active[(size_t)y * in.aw + k];
+                t[(size_t)y * fw + x] = v;
+            }
+        std::size_t nact = 0;
+        for (int y = 0; y < fh; ++y)
+            for (int x = 0; x < fw; ++x) {
+                std::uint8_t v = 0;
+                for (int k = std::max(0, y - db); !v && k <= std::min(fh - 1, y + db); ++k) v = t[(size_t)k * fw + x];
+                a[(size_t)y * fw + x] = v;
+                nact += v;
+                if (v) {
+                    a[(size_t)fh * fw + (size_t)std::min(hh - 1, y / 2) * hw + std::min(hw - 1, x / 2)] = 1;
+                    a[(size_t)fh * fw + (size_t)hh * hw + (size_t)std::min(qh - 1, y / 4) * qw + std::min(qw - 1, x / 4)] = 1;
+                }
+            }
+        if (nact < (size_t)fh * fw) {
+            if (!dAct.alloc(a.size())) { std::fprintf(stderr, "gpu_enh: device allocation failed\n"); return false; }
+            HIP_TRY(hipMemcpy(dAct.p, a.data(), a.size(), hipMemcpyHostToDevice));
+            HIP_TRY(hipMemcpy(dout.p, dimg.p, npx * 3, hipMemcpyDeviceToDevice));
+            act[0] = dAct.p; act[1] = dAct.p + (size_t)fh * fw; act[2] = act[1] + (size_t)hh * hw;
+        }
+        if (const char* e = std::getenv("CS_GPU_PROF"); e && e[0] == '1')
+            std::fprintf(stderr, "[gpu-prof] gpu_enh: %.0f%% of the blocks active (receptive field %d px)\n",
+                100.0 * nact / ((double)fh * fw), rf);
+    }
     const float* gk = m->fbuf.p + m->conv.back().b + m->conv.back().cout_p;   // Gaussian taps (after the last bias)
     auto grid = [](size_t n) { return dim3((unsigned)((n + kE - 1) / kE)); };
     if (lr) {
@@ -367,6 +453,7 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
         P.Wt = m->hbuf.p + cv.w; P.bias = m->fbuf.p + cv.b; P.RES = RES; P.OUT = OUT; P.COUT = cv.cout_p;
         P.mode = mode; P.relu = relu; P.img = dimg.p; P.out8 = dout.p; P.H = H; P.W = W;
         P.ia = ia; P.ib = ib; P.ob = ob; P.rb = rb; P.y0 = y0; P.ny = ny;
+        P.act = P.OH == Hp ? act[0] : P.OH == Hh ? act[1] : act[2];
         return launch_conv(CA + CB, cv.cout_p / 16, S, P);
     };
     auto full = [&](int li, const half_t* A, int CA, const half_t* B, int CB, int IH, int IW, int S, half_t* OUT,
@@ -384,7 +471,7 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
     };
     const int L_e0 = 1, L_down1 = L_e0 + 2 * bk[0], L_e1 = L_down1 + 1, L_down2 = L_e1 + 2 * bk[1], L_mid = L_down2 + 1,
               L_up2 = L_mid + 2 * bk[2], L_fuse1 = L_up2 + 1, L_d1 = L_fuse1 + 1, L_up1 = L_d1 + 2 * bk[1],
-              L_fuse0 = L_up1 + 1, L_tail = L_fuse0 + 1;
+              L_fuse0 = L_up1 + 1, L_d0 = L_fuse0 + 1, L_tail = L_d0 + 2 * nd0;
     if (L_tail + 1 != (int)m->conv.size()) return false;
     // rows b0 - h .. b1 + h - 1 of the padded image, clipped
     auto win = [&](int b0, int b1, int h, int& r0, int& r1) { r0 = std::max(0, b0 - h); r1 = std::min(Hp, b1 + h); };
@@ -395,7 +482,7 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
         int x0, x1;
         win(b0, b1, hA, x0, x1);
         k_input<<<grid((size_t)(x1 - x0) * Wp), kE>>>(dimg.p, H, W, Hp, Wp, dD.p, lr ? dM.p : nullptr,
-            lr && in.y_samp ? dS.p : nullptr, in.h, in.w, m->nx, X.p, x0, x1 - x0);
+            lr && in.y_samp ? dS.p : nullptr, in.h, in.w, m->nx, chroma, X.p, x0, x1 - x0);
         if (in.n_anchors > 0)
             k_anchors<<<grid((size_t)in.n_anchors), kE>>>(dA.p, in.n_anchors, dimg.p, H, W, Wp, X.p, x0, x1 - x0);
         // conv l of the chain (head = 1) leaves halo hA - l; the last one writes rows b0 .. b1 - 1 of S0
@@ -430,16 +517,28 @@ bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
     ok = ok && full(L_fuse1, freeh[0], 2 * c, s1, 2 * c, Hh, Wh, 1, freeh[1], nullptr, 0, 1);                // fuse1 -> D
     half_t* d = ok ? resblocks(L_d1, bk[1], freeh[1], freeh[0], freeh[2], 2 * c, Hh, Wh) : nullptr;         // d1
     ok = d != nullptr;
-    // Stage B: up1 (half-res rows -> U1 row pairs), fuse0 with S0, tail per band
+    // Stage B: up1 (half-res rows -> U1 row pairs), fuse0 with S0, d0's blocks, tail per band. Each d0 conv eats one
+    // halo row, so fuse0 writes rows b0 - 1 - 2 d0 .. b1 + 2 d0 (ReLU'd when d0 follows) and up1 one more.
     for (int b0 = 0; ok && b0 < Hp; b0 += BR) {
         const int b1 = std::min(Hp, b0 + BR);
         int v0, v1, u0, u1;
-        win(b0, b1, 1, v0, v1);
-        win(b0, b1, 2, u0, u1);
+        int h = 1 + 2 * nd0;
+        win(b0, b1, h, v0, v1);
+        win(b0, b1, h + 1, u0, u1);
         u0 &= ~1; u1 = std::min(Hp, (u1 + 1) & ~1);
         ok = conv(L_up1, d, 2 * c, 0, nullptr, 0, 0, Hh, Wh, 1, F[0].p, u0, nullptr, 0, 1, 1, u0 / 2, (u1 - u0) / 2);     // up1 -> U1
-        ok = ok && conv(L_fuse0, F[0].p, c, u0, S0.p, c, 0, Hp, Wp, 1, F[1].p, v0, nullptr, 0, 0, 0, v0, v1 - v0);     // fuse0 -> V
-        ok = ok && conv(L_tail, F[1].p, c, v0, nullptr, 0, 0, Hp, Wp, 1, nullptr, 0, nullptr, 0, 2, 0, b0, b1 - b0);  // tail -> 8-bit
+        ok = ok && conv(L_fuse0, F[0].p, c, u0, S0.p, c, 0, Hp, Wp, 1, F[1].p, v0, nullptr, 0, 0, nd0 > 0, v0, v1 - v0); // fuse0 -> V
+        half_t* cur = F[1].p; half_t* tmp = F[2].p; half_t* alt = F[0].p;   // U1 is dead once V exists
+        int cb = v0;
+        for (int i = 0; ok && i < nd0; ++i) {                                                        // d0
+            int t0_, t1_, r0, r1;
+            win(b0, b1, --h, t0_, t1_);
+            ok = conv(L_d0 + 2 * i, cur, c, cb, nullptr, 0, 0, Hp, Wp, 1, tmp, t0_, nullptr, 0, 0, 1, t0_, t1_ - t0_);
+            win(b0, b1, --h, r0, r1);
+            ok = ok && conv(L_d0 + 2 * i + 1, tmp, c, t0_, nullptr, 0, 0, Hp, Wp, 1, alt, r0, cur, cb, 0, 0, r0, r1 - r0);
+            std::swap(cur, alt); cb = r0;
+        }
+        ok = ok && conv(L_tail, cur, c, cb, nullptr, 0, 0, Hp, Wp, 1, nullptr, 0, nullptr, 0, 2, 0, b0, b1 - b0);     // tail -> 8-bit
     }
     if (!ok) return false;
     HIP_TRY(hipGetLastError());

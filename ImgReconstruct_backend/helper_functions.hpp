@@ -554,8 +554,11 @@ struct CsAnchorPlan {
 
 /** @brief closed-loop block choice: flag the worst 5% of 16x16 blocks by
 MSE between the original and a decode of its container (same size, BGR
-8-bit). Empty Mat when the inputs mismatch or are smaller than a block. */
-cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr);
+8-bit), or more when `count` anchors would fill them past 74% (production's
+fill: 450k anchors on 5% of a 12.2 MP photo's blocks), so the share grows
+with the count (--hr-scale). Empty Mat when the inputs mismatch or are
+smaller than a block. */
+cv::Mat cs_error_anchor_flags(const cv::Mat& orig_bgr, const cv::Mat& dec_bgr, int count = 0);
 
 /** @brief plaintext mode-19 anchor payload:
 [u32 K][u16 block][u32 W][u32 H][u32 L][L bytes PNG of flags][K luma bytes].

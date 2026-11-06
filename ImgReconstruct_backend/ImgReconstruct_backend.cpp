@@ -4,6 +4,7 @@
 #include "photo_upscaler.hpp"
 #include "cs_dict.hpp"
 #include "quality_utils.hpp"
+#include "enh_net.hpp"
 #include "cs_gpu.h"
 #ifdef CS_GPU_TILES
 #include "gpu_tiles.h"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <string>
@@ -34,6 +36,7 @@ void print_usage(const char* exe) {
         "Usage:\n"
         "  " << exe << " encrypt <input.png> <output.png> [options]\n"
         "  " << exe << " decrypt <input.png> <output.png> [options]\n"
+        "  " << exe << " encrypt|decrypt @<pairs.tsv> [options]   (batch: one 'input<TAB>output' per line, one process)\n"
         "  " << exe << " roundtrip <input.png> <output.png> [options]\n"
         "  " << exe << " compare <original.png> <decrypted.png> <out_prefix> [options]\n"
   "  " << exe << " train-dict <out.csd2> <img1.png> [img2.png ...] [atoms=N] [iters=N] [pairs=N]\n"
@@ -249,11 +252,20 @@ void print_usage(const char* exe) {
         "                        trailing payload (BGR mode 4, ycc420 mode 9;\n"
         "                        uniform sampling + 8-bit samples only; decrypt\n"
         "                        applies them as exact luma replacements)\n"
+        "  --hr-area             encrypt only: --hr-detail K is per 4032x3024\n"
+        "                        (12.2 MP); other sizes get K x their area /\n"
+        "                        12.2 MP (same anchor density). Off: K at any size\n"
+        "  --hr-scale <m>        encrypt only: multiply the --hr-detail anchor\n"
+        "                        count by m (0..16, default 1; the container\n"
+        "                        grows or shrinks with the anchors)\n"
   "  --sample-bits <L[,C]> bits for luma and optional chroma, each [1, 8]\n"
   "                        (one value applies to both; default 8; lower values shrink\n"
   "                        the container near-linearly at the cost of\n"
   "                        quantization noise; encrypt/roundtrip only;\n"
   "                        decrypt auto-detects from the header)\n"
+  "                        --seg-auto --ycc420 --hr-detail defaults to 6-bit luma /\n"
+  "                        8-bit chroma at the byte budget of 8-bit --ratio (~1.2x the\n"
+  "                        samples, capped at full sampling); --sample-bits 8 keeps 8-bit\n"
         "  --adaptive            encrypt with LOD-based adaptive sampling: each\n"
         "                        tile gets an 8-bit detail score shipped in the\n"
         "                        container; sample budget splits by score so\n"
@@ -340,6 +352,18 @@ void print_usage(const char* exe) {
   "                        |Laplacian|), rates weighted per level inside the\n"
   "                        class budget; --ratio is the luma sample budget\n"
   "                        (same as --adaptive at that ratio, not a rate scale).\n"
+  "  --multiscale <plan>   encrypt only: multi-scale container (mode 20), each\n"
+  "                        120 px tile at its own scale 2x..6x; plan = 8-bit\n"
+  "                        BGR PNG at the tile grid, channel 0 the scale,\n"
+  "                        channel 1 the tile's luma rate x 255 (decrypt needs\n"
+  "                        no flag). \"auto\": the encoder plans it for the\n"
+  "                        budget of a production container at --ratio.\n"
+  "  --ms-coarse <a>       encrypt only, with --multiscale auto: push tiles to the\n"
+  "                        coarse scales (0..1, default 0 = the plain plan). The\n"
+  "                        plan's coarseness (area mean of log(s/2)/log 3: 0 all\n"
+  "                        2x, 1 all 6x) moves the fraction a of the way from the\n"
+  "                        plain plan's to all-6x, at the same budget; the tiles\n"
+  "                        that lose the least predicted error go first.\n"
   "  --seg-blend <w>       encrypt/roundtrip only, needs --seg-mask or --seg-auto: sample\n"
   "                        a <w>-pixel band (0..128, 0 = off) on each\n"
   "                        side of every segment frontier with a smooth local\n"
@@ -631,14 +655,16 @@ int main(int argc, char* argv[])
         return run_compare(argv[2], argv[3], argv[4], amp);
     }
 
-    if (argc < 4) {
+    // encrypt / decrypt @<pairs.tsv>: a batch of jobs in this process (no output path argument)
+    const bool batch = (mode == "decrypt" || mode == "encrypt") && argc >= 3 && argv[2][0] == '@';
+    if (argc < (batch ? 3 : 4)) {
         std::cerr << "Error: missing input/output paths" << std::endl;
         print_usage(argv[0]);
         return 64;
     }
 
     const std::string input = argv[2];
-    const std::string output = argv[3];
+    const std::string output = batch ? std::string() : argv[3];
 
     std::string password;
     bool have_password = false;
@@ -660,6 +686,7 @@ int main(int argc, char* argv[])
     bool ycc422 = false;
     bool hf_focus = false;
     int hr_detail = 0;
+    float hr_scale = 1.0f;
     int adaptive_floor = 32;    float adaptive_strength = 0.5f;
     float adaptive_gamma = 1.0f;
     int adaptive_cutoff = 0;
@@ -671,6 +698,8 @@ int main(int argc, char* argv[])
     float region_blend = 0.5f;
     float lod_smooth = 0.0f;
     std::string seg_mask;
+    std::string multiscale_plan;
+    float ms_coarse = 0.0f;
     std::string seg_rates;
     int seg_blend = 0;
     std::string sampling = "points";
@@ -684,6 +713,7 @@ int main(int argc, char* argv[])
     bool full_res = false;
     int sample_bits = 8;
     int chroma_sample_bits = 8;
+    bool sample_bits_set = false;
     std::string solver_name = "fista";
     int solver = CS_SOLVER_FISTA;
     int fista_iters = 0;
@@ -760,6 +790,7 @@ int main(int argc, char* argv[])
         }},
         // post-pipeline restoration CNN (decrypt-side only, ycc containers)
         {"--enhance", "ONNX model path", false, [&](const char* v) { photo_up.enhance_model = v; return true; }},
+        {"--enhance2", "ONNX model path", false, [&](const char* v) { photo_up.enhance2_model = v; return true; }},
         // weights below do NOT force manual mode: AUTO still derives
         // coef/iterations from the container ratio; only the weight changes
         {"--tv", "floating point", false, [&](const char* v) { return set_float(v, tv_lambda, nullptr, nullptr); }},
@@ -823,6 +854,10 @@ int main(int argc, char* argv[])
         {"--ycc422", nullptr, false, [&](const char*) { ycc422 = true; return true; }},
         {"--hf-focus", nullptr, false, [&](const char*) { hf_focus = true; return true; }},
         {"--hr-detail", "integer", false, [&](const char* v) { return set_int(v, hr_detail, nullptr, nullptr); }},
+        {"--hr-area", nullptr, false, [&](const char*) { cs_set_hr_area_scaling(true); return true; }},
+        {"--hr-scale", "floating point in [0,16]", false, [&](const char* v) {
+            return set_float(v, hr_scale, [](float x) { return x < 0.0f || x > 16.0f; }, "Error: --hr-scale must be in [0, 16]");
+        }},
         {"--adaptive", nullptr, false, [&](const char*) { adaptive = true; return true; }},
         {"--adaptive-floor", "integer", false, [&](const char* v) {
             return set_int(v, adaptive_floor, [](int x) { return x < 0 || x > 255; }, "Error: --adaptive-floor must be in [0, 255]");
@@ -852,6 +887,10 @@ int main(int argc, char* argv[])
             return set_float(v, lod_smooth, [](float x) { return x < 0.0f || x > 8.0f; }, "Error: --lod-smooth must be in [0, 8]");
         }},
         {"--seg-mask", "label/color mask PNG path", false, [&](const char* v) { seg_mask = v; return true; }},
+        {"--multiscale", "plan PNG path", false, [&](const char* v) { multiscale_plan = v; return true; }},
+        {"--ms-coarse", "floating point in [0,1]", false, [&](const char* v) {
+            return set_float(v, ms_coarse, [](float x) { return x < 0.0f || x > 1.0f; }, "Error: --ms-coarse must be in [0, 1]");
+        }},
         {"--seg-rates", "comma-separated per-class rates", false, [&](const char* v) { seg_rates = v; return true; }},
         {"--seg-blend", "boundary blend width in pixels", false, [&](const char* v) {
             return set_int_strict(v, seg_blend, "Error: --seg-blend needs an integer in [0, 128]");
@@ -871,6 +910,7 @@ int main(int argc, char* argv[])
         {"--sample-split", "output prefix", false, [&](const char* v) { sample_split = v; return true; }},
         {"--sample-bits", "L or L,C, each integer in [1, 8]", false, [&](const char* v) {
             const std::string arg(v);
+            sample_bits_set = true;
             const size_t comma = arg.find(',');
             const std::string luma = arg.substr(0, comma);
             if (!parse_int(luma.c_str(), sample_bits)) return false;
@@ -936,7 +976,7 @@ int main(int argc, char* argv[])
         }},
     };
 
-    for (int i = 4; i < argc; i++) {
+    for (int i = batch ? 3 : 4; i < argc; i++) {
         const std::string a = argv[i];
         const Opt* opt = nullptr;
         for (const Opt& candidate : opts) {
@@ -1065,6 +1105,8 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: --hf-focus is encrypt-side only; ignoring for decrypt" << std::endl;
         hf_focus = false;
     }
+    if (hr_scale != 1.0f && hr_detail > 0)   // --hr-scale: the anchor count x m (the encoder then scales it by area)
+        hr_detail = (int)std::lround((double)hr_detail * hr_scale);
     if (hr_detail != 0 && mode != "encrypt" && mode != "roundtrip") {
         std::cerr << "Warning: --hr-detail is encrypt-side only; ignoring for decrypt" << std::endl;
         hr_detail = 0;
@@ -1080,7 +1122,7 @@ int main(int argc, char* argv[])
     // On encrypt, --enhance only feeds the closed-loop anchor pass (seg + ycc420 + hr-detail): the
     // blocks are ranked by the error left after the net the container will be decoded with.
     if (!photo_up.enhance_model.empty() && mode != "decrypt" && mode != "roundtrip" &&
-        !(hr_detail > 0 && seg_auto > 0 && ycc420)) {
+        !(hr_detail > 0 && ((seg_auto > 0 && ycc420) || !multiscale_plan.empty()))) {
         std::cerr << "Warning: --enhance on encrypt needs --seg-auto + --ycc420 + --hr-detail (anchor ranking); ignoring" << std::endl;
         photo_up.enhance_model.clear();
     }
@@ -1172,13 +1214,35 @@ int main(int argc, char* argv[])
         // the LOD-luma variant of the split container instead.
         const bool use_adaptive = adaptive || two_pass || spectral || !regions_json.empty() || lod_smooth > 0.0f || lod_full > 0;
         const int periodic_tile_arg = (use_adaptive || periodic) ? tile_size : 0;
-        if (mode == "encrypt") {
+        // Batch (encrypt / decrypt @<pairs.tsv>): one process for the whole list, so HIP start-up, kernel loads and
+        // the --enhance weights happen once. A failed job is reported and the batch goes on; rc = 1 if any failed.
+        std::vector<std::pair<std::string, std::string>> jobs;
+        if (batch) {
+            std::ifstream lf(input.substr(1));
+            if (!lf) { std::cerr << "Error: cannot read batch list '" << input.substr(1) << "'" << std::endl; return 64; }
+            for (std::string line; std::getline(lf, line);) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                const size_t tab = line.find('\t');
+                if (tab == std::string::npos) { std::cerr << "Error: batch line without a tab: " << line << std::endl; return 64; }
+                jobs.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+            }
+        }
+        const auto batch_line = [&](size_t j, int r, std::chrono::high_resolution_clock::time_point tj) {
+            if (r != 0) std::cerr << "Error: job failed: " << jobs[j].first << std::endl;
+            std::cout << "[batch] " << (j + 1) << "/" << jobs.size() << " " << jobs[j].second << " " <<
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - tj).count() << " ms" << std::endl;
+        };
+        if (mode == "encrypt" && !multiscale_plan.empty() && batch) {
+            std::cerr << "Error: --multiscale takes one input, not a batch" << std::endl; return 64;
+        }
+        else if (mode == "encrypt") {
             // --seg-auto + --ycc420 + --hr-detail: the encoder decodes its own
             // anchor-free container (cs-sr + PnP-ADMM, tv 0, --fast settings: it
             // only ranks 16x16 blocks by error, after the --enhance net when given) in
             // memory, then anchors the worst blocks. Flag map and anchor luma ride in the container.
             std::function<cv::Mat(const cv::Mat&)> anchor_decode;
-            if (hr_detail > 0 && seg_auto > 0 && ycc420) {
+            if (hr_detail > 0 && ((seg_auto > 0 && ycc420) || !multiscale_plan.empty())) {
                 anchor_decode = [&](const cv::Mat& container) {
                     CsPhotoUpscalerOptions pass_up = photo_up;
                     pass_up.backend = "cs-sr";
@@ -1197,11 +1261,50 @@ int main(int argc, char* argv[])
             struct JoinedThread { std::thread t; ~JoinedThread() { if (t.joinable()) t.join(); } } gpu_warm;
             if (anchor_decode && std::getenv("CS_GPU_TILES")) gpu_warm.t = std::thread(gpu_tiles::warmup);
 #endif
-            rc = encrypt_image::encrypt_image_tiled(input,
-output, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask,
-full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus, sample_bits,
+            if (!batch) jobs.emplace_back(input, output);
+            int failed = 0;
+            if (!multiscale_plan.empty()) { rc = cs_encrypt_multiscale(input, output, password, multiscale_plan, hr_detail, anchor_decode, ratio, ms_coarse); jobs.clear(); }
+            for (size_t j = 0; j < jobs.size(); ++j) {
+                const auto tj = std::chrono::high_resolution_clock::now();
+                const int r = encrypt_image::encrypt_image_tiled(jobs[j].first,
+jobs[j].second, password, ratio, periodic_tile_arg, nullptr, use_adaptive, adaptive_floor, adaptive_strength, show_mask && !batch,
+full_res, two_pass, pilot_ratio, regions_json, region_blend, lod_smooth, ycc420, hf_focus,
+(anchor_decode && !sample_bits_set) ? 0 : sample_bits,   // 0 = default 6-bit luma of the anchored seg-auto format
 chroma_sample_bits, lod_full, ycc422, spectral, sample_split, hr_detail, adaptive_gamma, adaptive_cutoff, seg_mask,
 seg_rates, seg_blend, sampling, seg_auto, seg_edge, seg_tile, anchor_decode);
+                if (!batch) { rc = r; break; }
+                failed += r != 0;
+                batch_line(j, r, tj);
+            }
+            if (batch) rc = failed ? 1 : 0;
+        }
+        else if (batch) {
+            // A side thread reads the next container while the current one decodes.
+            struct JoinedThread { std::thread t; ~JoinedThread() { if (t.joinable()) t.join(); } } gpu_warm, enh_pre;
+#ifdef CS_GPU_TILES
+            if (std::getenv("CS_GPU_TILES")) gpu_warm.t = std::thread(gpu_tiles::warmup);
+            if (!photo_up.enhance_model.empty())
+                enh_pre.t = std::thread([&photo_up] {
+                    cs_enhance_prefetch(photo_up.enhance_model);
+                    if (!photo_up.enhance2_model.empty()) cs_enhance_prefetch(photo_up.enhance2_model);
+                });
+#endif
+            cv::Mat next;
+            if (!jobs.empty()) next = cv::imread(jobs[0].first, cv::IMREAD_COLOR);
+            int failed = 0;
+            for (size_t j = 0; j < jobs.size(); ++j) {
+                const auto tj = std::chrono::high_resolution_clock::now();
+                cv::Mat cur = std::move(next);
+                std::thread reader;
+                if (j + 1 < jobs.size()) reader = std::thread([&next, &jobs, j] { next = cv::imread(jobs[j + 1].first, cv::IMREAD_COLOR); });
+                if (gpu_warm.t.joinable()) gpu_warm.t.join();   // the decode's own launches wait for the runtime anyway
+                const int r = cur.empty() ? -1 : decrypt_image::decrypt_image_tiled(cur, jobs[j].second, password,
+                    tiles, overlap, iterations, threads, coef, false, tv_lambda, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params);
+                if (reader.joinable()) reader.join();
+                failed += r != 0;
+                batch_line(j, r, tj);
+            }
+            rc = failed ? 1 : 0;
         }
         else if (mode == "decrypt") {
             rc = decrypt_image::decrypt_image_tiled(input, output, password,

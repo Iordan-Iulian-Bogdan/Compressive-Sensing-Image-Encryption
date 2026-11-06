@@ -98,7 +98,6 @@ def run_group(name, ratio):
             continue
         secs.append(time.time() - t0)
         im = np.asarray(Image.open(out).convert("RGB"))
-        os.remove(out)
         os.remove(out + ".log")
         names.append(v); imgs.append(im); sse.append(blocks_sse(orig, im))
     sse = np.stack(sse)

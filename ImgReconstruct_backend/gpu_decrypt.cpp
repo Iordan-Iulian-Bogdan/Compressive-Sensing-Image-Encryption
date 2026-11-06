@@ -47,7 +47,9 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<v
     #pragma omp parallel for schedule(dynamic, 8)
     for (int k = 0; k < np; ++k) {
         Plane& P = ps[(size_t)k];
-        if (P.rix->empty() || P.rows < 1 || P.cols < 1) continue;
+        // A plane without samples (a multi-scale layer's tiles of other scales) gets the flat fill and an empty
+        // problem, so it does not push its tile, and with it the whole layer, off the flat GPU path.
+        if (P.rows < 1 || P.cols < 1) continue;
         cs_point_sample_fill(*P.meas, P.ch, P.rows, P.cols, *P.rix, *P.riy, P.b, P.x);
         cv::Mat X(P.rows, P.cols, CV_32F, P.x.data());
         cs_dct_forward(X, 0);   // P.x now holds the coefficients

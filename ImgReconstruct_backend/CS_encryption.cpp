@@ -448,6 +448,21 @@ cv::Mat cs_segmask_density(const cv::Mat& labels,
     return density;
 }
 
+cv::Mat cs_seg_chroma_support(const cv::Mat& labels, const std::vector<uint8_t>& rates_q, int mode) {
+    if (labels.empty() || labels.type() != CV_8U)
+        throw std::runtime_error("chroma support: invalid label map");
+    int crows, ccols;
+    cs_chroma_dims(mode, labels.rows, labels.cols, crows, ccols);
+    cv::Mat sup = cv::Mat::zeros(crows, ccols, CV_8U);
+    for (int y = 0; y < labels.rows; ++y) {
+        const uint8_t* l = labels.ptr<uint8_t>(y);
+        uint8_t* s = sup.ptr<uint8_t>((std::min)(crows - 1, (int)((long long)y * crows / labels.rows)));
+        for (int x = 0; x < labels.cols; ++x)
+            if (l[x] < rates_q.size() && rates_q[l[x]] > 0) s[(std::min)(ccols - 1, (int)((long long)x * ccols / labels.cols))] = 255;
+    }
+    return sup;
+}
+
 void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
     const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32],
     int seg_blend, bool smooth_blend)
@@ -606,13 +621,37 @@ void CSencryption::returnYcc420ChromaIndices(int xm, int ym, int m_luma, const u
     cs_ycc420_channel_key(key, CS_YCC420_TAG_CR, key_cr);
     cs_ycc420_channel_key(key, CS_YCC420_TAG_CB, key_cb);
 
+    // Seg prefix version 2: partial Fisher-Yates over the support pixels (raster order) from the plane's key.
+    std::vector<int> pool;
+    if (!chroma_support.empty()) {
+        if (chroma_support.rows != crows || chroma_support.cols != ccols || chroma_support.type() != CV_8U)
+            throw std::runtime_error("chroma support: geometry mismatch (internal error)");
+        for (int r = 0; r < crows; ++r) {
+            const uint8_t* s = chroma_support.ptr<uint8_t>(r);
+            for (int c = 0; c < ccols; ++c) if (s[c]) pool.push_back(r * ccols + c);
+        }
+        if ((int)pool.size() < m_chroma) throw std::runtime_error("chroma support smaller than the chroma count");
+    }
+    const auto draw = [&](std::vector<int>& rx, std::vector<int>& ry, const uint8_t* k) {
+        if (pool.empty()) { returnRandomIndices(rx, ry, crows, ccols, m_chroma, k); return; }
+        std::vector<int> p(pool);
+        std::seed_seq seq(k, k + 32);
+        std::mt19937 gen(seq);
+        for (int i = 0; i < m_chroma; ++i) {
+            std::uniform_int_distribution<size_t> pick((size_t)i, p.size() - 1);
+            std::swap(p[(size_t)i], p[pick(gen)]);
+            rx[(size_t)i] = p[(size_t)i] / ccols;
+            ry[(size_t)i] = p[(size_t)i] % ccols;
+        }
+    };
+
     // the two planes draw from independent keys: Cb on a second thread
     std::exception_ptr cb_error;
     std::thread cb([&] {
-        try { returnRandomIndices(ri_cx2, ri_cy2, crows, ccols, m_chroma, key_cb); }
+        try { draw(ri_cx2, ri_cy2, key_cb); }
         catch (...) { cb_error = std::current_exception(); }
     });
-    try { returnRandomIndices(ri_cx1, ri_cy1, crows, ccols, m_chroma, key_cr); }
+    try { draw(ri_cx1, ri_cy1, key_cr); }
     catch (...) { cb.join(); throw; }
     cb.join();
     if (cb_error) std::rethrow_exception(cb_error);

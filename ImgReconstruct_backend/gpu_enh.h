@@ -17,8 +17,11 @@ std::string weights_path(const std::string& onnx_model);
 // prefetches them on a side thread, cs_enhance_prefetch).
 bool load(const std::string& weights_file);
 
-// Extra input planes of the loaded model (3 or 5), 0 when none is loaded.
+// Extra input planes of the loaded model (3, 5 or 9), 0 when none is loaded.
 int extra_planes();
+
+// Receptive-field radius in full-res px of the loaded model (an upper bound, see Inputs::active), 0 when none is loaded.
+int receptive_field();
 
 // One full-res luma anchor; the layout of CsHrSample (crypto_utils.hpp).
 struct Anchor { std::uint32_t idx; std::uint8_t y; };
@@ -31,6 +34,16 @@ struct Inputs {
     int h, w;
     const Anchor* anchors;              // full-res anchors (idx = row * W + col), may be null
     int n_anchors;
+    const std::uint8_t* cr_mask;        // ch x cw chroma sample masks / values (output / 4), null = none (9-plane nets)
+    const std::uint8_t* cr_samp;
+    const std::uint8_t* cb_mask;
+    const std::uint8_t* cb_samp;
+    int ch, cw;
+    // ah x aw flags of the 8 x 8 output blocks the caller reads (ah = ceil(H / 8), aw = ceil(W / 8)), null = all.
+    // Those blocks come out exactly as without it (the convs run on them dilated by the net's receptive field); the
+    // others are left as the input image.
+    const std::uint8_t* active = nullptr;
+    int ah = 0, aw = 0;
 };
 
 // Runs the loaded model on one image and writes the enhanced H x W x 3 BGR bytes to out_bgr (host; may alias
