@@ -1,0 +1,2 @@
+# No third-party dependencies — stdlib only (urllib, smtplib, json).
+# Python 3.10+ recommended. Nothing to install.

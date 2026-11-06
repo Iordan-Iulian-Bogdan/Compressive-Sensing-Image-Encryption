@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Slow Tab Refresher",
+  "version": "1.0.0",
+  "description": "Reloads matching tabs one at a time with a delay between each, so throttled sites can keep up.",
+  "permissions": ["tabs", "alarms", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Slow Tab Refresher"
+  }
+}

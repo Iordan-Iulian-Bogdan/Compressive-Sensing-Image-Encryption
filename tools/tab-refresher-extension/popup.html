@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 280px; font: 13px/1.4 system-ui, sans-serif; margin: 12px; }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  label { display: block; margin: 6px 0; }
+  input[type="text"] { width: 100%; box-sizing: border-box; }
+  input[type="number"] { width: 70px; }
+  .row { display: flex; gap: 8px; margin: 8px 0; }
+  button { flex: 1; padding: 6px; }
+  #status { min-height: 2.5em; margin: 8px 0 4px; }
+  progress { width: 100%; }
+  #log { padding-left: 18px; margin: 6px 0 0; max-height: 140px; overflow-y: auto; }
+  #log li { font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Slow Tab Refresher</h1>
+  <label>URL contains <input id="match" type="text" value="nhentai.net"></label>
+  <div class="row">
+    <label>Delay (s) <input id="delay" type="number" min="1" max="3600" value="10"></label>
+    <label>Cycles <input id="cycles" type="number" min="1" max="100" value="1"></label>
+  </div>
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+  <p id="status">Idle.</p>
+  <progress id="progress" max="1" value="0"></progress>
+  <ul id="log"></ul>
+  <script src="popup.js"></script>
+</body>
+</html>
