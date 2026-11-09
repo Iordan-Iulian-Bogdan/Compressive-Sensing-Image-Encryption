@@ -343,6 +343,23 @@ bool load(const std::string& path) {
     return true;
 }
 
+void reserve(int H, int W) {
+    int c = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_cur) c = g_cur->c;
+    }
+    const size_t nh = (size_t)((H + 3) / 4 * 2) * (size_t)((W + 3) / 4 * 2);
+    const size_t one = nh * 2 * (size_t)c * sizeof(half_t);   // one of the four half-res buffers of run()
+    if (c == 0 || 4 * one <= ((size_t)512 << 20)) return;
+    // One block per buffer (a piece must fit a block), a short pause after each as gpu_tiles::warmup: one hipMalloc
+    // holds the runtime lock
+    for (int i = 0; i < 4; ++i) {
+        gpu_common::arena_reserve((one + 255) & ~(size_t)255);
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+}
+
 bool run(const Inputs& in, std::uint8_t* out_bgr, double* ms) {
     Model* m = g_cur;
     if (!m || !in.bgr || in.H < 2 || in.W < 2) return false;

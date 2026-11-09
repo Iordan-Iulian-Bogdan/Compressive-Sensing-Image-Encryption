@@ -60,7 +60,10 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<v
         if (ps[(size_t)k].prepared)
             groups[std::make_tuple(ps[(size_t)k].inner, ps[(size_t)k].reweights, ps[(size_t)k].wscale)].push_back(k);
     const double t_prep = ms_since(t0);
-    if (on_gpu) on_gpu();
+    // on_gpu runs once, right before the first device work: on the merged path after the host layouts (the caller's
+    // GPU lock then covers the device half only), else before the per-group solves below.
+    bool begun = false;
+    const std::function<void()> begin = [&] { if (!begun) { begun = true; if (on_gpu) on_gpu(); } };
 
     const auto t1 = std::chrono::steady_clock::now();
     bool all = true;
@@ -72,7 +75,7 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<v
             probs.push_back({ P.rows, P.cols, P.b.data(), P.rix->data(), P.riy->data(), (int)P.rix->size(), P.x.data(), P.coef, P.tv });
         std::vector<gpu_tiles::PlaneGroup> pg;
         for (auto& g : groups) pg.push_back({ { std::get<0>(g.first), std::get<1>(g.first), std::get<2>(g.first) }, g.second });
-        if (gpu_tiles::solve_ycc_bgr(probs, pg, ycc_bgr)) {
+        if (gpu_tiles::solve_ycc_bgr(probs, pg, ycc_bgr, begin)) {
             for (Plane& P : ps) P.ok = true;
             *merged = true;
             std::fprintf(stderr, "[%s] phases: prep %.0f ms, gpu + device tail %.0f ms (%zu batches)\n",
@@ -80,6 +83,7 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<v
             return true;
         }
     }
+    begin();
     for (auto& g : groups) {
         std::vector<gpu_tiles::TileProblem> probs;
         probs.reserve(g.second.size());

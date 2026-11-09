@@ -370,9 +370,24 @@ struct Batch {
     std::vector<TileDev> td;
     std::vector<float> table, hX;
     DevBuf<TileDev> dtd; DevBuf<float> dtab, dX, db, dLAM, dWS, dW; DevBuf<int> drix, driy, dst, dso;
+    // host arrays build_host fills and upload copies to the device
+    std::vector<float> hb, lam;
+    std::vector<int> hrix, hriy, hst, so;
+    bool lean = false;
+    double layout_ms = 0.0;   // build_host's wall time
 
+    // build_host + upload (the two halves solve_ycc_bgr runs apart: the host half off the GPU lock)
+    bool build(const std::vector<TileProblem>& tiles, float wscale, PhaseProf& pp, bool lean_) {
+        if (!build_host(tiles, lean_)) return false;
+        pp.mark_sub(0);
+        return upload(wscale, pp);
+    }
+
+    // Host half: layout, tables, packed samples. Touches no device state.
     // lean (fused kernel): samples as one packed index each (in drix), no per-sample tile ids and no W / WS arrays
-    bool build(const std::vector<TileProblem>& tiles, float wscale, PhaseProf& pp, bool lean) {
+    bool build_host(const std::vector<TileProblem>& tiles, bool lean_) {
+        const auto h0 = std::chrono::steady_clock::now();
+        lean = lean_;
         nt = (int)tiles.size();
         TileLayout lay;
         for (const TileProblem& P : tiles) { lay.add(P.rows, P.cols); total_samples += P.m; }
@@ -391,9 +406,9 @@ struct Batch {
         }
         if (total > 2000000000LL) return false;
         hX.resize((size_t)total);
-        std::vector<float> hb((size_t)total_samples), lam((size_t)nt);
-        std::vector<int> hrix((size_t)total_samples), hriy(lean ? 0 : (size_t)total_samples), hst(lean ? 0 : (size_t)total_samples);
-        std::vector<int> so((size_t)nt + 1, 0);
+        hb.resize((size_t)total_samples); lam.resize((size_t)nt);
+        hrix.resize((size_t)total_samples); hriy.resize(lean ? 0 : (size_t)total_samples); hst.resize(lean ? 0 : (size_t)total_samples);
+        so.assign((size_t)nt + 1, 0);
         for (int t = 0; t < nt; ++t) so[(size_t)t + 1] = so[(size_t)t] + tiles[(size_t)t].m;
         parallel_for(nt, [&](int t) {
             const TileProblem& P = tiles[(size_t)t];
@@ -413,7 +428,12 @@ struct Batch {
                 }
             lam[(size_t)t] = P.lambda;
         });
-        pp.mark_sub(0);
+        layout_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+        return true;
+    }
+
+    // Device half: allocation, copies, and (not lean) the W / WS initialisation.
+    bool upload(float wscale, PhaseProf& pp) {
         const size_t ns = (size_t)std::max(1, total_samples);
         if (!dtd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dX.alloc((size_t)total) || !db.alloc(ns) ||
             !drix.alloc(ns) || !dLAM.alloc((size_t)nt) || !dso.alloc((size_t)nt + 1) ||
@@ -482,8 +502,15 @@ struct Batch {
 struct Kept { DevBuf<float> pix; std::vector<TileDev> td; };
 
 // tv = 0: exact fixed step 1/2 (previous behaviour, unchanged).
-bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm, Kept* keep = nullptr) {
-    PhaseProf pp;
+// The host half of solve_fixed (prepare_fixed) kept for its device half (run_fixed).
+struct FixedPrep {
+    std::unique_ptr<Batch> B;
+    bool fused = false;
+    size_t lds = 0;
+};
+
+// Host half: the fused / unfused choice and the batch's host layout. No device state is touched.
+bool prepare_fixed(const std::vector<TileProblem>& tiles, const Params& prm, FixedPrep& fp, bool keep) {
     // Fused per-tile loop (k_lr_fista; CS_GPU_LR_FUSED=0 keeps the launch-per-step loop) when every tile fits one
     // block: at most kLrThreads 4x4 output blocks, and A + B in 64 KB of LDS.
     size_t lds = 0;
@@ -495,8 +522,20 @@ bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm, Kept*
     const char* ef = std::getenv("CS_GPU_LR_FUSED");
     const bool fused = fit && lds <= 64 * 1024 && !(ef && ef[0] == '0');
     if (keep && !fused) return false;
-    Batch B;
-    if (!B.build(tiles, prm.wscale, pp, fused)) return false;
+    fp.fused = fused;
+    fp.lds = lds;
+    fp.B = std::make_unique<Batch>();
+    return fp.B->build_host(tiles, fused);
+}
+
+// Device half; the batch's device buffers are released on return (as when solve_fixed owned the Batch).
+bool run_fixed(const std::vector<TileProblem>& tiles, const Params& prm, FixedPrep& fp, Kept* keep = nullptr) {
+    PhaseProf pp;
+    pp.sub[0] = fp.B->layout_ms;
+    Batch& B = *fp.B;
+    const bool fused = fp.fused;
+    const size_t lds = fp.lds;
+    if (!B.upload(prm.wscale, pp)) return false;
     const size_t N = (size_t)B.total, bytes = N * sizeof(float);
     DevBuf<float> dY, dXP, dZ, dTMP, dPIX, dSC, dG, dEPS;
     if (!fused && (!dY.alloc(N) || !dXP.alloc(N) || !dZ.alloc(N) || !dTMP.alloc(N) || !dPIX.alloc(N) ||
@@ -553,7 +592,13 @@ bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm, Kept*
     }
     pp.mark(2);
     pp.print(fused ? "fixed (fused)" : "fixed", B.nt, B.max_rows, B.max_cols, B.total, B.total_samples, prm.inner, prm.reweights);
+    fp.B.reset();
     return ok;
+}
+
+bool solve_fixed(const std::vector<TileProblem>& tiles, const Params& prm, Kept* keep = nullptr) {
+    FixedPrep fp;
+    return prepare_fixed(tiles, prm, fp, keep != nullptr) && run_fixed(tiles, prm, fp, keep);
 }
 
 // tv > 0: smoothed-TV term + per-tile backtracking, as cs_fista_core_single (bt branch).
@@ -757,7 +802,8 @@ bool solve_fista_dct(const std::vector<TileProblem>& tiles, const Params& prm) {
     return true;
 }
 
-bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<PlaneGroup>& groups, unsigned char* out) {
+bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<PlaneGroup>& groups, unsigned char* out,
+    const std::function<void()>& gpu_begin) {
     if (planes.empty() || planes.size() % 3 || !available()) return false;
     const int nj = (int)(planes.size() / 3);
     std::vector<MergeDev> md((size_t)nj);
@@ -773,15 +819,22 @@ bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<Pla
     }
     for (const TileProblem& P : planes) if (P.tv > 0.0f) return false;
     if (out_bytes > 2000000000LL) return false;
+    // Host layouts of every group first: they need no device, so the caller can take the GPU lock (gpu_begin) after them.
+    std::vector<std::vector<TileProblem>> gtiles(groups.size());
+    std::vector<long long> gn(groups.size(), 0);
+    std::vector<FixedPrep> prep(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g) {
+        for (int k : groups[g].planes) { gtiles[g].push_back(planes[(size_t)k]); gn[g] += (long long)planes[(size_t)k].rows * planes[(size_t)k].cols; }
+        if (!prepare_fixed(gtiles[g], groups[g].prm, prep[g], true)) return false;
+    }
+    if (gpu_begin) gpu_begin();
     DevBuf<std::uint8_t> dOUT;   // first, so the arena reclaims the solves' buffers above it while it stays resident
     if (!dOUT.alloc((size_t)out_bytes)) return false;
     std::vector<Kept> kept(groups.size());
     for (size_t g = 0; g < groups.size(); ++g) {
-        std::vector<TileProblem> tiles;
-        long long n = 0;
-        for (int k : groups[g].planes) { tiles.push_back(planes[(size_t)k]); n += (long long)planes[(size_t)k].rows * planes[(size_t)k].cols; }
-        if (!kept[g].pix.alloc((size_t)n) || !solve_fixed(tiles, groups[g].prm, &kept[g])) return false;
-        (void)hipStreamQuery(nullptr);   // submits this group's launches before the host builds the next group
+        const std::vector<TileProblem>& tiles = gtiles[g];
+        if (!kept[g].pix.alloc((size_t)gn[g]) || !run_fixed(tiles, groups[g].prm, prep[g], &kept[g])) return false;
+        (void)hipStreamQuery(nullptr);   // submits this group's launches before the next group's upload
         for (size_t t = 0; t < tiles.size(); ++t) {
             const int k = groups[g].planes[t];
             MergeDev& M = md[(size_t)k / 3];

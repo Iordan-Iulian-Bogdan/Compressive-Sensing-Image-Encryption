@@ -39,6 +39,15 @@
 // Multi-scale (mode 20) layers decode on threads of their own: this thread's lock, when set, is held from a layer's
 // grid solve through its enhance nets, so the GPU stages run one layer at a time while the others unpack and prep.
 static thread_local std::mutex* t_ms_gpu_lock = nullptr;
+// Its holder: taken by the LR solve right before its device work (cs_ms_gpu_acquire; the host prep and layouts before it
+// run unlocked), released after the enhance nets (cs_ms_gpu_release, also by the guard on every exit of the decode).
+static thread_local std::unique_lock<std::mutex> t_ms_gpu_hold;
+static void cs_ms_gpu_acquire() {
+    if (t_ms_gpu_lock && !t_ms_gpu_hold.owns_lock()) t_ms_gpu_hold = std::unique_lock<std::mutex>(*t_ms_gpu_lock);
+}
+static void cs_ms_gpu_release() {
+    if (t_ms_gpu_hold.owns_lock()) t_ms_gpu_hold.unlock();
+}
 // The layer this thread decodes (scale s of the W x H photo, T px scale map): the enhance nets run only on the 8x8
 // blocks of the layer that the composite reads.
 struct CsMsNeed { const cv::Mat* map; int T, W, H, s; };
@@ -584,6 +593,7 @@ static void decrypt_tiles_ycc420(int num_threads,
         std::vector<char> solved;
         const auto g0 = std::chrono::steady_clock::now();
         cs_gpu_solve_tiles_ycc(jobs, solved, [&] {
+            cs_ms_gpu_acquire();   // a multi-scale layer: the GPU stages from here on run one layer at a time
             if (!bt.empty())
                 sr_prep_thread.t = std::thread([&] {
                     omp_set_num_threads(8);   // a third of the cores: the LR batches' own host work keeps the rest
@@ -601,6 +611,10 @@ static void decrypt_tiles_ycc420(int num_threads,
             for (int j = 0; j < num_tiles; ++j)
                 if (!y_meas[i][j].empty() && !gpu_done[(size_t)i][(size_t)j]) { flat_tiles = false; break; }
     }
+
+    // Normally taken already by the LR solve's on_gpu; without one (no LR jobs, CS_GPU_TILES unset) the layer takes the
+    // GPU lock here, before any cs-sr work.
+    cs_ms_gpu_acquire();
 
     // Batched GPU cs-sr stage: the luma SR of every tile in one GPU pass. The per-tile call below
     // takes the merged BGR tile with the luma container (gray-as-BGR, so the BGR2Y weights
@@ -1114,6 +1128,9 @@ int decrypt_image::decrypt_image_tiled(
                 pu.enhance_model = cs_enhance_pick(pu, bits / ((double)W * H));
             }
             pu.enhance_low_model.clear();
+            CsJoinedThread enh_reserve;   // arena room for the biggest layer's net, while the small layers hold the GPU
+            if (!pu.enhance_model.empty() && std::getenv("CS_GPU_TILES") && layer_of[2] >= 0)
+                enh_reserve.t = std::thread([&] { cs_enhance_reserve(pu.enhance_model, H, W); });
             {
                 std::vector<std::thread> th;
                 for (int i = 0; i < n; ++i)
@@ -1438,7 +1455,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         // The grid solve's per-tile containers (tens of thousands of small buffers) are freed on
         // this thread while the calm pass and the write run; joined when the decode returns.
         CsJoinedThread tile_frees;
-        std::unique_lock<std::mutex> ms_gpu;   // t_ms_gpu_lock, from the grid solve through the enhance nets
+        struct MsGpuGuard { ~MsGpuGuard() { cs_ms_gpu_release(); } } ms_gpu_guard;   // t_ms_gpu_lock, from the grid solve through the enhance nets
         // Automatic per-segment decode: the container carries its label map, so each tile takes a luma
         // coef scaled by its own class's sampled rate (chroma keeps the global coef at 0.5x).
         // CS_NO_SEG_PERCLASS=1 forces the global coef.
@@ -1560,7 +1577,6 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         }
         if (prep_error) std::rethrow_exception(prep_error);
         prof.mark("prep");
-        if (t_ms_gpu_lock && !ms_gpu.owns_lock()) ms_gpu = std::unique_lock<std::mutex>(*t_ms_gpu_lock);
 
         reconstructed = cv::Mat::zeros(rows, cols, CV_8UC3);
 
@@ -1677,7 +1693,7 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
         }
 
         prof.mark("enhance");
-        if (ms_gpu.owns_lock()) ms_gpu.unlock();
+        cs_ms_gpu_release();
         // HR-detail anchors (modes 4/9): exact native-luma replacements on
         // the final composite (see the BGR pipeline above); skipped after the net.
         if (!dimgs.hr_samples.empty() && !reconstructed.empty() && !enhanced && !std::getenv("CS_HR_NO_POSTHOC")) {

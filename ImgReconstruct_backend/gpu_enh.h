@@ -46,6 +46,11 @@ struct Inputs {
     int ah = 0, aw = 0;
 };
 
+// Adds device-arena blocks for a run() on an H x W image when its half-res activations would not fit the arena the
+// warm-up reserved (they otherwise cost a hipMalloc each inside the run). Meant for a side thread while other work
+// holds the GPU. No-op when nothing is loaded or the image is small.
+void reserve(int H, int W);
+
 // Runs the loaded model on one image and writes the enhanced H x W x 3 BGR bytes to out_bgr (host; may alias
 // in.bgr). ms, when given, receives {upload + planes, network, download} in milliseconds. False on a HIP failure or
 // when nothing is loaded; out_bgr is then untouched.

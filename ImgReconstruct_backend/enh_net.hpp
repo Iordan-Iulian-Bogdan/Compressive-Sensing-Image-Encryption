@@ -47,6 +47,11 @@ void cs_enh_project(cv::Mat& bgr, const CsEnhInputs& in);
 decode can do it on a side thread while it unpacks and solves. No-op in the CPU build or with CS_GPU_ENH=0. */
 void cs_enhance_prefetch(const std::string& model_path);
 
+/** @brief GPU build: loads `model_path` and reserves device-arena room for its run on an H x W image (large images
+only), so the multi-scale decode's biggest layer finds its activations in the arena instead of paying hipMalloc under
+the GPU lock. Meant for a side thread. No-op in the CPU build or with CS_GPU_ENH=0. */
+void cs_enhance_reserve(const std::string& model_path, int H, int W);
+
 /** @brief Receptive-field radius (full-res px, upper bound) of the HIP weights of `model_path`; 0 when the HIP path
 is off or they do not load (CsEnhInputs::active is then ignored). */
 int cs_enhance_receptive_field(const std::string& model_path);

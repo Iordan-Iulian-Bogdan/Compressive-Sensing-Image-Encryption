@@ -4,6 +4,7 @@
 // Plain C++ header: callers see no HIP headers. The implementation is in
 // gpu_tiles.hip. All tiles of a call are solved together, one thread block row
 // per tile, so thousands of small tiles keep the device busy.
+#include <functional>
 #include <vector>
 
 namespace gpu_tiles {
@@ -47,6 +48,9 @@ bool solve_fista_dct(const std::vector<TileProblem>& tiles, const Params& p);
 // left in gpu_common's resident slot for the cs-sr stage. Returns false (out untouched) when a plane needs another
 // solver, or on a HIP failure.
 struct PlaneGroup { Params prm; std::vector<int> planes; };
-bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<PlaneGroup>& groups, unsigned char* out);
+// gpu_begin, when set, is called once after the host layouts are built and before anything touches the device (not
+// when the call returns false first), so a caller can take a GPU lock for the device half only.
+bool solve_ycc_bgr(const std::vector<TileProblem>& planes, const std::vector<PlaneGroup>& groups, unsigned char* out,
+    const std::function<void()>& gpu_begin = {});
 
 }  // namespace gpu_tiles

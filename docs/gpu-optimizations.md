@@ -1030,3 +1030,61 @@ helpers as single-scale (`cs_sampling_mask_view`, `cs_present_mask_view`, split 
 The container is unchanged. On `iPhone14Pro_ProRAW48MP` at r0.3 the encode is the same size (5.25 MB, 5 layers),
 and the production decode scores the same as without the flag (34.98 dB, SSIM 0.948, ΔE95 4.21). The mask marks
 36.3% of the grid. The top 12% of the frame (sky, 3x-6x tiles) gets 0.65%.
+
+### 18.7 Arena room for the 2x layer's enhance net (2026-11-09, bit-identical)
+
+Profile of IMG_0620 (24.5 MP, r0.3, production decode, 1.35-1.41 s): the multi-scale layers take `gpu_lock` one after
+another, so the per-layer `profile[ycc] solve` figures include the wait for the lock (the 2x layer's 802 ms was ~300 ms
+of waiting). Time on the GPU per layer (differences of the "layer done" lines): 6x 269 ms, 5x 76, 4x 158, 3x 205, 2x 505.
+
+Inside the 2x layer, `gpu_enh::run` reported `device allocation 33 ms` against 0.0 ms for every other layer and for the
+2x layer's second net. A temporary print in `DevBuf::alloc` showed why: the four half-res activation buffers `Hb`
+(373 MB each at 5712x4284, c16) did not fit the arena (3 GiB cap, the 2x layer's cs-sr buffers still live) and fell
+back to `hipMalloc`, 7-9 ms each. The second net's `hipMalloc`s returned 0.0 ms (the runtime reuses the just-freed
+memory), so the cost was paid once, under the lock, on the critical path.
+
+Change: `gpu_enh::reserve(H, W)` (`cs_enhance_reserve` in `enh_net.cpp`) reserves four arena blocks of one `Hb` each
+(a piece must fit one block; 256 MiB blocks did not, the first attempt changed nothing: allocation still 32.8 ms),
+when the four total more than 512 MiB (about 16 MP and up; smaller images never fall back). The multi-scale decode
+(`image_decryption.cpp`, before the layer threads start) runs it on a side thread for the 2x layer's size, so the
+`hipMalloc`s overlap the small layers' GPU stages. Each block is a separate call with a 0.5 ms pause, like
+`gpu_tiles::warmup`.
+
+Measured (`prof24.enc.png`, r0.3, production decode, fresh exe names, ABBA, 3 s pauses, 4 runs each, idle GPU):
+`device allocation` 33.0 -> 0.0 ms; the first net's `upload + planes` 44 -> 11 ms; the 2x layer's "done" time
+1210 -> 1198 ms (profiled runs); wall 1353 -> 1345 ms mean (noise is ±15 ms, so the end-to-end gain is within it, ~0.6%).
+Output byte-identical (SHA-256 of the two decodes equal). The block reserve itself takes the HIP runtime lock for
+~8 ms four times on the side thread, which is what keeps the wall gain below the 33 ms removed from the critical path.
+Costs ~1.5 GB of extra device memory on 24 MP photos.
+
+### 18.8 The GPU lock covers only the device half of the LR solve (2026-11-09, bit-identical)
+
+The multi-scale layers take `gpu_lock` one at a time (18.3). Until now a layer took it before `decrypt_tiles_ycc420`, so
+the LR stage's host work ran under it: the plane prep (smooth fill + forward DCT of every tile, `solve_planes`, 27 ms on
+the 2x layer of a 24.5 MP photo) and the batches' host layouts (`Batch::build`: tile layout, DCT tables, packed sample
+indices, the warm-start copy; 22 ms for the 2x layer's two groups, `[gpu-prof] gpu_tiles ... layout`). The 2x layer waits for
+the lock until the 3x layer finishes (~720 ms), so that ~50 ms was idle-CPU time moved onto the critical path.
+
+Changes:
+- `gpu_tiles.hip`: `Batch::build` is split into `build_host` (no device state; fills the host arrays, now members) and
+  `upload`; `solve_fixed` into `prepare_fixed` + `run_fixed` (`solve_fixed` is their composition, same behaviour for
+  `solve_fista_dct`). `solve_ycc_bgr` builds the host layouts of every group first, then calls the new `gpu_begin`
+  callback, then allocates the device output and runs the groups. A group's device buffers are still released at the end
+  of its `run_fixed`.
+- `gpu_decrypt.cpp` (`solve_planes`): the `on_gpu` hook no longer runs right after the prep but once, just before the
+  first device work (`gpu_begin` of `solve_ycc_bgr`, or before the per-group fallback solves).
+- `image_decryption.cpp`: the layer's lock holder is a thread-local `unique_lock` (`cs_ms_gpu_acquire` /
+  `cs_ms_gpu_release`, a guard releases it on every exit). `on_gpu` takes it before starting the cs-sr host-prep thread;
+  `decrypt_tiles_ycc420` also takes it after the LR block (no-op when held), so a layer without LR jobs still holds it
+  before any cs-sr work. The early acquire before the call is gone (the first attempt kept it, so nothing moved:
+  1384 ms against 1334).
+
+Measured (`prof24.enc.png`, IMG_0620 r0.3, production decode, fresh exe names `opt2` = 18.7 only, `lock2` = this,
+ABBA, 3 s pauses, 12 runs each, idle GPU): wall 1343 -> 1288 ms mean (opt2 1306-1362, lock2 1266-1315 ms); 2x layer
+"done" 1227 -> 1094 ms and 3x layer 717 -> 689 ms in one profiled pair (single runs, ±25 ms). The decode is byte-identical
+(SHA-256 of both decodes equal); `cs_tests` passes (155 checks, GPU build). Together with 18.7 the 24.5 MP decode went
+from ~1.35-1.38 s to ~1.29 s.
+
+The gain is ~55 ms against 49 ms of host work moved, within the run noise (±25 ms); I did not separate any
+further effect. The two groups' host layouts are now both built before the first launch (the old code built group 1's
+layout while group 0 ran on the GPU), which no longer matters since both sit outside the lock.

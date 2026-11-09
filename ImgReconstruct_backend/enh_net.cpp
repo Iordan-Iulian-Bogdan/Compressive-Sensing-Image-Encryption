@@ -362,6 +362,15 @@ void cs_enhance_prefetch(const std::string& model_path) {
 #endif
 }
 
+void cs_enhance_reserve(const std::string& model_path, int H, int W) {
+#ifdef CS_GPU_TILES
+    if (const char* g = std::getenv("CS_GPU_ENH"); g && g[0] == '0') return;
+    if (gpu_enh::load(enh_weights_file(model_path))) gpu_enh::reserve(H, W);
+#else
+    (void)model_path; (void)H; (void)W;
+#endif
+}
+
 // Quantization bin [lo, hi] of the 8-bit values v that dequantize to s at `bits` (cs_quant / cs_dequant).
 static void quant_bins(int bits, float lo[256], float hi[256]) {
     for (int s = 0; s < 256; ++s) { lo[s] = 1e9f; hi[s] = -1e9f; }
