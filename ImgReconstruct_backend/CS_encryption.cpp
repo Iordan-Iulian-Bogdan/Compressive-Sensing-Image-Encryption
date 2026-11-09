@@ -10,203 +10,6 @@
 #include <thread>
 #include <xmmintrin.h>
 
-int CSencryption::params = AUTO_PARAM;
-
-namespace {
-// Fixed T-tetromino partition of each 4x4 acquisition cell (bench layout):
-// row-major cell value -> group 0..3.
-const uint8_t kTetroGroup[16] = { 0,0,0,2, 1,0,2,2, 1,1,3,2, 1,3,3,3 };
-}  // namespace
-
-void cs_tetro_group_pixels(int cell_r, int cell_c, int g, int xs[4], int ys[4]) {
-    int n = 0;
-    for (int k = 0; k < 16 && n < 4; ++k) {
-        if (kTetroGroup[k] == g) {
-            xs[n] = cell_c + k % 4;
-            ys[n] = cell_r + k / 4;
-            ++n;
-        }
-    }
-}
-
-std::vector<int> cs_compute_tile_sample_counts(const std::vector<uint8_t>& lod, int m_total,
-    int rows, int cols, int tile_size, int weight_base, int full_threshold, int cutoff)
-{
-    if (tile_size <= 0) {
-        throw std::runtime_error("adaptive sampling: tile size must be positive");
-    }
-    if (m_total < 0) {
-        throw std::runtime_error("adaptive sampling: negative measurement count");
-    }
-    if (weight_base < 1) weight_base = 1;
-    if (weight_base > 65535) weight_base = 65535;
-    const int tiles_x = (cols + tile_size - 1) / tile_size; // columns
-    const int tiles_y = (rows + tile_size - 1) / tile_size; // rows
-    const int nt = tiles_x * tiles_y;
-    if ((int)lod.size() != nt) {
-        throw std::runtime_error("adaptive sampling: lod length does not match tile grid");
-    }
-
-    std::vector<int> cap(nt);
-    std::vector<long long> w(nt);
-    for (int tr = 0; tr < tiles_y; ++tr) {
-        for (int tc = 0; tc < tiles_x; ++tc) {
-            const int i = tr * tiles_x + tc;
-            const int row0 = tr * tile_size;
-            const int col0 = tc * tile_size;
-            const int tile_w = (tile_size < cols - col0) ? tile_size : cols - col0;
-            const int tile_h = (tile_size < rows - row0) ? tile_size : rows - row0;
-            cap[i] = tile_w * tile_h;
-            // weight = capacity * (weight_base + lod): density ratio is
-            // (base+255)/(base+32). base is the aggression knob — high
-            // (e.g. 65535) is near-uniform, 1 is max LOD bias, 256 is the
-            // tuned default (--adaptive-strength 0.5). Capacity keeps total
-            // allocation proportional to tile size.
-            w[i] = (long long)cap[i] * ((long long)weight_base + (long long)lod[i]);
-        }
-    }
-
-    std::vector<int> counts(nt, 0);
-    std::vector<char> is_full(nt, 0);
-    const auto cut = [&](int i) { return cutoff > 0 && lod[i] < cutoff; };
-    long long pool_budget = m_total;
-    if (full_threshold > 0 && m_total > 0) {
-        // --lod-full: qualifying tiles (lod >= threshold) take their whole
-        // pixel capacity first, greedy fit in (lod desc, index asc) order
-        // against the budget; the pool below splits whatever remains.
-        // --adaptive-cutoff wins on overlap: cut tiles are never claimed.
-        std::vector<int> order;
-        order.reserve((size_t)nt);
-        for (int i = 0; i < nt; ++i)
-            if (lod[i] >= full_threshold && !cut(i)) order.push_back(i);
-        std::sort(order.begin(), order.end(), [&](int a, int b) {
-            if (lod[a] != lod[b]) return lod[a] > lod[b];
-            return a < b;
-        });
-        long long cost = 0;
-        for (int i : order) {
-            if (cost + cap[i] <= m_total) {
-                is_full[i] = 1;
-                counts[i] = cap[i];
-                cost += cap[i];
-            }
-        }
-        pool_budget = m_total - cost;
-    }
-
-    // pool = tiles still splitting the (remaining) budget via the standard
-    // largest-remainder machinery; with threshold 0 and cutoff 0 this is
-    // every tile and the allocation below is bit-identical to the legacy
-    // path. Cutoff tiles stay at count 0 (background blackout).
-    std::vector<int> pool;
-    pool.reserve((size_t)nt);
-    for (int i = 0; i < nt; ++i)
-        if (!is_full[i] && !cut(i)) pool.push_back(i);
-    const int np = (int)pool.size();
-    if (np == 0 || pool_budget <= 0) {
-        return counts;
-    }
-    long long poolW = 0;
-    for (int i : pool) poolW += w[i];
-    if (poolW == 0) {
-        return counts;
-    }
-
-    // largest-remainder proportional split: floor(budget * w_i / poolW),
-    // then hand the leftover one-by-one in (remainder desc, index asc)
-    // order — fully deterministic, no floating point
-    long long assigned = 0;
-    std::vector<std::pair<long long, int>> frac;
-    frac.reserve((size_t)np);
-    for (int i : pool) {
-        const long long num = pool_budget * w[i];
-        counts[i] = (int)(num / poolW);
-        assigned += counts[i];
-        frac.emplace_back(num % poolW, i);
-    }
-    std::sort(frac.begin(), frac.end(), [](const std::pair<long long, int>& a, const std::pair<long long, int>& b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second < b.second;
-    });
-    long long left = pool_budget - assigned;
-    for (int k = 0; left > 0; --left, ++k) {
-        counts[frac[(size_t)(k % np)].second]++;
-    }
-
-    // Clamp to per-tile capacity and redistribute until sum(counts) reaches
-    // target = min(budget, pool capacity). (History: an earlier version
-    // broke out of the remainder pass on the first full tile, leaving the
-    // sum short under skewed LOD; the loop below re-seats the excess.)
-    long long pool_cap = 0;
-    for (int i : pool) pool_cap += cap[i];
-    const long long target = (std::min)(pool_budget, pool_cap);
-
-    for (int pass = 0; pass < 2 * np + 16; ++pass) {
-        long long total = 0;
-        for (int i : pool) {
-            if (counts[i] > cap[i]) counts[i] = cap[i];
-            total += counts[i];
-        }
-        if (total == target) break;
-
-        if (total > target) {
-            // strip from highest-index pool tiles until exact (deterministic)
-            for (int k = np - 1; k >= 0 && total > target; --k) {
-                const int i = pool[(size_t)k];
-                if (counts[i] > 0) {
-                    const int take = (std::min)(counts[i], (int)(total - target));
-                    counts[i] -= take;
-                    total -= take;
-                }
-            }
-            break;
-        }
-
-        // total < target: place the shortfall among pool tiles that still
-        // have headroom — largest-remainder by weight, then one-by-one
-        const long long need = target - total;
-        long long headroom_w = 0;
-        for (int i : pool) {
-            if (counts[i] < cap[i]) headroom_w += w[i];
-        }
-        if (headroom_w == 0) break;  // every pool tile full
-
-        long long given = 0;
-        std::vector<std::pair<long long, int>> fr;
-        fr.reserve((size_t)np);
-        for (int i : pool) {
-            if (counts[i] >= cap[i]) continue;
-            const long long num = need * w[i];
-            const long long give = num / headroom_w;
-            const long long g = (std::min)(give, (long long)(cap[i] - counts[i]));
-            counts[i] += (int)g;
-            given += g;
-            fr.emplace_back(num % headroom_w, i);
-        }
-        std::sort(fr.begin(), fr.end(), [](const std::pair<long long, int>& a, const std::pair<long long, int>& b) {
-            if (a.first != b.first) return a.first > b.first;
-            return a.second < b.second;
-        });
-        long long rem = need - given;
-        if (rem > 0 && !fr.empty()) {
-            size_t idx = 0;
-            int stagnant = 0;
-            while (rem > 0 && stagnant < (int)fr.size()) {
-                const int i = fr[idx % fr.size()].second;
-                if (counts[i] < cap[i]) {
-                    counts[i]++;
-                    --rem;
-                    stagnant = 0;
-                }
-                else {
-                    ++stagnant;
-                }
-                ++idx;
-            }
-        }
-    }
-    return counts;
-}
 
 void CSencryption::returnRandomIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym, int numOfIndices, const uint8_t key[32]) {
 
@@ -244,210 +47,6 @@ void CSencryption::returnRandomIndices(std::vector<int>& ri_x, std::vector<int>&
     shuffle(ri_y, shuffle_seed);
 }
 
-// Tetromino-pair subset (modes 13/14): partial Fisher-Yates over the
-// cells*4 (cell, T-group) pair pool selects EXACTLY numPairs distinct
-// pairs; the taken prefix is already in random order, so no second shuffle
-// is needed. Pair id = cell * 4 + group with cells row-major over the
-// xm/4 x ym/4 grid of 4x4 acquisition cells (see cs_tetro_group_pixels).
-// Fully deterministic from (key, geometry, numPairs).
-void CSencryption::returnTetrominoPairIds(std::vector<int>& pairs, int xm, int ym, int numPairs, const uint8_t key[32]) {
-    if (xm % 4 != 0 || ym % 4 != 0) {
-        throw std::runtime_error("tetromino sampling needs dimensions divisible by 4");
-    }
-    const int total = (xm / 4) * (ym / 4) * 4;
-    if (numPairs < 0 || numPairs > total) {
-        throw std::runtime_error("requested pair count exceeds the number of available tetromino pairs");
-    }
-    std::seed_seq seq(key, key + 32);
-    std::mt19937 generator(seq);
-
-    std::vector<int> pool(total);
-    std::iota(pool.begin(), pool.end(), 0);
-    pairs.resize(numPairs);
-    for (int k = 0; k < numPairs; ++k) {
-        std::uniform_int_distribution<int> pick(k, total - 1);
-        const int j = pick(generator);
-        std::swap(pool[k], pool[j]);
-        pairs[k] = pool[k];
-    }
-}
-
-// Periodic tile-based sampling: generate random indices within one canonical
-// tile, then replicate that pattern across the entire image. Every tile of
-// the image carries the SAME sampling positions (identical local offsets).
-// samples_per_tile positions are drawn inside one tile_size x tile_size block.
-// The result is fully deterministic from (key, geometry) so encryption and
-// decryption regenerate identical index sets.
-void CSencryption::returnPeriodicIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym, int samples_per_tile, const uint8_t key[32], int tile_size) {
-
-    std::seed_seq seq(key, key + 32);
-    std::mt19937 generator(seq);
-
-    unsigned int shuffle_seed;
-    std::memcpy(&shuffle_seed, key, sizeof(shuffle_seed));
-
-    const int tile_pixels = tile_size * tile_size;
-    if (tile_size <= 0) {
-        throw std::runtime_error("periodic sampling: tile size must be positive");
-    }
-    if (samples_per_tile < 1 || samples_per_tile > tile_pixels) {
-        throw std::runtime_error("requested samples per tile exceeds the tile's pixel count");
-    }
-
-    // draw samples_per_tile distinct positions inside the canonical tile
-    std::vector<int> tile_pool(tile_pixels);
-    std::iota(tile_pool.begin(), tile_pool.end(), 0);
-    std::vector<int> tile_ri_x(samples_per_tile), tile_ri_y(samples_per_tile);
-    for (int k = 0; k < samples_per_tile; ++k) {
-        std::uniform_int_distribution<int> pick(k, tile_pixels - 1);
-        const int j = pick(generator);
-        std::swap(tile_pool[k], tile_pool[j]);
-        tile_ri_x[k] = tile_pool[k] / tile_size;
-        tile_ri_y[k] = tile_pool[k] % tile_size;
-    }
-
-    // replicate the pattern across the whole image; edge tiles keep only the
-    // positions that fall inside the image (deterministic on both sides)
-    const int tiles_x = (xm + tile_size - 1) / tile_size;
-    const int tiles_y = (ym + tile_size - 1) / tile_size;
-
-    ri_x.clear();
-    ri_y.clear();
-    ri_x.reserve((size_t)samples_per_tile * tiles_x * tiles_y);
-    ri_y.reserve((size_t)samples_per_tile * tiles_x * tiles_y);
-
-    for (int ty = 0; ty < tiles_y; ++ty) {
-        for (int tx = 0; tx < tiles_x; ++tx) {
-            const int base_x = tx * tile_size;
-            const int base_y = ty * tile_size;
-            const int tile_w = (tile_size < (xm - base_x)) ? tile_size : (xm - base_x);
-            const int tile_h = (tile_size < (ym - base_y)) ? tile_size : (ym - base_y);
-
-            for (int k = 0; k < samples_per_tile; ++k) {
-                const int local_x = tile_ri_x[k];
-                const int local_y = tile_ri_y[k];
-                if (local_x < tile_w && local_y < tile_h) {
-                    ri_x.push_back(base_x + local_x);
-                    ri_y.push_back(base_y + local_y);
-                }
-            }
-        }
-    }
-
-    // deterministic measurement ordering (same on both sides)
-    shuffle(ri_x, shuffle_seed);
-    shuffle(ri_y, shuffle_seed);
-}
-
-// Adaptive periodic sampling: per-tile sample counts come from the LOD byte
-// array (high detail -> more samples), each tile draws its own in-tile
-// pattern from the shared RNG in row-major tile order, then one global
-// shuffle fixes the measurement order. Deterministic from (key, lod, m, geom,
-// weight_base).
-void CSencryption::returnAdaptiveIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
-    const std::vector<uint8_t>& lod, int m_total, const uint8_t key[32], int tile_size,
-    int weight_base, int full_threshold, int cutoff)
-{
-    if (tile_size <= 0) {
-        throw std::runtime_error("adaptive sampling: tile size must be positive");
-    }
-
-    std::seed_seq seq(key, key + 32);
-    std::mt19937 generator(seq);
-
-    unsigned int shuffle_seed;
-    std::memcpy(&shuffle_seed, key, sizeof(shuffle_seed));
-
-    const std::vector<int> counts = cs_compute_tile_sample_counts(lod, m_total, xm, ym, tile_size, weight_base, full_threshold, cutoff);
-    // same grid as cs_compute_tile_sample_counts: tiles_cols across ym (cols),
-    // tiles_rows across xm (rows), lod index = tr * tiles_cols + tc
-    const int tiles_cols = (ym + tile_size - 1) / tile_size;
-    const int tiles_rows = (xm + tile_size - 1) / tile_size;
-
-    // exact index count (capacity clamp may drop a few when m > total pixels)
-    int total_draw = 0;
-    for (int c : counts) total_draw += c;
-
-    ri_x.clear();
-    ri_y.clear();
-    ri_x.reserve((size_t)total_draw);
-    ri_y.reserve((size_t)total_draw);
-
-    for (int tr = 0; tr < tiles_rows; ++tr) {
-        for (int tc = 0; tc < tiles_cols; ++tc) {
-            const int i = tr * tiles_cols + tc;
-            const int s = counts[i];
-            if (s <= 0) continue;
-
-            const int row0 = tr * tile_size;
-            const int col0 = tc * tile_size;
-            const int tile_w = (tile_size < ym - col0) ? tile_size : ym - col0; // extent in cols
-            const int tile_h = (tile_size < xm - row0) ? tile_size : xm - row0; // extent in rows
-            const int tile_pixels = tile_w * tile_h;
-            if (s > tile_pixels) continue;  // defensive; counts already capped
-
-            // partial Fisher-Yates over this tile only (same draw style as
-            // periodic/random so the key stream advances identically both sides)
-            std::vector<int> pool((size_t)tile_pixels);
-            std::iota(pool.begin(), pool.end(), 0);
-            for (int k = 0; k < s; ++k) {
-                std::uniform_int_distribution<int> pick(k, tile_pixels - 1);
-                const int j = pick(generator);
-                std::swap(pool[(size_t)k], pool[(size_t)j]);
-                const int local = pool[(size_t)k];
-                ri_x.push_back(row0 + local / tile_w);
-                ri_y.push_back(col0 + local % tile_w);
-            }
-        }
-    }
-
-    shuffle(ri_x, shuffle_seed);
-    shuffle(ri_y, shuffle_seed);
-}
-
-// Per-segment sampling (mode 10): each class id draws its own budgeted
-// share of its pixels (count_c = round(pix_c * q_c / 255)) via partial
-// Fisher-Yates over that class's pixel pool, classes in ascending id order
-// from one shared RNG stream, then one global shuffle fixes the measurement
-// order. Deterministic from (key, labels, rates): encryption draws it,
-// decryption regenerates it from the shipped body prefix.
-// seg_blend W > 0: each class splits into interior (distance to any frontier
-// > W, own rate) plus a narrow boundary band (distance <= W, boosted rate
-// max(own q, adjacent-class q)); interior then band draw per class in
-// ascending order. W == 0 keeps the legacy single-pool loop verbatim so old
-// containers regenerate bit-identically.
-cv::Mat cs_segmask_density(const cv::Mat& labels,
-    const std::vector<uint8_t>& rates_q, int width) {
-    if (labels.empty() || labels.type() != CV_8U || width < 0 || width > CS_SEGBLEND_MAX)
-        throw std::runtime_error("seg-mask density: invalid labels or width");
-    cv::Mat rates(labels.size(), CV_64F);
-    for (int y = 0; y < labels.rows; ++y) {
-        const uint8_t* lrow = labels.ptr<uint8_t>(y);
-        double* rrow = rates.ptr<double>(y);
-        for (int x = 0; x < labels.cols; ++x) {
-            const unsigned c = lrow[x];
-            rrow[x] = c < rates_q.size() ? rates_q[c] : 0.0;
-        }
-    }
-    cv::Mat kernel(1, 2 * width + 1, CV_64F);
-    for (int i = -width; i <= width; ++i)
-        kernel.at<double>(0, i + width) = width + 1 - std::abs(i);
-    cv::Mat filtered;
-    // Integer-valued kernel and input: all intermediate sums fit exactly in
-    // double, avoiding CPU/GPU-dependent floating probability regeneration.
-    cv::sepFilter2D(rates, filtered, CV_64F, kernel, kernel, {-1, -1}, 0, cv::BORDER_REPLICATE);
-    const double side = (width + 1.0) * (width + 1.0);
-    cv::Mat density(labels.size(), CV_16U);
-    const double inv = 257.0 / (side * side);
-    for (int y = 0; y < labels.rows; ++y) {
-        const double* frow = filtered.ptr<double>(y);
-        uint16_t* drow = density.ptr<uint16_t>(y);
-        for (int x = 0; x < labels.cols; ++x)
-            drow[x] = (uint16_t)std::llround(frow[x] * inv);
-    }
-    return density;
-}
-
 cv::Mat cs_seg_chroma_support(const cv::Mat& labels, const std::vector<uint8_t>& rates_q, int mode) {
     if (labels.empty() || labels.type() != CV_8U)
         throw std::runtime_error("chroma support: invalid label map");
@@ -464,14 +63,10 @@ cv::Mat cs_seg_chroma_support(const cv::Mat& labels, const std::vector<uint8_t>&
 }
 
 void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>& ri_y, int xm, int ym,
-    const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32],
-    int seg_blend, bool smooth_blend)
+    const cv::Mat& labels, const std::vector<uint8_t>& rates_q, const uint8_t key[32])
 {
     if (labels.empty() || labels.rows != xm || labels.cols != ym || labels.type() != CV_8U) {
         throw std::runtime_error("seg-mask sampling: label map geometry mismatch");
-    }
-    if (seg_blend < 0 || seg_blend > CS_SEGBLEND_MAX) {
-        throw std::runtime_error("seg-mask sampling: blend width out of range");
     }
 
     std::seed_seq seq(key, key + 32);
@@ -483,55 +78,7 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
     ri_x.clear();
     ri_y.clear();
 
-    if (smooth_blend && seg_blend > 0) {
-        const cv::Mat density = cs_segmask_density(labels, rates_q, seg_blend);
-        for (int y = 0; y < xm; ++y)
-            for (int x = 0; x < ym; ++x) {
-                const uint64_t threshold = ((uint64_t)density.at<uint16_t>(y, x) * (1ull << 32) + 32767) / 65535;
-                if ((uint64_t)generator() < threshold) {
-                    ri_x.push_back(y); ri_y.push_back(x);
-                }
-            }
-        shuffle(ri_x, shuffle_seed);
-        shuffle(ri_y, shuffle_seed);
-        return;
-    }
-
-    // Narrow boundary bands per class (W > 0 only): own-label pixels within
-    // W px of any frontier. Same label map both sides => identical bands.
-    // Bands, and the adjacent-class boost below, are independent per class: computed in parallel.
     const int nclass = (int)rates_q.size();
-    std::vector<cv::Mat> band;
-    std::vector<uint8_t> boost(rates_q);
-    if (seg_blend > 0) {
-        band.assign(rates_q.size(), cv::Mat());
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int c = 0; c < nclass; ++c) {
-            cv::Mat is_c = (labels == (uint8_t)c);
-            if (cv::countNonZero(is_c) == 0) continue;
-            cv::Mat dist;
-            cv::distanceTransform(is_c, dist, cv::DIST_L2, 3);
-            cv::Mat near = (dist <= (double)seg_blend) & (dist > 0.0);
-            if (cv::countNonZero(near) == 0) continue;
-            band[(size_t)c] = near;
-            // Adjacent-class boost: classes sharing a frontier with c (3x3 dilation
-            // touch). Flat within the band by design — the band is narrow, and a
-            // ramp would need inexact per-pixel draws on both sides.
-            cv::Mat dilated;
-            cv::dilate(is_c, dilated, cv::Mat());
-            uint8_t qb = rates_q[(size_t)c];
-            for (int r = 0; r < xm; ++r) {
-                const uint8_t* lrow = labels.ptr<uint8_t>(r);
-                const uint8_t* drow = dilated.ptr<uint8_t>(r);
-                for (int col = 0; col < ym; ++col) {
-                    if (drow[col] && lrow[col] != (uint8_t)c && lrow[col] < rates_q.size())
-                        qb = (std::max)(qb, rates_q[lrow[col]]);
-                }
-            }
-            boost[(size_t)c] = qb;
-        }
-    }
-
     auto want_of = [](size_t pix, uint8_t q) {
         if (pix == 0 || q == 0) return (size_t)0;
         const size_t want = (size_t)std::llround((double)pix * (double)q / 255.0);
@@ -560,49 +107,32 @@ void CSencryption::returnSegMaskIndices(std::vector<int>& ri_x, std::vector<int>
         }
     };
 
-    // Interior / band pools of every class in one raster pass (each pool keeps raster order),
+    // The pools of every class in one raster pass (each pool keeps raster order),
     // then the draws in ascending class order from the shared stream.
-    std::vector<std::vector<int>> pools((size_t)nclass), bpools((size_t)nclass);
+    std::vector<std::vector<int>> pools((size_t)nclass);
     for (int r = 0; r < xm; ++r) {
         const uint8_t* lrow = labels.ptr<uint8_t>(r);
         for (int col = 0; col < ym; ++col) {
             const int c = lrow[col];
             if (c >= nclass) continue;
-            const bool in_band = seg_blend > 0 && !band[(size_t)c].empty() && band[(size_t)c].ptr<uint8_t>(r)[col];
-            (in_band ? bpools : pools)[(size_t)c].push_back(r * ym + col);
+            pools[(size_t)c].push_back(r * ym + col);
         }
     }
     size_t total_want = 0;
-    for (size_t c = 0; c < rates_q.size(); ++c) {
-        const bool has_band = seg_blend > 0 && c < band.size() && !band[c].empty();
-        total_want += want_of(pools[c].size(), rates_q[c]) + (has_band ? want_of(bpools[c].size(), boost[c]) : 0);
-    }
+    for (size_t c = 0; c < rates_q.size(); ++c)
+        total_want += want_of(pools[c].size(), rates_q[c]);
     ri_x.reserve(total_want);
     ri_y.reserve(total_want);
     for (size_t c = 0; c < rates_q.size(); ++c) {
-        uint8_t qc = rates_q[c];
-        const bool has_band = seg_blend > 0 && c < band.size() && !band[c].empty();
-        if (qc == 0 && !has_band) continue;
+        const uint8_t qc = rates_q[c];
+        if (qc == 0) continue;
         draw_pool(pools[c], qc);
-        if (has_band) draw_pool(bpools[c], boost[c]);
     }
 
     // the same keyed permutation on both lists, one per thread
     std::thread shuffle_y([&] { shuffle(ri_y, shuffle_seed); });
     shuffle(ri_x, shuffle_seed);
     shuffle_y.join();
-}
-
-// YCC 4:2:0 index generation (mode 3; mode 7 = 4:2:2): m_luma full-res luma
-// positions from the key plus m_chroma coarse-grid positions per chroma
-// plane from tagged key copies. Fills ri_x/ri_y (luma) and ri_cx1/ri_cy1
-// (Cr), ri_cx2/ri_cy2 (Cb); m_chroma derives deterministically via
-// cs_chroma_count for the given mode.
-void CSencryption::returnYcc420Indices(int xm, int ym, int m_luma, const uint8_t key[32], int mode) {
-    ri_x.resize((size_t)m_luma);
-    ri_y.resize((size_t)m_luma);
-    returnRandomIndices(ri_x, ri_y, xm, ym, m_luma, key);
-    returnYcc420ChromaIndices(xm, ym, m_luma, key, mode);
 }
 
 // Coarse-grid chroma draws with domain-separated keys (Cr 0xA5, Cb 0x5A).
@@ -658,142 +188,4 @@ void CSencryption::returnYcc420ChromaIndices(int xm, int ym, int m_luma, const u
 
     cs_wipe(key_cr, sizeof(key_cr));
     cs_wipe(key_cb, sizeof(key_cb));
-}
-
-void cs_hf_thumb_weights(const cv::Mat& thumbnail, std::vector<float>& weights,
-                         int& weight_cols, int& weight_rows) {
-    weights.clear();
-    weight_cols = 0;
-    weight_rows = 0;
-    if (thumbnail.empty() || thumbnail.channels() != 3) return;
-    cv::Mat gray, laplacian, absolute;
-    cv::cvtColor(thumbnail, gray, cv::COLOR_BGR2GRAY);
-    cv::Laplacian(gray, laplacian, CV_32F);
-    absolute = cv::abs(laplacian);
-    if (!absolute.isContinuous()) absolute = absolute.clone();
-    weight_cols = absolute.cols;
-    weight_rows = absolute.rows;
-    const float* data = reinterpret_cast<const float*>(absolute.data);
-    weights.assign(data, data + static_cast<size_t>(weight_cols) * weight_rows);
-}
-
-void CSencryption::returnHfWeightedIndices(
-    std::vector<int>& out_rows, std::vector<int>& out_cols, int image_rows,
-    int image_cols, const std::vector<uint8_t>& lod, int total_samples,
-    const uint8_t key[32], int tile_size, int weight_base,
-    const std::vector<float>& weights, int weight_cols, int weight_rows,
-    float pixel_floor) {
-    if (tile_size <= 0 || weights.empty() || weight_cols <= 0 || weight_rows <= 0) {
-        throw std::runtime_error("HF-focus sampling requires a valid tile and thumbnail");
-    }
-    if (pixel_floor <= 0.0f) pixel_floor = 1.0f;
-
-    std::seed_seq seed(key, key + 32);
-    std::mt19937 generator(seed);
-    unsigned int shuffle_seed;
-    std::memcpy(&shuffle_seed, key, sizeof(shuffle_seed));
-    const std::vector<int> counts = cs_compute_tile_sample_counts(
-        lod, total_samples, image_rows, image_cols, tile_size, weight_base);
-    const int tile_cols = (image_cols + tile_size - 1) / tile_size;
-    const int tile_rows = (image_rows + tile_size - 1) / tile_size;
-    int sample_capacity = 0;
-    for (int count : counts) sample_capacity += count;
-    out_rows.clear();
-    out_cols.clear();
-    out_rows.reserve(static_cast<size_t>(sample_capacity));
-    out_cols.reserve(static_cast<size_t>(sample_capacity));
-
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-    std::vector<double> keys;
-    std::vector<double> ukeys;
-    std::vector<int> order;
-    std::vector<int> rest;
-    std::vector<char> taken;
-    for (int tile_row = 0; tile_row < tile_rows; ++tile_row) {
-        for (int tile_col = 0; tile_col < tile_cols; ++tile_col) {
-            const int tile_index = tile_row * tile_cols + tile_col;
-            const int sample_count = counts[tile_index];
-            if (sample_count <= 0) continue;
-            const int row0 = tile_row * tile_size;
-            const int col0 = tile_col * tile_size;
-            const int tile_width = (std::min)(tile_size, image_cols - col0);
-            const int tile_height = (std::min)(tile_size, image_rows - row0);
-            const int pixel_count = tile_width * tile_height;
-            if (sample_count >= pixel_count) {
-                for (int i = 0; i < pixel_count; ++i) {
-                    uniform(generator);
-                    out_rows.push_back(row0 + i / tile_width);
-                    out_cols.push_back(col0 + i % tile_width);
-                }
-                continue;
-            }
-            keys.resize(static_cast<size_t>(pixel_count));
-            ukeys.resize(static_cast<size_t>(pixel_count));
-            for (int i = 0; i < pixel_count; ++i) {
-                const int local_row = i / tile_width;
-                const int local_col = i % tile_width;
-                const int thumb_row = (std::min)(weight_rows - 1,
-                    (row0 + local_row) * weight_rows / image_rows);
-                const int thumb_col = (std::min)(weight_cols - 1,
-                    (col0 + local_col) * weight_cols / image_cols);
-                // HF weight compression: raw thumbnail-|Laplacian| weights
-                // are heavy-tailed (a strong edge can outweigh flat pixels
-                // 100:1), so a plain weighted top-k piles the tile's whole
-                // budget onto the feature and starves the rest. log1p bounds
-                // the effective boost: with floor F and gain K,
-                //   edge:flat = (F + K*log1p(200)) / (F + K*log1p(0.5))
-                //           ~ (8 + 4*5.3) / (8 + 4*0.41) ~ 3x  (F=8, K=4).
-                constexpr double kHfWeightGain = 4.0;
-                const double raw = (double)weights[
-                    static_cast<size_t>(thumb_row) * weight_cols + thumb_col];
-                const double cw = (double)pixel_floor +
-                    kHfWeightGain * std::log1p(raw > 0.0 ? raw : 0.0);
-                keys[static_cast<size_t>(i)] = std::pow(uniform(generator), 1.0 / cw);
-                ukeys[static_cast<size_t>(i)] = uniform(generator);
-            }
-            // Uniform base split: half of every tile's budget is drawn
-            // uniformly (independent stream) so no region can starve however
-            // spiky the weights are; the other half follows the compressed
-            // HF weights. Deterministic given (key, geometry, lod,
-            // thumbnail): decrypt regenerates identical positions through
-            // this same routine.
-            // COMPAT: positions differ from pre-change containers (modes
-            // 5/6/8); old containers must be re-encrypted. No spare
-            // authenticated header byte exists to version-gate the draw.
-            const int n_uni = sample_count / 2;
-            const int n_w = sample_count - n_uni;
-            order.resize(static_cast<size_t>(pixel_count));
-            std::iota(order.begin(), order.end(), 0);
-            taken.assign(static_cast<size_t>(pixel_count), 0);
-            if (n_uni > 0) {
-                std::nth_element(order.begin(), order.begin() + n_uni, order.end(),
-                    [&](int a, int b) {
-                        return ukeys[static_cast<size_t>(a)] > ukeys[static_cast<size_t>(b)];
-                    });
-                for (int i = 0; i < n_uni; ++i) {
-                    const int local = order[static_cast<size_t>(i)];
-                    taken[static_cast<size_t>(local)] = 1;
-                    out_rows.push_back(row0 + local / tile_width);
-                    out_cols.push_back(col0 + local % tile_width);
-                }
-            }
-            if (n_w > 0) {
-                rest.clear();
-                rest.reserve(static_cast<size_t>(pixel_count) - (size_t)n_uni);
-                for (int i = 0; i < pixel_count; ++i)
-                    if (!taken[static_cast<size_t>(i)]) rest.push_back(i);
-                std::nth_element(rest.begin(), rest.begin() + n_w, rest.end(),
-                    [&](int a, int b) {
-                        return keys[static_cast<size_t>(a)] > keys[static_cast<size_t>(b)];
-                    });
-                for (int i = 0; i < n_w; ++i) {
-                    const int local = rest[static_cast<size_t>(i)];
-                    out_rows.push_back(row0 + local / tile_width);
-                    out_cols.push_back(col0 + local % tile_width);
-                }
-            }
-        }
-    }
-    shuffle(out_rows, shuffle_seed);
-    shuffle(out_cols, shuffle_seed);
 }

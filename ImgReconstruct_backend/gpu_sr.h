@@ -4,8 +4,7 @@
 // For many solved LR tiles at once, the whole PnP-ADMM path of cs_sr_upscale_tile_2x on the
 // device, in one pass:
 //   NLM strength from the tile's Immerkaer noise estimate (cs_sr_prox_nlm_h)
-//   AVIR 2x warm start (separable matrices, gpu_avir_tables.hpp, + AVIR's exact dither), or the
-//   Swin2SR prior (--sr-prior-model, gpu_swin) when run() is asked for it
+//   AVIR 2x warm start (separable matrices, gpu_avir_tables.hpp, + AVIR's exact dither)
 //   BGR -> YCrCb (OpenCV 8-bit fixed point), luma / 255 as the ADMM start
 //   luma PnP-ADMM (gpu_admm::solve_pnp_admm_device, z stays on the device)
 //   round to 8 bits, merge with the warm start's Cr/Cb, YCrCb -> BGR
@@ -40,10 +39,7 @@ struct Tile {
 
 // Runs every tile through the pipeline with one shared ADMM parameter set (the caller groups
 // tiles by Params). Every tile must satisfy gpu_admm::supported(2*lr_rows, 2*lr_cols).
-// swin_prior: the warm start (luma start and Cr/Cb) is the Swin2SR 2x output of the tile, as
-// cs_sr_upscale_tile_2x does with --sr-prior-model; gpu_swin::load must have succeeded and every
-// tile must satisfy gpu_swin::supported. Returns false (outputs untouched) when the device is
-// missing or a HIP call fails.
-bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior = false);
+// Returns false (outputs untouched) when the device is missing or a HIP call fails.
+bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm);
 
 }  // namespace gpu_sr

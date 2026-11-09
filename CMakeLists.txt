@@ -40,13 +40,9 @@ add_library(cs_core STATIC
     ImgReconstruct_backend/CS_encryption.cpp
     ImgReconstruct_backend/clip_scorer.cpp
     ImgReconstruct_backend/crypto_utils.cpp
-    ImgReconstruct_backend/cs_dict.cpp
     ImgReconstruct_backend/helper_functions.cpp
-    ImgReconstruct_backend/onnx_denoise.cpp
     ImgReconstruct_backend/superres.cpp
     ImgReconstruct_backend/gap_tv.cpp
-    ImgReconstruct_backend/admm_l1tv.cpp
-    ImgReconstruct_backend/pnp_nlm.cpp
     ImgReconstruct_backend/image_decryption.cpp
     ImgReconstruct_backend/image_encryption.cpp
 )
@@ -82,9 +78,7 @@ set(CS_TEST_SOURCES
     tests/test_main.cpp
     tests/test_primitives.cpp
     tests/test_solvers.cpp
-    tests/test_adaptive.cpp
     tests/test_modes.cpp
-    tests/test_dual_tv.cpp
     tests/test_photo_sr.cpp)
 add_executable(cs_tests ${CS_TEST_SOURCES})
 target_link_libraries(cs_tests PRIVATE cs_core)

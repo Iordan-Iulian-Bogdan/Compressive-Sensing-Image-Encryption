@@ -1,5 +1,9 @@
-// Backend tests: crypto, shuffle, tiling, base roundtrip, sample split/bits, T-sampling.
+// Backend tests: crypto, shuffle, tiling, production roundtrips, sample bits.
 #include "test_common.hpp"
+
+// Regression floors for the production roundtrips (measured 2026-11-09 on the GPU build: 960x720 ratio 0.5
+// 32.3 dB / SSIM 0.974 single- and multi-scale; 480x360 sample-bits 27.1..29.4 dB).
+static const double ROUNDTRIP_MIN_PSNR = 30.0, ROUNDTRIP_MIN_SSIM = 0.95, SAMPLE_BITS_MIN_PSNR = 25.0;
 
 // ---------------------------------------------------------------------------
 // 1. crypto primitives
@@ -197,62 +201,56 @@ void test_tile_helpers() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. full roundtrip + PSNR + auth rejection
+// 4. full production roundtrip (single- and multi-scale) + PSNR + auth rejection
 // ---------------------------------------------------------------------------
 void test_roundtrip() {
     const std::string password = "roundtrip-test-password";
-    const int W = 960, H = 720;
-    cv::Mat original = make_test_image(W, H);
-
-cv::Mat encrypted;
-    const int enc_rc = encrypt_image::encrypt_image_tiled("", "", password, 1.0f, 0, &encrypted);
-    check(enc_rc != 0, "roundtrip: missing input file rejected");
-
+    const cv::Mat original = make_test_image(960, 720);
     const std::string tmp_in = ".cs_test_input.png";
+    const std::string tmp_enc = ".cs_test_input.enc.png";
     const std::string tmp_out = ".cs_test_output.png";
-    cv::Mat encrypted2;
+
+    check(prod_encrypt(".cs_test_missing.png", tmp_enc, password, 0.5f) != 0, "roundtrip: missing input file rejected");
     cv::imwrite(tmp_in, original);
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &encrypted2) == 0,
-        "roundtrip: encrypt to memory");
+    for (const bool ms : { false, true }) {
+        const char* tag = ms ? "roundtrip multi-scale" : "roundtrip single-scale";
+        char name[96];
+        std::snprintf(name, sizeof(name), "%s: encrypt", tag);
+        check(prod_encrypt(tmp_in, tmp_enc, password, 0.5f, ms) == 0, name);
+        const cv::Mat enc = read_container(tmp_enc);
+        const int want_mode = ms ? CS_MODE_MULTISCALE : CS_MODE_YCC420_SEG_HRDETAIL;
+        std::snprintf(name, sizeof(name), "%s: header mode %d", tag, want_mode);
+        check(!enc.empty() && enc.data[CS_OFF_PAD] == want_mode, name);
 
-    // wrong password must fail authentication before the solve
-    const int wrong_rc = decrypt_image::decrypt_image_tiled(encrypted2, tmp_out, "wrong-password-99", 24, 24, 5, 4, 0.01f, false);
-    check(wrong_rc == -2, "roundtrip: wrong password rejected with -2");
+        // wrong password and a tampered body must fail authentication before the solve
+        // (-2 from the single-scale path, -1 from the multi-scale wrapper)
+        const int want_rc = ms ? -1 : -2;
+        std::snprintf(name, sizeof(name), "%s: wrong password rejected with %d", tag, want_rc);
+        check(prod_decrypt(enc, tmp_out, "wrong-password-99") == want_rc, name);
+        cv::Mat tampered = enc.clone();
+        tampered.data[tampered.total() * 3 - 1] ^= 0x80;
+        std::snprintf(name, sizeof(name), "%s: tampered container rejected with %d", tag, want_rc);
+        check(prod_decrypt(tampered, tmp_out, password) == want_rc, name);
 
-    // tamper: flip one byte in the container body
-    cv::Mat tampered = encrypted2.clone();
-    tampered.data[tampered.total() * 3 - 1] ^= 0x80;
-    const int tamper_rc = decrypt_image::decrypt_image_tiled(tampered, tmp_out, password, 24, 24, 5, 4, 0.01f, false);
-    check(tamper_rc == -2, "roundtrip: tampered container rejected with -2");
-
-    // correct password: full solve
-    check(decrypt_image::decrypt_image_tiled(encrypted2, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0,
-        "roundtrip: decrypt succeeds");
-
-    cv::Mat decrypted = cv::imread(tmp_out, cv::IMREAD_COLOR);
-    check(!decrypted.empty(), "roundtrip: decrypted file readable");
-
-    // output is 2x the original size (solve -> org_size -> 2x upscale)
-    cv::Mat dec_sized;
-    cv::resize(decrypted, dec_sized, original.size());
-    const double p = cs_quality::psnr(original, dec_sized);
-    const double s = cs_quality::ssim(original, dec_sized);
-    std::printf("       roundtrip PSNR: %.2f dB\n", p);
-    std::printf("       roundtrip SSIM: %.4f\n", s);
-    // Regression guard, not a quality benchmark: with wavefront neighbor
-    // warm-starts the synthetic roundtrip measures ~26.8 dB today (19.2 dB
-    // with the old independent-solve order). A broken index pipeline
-    // (wrong sampling, misaligned offsets) collapses to single-digit dB,
-    // so 24 dB leaves ~2.7 dB of headroom for noise/rounding variance.
-    check(p > 24.0, "roundtrip: PSNR > 24 dB");
-    // SSIM is the perceptual companion to PSNR: structural breaks (tile seams,
-    // channel swaps) show up here even when MSE stays moderate. Baseline on
-    // the synthetic image with wavefront warm-starts is well above 0.9;
-    // 0.85 keeps headroom while still failing hard on structural damage.
-    if (s >= 0.0) check(s > 0.85, "roundtrip: SSIM > 0.85");
-    else check(false, "roundtrip: SSIM unavailable");
-
+        std::snprintf(name, sizeof(name), "%s: decrypt succeeds", tag);
+        check(prod_decrypt(enc, tmp_out, password) == 0, name);
+        const cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        std::snprintf(name, sizeof(name), "%s: decodes at the native size", tag);
+        check(dec.size() == original.size(), name);
+        if (dec.size() != original.size()) continue;
+        const double p = cs_quality::psnr(original, dec);
+        const double s = cs_quality::ssim(original, dec);
+        std::printf("       %s PSNR: %.2f dB, SSIM: %.4f\n", tag, p, s);
+        // Regression guards, not quality benchmarks: a broken index pipeline (wrong sampling,
+        // misaligned offsets) collapses to single-digit dB and SSIM well below 0.5.
+        std::snprintf(name, sizeof(name), "%s: PSNR > %.0f dB", tag, ROUNDTRIP_MIN_PSNR);
+        check(p > ROUNDTRIP_MIN_PSNR, name);
+        std::snprintf(name, sizeof(name), "%s: SSIM > %.2f", tag, ROUNDTRIP_MIN_SSIM);
+        if (s >= 0.0) check(s > ROUNDTRIP_MIN_SSIM, name);
+        else check(false, "roundtrip: SSIM unavailable");
+    }
     std::remove(tmp_in.c_str());
+    std::remove(tmp_enc.c_str());
     std::remove(tmp_out.c_str());
 }
 
@@ -262,6 +260,7 @@ cv::Mat encrypted;
 void test_odd_size_roundtrip() {
     const std::string password = "odd-size-test-password";
     const std::string tmp_in = ".cs_test_odd_in.png";
+    const std::string tmp_enc = ".cs_test_odd_in.enc.png";
     const std::string tmp_out = ".cs_test_odd_out.png";
     const cv::Mat full = make_test_image(321, 241);
     double p_even = 0.0;
@@ -270,12 +269,11 @@ void test_odd_size_roundtrip() {
         const cv::Mat original = full(cv::Rect(0, 0, hw[1], hw[0])).clone();
         cv::imwrite(tmp_in, original);
         char tag[96];
-        cv::Mat enc;
-        bool ok = encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &enc) == 0;
+        bool ok = prod_encrypt(tmp_in, tmp_enc, password, 0.5f) == 0;
         std::snprintf(tag, sizeof(tag), "odd size: %dx%d encrypt", hw[0], hw[1]);
         check(ok, tag);
         if (!ok) continue;
-        ok = decrypt_image::decrypt_image_tiled(enc, tmp_out, password, 24, 24, 5, 4, 0.01f, false) == 0;
+        ok = prod_decrypt(read_container(tmp_enc), tmp_out, password) == 0;
         std::snprintf(tag, sizeof(tag), "odd size: %dx%d decrypt", hw[0], hw[1]);
         check(ok, tag);
         if (!ok) continue;
@@ -283,398 +281,17 @@ void test_odd_size_roundtrip() {
         std::snprintf(tag, sizeof(tag), "odd size: %dx%d decodes at the native size", hw[0], hw[1]);
         check(dec.size() == original.size(), tag);
         if (dec.size() != original.size()) continue;
-        // pixel-aligned with the original (no resample): as good as the even crop of the same image
+        // pixel-aligned with the original (no resample): about as good as the even crop of the same image (the
+        // production decode measures up to 1.3 dB lower on these small crops; a shifted grid costs several dB)
         const double p = cs_quality::psnr(original, dec);
         std::printf("       odd size %dx%d PSNR: %.2f dB\n", hw[0], hw[1], p);
         if (hw[0] % 2 == 0 && hw[1] % 2 == 0) p_even = p;
-        std::snprintf(tag, sizeof(tag), "odd size: %dx%d PSNR within 1 dB of the even crop", hw[0], hw[1]);
-        check(p > p_even - 1.0, tag);
+        std::snprintf(tag, sizeof(tag), "odd size: %dx%d PSNR within 2 dB of the even crop", hw[0], hw[1]);
+        check(p > p_even - 2.0, tag);
     }
     std::remove(tmp_in.c_str());
+    std::remove(tmp_enc.c_str());
     std::remove(tmp_out.c_str());
-}
-
-void test_sample_split() {
-    // Hand-made density: 64x64 image, 32px grid -> 2x2 tiles with
-    // 100/300/200/200 samples (mean 200): under={(0,0)}, over={(0,1)}.
-    const cv::Mat src = make_test_image(64, 64);
-    const int per_tile[4] = { 100, 300, 200, 200 };
-    std::vector<int> rx, ry;
-    for (int t = 0; t < 4; ++t) {
-        const int tr = t / 2, tc = t % 2, n = per_tile[t];
-        for (int k = 0; k < n; ++k) {
-            rx.push_back(tr * 32 + (k * 7) % 32);
-            ry.push_back(tc * 32 + (k * 13) % 32);
-        }
-    }
-    cv::Mat under, over;
-    check(cs_build_sample_class_views(src, rx, ry, 32, under, over),
-        "sample-split: builds on valid input");
-    check(under.size() == src.size() && under.type() == CV_8UC3 &&
-        over.size() == src.size() && over.type() == CV_8UC3,
-        "sample-split: full geometry and color type");
-    auto tile_nonblack = [](const cv::Mat& m, int tr, int tc, int ts) {
-        const int h = (std::min)(ts, m.rows - tr * ts);
-        const int w = (std::min)(ts, m.cols - tc * ts);
-        long long nz = 0;
-        for (int r = 0; r < h; ++r) {
-            const cv::Vec3b* p = m.ptr<cv::Vec3b>(tr * ts + r) + tc * ts;
-            for (int k = 0; k < w; ++k)
-                if (p[k] != cv::Vec3b(0, 0, 0)) ++nz;
-        }
-        return nz;
-    };
-    // sparse tile lives in under only, dense tile in over only, ties black.
-    // Both canvases carry a text label in the top band of tile (0,0), so
-    // row-0 membership is probed on a strip below the text (y 26..31).
-    auto strip_nonblack = [](const cv::Mat& m, int tr, int tc, int ts) {
-        const int w = (std::min)(ts, m.cols - tc * ts);
-        long long nz = 0;
-        for (int r = 26; r < 32; ++r) {
-            const cv::Vec3b* p = m.ptr<cv::Vec3b>(tr * ts + r) + tc * ts;
-            for (int k = 0; k < w; ++k)
-                if (p[k] != cv::Vec3b(0, 0, 0)) ++nz;
-        }
-        return nz;
-    };
-    check(strip_nonblack(under, 0, 0, 32) > 0 && strip_nonblack(over, 0, 0, 32) == 0,
-        "sample-split: sparse tile lands in under canvas only");
-    check(strip_nonblack(over, 0, 1, 32) > 0 && strip_nonblack(under, 0, 1, 32) == 0,
-        "sample-split: dense tile lands in over canvas only");
-    check(tile_nonblack(under, 1, 0, 32) == 0 && tile_nonblack(over, 1, 0, 32) == 0 &&
-        tile_nonblack(under, 1, 1, 32) == 0 && tile_nonblack(over, 1, 1, 32) == 0,
-        "sample-split: mean-tied tiles stay black in both");
-    // canvases reproduce source pixels where they are non-black (same strip)
-    {
-        cv::Mat diff;
-        cv::absdiff(src(cv::Rect(0, 26, 32, 6)), under(cv::Rect(0, 26, 32, 6)), diff);
-        cv::Mat gray;
-        cv::cvtColor(diff, gray, cv::COLOR_BGR2GRAY);
-        check(cv::countNonZero(gray) == 0, "sample-split: under tile pixels match source");
-    }
-    // degenerate inputs rejected
-    cv::Mat u2, o2;
-    check(!cs_build_sample_class_views(src, {}, {}, 32, u2, o2),
-        "sample-split: empty indices rejected");
-    check(!cs_build_sample_class_views(src, rx, ry, 0, u2, o2),
-        "sample-split: tile_size<1 rejected");
-    check(!cs_build_sample_class_views(cv::Mat(), rx, ry, 32, u2, o2),
-        "sample-split: empty image rejected");
-    // exact-uniform grid: nothing to split
-    {
-        std::vector<int> ux, uy;
-        for (int r = 0; r < 64; ++r)
-            for (int c = 0; c < 64; ++c) { ux.push_back(r); uy.push_back(c); }
-        check(!cs_build_sample_class_views(src, ux, uy, 32, u2, o2),
-            "sample-split: uniform grid reports nothing to split");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 5b2. T-tetromino sampling (tcluster points + tmeans groups)
-// ---------------------------------------------------------------------------
-void test_tsampling() {
-    // Fixed-partition geometry: 8x8 grid -> 16 groups of 4, disjoint and
-    // complete, each group a T-tetromino (3 leaves + 1 branch by Manhattan
-    // adjacency, mirroring the bench self-test).
-    {
-        bool ok = true;
-        std::vector<int> seen(64, 0);
-        for (int cell = 0; cell < 4; ++cell) {
-            for (int g = 0; g < 4; ++g) {
-                int xs[4], ys[4];
-                cs_tetro_group_pixels((cell / 2) * 4, (cell % 2) * 4, g, xs, ys);
-                int deg[4] = { 0, 0, 0, 0 };
-                for (int a = 0; a < 4; ++a) {
-                    // helper returns global coords already (origin included)
-                    const int gx = xs[a], gy = ys[a];
-                    if (gx < 0 || gx >= 8 || gy < 0 || gy >= 8) ok = false;
-                    else seen[(size_t)gy * 8 + gx]++;
-                    for (int b = 0; b < 4; ++b) {
-                        if (a != b && std::abs(xs[a] - xs[b]) + std::abs(ys[a] - ys[b]) == 1) deg[a]++;
-                    }
-                }
-                int leaves = 0, branches = 0;
-                for (int a = 0; a < 4; ++a) {
-                    if (deg[a] == 1) leaves++;
-                    else if (deg[a] >= 2) branches++;
-                    else ok = false;
-                }
-                ok = ok && (leaves == 3 && branches == 1);
-            }
-        }
-        for (int v : seen) ok = ok && (v == 1);
-        check(ok, "tsampling: fixed partition disjoint+complete, all groups T-shaped");
-    }
-
-    // Grouped solve on a constant tile recovers it (catches operator/value
-    // scaling bugs: unit-norm rows against raw means decode at 1/4, true
-    // averages decode exactly).
-    {
-        const int S = 8;
-        const float c = 0.4f;
-        std::vector<int> off = { 0 };
-        std::vector<int> px;
-        std::vector<float> w;
-        for (int cell = 0; cell < 4; ++cell) {
-            for (int g = 0; g < 4; ++g) {
-                int xs[4], ys[4];
-                cs_tetro_group_pixels((cell / 2) * 4, (cell % 2) * 4, g, xs, ys);
-                for (int q = 0; q < 4; ++q) {
-                    px.push_back(ys[q] * S + xs[q]);
-                    w.push_back(0.25f);
-                }
-                off.push_back((int)px.size());
-            }
-        }
-        cs_meas_groups G{ off.data(), px.data(), w.data(), 16 };
-        cv::Mat meas(1, CS_HEADER_PIXELS + 16, CV_8UC3, cv::Scalar(0, 0, 0));
-        const int v = (int)(c * 255.0f + 0.5f);
-        for (int k = 0; k < 16; ++k) meas.at<cv::Vec3b>(k + CS_HEADER_PIXELS) = cv::Vec3b(v, v, v);
-        cv::Mat ref(S, S, CV_32F, cv::Scalar(0));
-        std::vector<int> empty;
-        reconstruct_color_channel_fista(meas, 0, 1e-6f, S, S, empty, empty, 2, ref,
-            false, cs_null_mat(), 0.0f, 1, 0, CS_BASIS_DCT, 1.0f, false, &G);
-        const double mean = cv::mean(cv::Mat(S, S, CV_32F, ref.data))[0];
-        std::printf("       tsampling grouped const: mean=%.2f (expect ~%.1f)\n", mean, c * 255.0);
-        check(std::fabs(mean - c * 255.0) < 1.5, "tsampling: grouped constant tile decodes exactly");
-    }
-
-    // End-to-end container roundtrips on synthetic content (half-res
-    // defaults like the ycc sibling tests).
-    const std::string password = "tsampling-test-password";
-    cv::Mat original = make_test_image(192, 144);
-    const std::string tmp_in = ".cs_test_tsampling_in.png";
-    cv::imwrite(tmp_in, original);
-
-    // tcluster points, ratio 0.5
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_tcluster(0.5f, password, 8, 0);
-        cv::Mat container = enc.get_mat();
-        check(!container.empty(), "tsampling: tcluster encrypt to memory");
-        const cv::Mat flat = container.reshape(0, (int)container.total());
-        check(flat.data[CS_OFF_PAD] == CS_MODE_TCLUSTER, "tsampling: tcluster header mode=13");
-        const std::string tmp_out = ".cs_test_tsampling_tc.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
-            "tsampling: tcluster decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "tsampling: tcluster output readable");
-        if (!dec.empty()) {
-            cv::Mat sized;
-            cv::resize(dec, sized, original.size());
-            const double p = cs_quality::psnr(original, sized);
-            std::printf("       tsampling tcluster PSNR (ratio 0.5): %.2f dB\n", p);
-            check(p > 13.0, "tsampling: tcluster PSNR sane");
-        }
-        std::remove(tmp_out.c_str());
-    }
-
-    // tcluster full coverage (ratio 1.0): every pixel exactly once
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_tcluster(1.0f, password, 8, 0);
-        cv::Mat container = enc.get_mat();
-        const std::string tmp_out = ".cs_test_tsampling_tc1.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
-            "tsampling: tcluster full-coverage decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        if (!dec.empty()) {
-            cv::Mat sized;
-            cv::resize(dec, sized, original.size());
-            const double p = cs_quality::psnr(original, sized);
-            std::printf("       tsampling tcluster PSNR (ratio 1.0): %.2f dB\n", p);
-            check(p > 27.0, "tsampling: tcluster full coverage near-exact");
-        }
-        std::remove(tmp_out.c_str());
-    }
-
-    // tmeans groups, ratio 0.25 (full pair coverage)
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_tmeans(0.25f, password, 8, 0);
-        cv::Mat container = enc.get_mat();
-        check(!container.empty(), "tsampling: tmeans encrypt to memory");
-        const cv::Mat flat = container.reshape(0, (int)container.total());
-        check(flat.data[CS_OFF_PAD] == CS_MODE_TMEANS, "tsampling: tmeans header mode=14");
-        const std::string tmp_out = ".cs_test_tsampling_tm.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 4, 24, 5, 4, 0.01f, false) == 0,
-            "tsampling: tmeans decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "tsampling: tmeans output readable");
-        if (!dec.empty()) {
-            cv::Mat sized;
-            cv::resize(dec, sized, original.size());
-            const double p = cs_quality::psnr(original, sized);
-            std::printf("       tsampling tmeans PSNR (ratio 0.25): %.2f dB\n", p);
-            check(p > 24.0, "tsampling: tmeans PSNR sane");
-            // joint SOMP through the grouped path
-            const std::string tmp_joint = ".cs_test_tsampling_tmj.png";
-            check(decrypt_image::decrypt_image_tiled(container, tmp_joint, password, 4, 24, 5, 4, 0.01f, false,
-                0.0f, false, CS_SOLVER_FISTA_JOINT) == 0, "tsampling: tmeans joint decrypt succeeds");
-            cv::Mat decj = cv::imread(tmp_joint, cv::IMREAD_COLOR);
-            check(!decj.empty(), "tsampling: tmeans joint output readable");
-            if (!decj.empty()) {
-                cv::Mat jsized;
-                cv::resize(decj, jsized, original.size());
-                const double pj = cs_quality::psnr(original, jsized);
-                std::printf("       tsampling tmeans joint PSNR: %.2f dB\n", pj);
-                check(pj > 20.0, "tsampling: tmeans joint PSNR sane");
-            }
-            std::remove(tmp_joint.c_str());
-        }
-        std::remove(tmp_out.c_str());
-    }
-
-    // YCC420 with T-tetromino luma (full-res manual like the CLI runs).
-    // Sparse YCC needs iterations to converge (same as uniform YCC at
-    // matched ratios); tmeans uses 40, tcluster defaults.
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_ycc420_t(0.5f, password, 8, 0, CS_MODE_YCC420, CS_MODE_YCC420_TCLUSTER);
-        cv::Mat container = enc.get_mat();
-        check(!container.empty(), "tsampling: ycc420 tcluster encrypt to memory");
-        const cv::Mat flat = container.reshape(0, (int)container.total());
-        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC420_TCLUSTER, "tsampling: ycc420 tcluster header mode=15");
-        const std::string tmp_out = ".cs_test_tsampling_ytc.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 5, 4, 0.01f, false,
-            0.0f, true) == 0, "tsampling: ycc420 tcluster decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "tsampling: ycc420 tcluster output readable");
-        if (!dec.empty()) {
-            const double p = cs_quality::psnr(original, dec);
-            std::printf("       tsampling ycc420 tcluster PSNR (ratio 0.5): %.2f dB\n", p);
-            check(p > 13.0, "tsampling: ycc420 tcluster PSNR sane");
-        }
-        std::remove(tmp_out.c_str());
-    }
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_ycc420_t(0.25f, password, 8, 0, CS_MODE_YCC420, CS_MODE_YCC420_TMEANS);
-        cv::Mat container = enc.get_mat();
-        check(!container.empty(), "tsampling: ycc420 tmeans encrypt to memory");
-        const cv::Mat flat = container.reshape(0, (int)container.total());
-        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC420_TMEANS, "tsampling: ycc420 tmeans header mode=16");
-        const std::string tmp_out = ".cs_test_tsampling_ytm.png";
-        // manual: AUTO_PARAM would replace the 1 tile / 40 iters / 0.01 below
-        // with the auto grid and the YCC lambda law
-        CSencryption::params = MANUAL_PARAM;
-        const int rc_tm = decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
-            0.0f, true);
-        CSencryption::params = AUTO_PARAM;
-        check(rc_tm == 0, "tsampling: ycc420 tmeans decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "tsampling: ycc420 tmeans output readable");
-        if (!dec.empty()) {
-            const double p = cs_quality::psnr(original, dec);
-            std::printf("       tsampling ycc420 tmeans PSNR (ratio 0.25, it40): %.2f dB\n", p);
-            // Sparse YCC needs iterations to converge (same as uniform YCC
-            // at matched ratios); the bar pins the wired-up grouped path
-            // (~9 dB garbage when miswired), not content quality.
-            check(p > 16.0, "tsampling: ycc420 tmeans PSNR sane");
-        }
-        std::remove(tmp_out.c_str());
-    }
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_ycc420_t(0.5f, password, 8, 0, CS_MODE_YCC422, CS_MODE_YCC422_TCLUSTER);
-        cv::Mat container = enc.get_mat();
-        const cv::Mat flat = container.reshape(0, (int)container.total());
-        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC422_TCLUSTER, "tsampling: ycc422 tcluster header mode=17");
-        const std::string tmp_out = ".cs_test_tsampling_ytc422.png";
-        check(decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 5, 4, 0.01f, false,
-            0.0f, true) == 0, "tsampling: ycc422 tcluster decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "tsampling: ycc422 tcluster output readable");
-        if (!dec.empty()) {
-            const double p = cs_quality::psnr(original, dec);
-            std::printf("       tsampling ycc422 tcluster PSNR (ratio 0.5): %.2f dB\n", p);
-            check(p > 13.0, "tsampling: ycc422 tcluster PSNR sane");
-        }
-        std::remove(tmp_out.c_str());
-    }
-    {
-        encrypt_image enc(tmp_in);
-        enc.encrypt_ycc420_t(0.25f, password, 8, 0, CS_MODE_YCC422, CS_MODE_YCC422_TMEANS);
-        cv::Mat container = enc.get_mat();
-        const cv::Mat flat = container.reshape(0, (int)container.total());
-        check(flat.data[CS_OFF_PAD] == CS_MODE_YCC422_TMEANS, "tsampling: ycc422 tmeans header mode=18");
-        const std::string tmp_out = ".cs_test_tsampling_ytm422.png";
-        // manual: AUTO_PARAM would replace the 1 tile / 40 iters / 0.01 below
-        // with the auto grid and the YCC lambda law
-        CSencryption::params = MANUAL_PARAM;
-        const int rc_tm = decrypt_image::decrypt_image_tiled(container, tmp_out, password, 1, 24, 40, 4, 0.01f, false,
-            0.0f, true);
-        CSencryption::params = AUTO_PARAM;
-        check(rc_tm == 0, "tsampling: ycc422 tmeans decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "tsampling: ycc422 tmeans output readable");
-        if (!dec.empty()) {
-            const double p = cs_quality::psnr(original, dec);
-            std::printf("       tsampling ycc422 tmeans PSNR (ratio 0.25, it40): %.2f dB\n", p);
-            // Same iteration physics as the 420 sibling (see above).
-            check(p > 16.0, "tsampling: ycc422 tmeans PSNR sane");
-        }
-        std::remove(tmp_out.c_str());
-    }
-
-    std::remove(tmp_in.c_str());
-}
-
-void test_adaptive_tile_grid_limit() {
-    // The lod byte count travels in a 16-bit header field: tile grids over
-    // 65535 tiles truncate it and decrypt silently regenerates wrong
-    // positions (6 dB garbage, exit 0). Encrypt must refuse up front.
-    const std::string input_path = ".cs_test_t1_input.png";
-    const std::string output_path = ".cs_test_t1_output.png";
-    const std::string password = "tile-grid-limit-password";
-    // NB: encrypt downsamples 2x by default, so size for 76,800 post-
-    // downscale tiles (over the 65535 limit): 640x480 -> 320x240.
-    cv::Mat original = make_test_image(640, 480); // tile-size 1 = 76,800 tiles
-    check(cv::imwrite(input_path, original), "tile-grid-limit: write source image");
-
-    int rc = encrypt_image::encrypt_image_tiled(
-        input_path, "", password, 0.5f, 1, nullptr, true, 32, 0.5f,
-        false, false, false, 0.05f, "", 0.5f, 0.0f, false, false,
-        8, 0, 0, false, false);
-    check(rc != 0, "tile-grid-limit: BGR adaptive tile-size 1 rejected");
-    rc = encrypt_image::encrypt_image_tiled(
-        input_path, "", password, 0.5f, 1, nullptr, true, 32, 0.5f,
-        false, false, false, 0.05f, "", 0.5f, 0.0f, true, false,
-        8, 0, 0, false, false);
-    check(rc != 0, "tile-grid-limit: ycc420 adaptive tile-size 1 rejected");
-
-    // Positive control: 64x48 at tile-size 1 = 3072 tiles fits the field, so
-    // the 1px-tile machinery must roundtrip sane end to end.
-    const std::string small_in = ".cs_test_t1_small.png";
-    const std::string small_out = ".cs_test_t1_small_out.png";
-    cv::Mat small = make_test_image(64, 48);
-    check(cv::imwrite(small_in, small), "tile-grid-limit: write small image");
-    cv::Mat encrypted;
-    rc = encrypt_image::encrypt_image_tiled(
-        small_in, "", password, 0.5f, 1, &encrypted, true, 32, 0.5f,
-        false, true, false, 0.05f, "", 0.5f, 0.0f, false, false,
-        8, 0, 0, false, false);
-    check(rc == 0, "tile-grid-limit: small tile-size 1 encrypts");
-    if (rc == 0) {
-        CSencryption::params = AUTO_PARAM;
-        const int decrypt_rc = decrypt_image::decrypt_image_tiled(
-            encrypted, small_out, password, 1, 24, 5, 4, 0.01f, false);
-        check(decrypt_rc == 0, "tile-grid-limit: small tile-size 1 decrypts");
-        const cv::Mat decoded = cv::imread(small_out, cv::IMREAD_COLOR);
-        check(!decoded.empty(), "tile-grid-limit: output readable");
-        if (!decoded.empty()) {
-            cv::Mat sized;
-            cv::resize(decoded, sized, small.size());
-            const double p = cs_quality::psnr(small, sized);
-            std::printf("       tile-size 1 64x48 PSNR (ratio 0.5): %.2f dB\n", p);
-            check(p > 12.0, "tile-grid-limit: small tile-size 1 PSNR sane");
-        }
-        std::remove(small_out.c_str());
-    }
-    std::remove(small_in.c_str());
-    std::remove(input_path.c_str());
-    std::remove(output_path.c_str());
 }
 
 void test_sample_bits() {
@@ -723,77 +340,47 @@ void test_sample_bits() {
 
     const std::string password = "sample-bits-test-password";
     const std::string tmp_in = ".cs_test_sb_in.png";
+    const std::string tmp_enc = ".cs_test_sb_in.enc.png";
     const std::string tmp_out = ".cs_test_sb_out.png";
-    cv::Mat original = make_test_image(480, 360);
+    const cv::Mat original = make_test_image(480, 360);
     cv::imwrite(tmp_in, original);
 
-    // 8-bit packed path must match the legacy unpacked layout exactly
-    // (full-res: native geometry, no half-res downscale, for a strong baseline)
-    cv::Mat enc8;
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc8,
-        false, 32, 0.5f, false, true, false, 0.05f, "", 0.5f, 0.0f,
-        false, false, 8) == 0, "sample-bits: encrypt 8-bit");
-    {
-        decrypt_image probe(enc8, password);
-        check(probe.get_sample_bits() == 8, "sample-bits: header reads back 8");
-    }
-    check(decrypt_image::decrypt_image_tiled(enc8, tmp_out, password, 4, 16, 5, 4, 0.01f, false) == 0,
-        "sample-bits: decrypt 8-bit");
-    cv::Mat dec8 = cv::imread(tmp_out, cv::IMREAD_COLOR);
-    // default pipeline decrypts at 2x the encrypted (half-res) geometry:
-    // resize back before scoring, same as test_roundtrip
-    cv::Mat dec8_sized;
-    cv::resize(dec8, dec8_sized, original.size());
-    const double p8 = cs_quality::psnr(original, dec8_sized);
-
-    // 4-bit container: smaller, header reads 4, wrong password still -2
-    cv::Mat enc4;
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc4,
-        false, 32, 0.5f, false, true, false, 0.05f, "", 0.5f, 0.0f,
-        false, false, 4) == 0, "sample-bits: encrypt 4-bit");
+    // encode at the given depths (0 = the default 6-bit luma / 8-bit chroma), check the header, decode, score
+    const auto run = [&](int bits, int chroma_bits, const char* tag, int want_y, int want_c, cv::Mat& enc) {
+        char name[96];
+        std::snprintf(name, sizeof(name), "sample-bits %s: encrypt", tag);
+        const bool ok = prod_encrypt(tmp_in, tmp_enc, password, 0.5f, false, 2000, bits, chroma_bits) == 0;
+        check(ok, name);
+        if (!ok) return -1.0;
+        enc = read_container(tmp_enc);
+        {
+            decrypt_image probe(enc, password);
+            std::snprintf(name, sizeof(name), "sample-bits %s: header reads back %d/%d", tag, want_y, want_c);
+            check(probe.get_sample_bits() == want_y && probe.get_sample_bits_chroma() == want_c, name);
+        }
+        std::snprintf(name, sizeof(name), "sample-bits %s: decrypt", tag);
+        check(prod_decrypt(enc, tmp_out, password) == 0, name);
+        const cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
+        return dec.size() == original.size() ? cs_quality::psnr(original, dec) : -1.0;
+    };
+    cv::Mat enc8, enc4, enc_def, enc64;
+    const double p8 = run(8, 0, "8-bit", 8, 8, enc8);
+    const double p4 = run(4, 0, "4-bit", 4, 4, enc4);
+    const double pd = run(0, 0, "default", 6, 8, enc_def);
+    const double p64 = run(6, 4, "split 6/4", 6, 4, enc64);
+    std::printf("       sample-bits PSNR 8-bit: %.2f dB, 4-bit: %.2f dB, default 6/8: %.2f dB, 6/4: %.2f dB\n",
+        p8, p4, pd, p64);
     check(enc4.total() < enc8.total(), "sample-bits: 4-bit container is smaller");
-    {
-        decrypt_image probe(enc4, password);
-        check(probe.get_sample_bits() == 4 && probe.get_sample_bits_chroma() == 4,
-            "sample-bits: header reads back uniform 4");
-    }
-    check(decrypt_image::decrypt_image_tiled(enc4, tmp_out, "wrong-password-99", 4, 16, 5, 4, 0.01f, false) == -2,
-        "sample-bits: packed container rejects wrong password");
-    check(decrypt_image::decrypt_image_tiled(enc4, tmp_out, password, 4, 16, 5, 4, 0.01f, false) == 0,
-        "sample-bits: decrypt 4-bit");
-    cv::Mat dec4 = cv::imread(tmp_out, cv::IMREAD_COLOR);
-    cv::Mat dec4_sized;
-    cv::resize(dec4, dec4_sized, original.size());
-    const double p4 = cs_quality::psnr(original, dec4_sized);
-    std::printf("       sample-bits PSNR 8-bit: %.2f dB, 4-bit: %.2f dB\n", p8, p4);
-    // Regression guard, not a quality benchmark: the 5-iteration manual
-    // solve at ratio 0.5 measures ~17.6 dB today. Plumbing breakage
-    // (wrong offsets, misaligned sections) collapses to single-digit dB,
-    // so 15 dB keeps margin while failing hard on real damage.
-    check(std::isfinite(p8) && p8 > 15.0, "sample-bits: 8-bit PSNR sane");
-    check(std::isfinite(p4) && p4 > 13.0 && p4 > p8 - 10.0, "sample-bits: 4-bit PSNR within its quantization budget");
-
-    // Split depth: Y uses 6 bits, Cr/Cb use 4 bits.
-    cv::Mat enc64;
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc64,
-        false, 32, 0.5f, false, true, false, 0.05f, "", 0.5f, 0.0f,
-        true, false, 6, 4) == 0, "sample-bits: encrypt split-depth YCC");
-    {
-        decrypt_image probe(enc64, password);
-        check(probe.get_sample_bits() == 6 && probe.get_sample_bits_chroma() == 4,
-            "sample-bits: header reads split depths");
-    }
-    check(decrypt_image::decrypt_image_tiled(enc64, tmp_out, password, 4, 16, 5, 4, 0.01f, false) == 0,
-        "sample-bits: decrypt split-depth YCC");
-    cv::Mat dec64 = cv::imread(tmp_out, cv::IMREAD_COLOR);
-    cv::Mat dec64_sized;
-    cv::resize(dec64, dec64_sized, original.size());
-    check(cs_quality::psnr(original, dec64_sized) > 15.0,
-        "sample-bits: split-depth YCC PSNR sane");
+    check(prod_decrypt(enc4, tmp_out, "wrong-password-99") == -2, "sample-bits: packed container rejects wrong password");
+    // Regression guards, not quality benchmarks: plumbing breakage (wrong offsets, misaligned sections)
+    // collapses to single-digit dB.
+    check(std::isfinite(p8) && p8 > SAMPLE_BITS_MIN_PSNR, "sample-bits: 8-bit PSNR sane");
+    check(std::isfinite(p4) && p4 > p8 - 10.0, "sample-bits: 4-bit PSNR within its quantization budget");
+    check(std::isfinite(pd) && pd > SAMPLE_BITS_MIN_PSNR, "sample-bits: default 6-bit PSNR sane");
+    check(std::isfinite(p64) && p64 > SAMPLE_BITS_MIN_PSNR, "sample-bits: split-depth PSNR sane");
     {
         cv::Mat tampered = enc64.clone();
-        uint8_t* raw = tampered.data;
-        raw[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] ^= 1;
+        tampered.data[CS_OFF_PAD + CS_OFF_SAMPLE_BITS_CHROMA] ^= 1;
         bool rejected = false;
         try { decrypt_image probe(tampered, password); }
         catch (const std::runtime_error&) { rejected = true; }
@@ -801,12 +388,10 @@ void test_sample_bits() {
     }
 
     // Out-of-range depths are rejected, not silently ignored.
-    cv::Mat enc_bad;
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc_bad,
-        false, 32, 0.5f, false, true, false, 0.05f, "", 0.5f, 0.0f,
-        false, false, 9) == -1, "sample-bits: out-of-range depth rejected");
+    check(prod_encrypt(tmp_in, tmp_enc, password, 0.5f, false, 2000, 9) == -1, "sample-bits: out-of-range depth rejected");
 
     std::remove(tmp_in.c_str());
+    std::remove(tmp_enc.c_str());
     std::remove(tmp_out.c_str());
 }
 

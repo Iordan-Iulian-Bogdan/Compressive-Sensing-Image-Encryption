@@ -1,109 +1,5 @@
-// Backend tests: FISTA/joint solvers, DCT and wavelet bases, auto-reg, GPU agreement.
+// Backend tests: DCT transforms, auto-reg, GPU agreement.
 #include "test_common.hpp"
-
-// ---------------------------------------------------------------------------
-// 4b. proximal solvers (reweighted-L1 FISTA + SOMP joint)
-// ---------------------------------------------------------------------------
-void test_fista_solvers() {
-    int s = -1;
-    check(cs_solver_from_name("fista", s) == 0 && s == CS_SOLVER_FISTA, "fista: fista parses to 1");
-    check(cs_solver_from_name("joint", s) == 0 && s == CS_SOLVER_FISTA_JOINT, "fista: joint parses to 2");
-    check(cs_solver_from_name("somp", s) == 0 && s == CS_SOLVER_FISTA_JOINT, "fista: somp aliases joint");
-    check(cs_solver_from_name("owlqn", s) != 0, "fista: removed owlqn name rejected");
-    check(cs_solver_from_name("admm", s) != 0, "fista: removed admm name rejected");
-    check(cs_solver_from_name("bogus", s) != 0, "fista: unknown solver name rejected");
-
-    const std::string password = "fista-test-password";
-    cv::Mat original = make_test_image(320, 240);
-    const std::string tmp_in = ".cs_test_fista_in.png";
-    const std::string tmp_out = ".cs_test_fista_out.png";
-    cv::imwrite(tmp_in, original);
-
-    cv::Mat encrypted;
-    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &encrypted) != 0) {
-        check(false, "fista: encrypt");
-        std::remove(tmp_in.c_str());
-        return;
-    }
-
-    const int solvers[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
-    const char* names[2] = { "fista", "joint" };
-    for (int k = 0; k < 2; ++k) {
-        char tag[64];
-        std::snprintf(tag, sizeof(tag), "fista: %s decrypt succeeds", names[k]);
-        const int rc = decrypt_image::decrypt_image_tiled(
-            encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false, solvers[k]);
-        check(rc == 0, tag);
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        std::snprintf(tag, sizeof(tag), "fista: %s output readable", names[k]);
-        check(!dec.empty(), tag);
-        if (!dec.empty()) {
-            cv::Mat sized;
-            cv::resize(dec, sized, original.size());
-            const double p = cs_quality::psnr(original, sized);
-            std::printf("       fista %s PSNR: %.2f dB\n", names[k], p);
-            std::snprintf(tag, sizeof(tag), "fista: %s PSNR finite and sane", names[k]);
-            check(std::isfinite(p) && p > 12.0, tag);
-        }
-    }
-
-    // native FISTA controls: few steps + single pass must still solve sanely
-    {
-        const int rc = decrypt_image::decrypt_image_tiled(
-            encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false,
-            CS_SOLVER_FISTA, 8, 1);
-        check(rc == 0, "fista: fista-iters/reweights override decrypt succeeds");
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        check(!dec.empty(), "fista: override output readable");
-        if (!dec.empty()) {
-            cv::Mat sized;
-            cv::resize(dec, sized, original.size());
-            const double p = cs_quality::psnr(original, sized);
-            std::printf("       fista override (8 iters, 1 pass) PSNR: %.2f dB\n", p);
-            check(std::isfinite(p) && p > 10.0, "fista: override PSNR finite and sane");
-        }
-    }
-    // under compression (ratio 0.5): FISTA vs joint on the same container --
-    // the regime where the data Hessian only fills half the grid
-    {
-        cv::Mat enc_half;
-        if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc_half) != 0) {
-            check(false, "fista: ratio-0.5 encrypt");
-        } else {
-            const int half[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
-            const char* hnames[2] = { "fista", "joint" };
-            for (int k = 0; k < 2; ++k) {
-                char tag[64];
-                std::snprintf(tag, sizeof(tag), "fista: %s ratio-0.5 decrypt succeeds", hnames[k]);
-                const int rc = decrypt_image::decrypt_image_tiled(
-                    enc_half, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false, half[k]);
-                check(rc == 0, tag);
-                cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-                std::snprintf(tag, sizeof(tag), "fista: %s ratio-0.5 output readable", hnames[k]);
-                check(!dec.empty(), tag);
-                if (!dec.empty()) {
-                    cv::Mat sized;
-                    cv::resize(dec, sized, original.size());
-                    const double p = cs_quality::psnr(original, sized);
-                    std::printf("       %s ratio 0.5 PSNR: %.2f dB\n", hnames[k], p);
-                    std::snprintf(tag, sizeof(tag), "fista: %s ratio-0.5 PSNR sane", hnames[k]);
-                    check(std::isfinite(p) && p > 12.0, tag);
-                }
-            }
-        }
-    }
-
-    // invalid values rejected before the solve
-    check(decrypt_image::decrypt_image_tiled(
-        encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false,
-        CS_SOLVER_FISTA, 501, 2) == -1, "fista: fista-iters > 500 rejected");
-    check(decrypt_image::decrypt_image_tiled(
-        encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false,
-        99, 0, 2) == -1, "fista: unknown solver id rejected");
-
-    std::remove(tmp_in.c_str());
-    std::remove(tmp_out.c_str());
-}
 
 // ---------------------------------------------------------------------------
 // 4c. CDF 9/7 wavelet basis (lifting DWT roundtrip + FISTA solves)
@@ -194,149 +90,6 @@ void test_block_dct() {
     }
 }
 
-void test_wavelet_basis() {
-    test_dct_adjoint();
-    test_block_dct();
-    int b = -1;
-    check(cs_basis_from_name("dct", b) == 0 && b == CS_BASIS_DCT, "wavelet: dct parses to 0");
-    check(cs_basis_from_name("wavelet", b) == 0 && b == CS_BASIS_CDF97, "wavelet: wavelet parses to 1");
-    check(cs_basis_from_name("cdf97", b) == 0 && b == CS_BASIS_CDF97, "wavelet: cdf97 aliases wavelet");
-    check(cs_basis_from_name("bogus", b) != 0, "wavelet: unknown basis name rejected");
-
-    // perfect-reconstruction unit check on several sizes (even, odd, tiny,
-    // non-square): forward + inverse must recover the input
-    {
-        cv::RNG rng(777);
-        const int sizes[][2] = { {8,8}, {16,16}, {63,63}, {64,64}, {65,65}, {100,77}, {37,53}, {240,180} };
-        bool ok = true;
-        for (const auto& wh : sizes) {
-            const int rows = wh[1], cols = wh[0];
-            const int n = rows * cols;
-            std::vector<float> v((size_t)n), ref((size_t)n);
-            for (int i = 0; i < n; ++i) {
-                v[(size_t)i] = ref[(size_t)i] = (float)rng.uniform(-1.0, 1.0);
-            }
-            const int lv = cs_dwt_levels(rows, cols);
-            cs_dwt_forward(v.data(), rows, cols, lv);
-            // transform must actually do something (energy spreads, DC in LL)
-            cs_dwt_inverse(v.data(), rows, cols, lv);
-            double worst = 0.0;
-            for (int i = 0; i < n; ++i) {
-                worst = (std::max)(worst, std::fabs((double)v[(size_t)i] - ref[(size_t)i]));
-            }
-            if (!(worst < 1e-3)) {
-                std::printf("       wavelet roundtrip %dx%d worst err %.6f\n", cols, rows, worst);
-                ok = false;
-            }
-        }
-        check(ok, "wavelet: fwd+inv roundtrip < 1e-3 on all sizes");
-        check(cs_dwt_levels(64, 64) == 3, "wavelet: 64px -> 3 levels");
-        check(cs_dwt_levels(480, 360) == 4, "wavelet: 480px -> 4 levels (capped)");
-    }
-
-    // adjoint identity <S a, b> == <a, S^T b>: the FISTA gradient
-    // differentiates through S^T, so this must hold or the solve freezes
-    {
-        cv::RNG rng(4242);
-        const int sizes[][2] = { {64,64}, {100,77}, {37,53} };
-        bool ok = true;
-        for (const auto& wh : sizes) {
-            const int rows = wh[1], cols = wh[0];
-            const int n = rows * cols;
-            const int lv = cs_dwt_levels(rows, cols);
-            std::vector<float> a((size_t)n), b((size_t)n);
-            for (int i = 0; i < n; ++i) {
-                a[(size_t)i] = (float)rng.uniform(-1.0, 1.0);
-                b[(size_t)i] = (float)rng.uniform(-1.0, 1.0);
-            }
-            std::vector<float> sa = a, stb = b;
-            cs_dwt_inverse(sa.data(), rows, cols, lv);
-            cs_dwt_synth_adjoint(stb.data(), rows, cols, lv);
-            double lhs = 0.0, rhs = 0.0, nrm = 0.0;
-            for (int i = 0; i < n; ++i) {
-                lhs += (double)sa[(size_t)i] * b[(size_t)i];
-                rhs += (double)a[(size_t)i] * stb[(size_t)i];
-                nrm += (double)sa[(size_t)i] * sa[(size_t)i];
-            }
-            const double rel = std::fabs(lhs - rhs) / (std::sqrt(nrm * n) + 1e-9);
-            if (!(rel < 1e-3)) {
-                std::printf("       wavelet adjoint %dx%d rel err %.6f\n", cols, rows, rel);
-                ok = false;
-            }
-        }
-        check(ok, "wavelet: <Sa,b> == <a,S^Tb> within 1e-3");
-    }
-
-    // per-scale threshold ramp (cs_make_basis wscale vector): LL and the
-    // coarsest detail band stay x1, the finest band gets x wscale; DCT
-    // maps the knob to a DC(x1)-to-peak(x wscale) frequency ramp
-    // (uniform only at wscale <= 1, the legacy behavior)
-    {
-        bool ok = true;
-        // 64x64 -> 3 levels, LL is 8x8
-        cs_fista_basis bx = cs_make_basis(64, 64, CS_BASIS_CDF97);
-        ok = ok && (int)bx.wscale.size() == 64 * 64;
-        ok = ok && std::fabs(bx.wscale[7 * 64 + 7] - 1.0f) < 1e-6f;  // LL corner
-        ok = ok && std::fabs(bx.wscale[8 * 64] - 1.0f) < 1e-6f;      // coarsest detail band
-        ok = ok && std::fabs(bx.wscale[63 * 64] - 2.0f) < 1e-5f;     // finest band (default 2.0)
-        float mn = 1e30f, mx = -1e30f;
-        for (float v : bx.wscale) { mn = (std::min)(mn, v); mx = (std::max)(mx, v); }
-        ok = ok && mn >= 1.0f - 1e-6f && mx <= 2.0f + 1e-5f;
-        // custom finest multiplier respected
-        cs_fista_basis bx3 = cs_make_basis(64, 64, CS_BASIS_CDF97, 3.0f);
-        ok = ok && std::fabs(bx3.wscale[63 * 64] - 3.0f) < 1e-4f;
-        ok = ok && std::fabs(bx3.wscale[0] - 1.0f) < 1e-6f;
-        // wscale 1.0 disables the ramp
-        cs_fista_basis bx1 = cs_make_basis(64, 64, CS_BASIS_CDF97, 1.0f);
-        for (float v : bx1.wscale) ok = ok && (std::fabs(v - 1.0f) < 1e-6f);
-        // DCT maps the knob to a frequency ramp (DC x1, peak x wscale)
-        cs_fista_basis bd = cs_make_basis(64, 64, CS_BASIS_DCT, 3.0f);
-        ok = ok && (std::fabs(bd.wscale[0] - 1.0f) < 1e-6f);
-        ok = ok && (std::fabs(bd.wscale[(size_t)63 * 64 + 63] - 3.0f) < 1e-4f);
-        cs_fista_basis bd1 = cs_make_basis(64, 64, CS_BASIS_DCT, 1.0f);
-        for (float v : bd1.wscale) ok = ok && (std::fabs(v - 1.0f) < 1e-6f);
-        check(ok, "wavelet: per-scale ramp LL=1, finest=wscale, DCT frequency ramp");
-    }
-
-    // end-to-end: wavelet-basis FISTA solves decrypt sanely
-    const std::string password = "wavelet-test-password";
-    cv::Mat original = make_test_image(320, 240);
-    const std::string tmp_in = ".cs_test_wavelet_in.png";
-    const std::string tmp_out = ".cs_test_wavelet_out.png";
-    cv::imwrite(tmp_in, original);
-
-    cv::Mat encrypted;
-    if (encrypt_image::encrypt_image_tiled(tmp_in, "", password, 1.0f, 0, &encrypted) != 0) {
-        check(false, "wavelet: encrypt");
-        std::remove(tmp_in.c_str());
-        return;
-    }
-
-    const int solvers[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
-    const char* names[2] = { "fista", "joint" };
-    for (int k = 0; k < 2; ++k) {
-        char tag[64];
-        std::snprintf(tag, sizeof(tag), "wavelet: %s+wavelet decrypt succeeds", names[k]);
-        const int rc = decrypt_image::decrypt_image_tiled(
-            encrypted, tmp_out, password, 4, 24, 5, 4, 0.01f, false, 0.0f, false,
-            solvers[k], 0, 2, CS_BASIS_CDF97);
-        check(rc == 0, tag);
-        cv::Mat dec = cv::imread(tmp_out, cv::IMREAD_COLOR);
-        std::snprintf(tag, sizeof(tag), "wavelet: %s+wavelet output readable", names[k]);
-        check(!dec.empty(), tag);
-        if (!dec.empty()) {
-            cv::Mat sized;
-            cv::resize(dec, sized, original.size());
-            const double p = cs_quality::psnr(original, sized);
-            std::printf("       wavelet %s PSNR: %.2f dB\n", names[k], p);
-            std::snprintf(tag, sizeof(tag), "wavelet: %s+wavelet PSNR finite and sane", names[k]);
-            check(std::isfinite(p) && p > 12.0, tag);
-        }
-    }
-    std::remove(tmp_in.c_str());
-    std::remove(tmp_out.c_str());
-}
-
 void test_auto_reg_params() {
     // Params-test fitted laws (single pin each; full curves in results.csv):
     // seg 0.045*r^-0.75, uniform 0.01875/r, tile factor (n/64)^0.15 in
@@ -370,51 +123,38 @@ void test_auto_reg_params() {
 }
 
 // ---------------------------------------------------------------------------
-// GPU/CPU FISTA agreement (--device gpu): without a HIP device,
-// set_enabled(true) stays off and both runs take the CPU path (trivially
-// identical); on GPU machines this measures real device-vs-host agreement.
-// Always restores CPU-only afterwards so later tests (none, this runs
-// last) and profiling stay deterministic.
+// GPU/CPU agreement of the production decode (--device gpu): without a HIP
+// device, set_enabled(true) stays off and both runs take the CPU path
+// (trivially identical); on GPU machines this measures real device-vs-host
+// agreement. Always restores CPU-only afterwards so profiling stays
+// deterministic.
 // ---------------------------------------------------------------------------
 void test_gpu_fista_agreement() {
     const std::string password = "gpu-fista-test-password";
     const std::string tmp_in = ".cs_test_gpu_in.png";
+    const std::string tmp_enc = ".cs_test_gpu_in.enc.png";
     const std::string tmp_cpu = ".cs_test_gpu_cpu.png";
     const std::string tmp_gpu = ".cs_test_gpu_gpu.png";
     cv::Mat original = make_test_image(96, 72);
     cv::imwrite(tmp_in, original);
-    cv::Mat enc;
-    check(encrypt_image::encrypt_image_tiled(tmp_in, "", password, 0.5f, 0, &enc,
-        false, 32, 0.5f, false, false, false, 0.05f, "", 0.5f, 0.0f,
-        false, false, 8) == 0, "gpu-fista: encrypt");
-    const int solvers[2] = { CS_SOLVER_FISTA, CS_SOLVER_FISTA_JOINT };
-    const char* names[2] = { "fista", "joint" };
-    for (int s = 0; s < 2; ++s) {
-        cs_gpu::set_enabled(false);
-        check(decrypt_image::decrypt_image_tiled(enc, tmp_cpu, password,
-            1, 0, 5, 2, 0.01f, false, 0.0f, false,
-            solvers[s], 0, 1, CS_BASIS_DCT, 2.0f,
-            CsPhotoUpscalerOptions(), false, false) == 0, "gpu-fista: cpu decrypt");
-        cs_gpu::set_enabled(true);
-        check(decrypt_image::decrypt_image_tiled(enc, tmp_gpu, password,
-            1, 0, 5, 2, 0.01f, false, 0.0f, false,
-            solvers[s], 0, 1, CS_BASIS_DCT, 2.0f,
-            CsPhotoUpscalerOptions(), false, false) == 0, "gpu-fista: gpu decrypt");
-        cs_gpu::set_enabled(false);
-        cv::Mat dec_cpu = cv::imread(tmp_cpu, cv::IMREAD_COLOR);
-        cv::Mat dec_gpu = cv::imread(tmp_gpu, cv::IMREAD_COLOR);
-        char tag[64];
-        std::snprintf(tag, sizeof(tag), "gpu-fista: %s cpu/gpu agreement", names[s]);
-        if (!dec_cpu.empty() && !dec_gpu.empty() && dec_cpu.size() == dec_gpu.size()) {
-            const double p = cs_quality::psnr(dec_cpu, dec_gpu);
-            std::printf("       gpu-fista %s agreement: %.2f dB\n", names[s], p);
-            check(p > 50.0, tag);
-        } else {
-            check(false, tag);
-        }
-        std::remove(tmp_cpu.c_str());
-        std::remove(tmp_gpu.c_str());
+    check(prod_encrypt(tmp_in, tmp_enc, password, 0.5f) == 0, "gpu-fista: encrypt");
+    const cv::Mat enc = read_container(tmp_enc);
+    cs_gpu::set_enabled(false);
+    check(prod_decrypt(enc, tmp_cpu, password) == 0, "gpu-fista: cpu decrypt");
+    cs_gpu::set_enabled(true);
+    check(prod_decrypt(enc, tmp_gpu, password) == 0, "gpu-fista: gpu decrypt");
+    cs_gpu::set_enabled(false);
+    cv::Mat dec_cpu = cv::imread(tmp_cpu, cv::IMREAD_COLOR);
+    cv::Mat dec_gpu = cv::imread(tmp_gpu, cv::IMREAD_COLOR);
+    if (!dec_cpu.empty() && !dec_gpu.empty() && dec_cpu.size() == dec_gpu.size()) {
+        const double p = cs_quality::psnr(dec_cpu, dec_gpu);
+        std::printf("       gpu-fista agreement: %.2f dB\n", p);
+        check(p > 50.0, "gpu-fista: cpu/gpu agreement");
+    } else {
+        check(false, "gpu-fista: cpu/gpu agreement");
     }
     std::remove(tmp_in.c_str());
+    std::remove(tmp_enc.c_str());
+    std::remove(tmp_cpu.c_str());
+    std::remove(tmp_gpu.c_str());
 }
-

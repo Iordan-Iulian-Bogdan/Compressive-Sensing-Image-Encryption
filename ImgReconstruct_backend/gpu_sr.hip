@@ -2,7 +2,7 @@
 #include "gpu_sr.h"
 #include "gpu_avir_tables.hpp"
 #include "gpu_common.hpp"
-#include "gpu_swin.h"
+
 
 #include <algorithm>
 #include <chrono>
@@ -229,15 +229,14 @@ struct SrProf {
 
 }  // namespace
 
-bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior) {
+bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm) {
     if (tiles.empty()) return true;
     SrProf sr_prof;
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) return false;
     const int nt = (int)tiles.size();
 
-    // Layout: LR bytes, HR planes (same order/offsets as gpu_admm's TileLayout), AVIR tables
-    // (none with the Swin2SR prior, which needs no AVIR buffers either).
+    // Layout: LR bytes, HR planes (same order/offsets as gpu_admm's TileLayout), AVIR tables.
     std::vector<SrDev> sd((size_t)nt);
     std::vector<float> table;
     std::map<std::pair<int, int>, std::pair<int, int>> tab_off;   // (R, C) -> (ar, ac)
@@ -247,7 +246,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
         const Tile& P = tiles[(size_t)t];
         auto key = std::make_pair(P.lr_rows, P.lr_cols);
         auto it = tab_off.find(key);
-        if (it == tab_off.end() && !swin_prior) {
+        if (it == tab_off.end()) {
             const std::vector<float>* Ar = nullptr; const std::vector<float>* Ac = nullptr;
             if (!cs_avir_2x_tables(P.lr_rows, P.lr_cols, Ar, Ac)) return false;
             const int ar = (int)table.size(); table.insert(table.end(), Ar->begin(), Ar->end());
@@ -257,7 +256,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
         SrDev d{};
         d.R = P.lr_rows; d.C = P.lr_cols;
         d.lr_off = (int)lr_total; d.hr_off = (int)hr_total;
-        if (!swin_prior) { d.ar = it->second.first; d.ac = it->second.second; }
+        d.ar = it->second.first; d.ac = it->second.second;
         sd[(size_t)t] = d;
         lr_total += (long long)P.lr_rows * P.lr_cols;
         hr_total += 4LL * P.lr_rows * P.lr_cols;
@@ -283,8 +282,8 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     sr_prof.mark(0);
 
     DevBuf<SrDev> dsd; DevBuf<float> dtab, dTMP, dF, dD, dZ, dH; DevBuf<std::uint8_t> dHR8, dCR, dCB, dOUT;
-    if (!dsd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dTMP.alloc(swin_prior ? 0 : (size_t)6 * lr_total) ||
-        !dF.alloc(swin_prior ? 0 : (size_t)3 * hr_total) || !dD.alloc(swin_prior ? 0 : (size_t)3 * nt * dstride) || !dZ.alloc((size_t)hr_total) ||
+    if (!dsd.alloc((size_t)nt) || !dtab.alloc(table.size()) || !dTMP.alloc((size_t)6 * lr_total) ||
+        !dF.alloc((size_t)3 * hr_total) || !dD.alloc((size_t)3 * nt * dstride) || !dZ.alloc((size_t)hr_total) ||
         !dH.alloc((size_t)nt) || (!dLR.p && !dLR.alloc((size_t)3 * lr_total)) || !dHR8.alloc((size_t)3 * hr_total) ||
         !dCR.alloc((size_t)hr_total) || !dCB.alloc((size_t)hr_total) || !dOUT.alloc((size_t)3 * hr_total)) {
         std::fprintf(stderr, "gpu_sr: device allocation failed\n");
@@ -298,12 +297,7 @@ bool run(std::vector<Tile>& tiles, const gpu_admm::Params& prm, bool swin_prior)
     const dim3 blk(kThreads);
     // NLM strength per tile (needed on the host for the ADMM problems)
     k_nlm_h<<<dim3((unsigned)nt), blk>>>(dsd.p, dLR.p, dH.p);
-    if (swin_prior) {
-        // Swin2SR 2x of every tile, straight into the 8-bit BGR warm start
-        std::vector<gpu_swin::Image> ims((size_t)nt);
-        for (int t = 0; t < nt; ++t) ims[(size_t)t] = { sd[(size_t)t].R, sd[(size_t)t].C, sd[(size_t)t].lr_off, sd[(size_t)t].hr_off };
-        if (!gpu_swin::run(ims, dLR.p, dHR8.p)) return false;
-    } else {
+    {
         // AVIR 2x: two separable passes, then the scan-order dither into 8-bit BGR
         k_avir_h<<<dim3((unsigned)((max_tmp + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dLR.p, dTMP.p);
         k_avir_v<<<dim3((unsigned)((max_hr + kThreads - 1) / kThreads), (unsigned)(3 * nt)), blk>>>(dsd.p, dtab.p, dTMP.p, dF.p);

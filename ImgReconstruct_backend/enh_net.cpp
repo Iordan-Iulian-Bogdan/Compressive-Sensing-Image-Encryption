@@ -138,10 +138,27 @@ struct EnhSession {
 std::mutex g_enh_mu;
 std::map<std::string, std::unique_ptr<EnhSession>> g_enh_cache;
 
+// The ORT DLL is delay-loaded and resolved from PATH: a stale system DLL
+// older than the vendored headers makes GetApi(ORT_API_VERSION) return null,
+// and constructing Ort::Env on it AV-crashes (not an Ort::Exception, so the
+// loader below cannot catch it). Probe the API table first so a
+// version-skewed runtime degrades to "model unavailable" instead of taking
+// the process down.
+bool ort_api_available() {
+    try {
+        const OrtApiBase* base = OrtGetApiBase();
+        if (!base || !base->GetApi) return false;
+        return base->GetApi(ORT_API_VERSION) != nullptr;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
 EnhSession* enh_session(const std::string& path) {
     std::lock_guard<std::mutex> lk(g_enh_mu);
     if (auto it = g_enh_cache.find(path); it != g_enh_cache.end()) return it->second.get();
-    if (!cs_onnx_api_ok()) { std::fprintf(stderr, "Warning: --enhance: onnxruntime unavailable\n"); return nullptr; }
+    if (!ort_api_available()) { std::fprintf(stderr, "Warning: --enhance: onnxruntime unavailable\n"); return nullptr; }
     try {
         auto e = std::make_unique<EnhSession>();
         Ort::SessionOptions opt;

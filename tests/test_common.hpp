@@ -4,7 +4,6 @@
 #include "crypto_utils.hpp"
 #include "image_encryption.hpp"
 #include "image_decryption.hpp"
-#include "cs_dict.hpp"
 #include "quality_utils.hpp"
 #include "cs_gpu.h"
 
@@ -54,53 +53,46 @@ inline cv::Mat make_test_image(int w, int h) {
     return img;
 }
 
+// Production encode / decode as the CLI runs them, without the nets: the single-scale seg8-tile container
+// (mode 19, --multiscale off) or the multi-scale one (mode 20), and the cs-sr PnP-ADMM decode (tv 0, 2 ADMM passes).
+// sample_bits 0 = the default 6-bit luma. The encoder's anchor pass decodes its container in memory, as the CLI does.
+inline int prod_encrypt(const std::string& in, const std::string& out, const std::string& password, float ratio,
+    bool multiscale = false, int hr_detail = 2000, int sample_bits = 0, int chroma_bits = 0) {
+    const std::function<cv::Mat(const cv::Mat&)> anchor_decode = [&](const cv::Mat& container) {
+        CsPhotoUpscalerOptions up;
+        up.auto_overlap = 8;
+        cv::Mat dec;
+        if (decrypt_image::decrypt_image_tiled(container, "", password, false, 0.0f, 12, up, &dec) != 0) dec.release();
+        return dec;
+    };
+    return multiscale
+        ? cs_encrypt_multiscale(in, out, password, hr_detail, anchor_decode, ratio)
+        : encrypt_image::encrypt_image_tiled(in, out, password, ratio, 8, hr_detail, sample_bits, chroma_bits, false,
+              anchor_decode);
+}
+
+inline int prod_decrypt(const cv::Mat& container, const std::string& out, const std::string& password) {
+    CsPhotoUpscalerOptions up;
+    up.sr_pnp_iters = 2;
+    return decrypt_image::decrypt_image_tiled(container, out, password, false, 0.0f, 0, up);
+}
+
+// The container as the decoder reads it from disk.
+inline cv::Mat read_container(const std::string& path) { return cv::imread(path, cv::IMREAD_COLOR); }
+
 // Test entry points, called in order from main() in test_main.cpp.
 void test_crypto();
 void test_shuffle();
 void test_tile_helpers();
 void test_roundtrip();
 void test_odd_size_roundtrip();
-void test_fista_solvers();
 void test_dct_adjoint();
 void test_block_dct();
-void test_wavelet_basis();
-void test_adaptive_counts();
-void test_sample_split();
-void test_grain_tv();
-void test_adaptive_roundtrip();
-void test_spectral_lod();
-void test_lod_full_roundtrip();
-void test_ycc420_roundtrip();
-void test_ycc422_roundtrip();
-void test_twopass_roundtrip();
-void test_tsampling();
-void test_regions_roundtrip();
-void test_photo_roundtrip();
-void test_photo_upscaler();
-void test_cs_super_resolution();
-void test_sr_direct();
-void test_coupled_dict();
-void test_dncnn_red();
-void test_onnx_denoisers();
-void test_onsager();
 void test_hr_detail();
 void test_hr_sr_anchors();
 void test_enh_planes();
-void test_edge_scores();
-void test_adaptive_gamma();
-void test_adaptive_cutoff();
-void test_anchor_weighted_red();
-void test_hf_focus_roundtrip();
-void test_hf_weighted_spread();
-void test_adaptive_tile_grid_limit();
 void test_sample_bits();
-void test_y_confidence_prior();
-void test_y_dual_tv_blend();
-void test_y_dual_tv_color_segment();
-void test_dual_tv_split();
 void test_seg_auto();
-void test_seg_edge();
 void test_encoder_geometry();
 void test_auto_reg_params();
-void test_per_tile_coef();
 void test_gpu_fista_agreement();

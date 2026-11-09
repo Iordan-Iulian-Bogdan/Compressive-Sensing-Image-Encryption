@@ -110,37 +110,6 @@ bool solve_planes(std::vector<Plane>& ps, const char* tag, const std::function<v
 }
 }  // namespace
 
-void cs_gpu_solve_tiles(std::vector<GpuTileJob>& jobs, std::vector<char>& solved) {
-    solved.assign(jobs.size(), 0);
-    std::vector<Plane> ps(jobs.size() * 3);
-    for (size_t j = 0; j < jobs.size(); ++j) {
-        const GpuTileJob& J = jobs[j];
-        for (int ch = 0; ch < 3; ++ch) {
-            Plane& P = ps[j * 3 + (size_t)ch];
-            const int it = ch == 0 ? J.iterations : J.iterations - J.iterations / 2;
-            P.meas = J.measurements; P.ch = ch; P.rows = J.rows; P.cols = J.cols;
-            P.rix = J.rix; P.riy = J.riy;
-            P.inner = cs_fista_inner_iters(it, J.fista_iters); P.reweights = J.reweights; P.wscale = J.wscale;
-            P.coef = J.coef; P.tv = J.tv;
-        }
-    }
-    if (!solve_planes(ps, "gpu-tiles")) return;
-
-    // Merge to 8-bit BGR, as the CPU path.
-    const int nj = (int)jobs.size();
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int j = 0; j < nj; ++j) {
-        Plane* P = &ps[(size_t)j * 3];
-        if (!(P[0].ok && P[1].ok && P[2].ok)) continue;
-        const GpuTileJob& J = jobs[(size_t)j];
-        cv::Mat planes[3];
-        for (int ch = 0; ch < 3; ++ch) planes[ch] = cv::Mat(J.rows, J.cols, CV_32F, P[ch].x.data());
-        cv::merge(planes, 3, *J.out);
-        J.out->convertTo(*J.out, CV_8UC3);
-        solved[(size_t)j] = 1;
-    }
-}
-
 void cs_gpu_solve_tiles_ycc(std::vector<GpuYccTileJob>& jobs, std::vector<char>& solved,
     const std::function<void()>& on_gpu) {
     solved.assign(jobs.size(), 0);
