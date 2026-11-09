@@ -192,6 +192,10 @@ struct CsPhotoUpscalerOptions {
   // off): the same kind of net run again on the projected output of the
   // first, its planes rebuilt against that output, then projected again.
   std::string enhance2_model;
+  // Low-ratio first stage (--enhance-low <model.onnx>, decrypt only, empty =
+  // off): replaces enhance_model on containers with few luma sample bits per
+  // output pixel (cs_enhance_pick in image_decryption.cpp).
+  std::string enhance_low_model;
 };
 
 // Effective args for the subprocess: the explicit override when set,

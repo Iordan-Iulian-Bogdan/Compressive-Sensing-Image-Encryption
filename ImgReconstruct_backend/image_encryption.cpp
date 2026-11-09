@@ -545,7 +545,21 @@ cv::Mat encrypt_image::get_mat() {
     return encrypted_img;// .clone();
 }
 
+static bool cs_sampling_mask_view(const cv::Mat& input_img, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    cv::Mat& out);
+static void cs_present_mask_view(const cv::Mat& view, const std::string& output_path);
+
 bool encrypt_image::build_sampling_mask_view(cv::Mat& out) const {
+    return cs_sampling_mask_view(input_img, ri_x, ri_y, out);
+}
+
+void encrypt_image::sample_positions(std::vector<int>& rows, std::vector<int>& cols) const {
+    rows = ri_x; cols = ri_y;
+}
+
+// source | binary mask | cyan overlay of the sample positions (rx = row, ry = col) on img.
+static bool cs_sampling_mask_view(const cv::Mat& input_img, const std::vector<int>& ri_x, const std::vector<int>& ri_y,
+    cv::Mat& out) {
     if (input_img.empty() || ri_x.empty() || ri_x.size() != ri_y.size()) {
         return false;
     }
@@ -601,6 +615,11 @@ void encrypt_image::present_sampling_mask(const std::string& output_path) const 
         std::cerr << "Warning: --show-mask: no sampling indices available\n";
         return;
     }
+    cs_present_mask_view(view, output_path);
+}
+
+// --show-mask output: <output>.mask.png, then a window until a key (CS_MASK_NO_WINDOW: file only).
+static void cs_present_mask_view(const cv::Mat& view, const std::string& output_path) {
 
     std::string mask_path;
     if (!output_path.empty()) {
@@ -3403,7 +3422,7 @@ static void ms_auto_plan(const cv::Mat& src, int T, float ratio, int hr_detail, 
 
 int cs_encrypt_multiscale(const std::string& input_path, const std::string& output_path, const std::string& password,
     const std::string& plan_path, int hr_detail, const std::function<cv::Mat(const cv::Mat&)>& anchor_decode, float ratio,
-    float coarse) {
+    float coarse, bool show_mask) {
     constexpr int T = 120;
     try {
         const cv::Mat src = cv::imread(input_path, cv::IMREAD_COLOR);
@@ -3448,6 +3467,8 @@ int cs_encrypt_multiscale(const std::string& input_path, const std::string& outp
             throw std::runtime_error("multi-scale: key derivation failed");
         std::vector<uint8_t> scales;
         std::vector<cv::Mat> layers;
+        const int gw = W / 2 * 2 / 2, gh = H / 2 * 2 / 2;   // --show-mask: the 2x layer's sampling grid
+        std::vector<int> mask_r, mask_c;
         for (int s = 2; s <= 6; ++s) {
             if (cv::countNonZero(map == s) == 0) continue;
             const double f = s / 2.0;
@@ -3499,6 +3520,14 @@ int cs_encrypt_multiscale(const std::string& input_path, const std::string& outp
                 e.encrypt_ycc420_segmask_ids(1.0f, password, ids, rates, 6, chroma_bits, CS_MODE_YCC420_SEG, 0, &ap, true);
             }
             e.release_key();
+            if (show_mask) {   // this layer's LR pixel (r, c) covers s x s photo pixels: its centre on the grid
+                std::vector<int> rr, cc;
+                e.sample_positions(rr, cc);
+                for (size_t k = 0; k < rr.size(); ++k) {
+                    mask_r.push_back((std::min)(gh - 1, (int)((rr[k] + 0.5) * s / 2.0)));
+                    mask_c.push_back((std::min)(gw - 1, (int)((cc[k] + 0.5) * s / 2.0)));
+                }
+            }
             cv::Mat c = e.get_mat();
             if (!c.isContinuous()) c = c.clone();
             std::cout << "multi-scale: " << s << "x layer " << lw << "x" << lh << ", " << cv::countNonZero(map == s)
@@ -3538,6 +3567,12 @@ int cs_encrypt_multiscale(const std::string& input_path, const std::string& outp
         out = out.reshape(3, side);
         if (!cv::imwrite(output_path, out)) throw std::runtime_error("failed to write '" + output_path + "'");
         std::cout << "multi-scale: " << layers.size() << " layers, container " << (size_t)total * 3 << " bytes" << std::endl;
+        if (show_mask) {   // on the photo shrunk as the 2x layer is (crop to even, then the pipeline's bilinear 2x)
+            cv::Mat grid, view;
+            cv::resize(src(cv::Rect(0, 0, gw * 2, gh * 2)), grid, cv::Size(gw, gh));
+            if (cs_sampling_mask_view(grid, mask_r, mask_c, view)) cs_present_mask_view(view, output_path);
+            else std::cerr << "Warning: --show-mask: no sampling indices available\n";
+        }
     }
     catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

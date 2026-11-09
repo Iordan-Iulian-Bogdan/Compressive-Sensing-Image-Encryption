@@ -419,6 +419,16 @@
     - Sweep speed: the first version computed metrics (`ratio_sweep.metrics`, ~19 s per 12 MP decode) inside the
       encode/decode worker, which left the GPU idle. Moving them to a separate pool of 8–12 processes cut it from
       ~11 s per run per worker to ~2 s.
+    - Layer-trained net, 2026-11-07 (not promoted): `6bclaylo_c16d2`, c16d2 9-plane from scratch, 128k steps, on
+      `F:\Training Data\enh_data_6bc_laylo` (whole-photo layers, 2x 40% at 225k anchors, 3x–6x 15% each, r0.1–0.3).
+      On the default multi-scale containers (32 photos) it is behind `6bclo5` at every ratio, alone and with u2dc
+      (details and numbers: `docs/enhance-nets.md`, run `20261106-233103_enh_laylo`). Training on layers at
+      these scales gives the net nothing the mixed low-ratio data does not.
+      - Found on the way: `6bclo5` + u2dc beats production's two stages at r0.1 / 0.2 (+0.26 / +0.06 dB, ΔE95
+        −0.24 / −0.07, SSIM +0.0045 / +0.0008) and loses at r0.3 (−0.06 dB). Adopted 2026-11-07 as
+        `--enhance-low` (picked below 0.43 luma sample bits per pixel; `docs/enhance-nets.md`, "Net choice by ratio").
+      - Not tried: training on layers cut from real planner containers (partial layers, layer borders, real
+        per-tile rates); this result makes it a low priority.
   - Open: the 48 MP photo with the planner; the 12 MP test photos.
 - [ ] **Per-tile sampling rate chosen closed-loop.** The scale test above found that choosing each 64x64 tile's
   sampling rate from the decodes at r0.05 / 0.1 / 0.3 / 0.5 / 0.9 (same total luma samples) beats the seg-auto

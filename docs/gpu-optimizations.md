@@ -1013,3 +1013,20 @@ What is still slower than production, largest first:
 
 Together: about +480 ms of extra stage time against −161 ms of cs-sr. With the overlaps that leaves the
 measured gap of ~0.3-0.4 s (1.63-1.83 s against 1.37-1.41 s).
+
+### 18.6 `--show-mask` on multi-scale encodes (2026-11-09)
+
+Before this, `--show-mask` wrote nothing when the encode was multi-scale. That is the production default since 11-06,
+so the documented way to view the sampling mask had silently stopped working. `cs_encrypt_multiscale` now takes
+`show_mask` (from `--show-mask`, off in batch mode). After each layer's final encrypt (the anchored one on the 2x
+layer), it collects that layer's luma sample positions (`encrypt_image::sample_positions`). A sample at LR pixel
+(r, c) of the s-x layer goes to ((r + 0.5) s / 2, (c + 0.5) s / 2) on the 2x layer's grid (W / 2 x H / 2), the
+centre of the photo area it covers. So coarse tiles show as sparse dots, and the density you see is samples per
+area. The view is the single-scale one: source | mask | cyan overlay. Its source panel is the photo shrunk the way
+the 2x layer is. It goes to `<output>.mask.png` plus a window (`CS_MASK_NO_WINDOW=1`: file only), through the same
+helpers as single-scale (`cs_sampling_mask_view`, `cs_present_mask_view`, split out of the
+`encrypt_image` members).
+
+The container is unchanged. On `iPhone14Pro_ProRAW48MP` at r0.3 the encode is the same size (5.25 MB, 5 layers),
+and the production decode scores the same as without the flag (34.98 dB, SSIM 0.948, ΔE95 4.21). The mask marks
+36.3% of the grid. The top 12% of the frame (sky, 3x-6x tiles) gets 0.65%.

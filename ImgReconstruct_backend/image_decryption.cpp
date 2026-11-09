@@ -49,6 +49,17 @@ static thread_local std::mutex* t_ms_gpu_lock = nullptr;
 struct CsMsNeed { const cv::Mat* map; int T, W, H, s; };
 static thread_local const CsMsNeed* t_ms_need = nullptr;
 
+// --enhance-low: the first-stage net for a container with `bits` luma sample bits per output pixel (all layers of a
+// multi-scale container together). Default multi-scale encodes give 0.19-0.29 at r0.1, 0.37-0.46 at r0.2 and
+// 0.55-0.64 at r0.3 (32 photos); the low-ratio net + --enhance2 beat the standard pair below 0.43 (+0.26 dB under
+// 0.3, +0.07..0.10 dB at 0.3-0.43) and lost above it (2026-11-07, docs/enhance-nets.md).
+static constexpr double CS_ENHANCE_LOW_BITS = 0.43;
+static const std::string& cs_enhance_pick(const CsPhotoUpscalerOptions& pu, double bits) {
+    const bool low = !pu.enhance_low_model.empty() && bits < CS_ENHANCE_LOW_BITS;
+    std::printf("enhance: %.3f luma sample bits per pixel, %s net\n", bits, low ? "low-ratio" : "standard");
+    return low ? pu.enhance_low_model : pu.enhance_model;
+}
+
 // Flags (ceil(h / 8) x ceil(w / 8)) of the w x h layer's 8x8 blocks the composite reads: within the 17x17 feather box
 // (8 px) plus the cubic resample's taps of a tile of the layer's scale.
 static cv::Mat cs_ms_needed_blocks(const CsMsNeed& n, int w, int h) {
@@ -1873,6 +1884,7 @@ int decrypt_image::decrypt_image_tiled(
         enh_prefetch.t = std::thread([&photo_up] {
             cs_enhance_prefetch(photo_up.enhance_model);
             if (!photo_up.enhance2_model.empty()) cs_enhance_prefetch(photo_up.enhance2_model);
+            if (!photo_up.enhance_low_model.empty()) cs_enhance_prefetch(photo_up.enhance_low_model);
         });
 #endif
     cv::Mat encrypted_img_g = cv::imread(input_path, cv::IMREAD_COLOR);
@@ -2555,6 +2567,18 @@ int decrypt_image::decrypt_image_tiled(
             // holds gpu_lock (t_ms_gpu_lock), so the GPU stages stay one layer at a time while the CPU stages overlap.
             std::mutex gpu_lock;
             std::vector<int> rc(n, -1);
+            // --enhance-low is chosen once for the whole container, from the luma sample bits of all its layers.
+            CsPhotoUpscalerOptions pu = photo_up;
+            if (!pu.enhance_low_model.empty() && !pu.enhance_model.empty()) {
+                double bits = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    CsHeaderInfo hi;
+                    if (cs_parse_header(layers[i].data, layers[i].total() * 3, password, hi)) bits += (double)hi.m * hi.sample_bits;
+                    cs_wipe(hi.key, sizeof(hi.key));
+                }
+                pu.enhance_model = cs_enhance_pick(pu, bits / ((double)W * H));
+            }
+            pu.enhance_low_model.clear();
             {
                 std::vector<std::thread> th;
                 for (int i = 0; i < n; ++i)
@@ -2565,7 +2589,7 @@ int decrypt_image::decrypt_image_tiled(
                         const auto tl = std::chrono::high_resolution_clock::now();
                         try {
                             rc[i] = decrypt_image_tiled(layers[i], "", password, num_tiles, overlap, iterations, nun_threads, coef,
-                                false, tv, full_res, solver, fista_iters, reweights, basis, wscale, photo_up, per_tile_coef,
+                                false, tv, full_res, solver, fista_iters, reweights, basis, wscale, pu, per_tile_coef,
                                 per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve_mask, seg_params, &decs[i]);
                         } catch (...) { rc[i] = -1; }
                         t_ms_gpu_lock = nullptr;
@@ -4022,7 +4046,9 @@ int decrypt_image::decrypt_image_tiled_ycc420(decrypt_image& dimgs,
                 } else if (photo_up.enhance2_model.empty()) need1 = need;
                 ein.active = need1.empty() ? nullptr : &need1;
             }
-            enhanced = cs_enhance_net(reconstructed, photo_up.enhance_model, ein);
+            const std::string& net1 = photo_up.enhance_low_model.empty() ? photo_up.enhance_model
+                : cs_enhance_pick(photo_up, (double)dimgs.get_m() * dimgs.get_sample_bits() / reconstructed.total());
+            enhanced = cs_enhance_net(reconstructed, net1, ein);
             ein.active = need.empty() ? nullptr : &need;
             // Data consistency: the net's output back onto the container's samples and anchors (all 32 test decodes
             // better, +0.04 dB at r0.3 to +0.10 dB at r0.9, dE-p95 -0.02 to -0.05).

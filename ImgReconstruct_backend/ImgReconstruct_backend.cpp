@@ -136,6 +136,10 @@ void print_usage(const char* exe) {
   "                        On encrypt (--seg-auto --ycc420 --hr-detail), pass\n"
   "                        the net you will decode with: the anchors then go\n"
   "                        where the error is left after it\n"
+  "  --enhance-low <model> decrypt: use this net instead of --enhance on\n"
+  "                        containers with under 0.43 luma sample bits per\n"
+  "                        output pixel (about r0.25 and below); the\n"
+  "                        decode prints the value and the net it chose\n"
   "  --tv <f>              total-variation fusion weight for the solver\n"
   "                        (>0 enables TV, smoother edges, helps at high\n"
   "                        compression; 0 = off). Default: auto (0.01 for\n"
@@ -799,6 +803,7 @@ int main(int argc, char* argv[])
         // post-pipeline restoration CNN (decrypt-side only, ycc containers)
         {"--enhance", "ONNX model path", false, [&](const char* v) { photo_up.enhance_model = v; return true; }},
         {"--enhance2", "ONNX model path", false, [&](const char* v) { photo_up.enhance2_model = v; return true; }},
+        {"--enhance-low", "ONNX model path", false, [&](const char* v) { photo_up.enhance_low_model = v; return true; }},
         // weights below do NOT force manual mode: AUTO still derives
         // coef/iterations from the container ratio; only the weight changes
         {"--tv", "floating point", false, [&](const char* v) { return set_float(v, tv_lambda, nullptr, nullptr); }},
@@ -1260,14 +1265,17 @@ int main(int argc, char* argv[])
             // memory, then anchors the worst blocks. Flag map and anchor luma ride in the container.
             std::function<cv::Mat(const cv::Mat&)> anchor_decode;
             if (hr_detail > 0 && ((seg_auto > 0 && ycc420) || !multiscale_plan.empty())) {
-                anchor_decode = [&](const cv::Mat& container) {
+                // CS_ENC_PROD_DECODE=1 (experiment): the decode's own overlap and FISTA steps instead of the --fast ones,
+                // so with CS_ADMM_PROX_OFF=1 --sr-pnp-iters 2 and the decode's nets the pass is the production decode.
+                const bool prod_dec = std::getenv("CS_ENC_PROD_DECODE") && std::getenv("CS_ENC_PROD_DECODE")[0] == '1';
+                anchor_decode = [&, prod_dec](const cv::Mat& container) {
                     CsPhotoUpscalerOptions pass_up = photo_up;
                     pass_up.backend = "cs-sr";
                     pass_up.sr_pnp = "admm";
-                    pass_up.auto_overlap = 8;
+                    if (!prod_dec) pass_up.auto_overlap = 8;
                     cv::Mat dec;
                     if (decrypt_image::decrypt_image_tiled(container, "", password,
-                            tiles, 8, iterations, threads, coef, false, 0.0f, full_res, solver, 12, reweights, basis, wscale, pass_up,
+                            tiles, prod_dec ? overlap : 8, iterations, threads, coef, false, 0.0f, full_res, solver, prod_dec ? fista_iters : 12, reweights, basis, wscale, pass_up,
                             per_tile_coef, per_tile_tv, grain_tv, use_onsager, nullptr, seg_solve, seg_params, &dec) != 0)
                         dec.release();
                     return dec;
@@ -1283,7 +1291,8 @@ int main(int argc, char* argv[])
             if (!multiscale_plan.empty()) {
                 for (size_t j = 0; j < jobs.size(); ++j) {
                     const auto tj = std::chrono::high_resolution_clock::now();
-                    const int r = cs_encrypt_multiscale(jobs[j].first, jobs[j].second, password, multiscale_plan, hr_detail, anchor_decode, ratio, ms_coarse);
+                    const int r = cs_encrypt_multiscale(jobs[j].first, jobs[j].second, password, multiscale_plan, hr_detail, anchor_decode, ratio, ms_coarse,
+                                                          show_mask && !batch);
                     if (!batch) { rc = r; break; }
                     failed += r != 0;
                     batch_line(j, r, tj);
@@ -1313,6 +1322,7 @@ seg_rates, seg_blend, sampling, seg_auto, seg_edge, seg_tile, anchor_decode);
                 enh_pre.t = std::thread([&photo_up] {
                     cs_enhance_prefetch(photo_up.enhance_model);
                     if (!photo_up.enhance2_model.empty()) cs_enhance_prefetch(photo_up.enhance2_model);
+                    if (!photo_up.enhance_low_model.empty()) cs_enhance_prefetch(photo_up.enhance_low_model);
                 });
 #endif
             cv::Mat next;

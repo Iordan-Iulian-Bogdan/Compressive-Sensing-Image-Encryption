@@ -132,6 +132,8 @@ public:
     // Build source | binary mask | cyan overlay from the indices used by the
     // last encrypt_* call. Returns false when no indices are available.
     bool build_sampling_mask_view(cv::Mat& out) const;
+    // The luma sample positions of the last encrypt_* call (rows, cols).
+    void sample_positions(std::vector<int>& rows, std::vector<int>& cols) const;
 
     // Build under/over-sampled tile canvases from the indices used by the
     // last encrypt_* call (see cs_build_sample_class_views). Writes
@@ -207,11 +209,14 @@ void cs_seg_edge_refine(const cv::Mat& bgr, cv::Mat& ids, std::vector<float>& ra
 // production closed-loop anchors, hr_detail x its share of the tiles. plan_path "auto": the encoder plans the
 // tiles for the budget of a production container at ratio; coarse in (0, 1] (--ms-coarse) moves the plan's
 // coarseness (area mean of log(s / 2) / log 3) that fraction of the way from the plain plan's to all-6x. Writes the container to output_path; returns 0 on success.
+// show_mask (--show-mask): every layer's luma samples on the 2x layer's grid (W/2 x H/2; a sample of the s-x layer
+// at its pixel's centre, so coarse tiles show sparse dots), as <output>.mask.png and a window like single-scale.
 // --hr-area: scale every encode's --hr-detail count by the photo's area / 4032 x 3024 (off by default).
 void cs_set_hr_area_scaling(bool on);
 int cs_encrypt_multiscale(const std::string& input_path, const std::string& output_path, const std::string& password,
     const std::string& plan_path, int hr_detail = 0,
-    const std::function<cv::Mat(const cv::Mat&)>& anchor_decode = {}, float ratio = 0.3f, float coarse = 0.0f);
+    const std::function<cv::Mat(const cv::Mat&)>& anchor_decode = {}, float ratio = 0.3f, float coarse = 0.0f,
+    bool show_mask = false);
 
 // Per-tile detail split (--seg-tile, the "seg8-tile" container): every 64x64
 // tile gets an LOD from its mean |Laplacian| (min-max to [32, 255]) bucketed

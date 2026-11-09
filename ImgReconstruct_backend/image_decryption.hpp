@@ -210,6 +210,7 @@ public:
     // Rectangular tile grid chosen in auto mode (rows x cols, 0 = the square num_tiles grid).
     int grid_rows = 0, grid_cols = 0;
     int get_sample_bits() const { return sample_bits; }
+    int get_m() const { return m; }
     int get_sample_bits_chroma() const { return sample_bits_chroma; }
     int get_lod_full_threshold() const { return lod_full_threshold; }
     bool get_thumb_seed(cv::Mat& out) const {

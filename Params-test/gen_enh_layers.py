@@ -1,9 +1,9 @@
 """Training pairs for an --enhance net on multi-scale (mode 20) layers, in the layout train_enh_fresh.py reads.
 
 Per photo (gen_enh_prod.py's photos and train/val split): a scale s (2x 40%, 3x..6x 15% each) and a ratio (0.1 / 0.3 /
-0.5) by crc32 of the name; the layer = the photo area-shrunk by s/2 (2x: the photo), even-sized, kept as keep\\<name>\\gt.png
+0.5, or ENH_RATIOS) by crc32 of the name; the layer = the photo area-shrunk by s/2 (2x: the photo), even-sized, kept as keep\\<name>\\gt.png
 (the net's target). It is encrypted as a one-layer `--multiscale` container, every 120 px tile at a random flat rate
-(log-normal around 1.2 x ratio, 0.02..1, as the planner's tiles), the 2x layers with 450k closed-loop anchors, the others
+(log-normal around 1.2 x ratio, 0.02..1, as the planner's tiles), the 2x layers with 450k (ENH_ANCHORS) closed-loop anchors, the others
 with none (as cs_encrypt_multiscale); decoded without the net, with the 9-plane dumps (an empty anchor sidecar when there
 are no anchors). Crops as gen_enh_prod.save_crops, against gt.png. Train with Params-test/finetune_enh_layers.py.
 
@@ -19,7 +19,7 @@ import gen_enh_prod as g
 Image.MAX_IMAGE_PIXELS = None
 T = 120
 SCALES = [2] * 8 + [3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6]   # 40% 2x, 15% each other
-RATIOS = [0.1, 0.3, 0.5]
+RATIOS = g.RATIOS or [0.1, 0.3, 0.5]   # ENH_RATIOS overrides
 
 
 def one_photo(split, name, f, log):
@@ -37,7 +37,7 @@ def one_photo(split, name, f, log):
     plan = np.zeros((th, tw, 3), np.uint8); plan[..., 0] = 2; plan[..., 1] = np.clip(np.rint(q * 255), 1, 254).reshape(th, tw)
     pp, enc = g.SCR + r"\plan.png", g.SCR + r"\container.png"
     Image.fromarray(plan[..., ::-1].copy(), "RGB").save(pp)
-    anchors = ["--hr-detail", "450000", "--enhance", g.RANK_NET] if s == 2 else []
+    anchors = ["--hr-detail", os.environ.get("ENH_ANCHORS", "450000"), "--enhance", g.RANK_NET] if s == 2 else []
     t0 = time.time()
     rc = g.run(["encrypt", keep + r"\gt.png", enc, "--password", g.PW, "--no-preview", "--multiscale", pp, *anchors], g.ENV, g.SCR + r"\enc.log")
     if rc != 0 or not os.path.exists(enc):
